@@ -19,7 +19,9 @@
 
      Natives: PlayerPedId, GetEntityCoords(entity, alive), GetHashKey, IsDoorRegisteredWithSystem,
      AddDoorToSystem, DoorSystemGetDoorState, DoorSystemSetDoorState, SetStateOfClosestDoorOfType,
-     RemoveDoorFromSystem, IsNuiFocused, RegisterKeyMapping (all apiset client).
+     RemoveDoorFromSystem, IsNuiFocused, RegisterKeyMapping, GetClosestObjectOfType, IsEntityAnObject,
+     GetEntityModel, GetEntityHeading, DoorSystemFindExistingDoor (all apiset client, verified with
+     fxref 2026-09-12); GetGamePool is the Cfx runtime helper.
 ]]
 
 local Doors = {}
@@ -94,6 +96,21 @@ local function interactionActive()
     return getActive ~= nil and getActive() ~= nil
 end
 
+--- A registered door whose model hash does not match the object standing at its coords controls
+--- nothing, silently. Once per session, as soon as the area is streamed in (within 40 m), look for
+--- an object of that model within 2 m and say so in the console when there is none.
+local function verifyObject(entry)
+    if entry.checked ~= nil then return end
+    local coords = entry.coords
+    if #(GetEntityCoords(PlayerPedId(), false) - coords) > 40.0 then return end
+    local object = GetClosestObjectOfType(coords.x, coords.y, coords.z, 2.0, entry.model, false, false, false)
+    entry.checked = object ~= 0
+    if object == 0 then
+        Core.Log.warn('door %s: no object with model %d within 2 m of %.1f, %.1f, %.1f — the model is wrong; '
+            .. 'look at the door and run /doorfind', tostring(entry.id), entry.model, coords.x, coords.y, coords.z)
+    end
+end
+
 --- Push one door's lock state into the game. Doors the door system will not take (interior
 --- doors that were never registered) fall back to SetStateOfClosestDoorOfType.
 local function applyState(entry)
@@ -111,6 +128,7 @@ local function applyState(entry)
         SetStateOfClosestDoorOfType(entry.model, coords.x, coords.y, coords.z, entry.locked, 0.0, false)
     end
     entry.applied = entry.locked
+    verifyObject(entry)
 end
 
 --- Hand a door back to the engine. Unlock it first: RemoveDoorFromSystem keeps the last lock
@@ -313,6 +331,68 @@ RegisterCommand(DOOR_CMD, function()
 end, false)
 
 RegisterKeyMapping(DOOR_CMD, 'Lock/Unlock Door', 'keyboard', INTERACT_KEY)
+
+--- The object the camera points at (6 m), else the nearest object within 3 m. One-shot: the
+--- pool scan is fine for a command, never for a loop.
+local function objectInFrontOrNearby()
+    local raycast = Core.Raycast
+    if raycast and raycast.getEntityInFront then
+        local entity = raycast.getEntityInFront(6.0)
+        if entity and entity ~= 0 and IsEntityAnObject(entity) then return entity, 'in front of you' end
+    end
+    local here = GetEntityCoords(PlayerPedId(), false)
+    local best, bestDist = 0, 3.0
+    for _, object in ipairs(GetGamePool('CObject')) do
+        local dist = #(GetEntityCoords(object, false) - here)
+        if dist < bestDist then
+            best, bestDist = object, dist
+        end
+    end
+    if best ~= 0 then return best, ('%.1f m away'):format(bestDist) end
+    return 0, nil
+end
+
+--- /doorfind — answers "is this the door?": prints the model hash, coords and heading of the
+--- object you look at (F8 console), whether the game's door system knows it, and which registered
+--- core door sits there — with its expected model, so a mismatch is spelled out. The printed
+--- `model = <hash>` line can be pasted into Core.Doors.register as it is.
+RegisterCommand('doorfind', function()
+    local object, where = objectInFrontOrNearby()
+    if object == 0 then
+        Core.UI.notify('No object in front of you or within 3 m — stand closer and look at the door', 'error')
+        return
+    end
+    local model = GetEntityModel(object)
+    local coords = GetEntityCoords(object, false)
+    local heading = GetEntityHeading(object)
+    local known, mapDoorHash = DoorSystemFindExistingDoor(coords.x, coords.y, coords.z, model, 0)
+    print(('[core] doorfind: object %s — model = %d, coords = vector3(%.2f, %.2f, %.2f), heading %.1f, '
+        .. 'door system: %s'):format(where, model, coords.x, coords.y, coords.z, heading,
+        known and ('known as door hash %d'):format(mapDoorHash or 0) or 'not a registered door (yet)'))
+    local matched = false
+    for id, entry in pairs(doors) do
+        local dist = #(entry.coords - coords)
+        if dist <= 2.5 then
+            matched = true
+            if entry.model == model then
+                print(('[core] doorfind: this IS core door "%s" (model matches, %.1f m from its coords)'):format(id, dist))
+                Core.UI.notify(('This is door "%s" — model matches'):format(id), 'success')
+            else
+                print(('[core] doorfind: core door "%s" is registered %.1f m from here but expects model %d, '
+                    .. 'the object here is %d — put `model = %d` into its Core.Doors.register call'):format(
+                    id, dist, entry.model, model, model))
+                Core.UI.notify(('Door "%s": model mismatch — see F8 console'):format(id), 'error')
+            end
+        end
+    end
+    if not matched then
+        Core.UI.notify(('Object model %d at %.1f, %.1f, %.1f — no core door registered here (F8 has the snippet)')
+            :format(model, coords.x, coords.y, coords.z), 'info')
+        print(('[core] doorfind: register it with Core.Doors.register({ id = \'my_door\', model = %d, '
+            .. 'coords = vector3(%.2f, %.2f, %.2f), locked = true, perms = { \'core.mod\' } })'):format(
+            model, coords.x, coords.y, coords.z))
+    end
+end, false)
 
 AddEventHandler('onClientResourceStop', function(resource)
     if resource ~= Core.name then return end

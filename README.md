@@ -548,6 +548,13 @@ end)
 `perms` entries are `'core.admin'`, `'faction:<id>'` or `'faction:<id>:<minRank>'`; an empty list means
 anyone. State rides on `GlobalState['door:<id>']`. Hooks: `doorLocked` / `doorUnlocked` `(id, src|nil)`.
 
+**Is it the right door?** A door whose `model` does not match the object at `coords` controls nothing.
+Two safety nets: the client warns once per session in the F8 console (`door <id>: no object with model …`)
+as soon as the area is streamed in, and `/doorfind` prints the model hash, coords and heading of the object
+you look at (or the nearest one within 3 m), tells you whether a registered core door sits there and whether
+its model matches, and prints a ready `Core.Doors.register` line. Paste the printed number as `model = <hash>`;
+a name works too when you know it.
+
 ### World, Screen, Cron (§17)
 
 | function | purpose |
@@ -741,7 +748,7 @@ up — see "Editor support (LuaLS)" below.
 
 Wave 2 (§15–§26). Steps 13 and 15 are the negative tests — same rule: they must fail quietly. The FXServer console cannot evaluate Lua, so where a step calls a `Core.*` function, wrap it in a throwaway `Core.Commands.register` in `core_example/server/main.lua` first.
 
-13. **Door, with and without permission:** walk to the `example_backroom` door at `24.9, -1345.4, 29.5` → the `[E] Lock / unlock door` pill appears within 2 m. As `core.mod`, press `E` → the door unlocks, `E` again re-locks it, and a second player standing there sees the door move too (it rides on `GlobalState`). Without `core.mod` → "You do not have access to this door" and the door does not move. Then `restart core` → the lock state is back as you left it.
+13. **Door, with and without permission:** walk to the `example_backroom` door at `24.9, -1345.4, 29.5`, look at it and run `/doorfind` — it must say the model matches (if not, paste the printed hash into `core_example/server/main.lua`) → the `[E] Lock / unlock door` pill appears within 2 m. As `core.mod`, press `E` → the door unlocks, `E` again re-locks it, and a second player standing there sees the door move too (it rides on `GlobalState`). Without `core.mod` → "You do not have access to this door" and the door does not move. Then `restart core` → the lock state is back as you left it.
 14. **Server-driven interaction:** step into the orange marker 3 m east of the 24/7 (`Server-side snack ($5)`) and press `E` → cash −$5, a green **YUM / Server-side snack** shard, and `server snack for <id> at … m` in the *server* log (`fxserver logs --resource core_example`, needs `Config.Debug`). The handler ran on the server; the client only reported the press.
 15. **Server-side distance and cooldown:** from ~10 m away run `TriggerServerEvent('core:server:worldInteract', '<id>')` in `F8` → nothing happens, no money moves. Spam `E` in the marker for 10 s → at most one purchase per second.
 16. **Weapons persist:** `/weapon <your id> WEAPON_PISTOL 50` → the pistol appears with 50 rounds. Fire ~10, wait for the 60 s snapshot (or die), then `/quit` and reconnect → the pistol is back with the *reduced* ammo. `/weapons clear <your id>` → it is gone and stays gone after a relog. Bonus negative: `/weapon` as a non-admin → "You are not allowed to do that".

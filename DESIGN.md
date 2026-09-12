@@ -1280,6 +1280,12 @@ within 100 m). Key: reuses `core_interact` when within 2.0 m of a registered doo
 `core:server:doorToggle (id)` (`Core.Net.on`, cooldown 500, distance ≤ 3.5). Text UI "[E] Lock/Unlock" while near
 a door the player may use. Hooks: `doorLocked (id, src|nil)`, `doorUnlocked (id, src|nil)`. Persisted `locked` on
 change (DB `doors`, `Doors.register` merges the stored state).
+Model verification (2026-09-12): a wrong `model` makes the door system control nothing, silently, so the client
+checks once per session (within 40 m, `GetClosestObjectOfType` 2 m) that an object of that model exists at
+`coords` and warns in the console otherwise, and the client command `/doorfind` prints the model hash, coords
+and heading of the object in front of the player (`Core.Raycast.getEntityInFront`, else the nearest object
+within 3 m via `GetGamePool('CObject')`), whether the door system knows it, and whether a registered core door
+at that spot expects a different model — with a ready `Core.Doors.register` line.
 
 ## 17. Environment (`Core.World`, `Core.Screen`, `Core.Cron`) — Rebar `useWorld`, `useCronJob`, time/weather services
 
