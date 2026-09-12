@@ -89,6 +89,15 @@ Config = {
     UI = {
         NotifyDurationMs = 5000, MaxNotifyPerSecond = 10, HudEnabled = true,
         ModalTimeoutMs = 300000, CancelKey = 'X',
+        -- Auto-hide of the whole NUI shell while the game draws over it (DESIGN §31.3).
+        -- One 200 ms thread reads only the enabled watchers; HudHidden is off by default
+        -- because IsHudHidden's semantics are undocumented and a wrong reading would hide
+        -- the shell for good.
+        AutoHide = {
+            IntervalMs = 200,
+            PauseMenu = true, ScreenFade = true, PlayerSwitch = true,
+            Warning = true, HudHidden = false, Cinematic = true,
+        },
     },
     DB = { KeyPrefix = 'doc:', FlushIntervalMs = 5000, Adapter = 'kvp' },
     Admin = { CarDefaultModel = 'adder' },

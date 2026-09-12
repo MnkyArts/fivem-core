@@ -36,6 +36,10 @@ local MAX_BUTTON <const> = 32
 local MAX_MENU_ITEMS <const> = 200
 local MAX_FIELDS <const> = 32
 local FIELD_TYPES <const> = { text = true, number = true, select = true, checkbox = true }
+-- Shell visibility (DESIGN §31.5): the reason a server push adds to the client's
+-- hide set, namespaced as 'server:<reason>' so no plugin can clear it.
+local MAX_REASON <const> = 32
+local REASON_PATTERN <const> = '^[%w_%-%.:]+$'
 
 --- Sub-namespace tables: the flat dotted key is the one exports.core:call resolves.
 UI.textUI = {}
@@ -151,6 +155,36 @@ local function hudSetVisible(src, visible)
 end
 
 define('hud', 'setVisible', hudSetVisible)
+
+-- ------------------------------------------------------------- visibility ----
+-- Fire-and-forget like every other push: the server keeps no record of which
+-- reasons a client holds, and a NUI reload drops them (§31.5).
+
+--- 'server:<reason>' for a valid reason, nil (and a log line) for anything else.
+local function reasonKey(op, reason)
+    if reason == nil then reason = 'default' end
+    if type(reason) ~= 'string' or #reason > MAX_REASON or not reason:find(REASON_PATTERN) then
+        Log.error('UI.%s: invalid reason (%s)', op, tostring(reason))
+        return nil
+    end
+    return 'server:' .. reason
+end
+
+--- UI.hide(src, reason?) — hides that player's whole NUI shell until every reason
+--- is gone. An open built-in modal and the focused page are closed client-side.
+function UI.hide(src, reason)
+    local key = reasonKey('hide', reason)
+    if not key then return false end
+    return push(src, 'hide', { key })
+end
+
+--- UI.show(src, reason?) — drops this server reason again; other reasons (the
+--- game-state watchers, a plugin's own) keep the shell hidden on their own.
+function UI.show(src, reason)
+    local key = reasonKey('show', reason)
+    if not key then return false end
+    return push(src, 'show', { key })
+end
 
 -- --------------------------------------------- key hints / shard / spinner ----
 

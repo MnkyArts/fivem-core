@@ -192,3 +192,18 @@ Natives to verify per file (names from the 2026-09-12 scouts where already verif
 - `server/getters.lua`: GetPlayerPed, GetEntityCoords (1-arg), GetVehiclePedIsIn, GetPedInVehicleSeat, GetVehicleMaxNumberOfPassengers (verify apiset), GetPlayerName.
 - `server/http.lua`: PerformHttpRequest (helper), SetHttpHandler (verify), GetConvar. `server/security.lua`: SetRoutingBucketEntityLockdownMode, CancelEvent; event handlers weaponDamageEvent/explosionEvent (runtime-facts §9 signatures `(sender, data)`).
 - `server/environment.lua`, `server/stats.lua`, `server/weapons.lua`, `server/remote.lua`, `server/ui.lua`, `server/globals.lua`, `server/services.lua`, `server/chat.lua`, `server/cron.lua`, `server/worldsync.lua`: no GTA natives beyond GetGameTimer/GetPlayerPed/GetEntityCoords/GetHashKey; `os.date`/`os.time` allowed server-side.
+
+## 6. UI visibility runs (DESIGN §31, 2026-09-12)
+
+| run | agent | owns | notes |
+|---|---|---|---|
+| UIV-1 | fivem-implementer (opus) | `shared/config.lua` (UI.AutoHide), `client/ui.lua` (reasons, watchers, hook, hidden transition, ui_ready re-send), `server/ui.lua` (hide/show), `types/core.lua`, `tests/server_tests.lua` | natives: IsPauseMenuActive, IsScreenFadedOut, IsScreenFadingOut, IsPlayerSwitchInProgress, IsWarningMessageActive, IsHudHidden, IsCinematicCamRendering (all client) — re-verify with fxref |
+| UIV-2 | general-purpose (opus) | `ui/src/store.js`, `ui/src/App.vue`, `ui/src/styles.css` (only the `.core-root.is-hidden` rule), `ui/tests/shell-regression.js`, Storybook story + Lua panel entry + Introduction.mdx, `README.md` | verify with `npx vite build` to a scratch dir, the regression over HTTP, `npx storybook build` |
+
+## 7. Game blur runs (DESIGN §32, 2026-09-12) — start after §6 runs are merged
+
+| run | agent | owns | notes |
+|---|---|---|---|
+| GB-1 | general-purpose (opus) | new `ui/src/gameblur.js`, `ui/src/main.js`, `ui/src/App.vue` (watchEffect only), `ui/src/store.js` (`store.blur`, `blur:set`), `ui/src/styles.css` (glass rules, `--color-panel-glass`, root override), `ui/tests/shell-regression.js` | verify: scratch vite build, regression over HTTP (+3 → 52), no CSS warnings |
+| GB-2 | general-purpose (opus) | `data-core-blur` on the built-in panels (Menu, InputDialog, AlertDialog, Hud, StatsBars, Notifications, TextUI, Progress, KeyHints, Spinner), `core_example/ui/src/Page.vue`, `templates/plugin/ui/src/Page.vue`, `.storybook/preview.js` (install), new `ui/src/stories/GameBlur.stories.js`, Introduction.mdx, README (Styling + Visibility wording + config + checklist step), template/example READMEs | verify: scratch vite build + storybook build |
+| GB-3 | fivem-implementer (opus) | `shared/config.lua` (`UI.Blur`), `client/ui.lua` (`blur:set` on ui_ready, `Core.UI.setBlur`), `types/core.lua`, `tests/server_tests.lua` untouched unless needed | no new natives |

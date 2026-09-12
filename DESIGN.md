@@ -928,6 +928,8 @@ configures no CSS toolchain; a scoped `<style>` that uses `@apply` points Tailwi
 `@reference "../../../core/ui/src/styles.css";` (relative to `<plugin>/ui/src`), which reads the tokens and emits
 nothing. `backdrop-filter` / `-webkit-backdrop-filter` and Tailwind's `backdrop-*` utilities are banned shell-wide:
 the game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid black box.
+A panel that should show the blurred game behind it carries `data-core-blur` instead (§32: the shell draws the
+game frame through FiveM's NUI render hook and blurs that copy).
 
 ### 7.2 Files
 
@@ -1600,3 +1602,172 @@ DefaultWeather = 'CLEAR', WeatherCycle = nil }`, `Stats` (§18), `Weapons = { Al
   `Player.forEach`, client interactions and `Stats.onChange`.
 - **Server operations**: after adding scripts to a manifest run `refresh` before `ensure` — FXServer caches
   manifests, so `ensure core` alone restarts the resource with the OLD file list.
+
+## 31. UI visibility — auto-hide on game states, `Core.UI.hide/show` (2026-09-12, after Liam's report)
+
+The NUI layer is composited above *everything* the game draws, including the pause menu, screen fades,
+warning screens and the player-switch cinematic. Without this section the HUD, text UI and notifications
+stayed visible over the ESC map. This section is binding for `client/ui.lua`, `server/ui.lua`,
+`shared/config.lua`, `ui/src/store.js`, `ui/src/App.vue`, `types/core.lua` and the docs.
+
+### 31.1 Model: a set of hide reasons
+
+- The client keeps `hiddenReasons = { [reasonKey] = true }`. The shell is hidden while the set is not
+  empty. Every reason is a string matching `^[%w_%-%.:]+$`, at most 48 characters after prefixing.
+- Reason keys are namespaced by who owns them, so no caller can clear somebody else's reason:
+  - core's own game-state watchers store `game:pause`, `game:fade`, `game:switch`, `game:warning`,
+    `game:hud`, `game:cinematic` verbatim;
+  - the server API stores `server:<reason>` verbatim (pushed through the existing `core:client:ui`
+    op channel, §21);
+  - a plugin calling `Core.UI.hide('cutscene')` gets `<resource>:cutscene` (owner from
+    `Core.Registry.getCaller()`); core itself (caller `core`) uses reasons verbatim.
+- Plugin reasons are tracked as registry kind `uihide` (client registry, §6.1) and dropped when the plugin
+  stops, so a crashed cutscene script cannot leave the shell hidden.
+
+### 31.2 Client API (`client/ui.lua`, reached through the proxy)
+
+| function | behaviour |
+|---|---|
+| `Core.UI.hide(reason?)` | adds the caller-namespaced reason (default reason `default`); returns true. |
+| `Core.UI.show(reason?)` | removes the caller's reason (default `default`); returns true when it removed one. A plugin can never remove `game:*`, `server:*` or another plugin's reason. |
+| `Core.UI.isHidden()` | true while any reason is set. |
+| `Core.UI.hiddenReasons()` | array copy of the reason keys (for admin/debug tooling). |
+| `Core.UI.setAutoHide(name, enabled)` | runtime toggle for one watcher: `pause`, `fade`, `switch`, `warning`, `hud`, `cinematic`; false for an unknown name. Disabling a watcher also clears its `game:<name>` reason. |
+
+Hook: `Core.on('uiVisibility', function(visible, reasons) end)` fires on every hidden⇄visible transition
+(not on every reason change), client side, with a copy of the reason list.
+
+### 31.3 Watchers (one thread, `Config.UI.AutoHide`)
+
+`Config.UI.AutoHide = { IntervalMs = 200, PauseMenu = true, ScreenFade = true, PlayerSwitch = true,
+Warning = true, HudHidden = false, Cinematic = true }`. One `CreateThread` loop, `Wait(IntervalMs)`
+(never 0), reads only the enabled natives and maps each boolean to add/remove of its `game:*` reason:
+
+| watcher | reason | native(s), client apiset, verified with fxref 2026-09-12 |
+|---|---|---|
+| PauseMenu | `game:pause` | `IsPauseMenuActive()` |
+| ScreenFade | `game:fade` | `IsScreenFadedOut() or IsScreenFadingOut()` |
+| PlayerSwitch | `game:switch` | `IsPlayerSwitchInProgress()` |
+| Warning | `game:warning` | `IsWarningMessageActive()` |
+| HudHidden | `game:hud` | `IsHudHidden()` — off by default: its exact semantics (DisplayHud(false) vs per-frame hides) are undocumented, a wrong reading would hide the shell for good |
+| Cinematic | `game:cinematic` | `IsCinematicCamRendering()` |
+
+The loop costs nothing visible in resmon (≤ 6 boolean natives every 200 ms) and sends a NUI message only
+when the *visible* state flips. Nothing is polled per frame.
+
+### 31.4 Behaviour on the hidden transition
+
+- NUI message `{ action = 'shell:visible', visible = false|true, reasons = { ... } }`, sent on every flip
+  and re-sent on `ui_ready` when the shell is (re)mounted while hidden, so a NUI reload lands in the right
+  state.
+- The shell root (`.core-root`) gets `is-hidden` → `visibility: hidden; pointer-events: none`. State keeps
+  running while hidden: progress bars still complete, notifications still expire, HUD values still update.
+- To make sure a player is never stuck behind an invisible focus-holding element, the hidden transition
+  closes the open built-in modal (menu/input/alert: the awaiting Lua receives the same cancel value as on
+  ESC) and the focused page (`page:close`, its `close` event fires as usual), then re-applies focus.
+  Overlay pages (non-focus), text UI, key hints, spinner, shard and progress are left alone (merely
+  hidden). This is documented behaviour: hiding with a modal open equals cancelling it.
+- Showing again does nothing but flip the flag: whatever is still active reappears.
+
+### 31.5 Server API (`server/ui.lua`)
+
+`Core.UI.hide(src, reason?)` and `Core.UI.show(src, reason?)` validate `src` (§4) and the reason
+(pattern above, ≤ 32 chars, default `default`), then push ops `hide` / `show` with the single argument
+`'server:' .. reason` through `core:client:ui`. The client handler is the generic one from §21
+(`Core.UI[op](table.unpack(args))`), which runs with caller `core`, so the prefixed key is stored
+verbatim. Server reasons follow the player's session: they are cleared on the client when the NUI reloads
+(the client re-sends nothing for them), and the server does not track them (fire-and-forget like every
+§21 push).
+
+### 31.6 Shell, tests, docs
+
+- `ui/src/store.js`: `store.shell = { visible: true, reasons: [] }` and the `shell:visible` action.
+- `ui/src/App.vue`: `:class="{ 'is-hidden': !store.shell.visible }"` + `aria-hidden` on `.core-root`;
+  the rule lives in `ui/src/styles.css` `@layer components`.
+- `ui/tests/shell-regression.js`: hide → computed `visibility` of `.core-root` is `hidden` and the text UI
+  is not visible; show → visible again and the notifications posted before are still there (+3 checks).
+- Storybook: a `Shell/Visibility` story with a control toggling `shell:visible` over the HUD + text UI,
+  its Lua panel showing `Core.UI.hide('cutscene')` / `Core.UI.show('cutscene')` and the config block.
+- `types/core.lua`: stubs for the five client functions, the two server functions and the hook name.
+- `tests/server_tests.lua`: `Core.UI.hide/show` validation (bad src, bad reason, pushed op + argument).
+- README: "Visibility (pause menu, fades, cutscenes)" under UI, cheat-sheet lines, config key in the
+  table, two checklist steps (ESC hides the HUD and text UI; `/exmenu` open → ESC is swallowed by the NUI,
+  so the menu closes first and the pause menu opens on the second press).
+
+## 32. Game blur — glass panels through FiveM's NUI render hook (2026-09-12, Liam's pointer)
+
+`backdrop-filter` cannot blur the game (the NUI page is transparent, there is nothing behind it inside the
+CEF), but FiveM's NUI core exposes the game's back buffer to WebGL: `code/components/nui-core/src/NUIInitialize.cpp`
+hooks `glTexParameterf`, and a `TEXTURE_2D` texture that receives on `TEXTURE_WRAP_T` the sequence
+`CLAMP_TO_EDGE → MIRRORED_REPEAT → REPEAT` is bound to the game frame (shared D3D11 texture → EGL pbuffer).
+The FiveM main menu (`ext/cfx-ui/src/app/app.component.ts`) draws that texture into a full-screen canvas at
+30 fps and CSS-blurs the canvas; the hook is process-wide, so a resource NUI frame can do the same. This
+section makes it a framework feature. The `backdrop-filter` ban (§7.1) stays: it renders a black box.
+
+### 32.1 Consumers: `data-core-blur`
+
+Any element inside `#app` carrying `data-core-blur` gets a live, blurred copy of the game behind it. The
+optional value is the blur radius in CSS px (default `Config.UI.Blur.Strength`); `data-core-blur="0"`
+switches it off for that element. Plugin pages need no JavaScript: the attribute is enough. Cost is one
+small canvas copy per consumer per frame, so consumers are panels (a HUD box, a dialog, a page), never list
+rows or per-item elements; the shell keeps its own count ≤ 12.
+
+Built-ins that carry it: the three modal panels (`Menu`, `InputDialog`, `AlertDialog`), the HUD box, the stats
+box, each notification card, the text UI pill, the progress box, the key-hint bar and the spinner pill; not
+the shard band, not `PageHost` (pages decide for themselves). The example plugin page and the template page
+carry it on their panel.
+
+### 32.2 Module `ui/src/gameblur.js`
+
+`installGameBlur(root, initial)` → controller `{ setConfig({ enabled, strength, fps, scale }), isAvailable(),
+mode() }`, installed once from `main.js` after mount and from `.storybook/preview.js`; exposed as
+`window.CoreUI.gameBlur` for advanced pages.
+
+- **Source**: one hidden WebGL canvas (`alpha:false, antialias:false, depth:false, stencil:false,
+  preserveDrawingBuffer:true, failIfMajorPerformanceCaveat:false`) of viewport × `scale` (default 0.5,
+  clamped 0.1–1) with the hook sequence exactly as the main menu (CLAMP_TO_EDGE, MIRRORED_REPEAT, REPEAT,
+  then CLAMP_TO_EDGE again) and a pass-through shader drawing one full quad.
+- **Availability probe**: after the first draw `readPixels` at four points; if every sample is the 1×1
+  placeholder colour (0,0,255) the hook is not active (browser, Storybook, a build that dropped it) →
+  mode `fallback`: the source is a 2D canvas painted with a procedural dusk gradient (the Storybook preview's
+  colours) so the effect stays visible during development. No WebGL at all → mode `off`. The root element
+  gets `data-game-blur="live" | "fallback" | "off"`.
+- **Discovery**: one `MutationObserver` on `#app` (childList, subtree, attributeFilter `data-core-blur`).
+  A consumer element gets `position: relative` when static and `isolation: isolate`; a wrapper
+  `<div class="core-glass" aria-hidden="true">` (absolute, inset 0, overflow hidden, border-radius inherit,
+  z-index -1, pointer-events none) is inserted as its first child, holding a `<canvas>` that is inset by
+  −2×strength on every side (so the blur has no transparent edge bleed) with `filter: blur(<strength>px)`.
+  Removing the attribute or the element removes the wrapper.
+- **Frame loop**: `setTimeout` at `fps` (default 30, clamped 5–60), like the main menu — never
+  `requestAnimationFrame` at full rate. It runs only while: enabled, at least one consumer is connected and
+  visible (non-zero rect), the shell is visible (§31), and `document.hidden` is false. Otherwise the loop
+  stops completely (zero cost). Each frame: one WebGL draw of the game quad, then per consumer
+  `getBoundingClientRect()` of the wrapper (expanded by the margin), the canvas backing size = rect × scale
+  (only reassigned when it changes), and `drawImage(source, sx, sy, sw, sh, 0, 0, w, h)` from the matching
+  region of the source (clamped to its bounds).
+- **Panel alpha**: while mode is `live` or `fallback` the root override
+  `:root[data-game-blur="live"], :root[data-game-blur="fallback"] { --color-panel: var(--color-panel-glass) }`
+  applies (`--color-panel-glass: rgba(14, 16, 20, 0.62)` in `@theme`), so `bg-panel`/`.core-panel` become
+  glass instead of near-opaque. Without blur the 0.86 panel stays as it is today.
+- **Config messages**: `{ action = 'blur:set', enabled, strength, fps, scale }` from Lua on `ui_ready` and
+  on change; the store keeps `store.blur` and `App.vue` forwards it to the controller with a `watchEffect`.
+  The dev shim can send it too (Storybook control).
+
+### 32.3 Lua side
+
+`Config.UI.Blur = { Enabled = true, Strength = 10, Fps = 30, Scale = 0.5 }`. `client/ui.lua` sends
+`blur:set` right after the HUD snapshot in `ui_ready` and offers `Core.UI.setBlur(enabled)` (client, proxy;
+session-scoped override of `Enabled`, re-sent on `ui_ready`; returns true). `types/core.lua` gets the stub,
+README the config keys, and the checklist a step ("open /exmenu: the game behind the panel is blurred;
+`Config.UI.Blur.Enabled = false` + restart removes it").
+
+### 32.4 Tests and docs
+
+- `ui/tests/shell-regression.js` (+3): in the browser the root reports `data-game-blur="fallback"`; after
+  `menu:open` the menu panel contains a `.core-glass canvas`; after `blur:set { enabled: false }` no
+  `.core-glass` element exists and the root reports `off`.
+- Storybook: a "Shell/Game blur" story (controls: enabled, strength, scale) over the HUD + a menu, its Lua
+  panel showing the config block and `Core.UI.setBlur(false)`; one paragraph in Introduction.mdx. The
+  Storybook backdrop gradient and the fallback gradient use the same colours so the glass looks coherent.
+- Wording fix everywhere the ban is documented (§7.1, README, template and example READMEs, Introduction.mdx,
+  `styles.css` header): "`backdrop-filter` is banned — put `data-core-blur` on the panel instead (§32)".

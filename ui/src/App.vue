@@ -13,10 +13,18 @@ import PageHost from './components/PageHost.vue'
 import Menu from './components/Menu.vue'
 import InputDialog from './components/InputDialog.vue'
 import AlertDialog from './components/AlertDialog.vue'
+import { store } from './store.js'
 </script>
 
 <template>
-  <div class="core-root pointer-events-none fixed inset-0 overflow-hidden text-fg antialiased">
+  <!-- §31: the client hides the whole shell behind the pause menu, a screen fade or a
+       cutscene. `is-hidden` only stops the paint (styles.css) — nothing unmounts, so every
+       timer, the progress bar and the HUD keep running underneath. -->
+  <div
+    class="core-root pointer-events-none fixed inset-0 overflow-hidden text-fg antialiased"
+    :class="{ 'is-hidden': !store.shell.visible }"
+    :aria-hidden="store.shell.visible ? null : 'true'"
+  >
     <!-- top-right rail: HUD, the stat bars under it, then the notification stack (z 40) -->
     <div class="rail-tr pointer-events-none absolute top-4 right-4 z-40 flex flex-col items-end gap-2.5">
       <Hud />

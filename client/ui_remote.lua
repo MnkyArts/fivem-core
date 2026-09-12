@@ -29,6 +29,8 @@ local OPS <const> = {
     ['shard'] = 'shard',
     ['spinner.show'] = 'spinner.show',
     ['spinner.hide'] = 'spinner.hide',
+    ['hide'] = 'hide',                 -- §31.5: reason arrives as 'server:<reason>'
+    ['show'] = 'show',
 }
 
 -- Every op takes at most three arguments (`send(id, event, data)`), so the

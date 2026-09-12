@@ -886,6 +886,211 @@ local function pushLocale()
     if ok and type(data) == 'table' then localeSet(data) end
 end
 
+-- ------------------------------------------------------- shell visibility ----
+-- The shell is hidden while `hiddenReasons` is not empty (DESIGN §31). Reason keys
+-- are namespaced by their owner, so no caller can clear one it does not own: the
+-- game-state watchers below own 'game:*', a server push arrives as 'server:*' (it
+-- is dispatched with caller `core`, so its key is stored verbatim) and a plugin
+-- gets '<resource>:<reason>'. Natives verified with fxref on 2026-09-12 (client):
+-- IsPauseMenuActive, IsScreenFadedOut, IsScreenFadingOut, IsPlayerSwitchInProgress,
+-- IsWarningMessageActive, IsHudHidden, IsCinematicCamRendering.
+
+local MAX_REASON_KEY <const> = 48
+local REASON_PATTERN <const> = '^[%w_%-%.:]+$'
+local DEFAULT_INTERVAL_MS <const> = 200
+local MIN_INTERVAL_MS <const> = 50        -- a watcher loop must never approach Wait(0)
+local IDLE_INTERVAL_MS <const> = 1000     -- every watcher disabled: sleep instead of spinning
+
+--- One entry per auto-hide watcher: the `setAutoHide` name, its Config.UI.AutoHide
+--- key, the reason it owns and the boolean natives it reads.
+local WATCHERS <const> = {
+    { name = 'pause', cfg = 'PauseMenu', default = true, reason = 'game:pause',
+        read = function() return IsPauseMenuActive() end },
+    { name = 'fade', cfg = 'ScreenFade', default = true, reason = 'game:fade',
+        read = function() return IsScreenFadedOut() or IsScreenFadingOut() end },
+    { name = 'switch', cfg = 'PlayerSwitch', default = true, reason = 'game:switch',
+        read = function() return IsPlayerSwitchInProgress() end },
+    { name = 'warning', cfg = 'Warning', default = true, reason = 'game:warning',
+        read = function() return IsWarningMessageActive() end },
+    -- off by default: IsHudHidden's exact semantics are undocumented and a wrong
+    -- reading would hide the shell for good
+    { name = 'hud', cfg = 'HudHidden', default = false, reason = 'game:hud',
+        read = function() return IsHudHidden() end },
+    { name = 'cinematic', cfg = 'Cinematic', default = true, reason = 'game:cinematic',
+        read = function() return IsCinematicCamRendering() end },
+}
+
+local hiddenReasons = {}        -- reason key -> true
+local hiddenCount = 0
+local shellVisible = true       -- the last state the shell was told about
+local autoHide = {}             -- watcher name -> enabled (Config at load, setAutoHide at runtime)
+local watcherByName = {}
+
+--- Config.UI.AutoHide value with a default (the whole table may be absent).
+local function autoCfg(key, default)
+    local cfg = uiCfg('AutoHide', nil)
+    if type(cfg) ~= 'table' then return default end
+    local value = cfg[key]
+    if value == nil then return default end
+    return value
+end
+
+for i = 1, #WATCHERS do
+    local watcher = WATCHERS[i]
+    watcherByName[watcher.name] = watcher
+    autoHide[watcher.name] = autoCfg(watcher.cfg, watcher.default) == true
+end
+
+--- A fresh sorted array of the reason keys (hook payload and NUI message).
+local function reasonList()
+    local list = {}
+    for key in pairs(hiddenReasons) do list[#list + 1] = key end
+    table.sort(list)
+    return list
+end
+
+--- Tells the shell what it should be doing right now (flip, and ui_ready).
+local function sendVisible()
+    send({ action = 'shell:visible', visible = shellVisible, reasons = reasonList() })
+end
+
+--- Applies a change of the reason set. One message and one hook per hidden<->visible
+--- flip, never per reason change (§31.4). Hiding first closes whatever holds the
+--- cursor — the open built-in modal (its await gets the same value as on ESC) and
+--- the focused page — so nobody is stuck behind an invisible element.
+local function applyVisibility()
+    local visible = hiddenCount == 0
+    if visible == shellVisible then return end
+    shellVisible = visible
+    if not visible then
+        closeModal()
+        if openPage then closeOne(openPage) end
+        applyFocus()
+    end
+    sendVisible()
+    Core.emitHook('uiVisibility', visible, reasonList())
+end
+
+--- Adds an already-namespaced key. `owner` is tracked in the registry so the reason
+--- dies with a plugin that stops (§31.1); core's own keys need no bookkeeping.
+local function addReason(key, owner)
+    if hiddenReasons[key] then return false end
+    hiddenReasons[key] = true
+    hiddenCount = hiddenCount + 1
+    if owner and owner ~= 'core' then Registry.track('uihide', key, owner) end
+    applyVisibility()
+    return true
+end
+
+--- Removes an already-namespaced key. Called without an owner from the registry
+--- sweep, which has already dropped its own bookkeeping.
+local function removeReason(key, owner)
+    if not hiddenReasons[key] then return false end
+    hiddenReasons[key] = nil
+    hiddenCount = hiddenCount - 1
+    if owner and owner ~= 'core' then Registry.untrack('uihide', key) end
+    applyVisibility()
+    return true
+end
+
+--- The key the CURRENT caller may touch, plus that caller. Core (and everything it
+--- dispatches, including the §21 server pushes) uses the reason verbatim; a plugin
+--- is confined to its own '<resource>:' space and can never clear a foreign reason.
+local function reasonKeyFor(fn, reason)
+    if reason == nil then reason = 'default' end
+    if type(reason) ~= 'string' or not reason:find(REASON_PATTERN) then
+        Log.error('UI.%s: invalid reason (%s)', fn, tostring(reason))
+        return nil
+    end
+    local owner = Registry.getCaller()
+    local key = owner == 'core' and reason or (owner .. ':' .. reason)
+    if #key > MAX_REASON_KEY then
+        Log.error("UI.%s: reason '%s' is longer than %d characters", fn, key, MAX_REASON_KEY)
+        return nil
+    end
+    return key, owner
+end
+
+--- UI.hide(reason?) — hides the whole shell until every reason is gone.
+function UI.hide(reason)
+    local key, owner = reasonKeyFor('hide', reason)
+    if not key then return false end
+    addReason(key, owner)
+    return true
+end
+
+--- UI.show(reason?) — drops this caller's reason; true when it removed one.
+function UI.show(reason)
+    local key, owner = reasonKeyFor('show', reason)
+    if not key then return false end
+    return removeReason(key, owner)
+end
+
+function UI.isHidden()
+    return hiddenCount > 0
+end
+
+--- UI.hiddenReasons() — a copy of the reason keys, for admin and debug tooling.
+function UI.hiddenReasons()
+    return reasonList()
+end
+
+--- UI.setAutoHide('pause'|'fade'|'switch'|'warning'|'hud'|'cinematic', enabled) —
+--- runtime toggle for one watcher; only `true` enables. Disabling one also clears
+--- the reason it owns, so the shell never stays hidden by a watcher nobody reads.
+function UI.setAutoHide(name, enabled)
+    local watcher = type(name) == 'string' and watcherByName[name] or nil
+    if not watcher then
+        Log.error('UI.setAutoHide: unknown watcher (%s)', tostring(name))
+        return false
+    end
+    local on = enabled == true
+    autoHide[watcher.name] = on
+    if not on then removeReason(watcher.reason) end
+    return true
+end
+
+--- A reloaded shell forgets the server's reasons: the server pushes them
+--- fire-and-forget and never re-sends them (§31.5).
+local function clearServerReasons()
+    for key in pairs(hiddenReasons) do
+        if key:sub(1, 7) == 'server:' then removeReason(key) end
+    end
+end
+
+-- A plugin that stops cannot leave the shell hidden behind it (§31.1).
+Registry.onOwnerStop('uihide', function(id)
+    removeReason(id)
+end)
+
+--- Config.UI.AutoHide.IntervalMs, clamped: this loop must never approach Wait(0).
+local function watcherInterval()
+    local ms = tonumber(autoCfg('IntervalMs', DEFAULT_INTERVAL_MS)) or DEFAULT_INTERVAL_MS
+    if ms < MIN_INTERVAL_MS then return MIN_INTERVAL_MS end
+    return ms
+end
+
+-- One thread for every game state (§31.3): at most six boolean natives per tick,
+-- nothing per frame, and a NUI message only when the visible state flips.
+CreateThread(function()
+    while true do
+        local active = false
+        for i = 1, #WATCHERS do
+            local watcher = WATCHERS[i]
+            if autoHide[watcher.name] then
+                active = true
+                if watcher.read() then
+                    addReason(watcher.reason)
+                else
+                    removeReason(watcher.reason)
+                end
+            end
+        end
+        local sleep = active and watcherInterval() or IDLE_INTERVAL_MS
+        Wait(sleep)
+    end
+end)
+
 -- ------------------------------------------------------------ NUI → Lua ----
 -- Every callback answers cb(...) — a missing cb hangs the page's fetch().
 
@@ -898,6 +1103,7 @@ RegisterNuiCallback('ui_ready', function(_, cb)
     uiReadyAt = now
     nuiReady = true
     resolveAllPending()                 -- the reloaded shell forgot every open modal
+    clearServerReasons()                -- ... and the server's hide reasons, which nobody re-sends
     applyFocus()
     for id, page in pairs(pages) do
         send({
@@ -923,6 +1129,7 @@ RegisterNuiCallback('ui_ready', function(_, cb)
         send({ action = 'page:open', id = openPage, props = current.props or {} })
     end
     send({ action = 'focus', focused = focusOwned })
+    if not shellVisible then sendVisible() end   -- a shell mounted while hidden starts hidden (§31.4)
     Core.emitHook('uiReady')
     cb({ ok = true })
 end)

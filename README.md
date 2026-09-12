@@ -44,7 +44,7 @@ and stops a client forging `cash`, `faction` or a vehicle's `locked`.
 **Operating it**: FXServer caches manifests — after adding or removing script files run `refresh` before
 `ensure core`, otherwise the restart silently runs the old file list. `ensure core` also restarts every
 resource that declares `dependency 'core'`. Status (2026-09-12): fxlint clean, 379 lib + 554 server offline
-checks green, UI regression 46/46, Storybook 36 play functions green, both resources start clean on the dev
+checks green, UI regression 49/49, Storybook 37 play functions green, both resources start clean on the dev
 server; **the in-game checklist below has not been run yet**.
 
 The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
@@ -260,6 +260,7 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 | `Core.Raycast` §6.9 | `fromCamera(distance?, flags?, ignoreEntity?)` `between(from, to, …)` `getEntityInFront(distance?)` |
 | `Core.UI` §6.10 | `registerPage` `unregisterPage` `open(id, props?)` `close(id?)` `closeAll()` `isOpen(id)` `getOpenPage()` `isFocused()` `send(id, event, data)` |
 | | `notify` · `textUI.show/hide/isShown` · `progress` + `progress.cancel` · `menu.open/close` · `input.open` · `alert` · `hud.set/setVisible` |
+| | §31 `hide(reason?)` `show(reason?)` `isHidden()` `hiddenReasons()` `setAutoHide(name, bool)` — auto-hide over the pause menu, fades and cutscenes; hook `uiVisibility (visible, reasons)` |
 
 Also on `Core` itself: `Core.name` `isServer` `isClient` `isCore` `version` `Config` (core's config, read-only),
 `Core.on(hook, fn)` `Core.emitHook(hook, …)` `Core.isReady()` `Core.onReady(fn)` `Core.onPlayerLoaded(fn)` (§2.4).
@@ -279,6 +280,53 @@ if Core.UI.alert({ title = 'Sell', message = 'Sell this car?', confirm = 'Sell' 
 
 `progress`, `menu.open`, `input.open` and `alert` await their result, so call them from a thread, command or
 event handler — never at file scope.
+
+### Visibility (pause menu, fades, cutscenes)
+
+The NUI layer is composited above *everything* the game draws, so on its own the HUD, the text UI pill and
+your notifications would sit on top of the ESC map. core watches for that itself: **one** 200 ms thread
+(`Config.UI.AutoHide`) reads at most six booleans and hides the whole shell — `.core-root` gets
+`visibility: hidden; pointer-events: none` — while any of them is true. Nothing is polled per frame and a
+NUI message only goes out when the visible state actually flips.
+
+| `Config.UI.AutoHide` key | default | the shell hides while | reason key |
+|---|---|---|---|
+| `IntervalMs` | `200` | — | the poll interval; never set it to `0` |
+| `PauseMenu` | `true` | the ESC menu / map is open | `game:pause` |
+| `ScreenFade` | `true` | the screen is faded out or fading out | `game:fade` |
+| `PlayerSwitch` | `true` | the player-switch cinematic runs | `game:switch` |
+| `Warning` | `true` | a warning screen is up | `game:warning` |
+| `HudHidden` | `false` | the game HUD is hidden | `game:hud` — off on purpose: `IsHudHidden`'s exact semantics are undocumented, and a wrong reading would hide the shell for good |
+| `Cinematic` | `true` | the cinematic camera renders | `game:cinematic` |
+
+Hiding is a **set of reasons**, not a flag, so two callers can never fight over it: the shell is hidden
+while the set is not empty, and every key is namespaced by its owner — core's watchers own `game:*`, the
+server API owns `server:*`, and a plugin's `Core.UI.hide('cutscene')` is stored as `<resource>:cutscene`.
+A plugin can only clear its own reason, and every reason it holds is dropped when the resource stops, so a
+crashed cutscene script cannot leave the shell hidden.
+
+```lua
+-- client (§31.2) — the reason defaults to 'default'
+Core.UI.hide('cutscene')                  -- adds <resource>:cutscene; returns true
+Core.UI.show('cutscene')                  -- true when it removed one; never touches game:* or server:*
+Core.UI.isHidden()                        -- true while any reason is set
+Core.UI.hiddenReasons()                   -- { 'game:pause', 'my_plugin:cutscene' } — admin/debug tooling
+Core.UI.setAutoHide('cinematic', false)   -- pause|fade|switch|warning|hud|cinematic; also clears game:<name>
+Core.on('uiVisibility', function(visible, reasons) end)   -- fires on the flip only, never per reason
+
+-- server (§31.5), for one player
+Core.UI.hide(src, 'cutscene')             -- stored on that client as server:cutscene
+Core.UI.show(src, 'cutscene')
+```
+
+While it is hidden the shell keeps **running**: progress bars still complete, notifications still expire,
+HUD values still update, and showing again does nothing but flip the flag — whatever is still active
+reappears. The one exception is focus, because a player must never be stuck behind an invisible element
+that holds the cursor: the hidden transition closes the open built-in modal (menu / input / alert resolve
+with exactly what ESC gives them) and the focused page (`page:close`, its `close` event fires as usual).
+**Hiding with a modal open equals cancelling it** — that is documented behaviour, not a bug. Overlay pages,
+the text UI, key hints, the spinner, the shard and the progress bar are only hidden, never cancelled.
+Server reasons are fire-and-forget: they follow the session and are gone when the NUI reloads.
 
 ### Plugin pages
 
@@ -523,6 +571,7 @@ if pick == 'snack' then Core.UI.shard(src, { title = 'Bought', style = 'success'
 | `Core.UI.input.open(src, opts) -> values\|nil` · `alert(src, opts) -> bool` | awaits |
 | `Core.UI.keys.show(src, { { key = 'E', label = 'Interact' }, … })` / `keys.hide(src)` | instructional buttons |
 | `Core.UI.shard(src, { title, subtitle?, duration = 4000, style = 'wasted'\|'success'\|'info' })` · `spinner.show(src, text)` / `spinner.hide(src)` · `hud.setVisible(src, bool)` | the big centre card, the spinner, the HUD toggle |
+| `Core.UI.hide(src, reason?)` / `Core.UI.show(src, reason?)` (§31) | hide the whole shell for one player — stored client-side as `server:<reason>`; see "Visibility" under UI |
 
 The same `keys`, `shard`, `spinner` and `hud` calls exist on the client without the `src`. The HUD now
 also shows health, armour, speed, street/zone and a bar per `hud = true` stat.
@@ -653,6 +702,11 @@ Wave 2 (§15–§26). Steps 13 and 15 are the negative tests — same rule: they
 18. **Stats decay and thresholds:** watch the hunger/thirst bars in the HUD — they drop by `decayPerMinute` every `TickMs`. Put one just above a threshold (`Core.Stats.set(<id>, 'hunger', 26)`) and let it decay past 25 → the threshold notification fires **once**, not every tick. Buy a snack → hunger jumps +20 and the bar follows immediately.
 19. **Chat channels:** `/ooc hello` reaches everyone; `/me waves` shows `* <name> waves` only to players within 20 m; `/a test` is visible to `core.mod` staff only and rejected for everyone else; `/pm <id> hi` reaches exactly that player and echoes to you. Spam any of them → the cooldown drops the extras silently. Set `Config.Chat.Mode = 'proximity'`, `restart core` → plain chat is now range-limited while `/ooc` stays global.
 20. **Server-opened menu, key hints and shard:** run `/exmenu` → a menu opens on *your* screen although `server/main.lua` called it; pick "Heal me" → health goes to 200 and a green **HEALED** shard slides in; press `ESC` instead → the menu returns `nil` and nothing happens. Walk into the 24/7 marker → the `[E]` key hints appear on `onEnter` and go on `onExit`; `restart core_example` while they are up → they disappear with it, no leftovers.
+
+UI visibility (§31). Step 22 is where the two keyboards meet: while the NUI holds focus the game never sees `ESC`.
+
+21. **The shell hides behind the pause menu:** stand in the 24/7 marker so the HUD, the stat bars and the `[E]` pill are all up, raise a long notification, then press `ESC` → the moment the map opens *everything* core draws is gone, and it is all back unchanged (same values, the toast with its remaining time) when you close it. `Core.Screen.fade(<id>, 800)` does the same for a fade. Then hide it by hand: `Core.UI.hide('test')` from a throwaway **client** command in `core_example/client/main.lua` → the shell stays gone until `Core.UI.show('test')`, `Core.UI.isHidden()` is `true` and `Core.UI.hiddenReasons()` lists `core_example:test`; `restart core_example` while it still holds that reason → the shell comes straight back (the plugin's `uihide` registrations die with it).
+22. **A modal cancels instead of hiding:** run `/exmenu` and press `ESC` **once** while the menu is up → the NUI has focus, so the menu swallows the key, returns `nil` and closes; the pause menu does **not** open. Press `ESC` again → now the pause menu opens and the rest of the shell hides with it. Same rule from the server: `Core.UI.hide(<id>, 'cutscene')` with the menu open → the menu closes with `nil` and focus is released, no invisible cursor left behind (hiding with a modal open equals cancelling it).
 
 ## Troubleshooting
 

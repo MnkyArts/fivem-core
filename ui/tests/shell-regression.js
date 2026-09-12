@@ -249,6 +249,26 @@
       send({ action: 'page:unregister', id: 'test' })
     }
 
+    // ---- 9. shell visibility (DESIGN §31) ---------------------------------
+    // client/ui.lua hides the whole shell while it holds a reason (pause menu, screen fade,
+    // cutscene, `Core.UI.hide`). Only the paint stops: nothing unmounts, so the state posted
+    // before the flip is still there when it comes back.
+    const vis = (el) => (el ? getComputedStyle(el).visibility : '')
+    const root = q('.core-root')
+    send({ action: 'notify', id: 91, message: 'Survives the pause menu', type: 'info', duration: 60000 })
+    send({ action: 'textui:show', key: 'E', text: 'Hidden while paused', position: 'bottom' })
+    await waitFor(() => hasText('Hidden while paused'))
+    send({ action: 'shell:visible', visible: false, reasons: ['game:pause'] })
+    await waitFor(() => vis(root) === 'hidden')
+    check('shell:visible false hides .core-root', !!root && vis(root) === 'hidden')
+    check('a hidden shell renders no text UI',
+      !hasText('Hidden while paused') && !!q('.textui') && vis(q('.textui')) === 'hidden')
+    send({ action: 'shell:visible', visible: true, reasons: [] })
+    await waitFor(() => vis(root) === 'visible')
+    check('shell:visible true restores the shell with the toast posted before it hid',
+      vis(root) === 'visible' && hasText('Survives the pause menu') && hasText('Hidden while paused'))
+    send({ action: 'textui:hide' })
+
     say('PASS ' + pass + '/' + total)
     return out.join('\n')
   } finally {

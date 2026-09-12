@@ -42,9 +42,11 @@
 ---| '"cheatDetected"'      # (server) (src, kind, details)
 ---| '"chatMessage"'        # (server) (src, channel, message)
 ---| '"uiReady"'            # (client) () — the NUI shell (re)loaded and re-registered its pages
+---| '"uiVisibility"'       # (client) (visible, reasons) — the shell was hidden or shown again (§31)
 
 ---@alias CoreNotifyType '"info"' | '"success"' | '"error"' | '"warning"'
 ---@alias CorePageType '"page"' | '"overlay"'
+---@alias CoreAutoHideWatcher '"pause"' | '"fade"' | '"switch"' | '"warning"' | '"hud"' | '"cinematic"'
 ---@alias CoreShardStyle '"wasted"' | '"success"' | '"info"'
 ---@alias CoreInputFieldType '"text"' | '"number"' | '"select"' | '"checkbox"'
 ---@alias CoreMoneyAccount '"cash"' | '"bank"' | string
@@ -527,6 +529,7 @@ Core = {}
 ---@overload fun(hook: '"cheatDetected"', fn: fun(src: integer, kind: string, details: table)): any
 ---@overload fun(hook: '"chatMessage"', fn: fun(src: integer, channel: string, message: string)): any
 ---@overload fun(hook: '"uiReady"', fn: fun()): any
+---@overload fun(hook: '"uiVisibility"', fn: fun(visible: boolean, reasons: string[])): any
 function Core.on(hook, fn) end
 
 ---Fires a hook on this side (`TriggerEvent('core:hook:<hook>', ...)`). Plugins may emit their own.
@@ -1517,6 +1520,33 @@ function Core.UI.alert(opts, serverOpts) end
 ---@param serverOpts? CoreShardOptions server only
 ---@return boolean ok
 function Core.UI.shard(opts, serverOpts) end
+---(client) `hide(reason?)` adds a hide reason: the whole shell stops painting while any is
+---set. The caller's own resource name is prefixed, so nobody can clear a foreign reason;
+---hiding also cancels the open built-in modal and closes the focused page (DESIGN §31).
+---(server) `hide(src, reason?)` does the same on that player's client, as `server:<reason>`.
+---@param reason? string|integer client: the reason (default `default`); server: the player's src
+---@param serverReason? string server only
+---@return boolean ok
+function Core.UI.hide(reason, serverReason) end
+---(client) `show(reason?)` removes this caller's reason; true when it removed one. The shell
+---stays hidden while another reason (a game state, the server, another plugin) is still set.
+---(server) `show(src, reason?)` removes that player's `server:<reason>`.
+---@param reason? string|integer client: the reason (default `default`); server: the player's src
+---@param serverReason? string server only
+---@return boolean ok
+function Core.UI.show(reason, serverReason) end
+---(client) True while the shell is hidden by at least one reason.
+---@return boolean
+function Core.UI.isHidden() end
+---(client) A copy of the current hide reason keys, sorted (admin and debug tooling).
+---@return string[]
+function Core.UI.hiddenReasons() end
+---(client) Enables or disables one auto-hide watcher at runtime (`Config.UI.AutoHide`).
+---Only `true` enables; disabling one also clears the `game:<name>` reason it owns.
+---@param name CoreAutoHideWatcher
+---@param enabled boolean
+---@return boolean ok false for an unknown watcher
+function Core.UI.setAutoHide(name, enabled) end
 
 --------------------------------------------------------------------------------
 -- Core.Markers (client/markers.lua §6.4, server/worldsync.lua §15)

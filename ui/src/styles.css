@@ -113,6 +113,11 @@
 @layer components {
   .core-interactive { pointer-events: auto; }
 
+  /* §31: App.vue sets `is-hidden` while the client holds a hide reason (pause menu, screen
+     fade, cutscene, `Core.UI.hide`). `visibility` keeps the layout and the components alive —
+     no `display: none`, no unmount — so timers, the progress bar and the HUD carry on. */
+  .core-root.is-hidden { visibility: hidden; pointer-events: none; }
+
   .core-panel {
     background: var(--core-panel);
     border: 1px solid var(--core-border);

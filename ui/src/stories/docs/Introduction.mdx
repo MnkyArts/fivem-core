@@ -13,6 +13,16 @@ It is a **game overlay**: `html`, `body` and `.core-root` are transparent and
 `pointer-events: none`. Nothing in it reacts to the mouse unless a modal or a plugin page is
 open — otherwise the player could not shoot, drive or look around.
 
+Because the CEF is composited above *everything* the game draws, the pause menu included, the
+client also takes the whole shell away when the game needs the screen: `client/ui.lua` watches the
+pause menu, screen fades, the player switch, warning screens and the cinematic camera
+(`Config.UI.AutoHide`, one 200 ms thread) and sends `shell:visible` on each flip, which puts
+`is-hidden` on `.core-root` (`visibility: hidden; pointer-events: none`). A plugin joins in with
+`Core.UI.hide('cutscene')` / `Core.UI.show('cutscene')`, and the server with
+`Core.UI.hide(src, 'cutscene')`. Hiding never unmounts anything — timers, the progress bar and the
+HUD keep running underneath — but it *does* cancel an open modal, because nothing invisible may
+keep NUI focus. See **Shell → Visibility** and DESIGN §31.
+
 Every story in this Storybook drives the same reactive store the game drives, with the same
 `SendNUIMessage` payloads. Nothing is faked with component props. The **Lua** panel
 (bottom right, next to Controls and Interactions) shows, per story:

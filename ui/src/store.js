@@ -8,6 +8,10 @@ const SHARD_DEFAULT_MS = 4000
 const SHARD_STYLES = ['wasted', 'success', 'info']
 
 export const store = reactive({
+  // §31: the whole shell is hidden while the client holds at least one hide reason
+  // (pause menu, screen fade, player switch, warning, cutscene, or a plugin's
+  // `Core.UI.hide`). Nothing unmounts — only `.core-root` stops painting.
+  shell: { visible: true, reasons: [] },
   notifications: [],
   textui: { visible: false, key: '', text: '', position: 'bottom' },
   progress: { visible: false, id: null, label: '', duration: 0, canCancel: false, startedAt: 0 },
@@ -161,9 +165,10 @@ function statEntry(name, raw) {
   return { name, label: def.label ? String(def.label) : name, value, min, max }
 }
 
-/** Story/test helper: back to a freshly loaded shell for everything §21 added. */
+/** Story/test helper: back to a freshly loaded shell for everything §21 and §31 added. */
 export function resetExtras() {
   hideShard()
+  Object.assign(store.shell, { visible: true, reasons: [] })
   Object.assign(store.spinner, { visible: false, text: '' })
   Object.assign(store.keys, { visible: false, items: [] })
   for (const name of Object.keys(store.stats)) delete store.stats[name]
@@ -393,6 +398,14 @@ const actions = {
     delete store.overlays[id]
   },
   'page:event': (m) => emitPageEvent(m.id, m.event, m.data),
+  // §31.4: one message per hidden<->visible flip (never per reason change), re-sent on
+  // `ui_ready` while hidden so a NUI reload lands in the right state. Hiding only stops the
+  // paint: timers, the progress bar and the HUD keep running underneath. `reasons` is
+  // debug information for a page or the console — nothing in the shell branches on it.
+  'shell:visible': (m) => Object.assign(store.shell, {
+    visible: m.visible !== false,
+    reasons: Array.isArray(m.reasons) ? m.reasons.map(String) : [],
+  }),
   focus: (m) => { store.focused = !!m.focused },
 }
 

@@ -35,6 +35,26 @@ function playground (args) {
   store.progress.startedAt = Date.now() - (Number(args.elapsed) || 0) // start the fill part way across
 }
 
+/** The same live rail, plus the §31 visibility flip the `hidden` control drives. */
+function visibilityScene (args) {
+  hud(args)
+  send({ action: 'textui:show', key: args.promptKey, text: args.prompt, position: 'bottom' })
+  // Posted once: an identical toast coalesces into a `count` badge, so re-sending it on every
+  // toggle would only make the badge climb. The point of the story is that ONE message flips
+  // the shell and nothing else moves.
+  if (!store.notifications.length) {
+    send({
+      action: 'notify',
+      id: rid('n'),
+      type: 'info',
+      title: 'Dispatch',
+      message: 'Toasts keep expiring while the shell is hidden — nothing is unmounted.',
+      duration: HOLD_MS,
+    })
+  }
+  send({ action: 'shell:visible', visible: !args.hidden, reasons: args.hidden ? [args.reason] : [] })
+}
+
 /** A modal over the live rail. */
 function menuScene (args) {
   hud(args)
@@ -165,5 +185,94 @@ export const MenuOverHud = {
     await waitFor(() => expect(canvas.queryByText(args.menuTitle)).toBeNull())
     expect(canvas.getByText(args.prompt)).toBeInTheDocument()
     menuScene(args) // reopen the menu for the reader
+  },
+}
+
+export const Visibility = {
+  name: 'Visibility',
+  args: {
+    prompt: 'Search the vehicle',
+    hidden: false,
+    reason: 'my_plugin:cutscene',
+  },
+  argTypes: {
+    hidden: {
+      control: 'boolean',
+      description: 'Sends `shell:visible`. On means the client holds at least one hide reason.',
+      table: { category: 'shell:visible' },
+    },
+    reason: {
+      control: 'select',
+      options: ['game:pause', 'game:fade', 'game:switch', 'game:warning', 'game:cinematic', 'server:admin', 'my_plugin:cutscene'],
+      description: '`reasons[1]` — debug information only; nothing in the shell branches on it.',
+      table: { category: 'shell:visible' },
+    },
+  },
+  parameters: {
+    lua: {
+      message: 'shell:visible',
+      call: "-- client, from any plugin: the reason is namespaced with the calling resource\n"
+        + "Core.UI.hide('cutscene')            -- stored as my_plugin:cutscene\n"
+        + "-- ... play the cutscene ...\n"
+        + "Core.UI.show('cutscene')            -- a plugin can only clear its OWN reason\n"
+        + "Core.UI.isHidden()                  -- true while any reason is set\n"
+        + "Core.UI.hiddenReasons()             -- { 'game:pause', 'my_plugin:cutscene' }\n"
+        + "Core.UI.setAutoHide('cinematic', false)   -- turn one watcher off at runtime\n"
+        + "\n"
+        + "-- server, for one player (pushed through core:client:ui, stored as server:cutscene)\n"
+        + "Core.UI.hide(src, 'cutscene')\n"
+        + "Core.UI.show(src, 'cutscene')\n"
+        + "\n"
+        + "-- client hook, on the hidden <-> visible flip only (never per reason)\n"
+        + "Core.on('uiVisibility', function(visible, reasons) end)\n"
+        + "\n"
+        + "-- shared/config.lua: core's own watchers, one thread, six booleans every 200 ms\n"
+        + "Config.UI.AutoHide = {\n"
+        + "    IntervalMs   = 200,\n"
+        + "    PauseMenu    = true,    -- game:pause       IsPauseMenuActive()\n"
+        + "    ScreenFade   = true,    -- game:fade        IsScreenFadedOut() / IsScreenFadingOut()\n"
+        + "    PlayerSwitch = true,    -- game:switch      IsPlayerSwitchInProgress()\n"
+        + "    Warning      = true,    -- game:warning     IsWarningMessageActive()\n"
+        + "    HudHidden    = false,   -- game:hud         IsHudHidden() - off, semantics undocumented\n"
+        + "    Cinematic    = true,    -- game:cinematic   IsCinematicCamRendering()\n"
+        + "}",
+      note: 'Fire and forget: `shell:visible` has no NUI callback. The watcher thread sends one '
+        + 'message per hidden<->visible flip and re-sends it on `ui_ready`, so a NUI reload while '
+        + 'the pause menu is open comes back hidden.',
+    },
+    docs: {
+      description: {
+        story: 'The NUI layer is composited above *everything* the game draws — the pause menu, a '
+          + 'screen fade, the player-switch cinematic. So core hides the whole shell instead: '
+          + '`.core-root` gets `is-hidden` → `visibility: hidden; pointer-events: none`. Flip the '
+          + '**hidden** control and watch the HUD, the toast and the pill go together.\n\n'
+          + 'Nothing unmounts. The toast keeps its dismiss timer, a progress bar still completes '
+          + 'and the HUD still takes `hud:set` while hidden; showing again only flips the flag. '
+          + 'The one thing hiding *does* change is a modal: the hidden transition cancels an open '
+          + 'menu / input / alert and closes the focused page, because a player must never be '
+          + 'stuck behind an invisible element that holds NUI focus. **Hiding with a modal open '
+          + 'equals cancelling it.**',
+      },
+    },
+  },
+  render: liveScene(visibilityScene, view),
+  play: async ({ canvasElement, args }) => {
+    const canvas = within(canvasElement)
+    const root = () => canvasElement.querySelector('.core-root')
+    const vis = () => getComputedStyle(root()).visibility
+    await waitFor(() => expect(canvas.getByText(args.prompt)).toBeInTheDocument())
+    expect(vis()).toBe('visible')
+
+    send({ action: 'shell:visible', visible: false, reasons: ['game:pause'] })
+    await waitFor(() => expect(vis()).toBe('hidden'))
+    expect(root().getAttribute('aria-hidden')).toBe('true')
+    // Still mounted, merely not painted — getByText reads textContent, not what is on screen.
+    expect(canvas.getByText(args.prompt)).toBeInTheDocument()
+    expect(canvas.getByText('Dispatch')).toBeInTheDocument()
+
+    send({ action: 'shell:visible', visible: true, reasons: [] })
+    await waitFor(() => expect(vis()).toBe('visible'))
+    expect(root().getAttribute('aria-hidden')).toBeNull()
+    visibilityScene(args) // back to whatever the control says, so the story stays pokeable
   },
 }
