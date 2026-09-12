@@ -1609,6 +1609,16 @@ DefaultWeather = 'CLEAR', WeatherCycle = nil }`, `Stats` (§18), `Weapons = { Al
 - **Server operations**: after adding scripts to a manifest run `refresh` before `ensure` — FXServer caches
   manifests, so `ensure core` alone restarts the resource with the OLD file list.
 
+### 30.1 Console-warning hygiene (2026-09-12, in-game)
+
+FiveM replaces the game's entity-by-network-id lookup with a version that logs
+`GetNetworkObject: no object by ID <n>` for every id the client does not hold, and the client-side
+`GetEntityFromStateBagName` goes through that lookup. Entity state bags do reach clients that have the
+entity out of scope, so a server writing a bag on a far-away ped every 2 s spammed the console. Rule:
+every `entity:` bag handler parses the id and checks `NetworkDoesEntityExistWithNetworkId` (warning-free)
+before resolving (`entityFromBag` in client/vehicles.lua), and `NetworkGetEntityFromNetworkId` is only
+ever called behind that same check (blips, interactions, vehicles).
+
 ## 31. UI visibility — auto-hide on game states, `Core.UI.hide/show` (2026-09-12, after Liam's report)
 
 The NUI layer is composited above *everything* the game draws, including the pause menu, screen fades,

@@ -413,10 +413,24 @@ function Vehicles.saveProps(veh)
     return true
 end
 
+--- GetEntityFromStateBagName resolves `entity:<netId>` through the game's lookup, which FiveM
+--- patches to log a console warning for every entity this client does not hold — and entity bags
+--- do reach clients that have the entity out of scope, so a server writing a bag every few
+--- seconds spams the console. The existence check is warning-free, so it runs first.
+local function entityFromBag(bagName)
+    local netId = tonumber(string.match(bagName, '^entity:(%d+)$'))
+    if netId then
+        if not NetworkDoesEntityExistWithNetworkId(netId) then return 0 end
+        return GetEntityFromStateBagName(bagName)
+    end
+    if string.find(bagName, '^localEntity:') then return GetEntityFromStateBagName(bagName) end
+    return 0
+end
+
 -- Server writes `locked`, every client mirrors it onto the doors. Core vehicles only.
 AddStateBagChangeHandler('locked', nil, function(bagName, _, value)
     if type(value) ~= 'boolean' then return end
-    local veh = GetEntityFromStateBagName(bagName)
+    local veh = entityFromBag(bagName)
     if veh == 0 or not DoesEntityExist(veh) then return end
     if not Entity(veh).state.coreVeh then return end
     SetVehicleDoorsLocked(veh, value and 2 or 1)
