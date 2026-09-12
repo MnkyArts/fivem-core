@@ -1096,7 +1096,9 @@ end)
 -- carries `data-core-blur` (DESIGN §32). Lua owns nothing but the config: one
 -- `blur:set` on ui_ready and one per UI.setBlur call, no per-frame work here.
 
-local blurOverride = nil        -- UI.setBlur value for this session, nil = follow Config
+local blurOverride = {}         -- UI.setBlur values for this session; a nil key follows Config
+
+local BLUR_TUNABLES <const> = { strength = 'Strength', fps = 'Fps', scale = 'Scale' }
 
 --- Config.UI.Blur value with a default (the whole table may be absent).
 local function blurCfg(key, default)
@@ -1107,30 +1109,57 @@ local function blurCfg(key, default)
     return value
 end
 
---- A tunable is forwarded only when it really is a number; otherwise the key stays
---- out of the message and the shell keeps its own default (it clamps them anyway).
+--- A tunable is forwarded only when it really is a number (override first, then Config);
+--- otherwise the key stays out of the message and the shell keeps its own default (it
+--- clamps them anyway: strength 0-40, fps 5-60, scale 0.1-1).
 local function blurNumber(key)
-    local value = blurCfg(key, nil)
+    local value = blurOverride[key]
+    if type(value) ~= 'number' then value = blurCfg(BLUR_TUNABLES[key], nil) end
     return type(value) == 'number' and value or nil
 end
 
 --- Tells the shell whether to draw the glass, and how (flip, and ui_ready).
 local function sendBlur()
-    local enabled = blurOverride
+    local enabled = blurOverride.enabled
     if enabled == nil then enabled = blurCfg('Enabled', true) == true end
     send({
         action = 'blur:set', enabled = enabled,
-        strength = blurNumber('Strength'), fps = blurNumber('Fps'), scale = blurNumber('Scale'),
+        strength = blurNumber('strength'), fps = blurNumber('fps'), scale = blurNumber('scale'),
     })
 end
 
---- UI.setBlur(enabled) — session-scoped override of Config.UI.Blur.Enabled; only
---- `true` enables. Re-sent on ui_ready, so a shell reload keeps the override.
-function UI.setBlur(enabled)
-    blurOverride = enabled == true
+--- UI.setBlur(enabled, opts?) — session-scoped override of Config.UI.Blur; only `true`
+--- enables. `opts` may carry numeric `strength` (px), `fps` and `scale`; a key that is not
+--- a number is ignored, so `setBlur(true)` keeps the earlier tuning. Re-sent on ui_ready,
+--- so a shell reload keeps the override.
+function UI.setBlur(enabled, opts)
+    blurOverride.enabled = enabled == true
+    if type(opts) == 'table' then
+        for key in pairs(BLUR_TUNABLES) do
+            if type(opts[key]) == 'number' then blurOverride[key] = opts[key] end
+        end
+    end
     sendBlur()
     return true
 end
+
+--- /uiblur              -> shows the current values
+--- /uiblur off | on     -> toggles the glass
+--- /uiblur 4 [0.5] [30] -> strength px [, scale [, fps]] — tuning without a restart; the
+--- value you like goes into Config.UI.Blur afterwards.
+RegisterCommand('uiblur', function(_, args)
+    local first = args and args[1]
+    if first == 'off' or first == 'on' then
+        UI.setBlur(first == 'on')
+    elseif first ~= nil then
+        UI.setBlur(true, { strength = tonumber(first), scale = tonumber(args[2]), fps = tonumber(args[3]) })
+    end
+    local enabled = blurOverride.enabled
+    if enabled == nil then enabled = blurCfg('Enabled', true) == true end
+    UI.notify(('Game blur %s: strength %s px, scale %s, fps %s'):format(
+        enabled and 'on' or 'off', tostring(blurNumber('strength') or '?'),
+        tostring(blurNumber('scale') or '?'), tostring(blurNumber('fps') or '?')), 'info')
+end, false)
 
 -- ------------------------------------------------------------ NUI → Lua ----
 -- Every callback answers cb(...) — a missing cb hangs the page's fetch().

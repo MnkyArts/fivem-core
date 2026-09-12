@@ -445,13 +445,15 @@ visible, the shell is visible (§31) and the tab is not hidden; otherwise it sto
 | `Config.UI.Blur` key | default | what it does |
 |---|---|---|
 | `Enabled` | `true` | draw the glass at all; `false` removes every wrapper and stops the loop |
-| `Strength` | `10` | blur radius in CSS px (0–40) — the default for an attribute without a value |
+| `Strength` | `4` | blur radius in CSS px (0–40) — the default for an attribute without a value; tune it in-game with `/uiblur` first |
 | `Fps` | `30` | copies per second (5–60); `setTimeout`, never a full-rate `requestAnimationFrame` |
 | `Scale` | `0.5` | resolution of the copy (0.1–1). It is blurred anyway, so half is plenty |
 
 ```lua
 Core.UI.setBlur(false)   -- client; session-scoped override of Enabled, re-sent on a NUI reload
 Core.UI.setBlur(true)    -- back on; returns true
+Core.UI.setBlur(true, { strength = 3, scale = 0.5, fps = 30 })   -- numeric overrides of the tunables
+-- in-game tuning without a restart: /uiblur (prints), /uiblur off|on, /uiblur 3 [0.5] [30]
 ```
 
 Outside the CEF (a browser, this repo's Storybook) there is no hook: core probes once and falls back

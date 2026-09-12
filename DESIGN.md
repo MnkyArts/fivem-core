@@ -1762,9 +1762,12 @@ mode() }`, installed once from `main.js` after mount and from `.storybook/previe
 
 ### 32.3 Lua side
 
-`Config.UI.Blur = { Enabled = true, Strength = 10, Fps = 30, Scale = 0.5 }`. `client/ui.lua` sends
-`blur:set` right after the HUD snapshot in `ui_ready` and offers `Core.UI.setBlur(enabled)` (client, proxy;
-session-scoped override of `Enabled`, re-sent on `ui_ready`; returns true). `types/core.lua` gets the stub,
+`Config.UI.Blur = { Enabled = true, Strength = 4, Fps = 30, Scale = 0.5 }` (Strength 10 was far too heavy on
+real game footage — Liam, 2026-09-12). `client/ui.lua` sends `blur:set` right after the HUD snapshot in
+`ui_ready` and offers `Core.UI.setBlur(enabled, opts?)` (client, proxy; session-scoped override of `Enabled`
+and, through numeric `opts.strength/fps/scale`, of the tunables; re-sent on `ui_ready`; returns true). The
+client command `/uiblur` (`/uiblur` prints, `/uiblur off|on`, `/uiblur <strength> [scale] [fps]`) drives the
+same override so a value can be tuned in-game without a restart. `types/core.lua` gets the stub,
 README the config keys, and the checklist a step ("open /exmenu: the game behind the panel is blurred;
 `Config.UI.Blur.Enabled = false` + restart removes it").
 

@@ -1547,12 +1547,14 @@ function Core.UI.hiddenReasons() end
 ---@param enabled boolean
 ---@return boolean ok false for an unknown watcher
 function Core.UI.setAutoHide(name, enabled) end
----(client) Session-scoped override of `Config.UI.Blur.Enabled` (DESIGN §32): turns the
----live game blur behind every `data-core-blur` panel on or off for this client. Only
----`true` enables; strength, fps and scale stay as configured. Re-sent on a shell reload.
+---(client) Session-scoped override of `Config.UI.Blur` (DESIGN §32): turns the live game
+---blur behind every `data-core-blur` panel on or off for this client. Only `true` enables;
+---numeric `opts.strength` (px), `opts.fps` and `opts.scale` override the configured
+---tunables (non-numbers are ignored). Re-sent on a shell reload. `/uiblur` drives the same.
 ---@param enabled boolean
+---@param opts? { strength?: number, fps?: number, scale?: number }
 ---@return boolean ok always true
-function Core.UI.setBlur(enabled) end
+function Core.UI.setBlur(enabled, opts) end
 
 --------------------------------------------------------------------------------
 -- Core.Markers (client/markers.lua §6.4, server/worldsync.lua §15)

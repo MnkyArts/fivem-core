@@ -101,7 +101,7 @@ Config = {
         -- Live game blur behind every `data-core-blur` panel (DESIGN §32). The shell
         -- copies the game frame into a small canvas at `Fps` and CSS-blurs it: Strength
         -- is the blur radius in CSS px, Scale the copy resolution (0.1-1, lower = cheaper).
-        Blur = { Enabled = true, Strength = 10, Fps = 30, Scale = 0.5 },
+        Blur = { Enabled = true, Strength = 4, Fps = 30, Scale = 0.5 },
     },
     DB = { KeyPrefix = 'doc:', FlushIntervalMs = 5000, Adapter = 'kvp' },
     Admin = { CarDefaultModel = 'adder' },
