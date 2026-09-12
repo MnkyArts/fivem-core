@@ -45,7 +45,9 @@ end
 local function resolveEntity(opts)
     local entity = tonumber(opts.entity)
     if not entity and tonumber(opts.netId) then
-        entity = NetworkGetEntityFromNetworkId(math.floor(tonumber(opts.netId)))
+        local netId = math.floor(tonumber(opts.netId))
+        -- an id the client does not hold yet resolves to nothing (and would log a console warning)
+        entity = NetworkDoesEntityExistWithNetworkId(netId) and NetworkGetEntityFromNetworkId(netId) or 0
     end
     if not entity or entity == 0 or not DoesEntityExist(entity) then return nil end
     return math.floor(entity)
