@@ -106,13 +106,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 <template>
   <Transition name="dlg">
-    <div v-if="visible" class="core-backdrop dlg-back">
-      <div ref="panel" class="core-panel core-modal dlg" role="dialog" :aria-label="store.input.title || 'Input'">
+    <div v-if="visible" class="core-backdrop dlg-back z-50">
+      <div
+        ref="panel" class="core-panel core-modal dlg w-[380px] max-w-[80vw] animate-[core-pop-in_0.12s_var(--ease-ui)]"
+        role="dialog" :aria-label="store.input.title || 'Input'"
+      >
         <h2 class="core-title">{{ store.input.title || 'Input' }}</h2>
-        <div class="fields">
+        <div class="fields mt-2.5 max-h-[52vh] overflow-y-auto">
           <div v-for="(f, i) in fields" :key="f.name || i" class="core-field">
             <label v-if="f.type !== 'checkbox'" class="core-label" :for="'f-' + f.name">
-              {{ f.label || f.name }}<em v-if="f.required">*</em>
+              {{ f.label || f.name }}<em v-if="f.required" class="ml-0.5 text-error not-italic">*</em>
             </label>
             <select
               v-if="f.type === 'select'" :id="'f-' + f.name" v-model="values[f.name]"
@@ -122,18 +125,18 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             </select>
             <label v-else-if="f.type === 'checkbox'" class="core-check">
               <input v-model="values[f.name]" type="checkbox" :data-field="f.name" @change="clearError(f.name)" />
-              <span>{{ f.label || f.name }}<em v-if="f.required">*</em></span>
+              <span>{{ f.label || f.name }}<em v-if="f.required" class="ml-0.5 text-error not-italic">*</em></span>
             </label>
             <input
               v-else :id="'f-' + f.name" v-model="values[f.name]" class="core-input" :data-field="f.name"
               :type="f.type === 'number' ? 'number' : 'text'" :placeholder="f.placeholder || ''"
               :min="f.min" :max="f.max" @input="clearError(f.name)"
             />
-            <p v-if="errors[f.name]" class="err" :data-error="f.name">{{ errors[f.name] }}</p>
+            <p v-if="errors[f.name]" class="err mt-1 text-ui-xs text-error" :data-error="f.name">{{ errors[f.name] }}</p>
           </div>
           <p v-if="!fields.length" class="core-text">No fields</p>
         </div>
-        <div class="actions">
+        <div class="actions mt-3 flex justify-end gap-2">
           <button v-if="cancelLabel" type="button" class="core-btn" data-role="cancel" @click="cancel">{{ cancelLabel }}</button>
           <button type="button" class="core-btn core-btn--primary" data-role="submit" @click="submit">
             {{ store.input.submit || 'OK' }}
@@ -145,12 +148,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </template>
 
 <style scoped>
-.dlg-back { z-index: 50; }
-.dlg { width: 380px; max-width: 80vw; animation: core-pop-in 0.12s var(--core-ease, ease); }
-.fields { max-height: 52vh; margin-top: 10px; overflow-y: auto; }
-.core-label em, .core-check em { margin-left: 2px; color: var(--core-error, #ff5d5d); font-style: normal; }
-.err { margin: 4px 0 0; font-size: var(--core-fs-xs, 10px); color: var(--core-error, #ff5d5d); }
-.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+/* Only what Vue toggles itself; everything static lives in the template's utilities. */
 .dlg-enter-active, .dlg-leave-active { transition: opacity 0.12s ease; }
 .dlg-enter-from, .dlg-leave-to { opacity: 0; }
 </style>

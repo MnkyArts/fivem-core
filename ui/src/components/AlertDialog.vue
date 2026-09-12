@@ -44,11 +44,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 <template>
   <Transition name="alert">
-    <div v-if="visible" class="core-backdrop alert-back">
-      <div ref="panel" class="core-panel core-modal alert" role="alertdialog" :aria-label="store.alert.title || 'Notice'">
+    <div v-if="visible" class="core-backdrop alert-back z-50">
+      <div
+        ref="panel" class="core-panel core-modal alert w-[380px] max-w-[80vw] animate-[core-pop-in_0.12s_var(--ease-ui)]"
+        role="alertdialog" :aria-label="store.alert.title || 'Notice'"
+      >
         <h2 class="core-title">{{ store.alert.title || 'Notice' }}</h2>
-        <p class="core-text msg">{{ message }}</p>
-        <div class="actions">
+        <p class="core-text msg mt-2 max-h-[50vh] overflow-y-auto leading-normal whitespace-pre-line">{{ message }}</p>
+        <div class="actions mt-3.5 flex justify-end gap-2">
           <button v-if="cancelLabel" type="button" class="core-btn" data-role="cancel" @click="cancel">
             {{ cancelLabel }}
           </button>
@@ -62,10 +65,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </template>
 
 <style scoped>
-.alert-back { z-index: 50; }
-.alert { width: 380px; max-width: 80vw; animation: core-pop-in 0.12s var(--core-ease, ease); }
-.msg { margin-top: 8px; max-height: 50vh; overflow-y: auto; white-space: pre-line; line-height: 1.5; }
-.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+/* Only what Vue toggles itself; everything static lives in the template's utilities. */
 .alert-enter-active, .alert-leave-active { transition: opacity 0.12s ease; }
 .alert-enter-from, .alert-leave-to { opacity: 0; }
 </style>

@@ -9,20 +9,28 @@ on('hello', (data) => console.log('my_plugin: from Lua ->', data))   // Core.UI.
 </script>
 
 <template>
-    <div class="panel">
-        <h1>my_plugin</h1>
-        <p>{{ hud.name || 'nobody' }} — {{ props.title || 'props from Lua show up here' }}</p>
-        <button @click="emit('hello', { at: Date.now() })">Send an event</button>
-        <button @click="close()">Close</button>
+    <!-- Styling is Tailwind CSS v4 — nothing to install or configure: core's build scans
+         <plugin>/ui/src and emits the utilities this file uses into its one bundle (README §3).
+         Core's theme tokens (core/ui/src/styles.css), usable as normal utilities:
+           colours  bg-panel bg-panel-solid bg-panel-raise border-border border-border-strong
+                    bg-backdrop text-accent bg-accent-soft text-success text-error text-warning
+                    text-info text-fg text-fg-dim text-fg-faint
+           radius   rounded-ui rounded-ui-sm   shadow shadow-ui   easing ease-ui
+           fonts    font-sans font-mono        sizes  text-ui text-ui-sm text-ui-xs
+         Shared component classes: core-panel core-modal core-backdrop core-title core-text
+         core-label core-btn (--primary/--ghost/--danger) core-field core-input core-select
+         core-check core-key core-list core-item core-interactive.
+         Never use backdrop-filter or Tailwind's backdrop-* utilities: FiveM's CEF paints the
+         filtered area as a solid black box. -->
+    <div class="pointer-events-none fixed inset-0 flex items-center justify-center font-sans text-fg">
+        <section class="core-panel core-modal core-interactive w-[380px]">
+            <h1 class="core-title">my_plugin</h1>
+            <p class="core-text mb-3">{{ hud.name || 'nobody' }} — {{ props.title || 'props from Lua show up here' }}</p>
+            <div class="flex gap-2">
+                <button class="core-btn core-btn--primary" @click="emit('hello', { at: Date.now() })">Send an
+                    event</button>
+                <button class="core-btn" @click="close()">Close</button>
+            </div>
+        </section>
     </div>
 </template>
-
-<style scoped>
-/* Shell palette: panel rgba(14,16,20,.86), hairline rgba(255,255,255,.08), accent #5b8cff, text #e8eaf0. */
-.panel { position: fixed; inset: 0; margin: auto; width: 380px; height: fit-content; padding: 18px;
-    border: 1px solid rgba(255, 255, 255, .08); border-radius: 8px; background: rgba(14, 16, 20, .86);
-    color: #e8eaf0; font-family: 'Segoe UI', system-ui, sans-serif; pointer-events: auto; }
-h1 { margin: 0 0 8px; font-size: 15px; }
-button { margin-right: 8px; padding: 7px 11px; border: 0; border-radius: 6px; background: #5b8cff;
-    color: #0b0d11; font: inherit; font-weight: 600; cursor: pointer; }
-</style>

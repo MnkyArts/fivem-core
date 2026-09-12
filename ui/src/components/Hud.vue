@@ -10,6 +10,11 @@ import { store } from '../store.js'
 const WARNING_PCT = 25
 const ERROR_PCT = 10
 
+// Health thresholds as theme utilities; `is-ok` / `is-warning` / `is-error` stay on the
+// row as hook classes (the stories read them back off `.hud .bar`).
+const HEALTH_FILL = { ok: 'bg-success', warning: 'bg-warning', error: 'bg-error' }
+const HEALTH_LABEL = { ok: 'text-fg-dim', warning: 'text-fg-dim', error: 'text-error' }
+
 function money (n) {
   const v = Math.round(Number(n) || 0)
   return '$' + v.toLocaleString('en-US')
@@ -47,228 +52,98 @@ const factionColor = computed(() => (faction.value && faction.value.color) || 'v
 
 <template>
   <Transition name="hud">
-    <div v-if="store.hud.visible" class="hud">
-      <div class="line">
-        <span class="lbl">Cash</span>
-        <span class="val cash">{{ cash }}</span>
+    <div
+      v-if="store.hud.visible"
+      class="hud pointer-events-none min-w-[176px] pt-[10px] px-[12px] pb-[8px]
+             bg-panel border border-border rounded-ui text-[13px] leading-[1.35] text-right"
+    >
+      <div class="line flex items-baseline justify-between gap-[12px]">
+        <span class="lbl text-ui-xs tracking-[0.08em] uppercase text-fg-dim">Cash</span>
+        <span class="val cash tabular-nums font-semibold text-success">{{ cash }}</span>
       </div>
-      <div class="line">
-        <span class="lbl">Bank</span>
-        <span class="val bank">{{ bank }}</span>
-      </div>
-
-      <div v-if="health !== null || armour !== null" class="vitals">
-        <div v-if="health !== null" class="bar" :class="'is-' + healthLevel">
-          <span class="blbl">Health</span>
-          <span class="track"><span class="fill" :style="{ width: health + '%' }"></span></span>
-        </div>
-        <div v-if="armour !== null" class="bar is-armour">
-          <span class="blbl">Armour</span>
-          <span class="track"><span class="fill" :style="{ width: armour + '%' }"></span></span>
-        </div>
+      <div class="line flex items-baseline justify-between gap-[12px]">
+        <span class="lbl text-ui-xs tracking-[0.08em] uppercase text-fg-dim">Bank</span>
+        <span class="val bank tabular-nums font-semibold text-fg">{{ bank }}</span>
       </div>
 
-      <div v-if="hasMeta" class="meta">
-        <div v-if="speed !== null" class="line">
-          <span class="lbl">Speed</span>
-          <span class="val speed">{{ speed }}<i>km/h</i></span>
+      <div
+        v-if="health !== null || armour !== null"
+        class="vitals mt-[7px] pt-[7px] border-t border-border flex flex-col gap-[5px]"
+      >
+        <div
+          v-if="health !== null"
+          class="bar flex items-center gap-[9px]"
+          :class="'is-' + healthLevel"
+        >
+          <!-- same 54 px label column as StatsBars.vue, so both stacks line up in the rail -->
+          <span
+            class="blbl flex-[0_0_54px] text-left text-ui-xs font-semibold tracking-[0.08em] uppercase"
+            :class="HEALTH_LABEL[healthLevel]"
+          >Health</span>
+          <span class="track flex-auto h-[4px] rounded-[3px] bg-[rgba(255,255,255,0.08)] overflow-hidden">
+            <span
+              class="fill block h-full rounded-[3px] [transition:width_0.2s_var(--ease-ui),background_0.2s_ease]"
+              :class="HEALTH_FILL[healthLevel]"
+              :style="{ width: health + '%' }"
+            ></span>
+          </span>
         </div>
-        <div v-if="street || zone" class="place">
-          <span class="street">{{ street }}</span>
-          <span v-if="zone" class="zone">{{ zone }}</span>
+        <div v-if="armour !== null" class="bar is-armour flex items-center gap-[9px]">
+          <span class="blbl flex-[0_0_54px] text-left text-ui-xs font-semibold tracking-[0.08em] uppercase text-fg-dim">Armour</span>
+          <span class="track flex-auto h-[4px] rounded-[3px] bg-[rgba(255,255,255,0.08)] overflow-hidden">
+            <span
+              class="fill block h-full rounded-[3px] bg-accent [transition:width_0.2s_var(--ease-ui),background_0.2s_ease]"
+              :style="{ width: armour + '%' }"
+            ></span>
+          </span>
         </div>
       </div>
 
-      <div v-if="faction" class="line faction">
-        <span class="tag" :style="{ borderColor: factionColor, color: factionColor }">
+      <div v-if="hasMeta" class="meta mt-[7px] pt-[7px] border-t border-border">
+        <div v-if="speed !== null" class="line flex items-baseline justify-between gap-[12px]">
+          <span class="lbl text-ui-xs tracking-[0.08em] uppercase text-fg-dim">Speed</span>
+          <span class="val speed tabular-nums font-semibold">{{ speed }}<i class="ml-[3px] not-italic text-ui-xs font-medium text-fg-dim">km/h</i></span>
+        </div>
+        <div
+          v-if="street || zone"
+          class="place flex items-baseline justify-end gap-[7px] mt-[3px] text-[11px] text-fg-dim overflow-hidden"
+        >
+          <span class="street text-fg truncate">{{ street }}</span>
+          <span
+            v-if="zone"
+            class="zone flex-none max-w-[92px] text-ui-xs tracking-[0.06em] uppercase text-fg-faint truncate"
+          >{{ zone }}</span>
+        </div>
+      </div>
+
+      <div
+        v-if="faction"
+        class="line faction mt-[6px] pt-[6px] border-t border-border
+               flex items-baseline justify-end gap-[8px]"
+      >
+        <span
+          class="tag px-[5px] py-px border border-accent rounded-[4px] text-ui-xs font-bold
+                 tracking-[0.06em] uppercase text-accent"
+          :style="{ borderColor: factionColor, color: factionColor }"
+        >
           {{ faction.tag || '?' }}
         </span>
-        <span class="fname">{{ faction.name }}</span>
+        <span class="fname max-w-[150px] truncate text-ui-sm text-fg-dim">{{ faction.name }}</span>
       </div>
 
-      <div class="ident">
-        <span class="name">{{ store.hud.name }}</span>
-        <span v-if="store.hud.serverId" class="sid">#{{ store.hud.serverId }}</span>
+      <div
+        class="ident mt-[6px] pt-[6px] border-t border-border flex items-baseline justify-end
+               gap-[8px] text-[11px] text-fg-dim"
+      >
+        <span class="name max-w-[150px] truncate">{{ store.hud.name }}</span>
+        <span v-if="store.hud.serverId" class="sid tabular-nums text-accent">#{{ store.hud.serverId }}</span>
       </div>
     </div>
   </Transition>
 </template>
 
 <style scoped>
-.hud {
-  pointer-events: none;
-  min-width: 176px;
-  padding: 10px 12px 8px;
-  background: var(--core-panel, rgba(14, 16, 20, 0.86));
-  border: 1px solid var(--core-border, rgba(255, 255, 255, 0.08));
-  border-radius: var(--core-radius, 8px);
-  font-size: 13px;
-  line-height: 1.35;
-  text-align: right;
-}
-
-.line {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.lbl {
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-}
-
-.val {
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-}
-
-.cash { color: var(--core-success, #3ddc84); }
-.bank { color: var(--core-text, #f2f4f8); }
-
-.vitals,
-.meta {
-  margin-top: 7px;
-  padding-top: 7px;
-  border-top: 1px solid var(--core-border, rgba(255, 255, 255, 0.08));
-}
-
-.vitals {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.bar {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-}
-
-/* same 54 px label column as StatsBars.vue, so both stacks line up in the rail */
-.blbl {
-  flex: 0 0 54px;
-  text-align: left;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-}
-
-.track {
-  flex: 1 1 auto;
-  height: 4px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.08);
-  overflow: hidden;
-}
-
-.fill {
-  display: block;
-  height: 100%;
-  border-radius: 3px;
-  background: var(--core-success, #3ddc84);
-  transition: width 0.2s var(--core-ease, ease), background 0.2s ease;
-}
-
-.is-warning .fill { background: var(--core-warning, #ffb347); }
-.is-error .fill { background: var(--core-error, #ff5d5d); }
-.is-error .blbl { color: var(--core-error, #ff5d5d); }
-.is-armour .fill { background: var(--core-accent, #5b8cff); }
-
-.speed i {
-  margin-left: 3px;
-  font-style: normal;
-  font-size: 10px;
-  font-weight: 500;
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-}
-
-.place {
-  display: flex;
-  align-items: baseline;
-  justify-content: flex-end;
-  gap: 7px;
-  margin-top: 3px;
-  font-size: 11px;
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-  overflow: hidden;
-}
-
-.street {
-  color: var(--core-text, #f2f4f8);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.zone {
-  flex: 0 0 auto;
-  max-width: 92px;
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--core-text-faint, rgba(242, 244, 248, 0.38));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.faction {
-  margin-top: 6px;
-  padding-top: 6px;
-  border-top: 1px solid var(--core-border, rgba(255, 255, 255, 0.08));
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.tag {
-  padding: 1px 5px;
-  border: 1px solid var(--core-accent, #5b8cff);
-  border-radius: 4px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.fname {
-  font-size: 12px;
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-  max-width: 150px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ident {
-  margin-top: 6px;
-  padding-top: 6px;
-  border-top: 1px solid var(--core-border, rgba(255, 255, 255, 0.08));
-  display: flex;
-  align-items: baseline;
-  justify-content: flex-end;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-}
-
-.name {
-  max-width: 150px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.sid {
-  font-variant-numeric: tabular-nums;
-  color: var(--core-accent, #5b8cff);
-}
-
+/* Vue transition classes — not expressible as utilities. */
 .hud-enter-active,
 .hud-leave-active { transition: opacity 0.18s ease, transform 0.18s ease; }
 

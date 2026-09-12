@@ -314,6 +314,59 @@ self-hosted bundle, but nothing ships that way any more.)
 `window.CoreUI` also exposes `Vue`, `hud` (live HUD snapshot) and `post`. The exact NUI protocol
 (`page:register`, `page:open`, `ui_event`, `menu_result`, …) is DESIGN §6.10. No CDNs, no web fonts: no network.
 
+### Styling with Tailwind
+
+The shell's CSS is **Tailwind CSS v4**, CSS-first: `@tailwindcss/vite` in `ui/vite.config.js` and one
+entry stylesheet, `ui/src/styles.css`, which holds the `@theme` tokens, the shared `.core-*` classes
+and the base layer. There is no `tailwind.config.js` and no PostCSS step.
+
+A plugin page gets all of it for free: `styles.css` also scans the sibling resources
+(`@source "../../../*/ui/src/**/*.{vue,js}"`), so utilities used in `<plugin>/ui/src` are emitted into
+core's one bundle. Plugins install nothing — `cd core/ui && npm run build` rebuilds the shell *and*
+every plugin page's CSS at once (`core/html/assets/app.css`).
+
+The design tokens are ordinary utilities, opacity modifiers included (`bg-accent/10`):
+
+| group | utilities | value |
+|---|---|---|
+| surfaces | `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-backdrop` | `rgba(14,16,20,.86)` · `#0e1014` · `rgba(255,255,255,.04)` · `rgba(0,0,0,.28)` |
+| hairlines | `border-border` `border-border-strong` | `rgba(255,255,255,.08)` · `rgba(255,255,255,.16)` |
+| text | `text-fg` `text-fg-dim` `text-fg-faint` | `#f2f4f8` · 62 % · 38 % |
+| accent | `text-accent` `bg-accent-soft` | `#5b8cff` · `rgba(91,140,255,.18)` |
+| states | `text-success` `text-error` `text-warning` `text-info` | `#3ddc84` · `#ff5d5d` · `#ffb347` · `#5b8cff` |
+| shape | `rounded-ui` `rounded-ui-sm` `shadow-ui` `ease-ui` | 8 px · 5 px · `0 8px 28px rgba(0,0,0,.45)` · `cubic-bezier(.22,.61,.36,1)` |
+| type | `font-sans` `font-mono` · `text-ui` `text-ui-sm` `text-ui-xs` | system stack · Cascadia Mono · 14 / 12 / 10 px |
+| motion | `animate-core-slide-in` `animate-core-fade-in` `animate-core-pop-in` | the shell's three entrances |
+
+Prefer the shared component classes over rebuilding a panel by hand — they are what the built-in
+menus and dialogs are made of, so a page written with them cannot drift from the shell:
+
+| class | what it is |
+|---|---|
+| `core-panel` `core-modal` `core-backdrop` | the dark panel, its 320–460 px modal padding, the dimmed full-screen layer |
+| `core-title` `core-text` `core-label` | 15 px heading, dimmed body copy, uppercase micro-label |
+| `core-btn` + `core-btn--primary` / `--ghost` / `--danger` | the button, its three variants, `[disabled]` handled |
+| `core-field` `core-input` `core-select` `core-check` `core-key` | form row, text field, select, checkbox row, keycap |
+| `core-list` `core-item` (+ `.is-active` / `.is-disabled`) | scrollable list and its rows |
+| `core-interactive` | `pointer-events: auto` — the shell is click-through, so anything clickable needs it |
+
+```vue
+<div class="core-panel core-interactive w-[380px] font-sans text-fg">
+    <h1 class="core-title">my_plugin</h1>
+    <p class="text-ui-sm text-fg-dim">Utilities and tokens, no stylesheet of your own.</p>
+    <button class="core-btn core-btn--primary mt-3" @click="close()">Close</button>
+</div>
+```
+
+A scoped `<style>` block is compiled on its own, so `@apply` inside one needs the theme pointed out
+first — relative to the file, which from a plugin is
+`@reference "../../../core/ui/src/styles.css";` (`<plugin>/ui/src` → the resources folder → core).
+It emits nothing; only the tokens are read. Utilities in the template need no `@reference`.
+
+**Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities**: the
+game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
+black box. `core/ui/src/styles.css` documents the same rule.
+
 ## Hooks, events and state bags
 
 Hooks are local events on the same side: `Core.on('playerLoaded', fn)` / `Core.emitHook('name', …)` (§8).

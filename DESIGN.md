@@ -906,12 +906,28 @@ equivalent focus release (synchronous).
 
 ### 7.1 Stack and build
 
-Vue 3 + Vite, plain JavaScript (no TypeScript), `<script setup>` SFCs, scoped CSS, no UI library, no
-external fonts (the CEF cannot fetch the web). `ui/package.json` scripts: `dev` (Vite dev server with the
-dev shim), `build` (→ `../html`). `vite.config.js`: `base: './'`, `build.outDir: '../html'`,
+Vue 3 + Vite, plain JavaScript (no TypeScript), `<script setup>` SFCs, Tailwind utilities with scoped CSS where
+a component needs it, no UI component library, no external fonts (the CEF cannot fetch the web).
+`ui/package.json` scripts: `dev` (Vite dev server with the dev shim), `build` (→ `../html`).
+`vite.config.js`: `base: './'`, `build.outDir: '../html'`,
 `build.emptyOutDir: true`, deterministic file names (`assets/app.js`, `assets/app.css`, no hashes) so the
 manifest's `files { 'html/**' }` stays stable. `src/main.js` does `import * as Vue from 'vue'; window.Vue = Vue`
 **before** mounting so plugin bundles share the one Vue instance.
+
+**The CSS framework is Tailwind CSS v4**, CSS-first: `@tailwindcss/vite` is the only Vite plugin besides
+`@vitejs/plugin-vue`, there is no `tailwind.config.js` and no PostCSS step, and `src/styles.css` is the entry
+(`@import "tailwindcss"` + one `@theme` block + the `@layer components` with the shared `.core-*` classes).
+Every §7.2 token is therefore also a utility: `--color-panel|panel-solid|panel-raise|border|border-strong|backdrop|accent|accent-soft|success|error|warning|info|fg|fg-dim|fg-faint`
+→ `bg-*` / `text-*` / `border-*` (with opacity modifiers, `bg-accent/10`), `--radius-ui[-sm]` → `rounded-ui[-sm]`,
+`--shadow-ui` → `shadow-ui`, `--ease-ui` → `ease-ui`, `--text-ui[-sm|-xs]` → `text-ui[-sm|-xs]`,
+`--font-sans|--font-mono` → `font-sans|font-mono`, `--animate-core-*` → `animate-core-*`. Plugin pages are compiled
+into this same bundle (§7.4), so the entry scans them too: `@source "../../../*/ui/src/**/*.{vue,js}"` — the file
+pattern is load-bearing, a `@source` path containing `*` is matched against *files*, so the bare directory
+`../../../*/ui/src` matches nothing and plugin utilities silently never reach the bundle. A plugin installs and
+configures no CSS toolchain; a scoped `<style>` that uses `@apply` points Tailwind at the theme with
+`@reference "../../../core/ui/src/styles.css";` (relative to `<plugin>/ui/src`), which reads the tokens and emits
+nothing. `backdrop-filter` / `-webkit-backdrop-filter` and Tailwind's `backdrop-*` utilities are banned shell-wide:
+the game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid black box.
 
 ### 7.2 Files
 

@@ -105,35 +105,14 @@ onMounted(syncTags)
 </script>
 
 <template>
-  <div class="page-host">
-    <div class="overlay-layer">
+  <div class="page-host pointer-events-none fixed inset-0">
+    <!-- overlays: click-through layer under the open page (z 10) -->
+    <div class="overlay-layer pointer-events-none absolute inset-0 z-10">
       <component :is="o.component" v-for="o in overlays" :key="o.id" :props="o.props" />
     </div>
-    <div v-if="openComponent" class="page-layer">
+    <!-- the open page: the only shell layer that takes the mouse (z 20) -->
+    <div v-if="openComponent" class="page-layer pointer-events-auto absolute inset-0 z-20 overflow-hidden">
       <component :is="openComponent" :props="openProps" />
     </div>
   </div>
 </template>
-
-<style scoped>
-.page-host {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-}
-
-.overlay-layer {
-  position: absolute;
-  inset: 0;
-  z-index: 10;
-  pointer-events: none;
-}
-
-.page-layer {
-  position: absolute;
-  inset: 0;
-  z-index: 20;
-  pointer-events: auto;
-  overflow: hidden;
-}
-</style>

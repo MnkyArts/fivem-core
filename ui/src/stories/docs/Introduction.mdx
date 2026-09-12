@@ -97,6 +97,47 @@ Dev dependencies are hoisted by the npm workspace at `resources/package.json`
 dist. The `script` / `style` URL loader in `PageHost.vue` still exists as a fallback for
 prebuilt third-party bundles — see **Docs → Plugin Pages**.
 
+## Styling (Tailwind v4)
+
+`src/styles.css` is the single stylesheet: `@import "tailwindcss"`, one `@theme` block of design
+tokens, and the shared `.core-*` component classes. No `tailwind.config.js`, no PostCSS — the
+CSS *is* the config, compiled by `@tailwindcss/vite`. Because the tokens live in `@theme`, each one
+is also a utility (opacity modifiers included, e.g. `bg-accent/10`):
+
+| group | utilities |
+| --- | --- |
+| surfaces | `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-backdrop` |
+| hairlines | `border-border` `border-border-strong` |
+| text | `text-fg` `text-fg-dim` `text-fg-faint` |
+| accent / states | `text-accent` `bg-accent-soft` · `text-success` `text-error` `text-warning` `text-info` |
+| shape | `rounded-ui` `rounded-ui-sm` `shadow-ui` `ease-ui` |
+| type | `font-sans` `font-mono` · `text-ui` `text-ui-sm` `text-ui-xs` |
+| motion | `animate-core-slide-in` `animate-core-fade-in` `animate-core-pop-in` |
+
+The component classes are what the built-ins are made of, and any page can reuse them:
+`core-panel` `core-modal` `core-backdrop` `core-title` `core-text` `core-label` `core-btn`
+(`--primary` / `--ghost` / `--danger`) `core-field` `core-input` `core-select` `core-check`
+`core-key` `core-list` `core-item` (`.is-active` / `.is-disabled`) and `core-interactive`
+(`pointer-events: auto` — the shell is click-through, so anything clickable needs it).
+
+```vue
+<div class="core-panel core-interactive w-[380px] font-sans text-fg">
+  <h1 class="core-title">my_plugin</h1>
+  <p class="text-ui-sm text-fg-dim">Utilities + tokens, no stylesheet of your own.</p>
+  <button class="core-btn core-btn--primary mt-3" @click="close()">Close</button>
+</div>
+```
+
+A plugin page gets this for free — `styles.css` scans the sibling resources
+(`@source "../../../*/ui/src/**/*.{vue,js}"`), so its utilities are emitted into the same bundle.
+A scoped `<style>` that uses `@apply` has to point Tailwind at the theme first, with the path
+relative to the file: `@reference "../../../core/ui/src/styles.css";` from `<plugin>/ui/src`. It
+reads the tokens and emits nothing.
+
+**Never use `backdrop-filter` / `-webkit-backdrop-filter` or the `backdrop-*` utilities.** The game
+frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
+black box — it looks fine in this Storybook and black in-game.
+
 ## Working offline
 
 `window.GetParentResourceName` only exists inside the CEF. Without it the shell switches to

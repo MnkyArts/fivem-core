@@ -66,10 +66,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 <template>
   <Transition name="menu">
-    <div v-if="visible" class="core-backdrop menu-back">
-      <div class="core-panel core-modal menu">
+    <div v-if="visible" class="core-backdrop menu-back z-50">
+      <div class="core-panel core-modal menu w-[380px] max-w-[80vw] pb-1.5 animate-[core-pop-in_0.12s_var(--ease-ui)]">
         <h2 class="core-title">{{ store.menu.title || 'Menu' }}</h2>
-        <ul ref="listEl" class="core-list" role="menu">
+        <ul ref="listEl" class="core-list mt-2" role="menu">
           <li
             v-for="(item, i) in items"
             :key="i"
@@ -82,66 +82,23 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             @mouseenter="hover(i)"
             @click="choose(i)"
           >
-            <span v-if="item.icon" class="icon">{{ item.icon }}</span>
-            <span class="body">
-              <span class="label">{{ item.label }}</span>
-              <span v-if="item.description" class="desc">{{ item.description }}</span>
+            <span v-if="item.icon" class="icon min-w-5 flex-none text-center text-[13px] text-accent">{{ item.icon }}</span>
+            <span class="body flex min-w-0 flex-col">
+              <span class="label text-ui-sm leading-[1.3]">{{ item.label }}</span>
+              <span v-if="item.description" class="desc text-ui-xs text-fg-dim">{{ item.description }}</span>
             </span>
           </li>
           <li v-if="!items.length" class="core-item is-disabled">No entries</li>
         </ul>
-        <p class="hint">&#8593;&#8595; move &middot; <b>Enter</b> select &middot; <b>Esc</b> close</p>
+        <!-- one line on purpose: Vue's whitespace: 'condense' would eat the spaces around the <b>s -->
+        <p class="hint mt-2 border-t border-t-border pt-2 text-ui-xs text-fg-faint [&_b]:font-semibold [&_b]:text-fg-dim">&#8593;&#8595; move &middot; <b>Enter</b> select &middot; <b>Esc</b> close</p>
       </div>
     </div>
   </Transition>
 </template>
 
 <style scoped>
-.menu-back { z-index: 50; }
-
-.menu {
-  width: 380px;
-  max-width: 80vw;
-  padding-bottom: 6px;
-  animation: core-pop-in 0.12s var(--core-ease, ease);
-}
-
-.core-list { margin-top: 8px; }
-
-.icon {
-  flex: 0 0 auto;
-  min-width: 20px;
-  text-align: center;
-  font-size: 13px;
-  color: var(--core-accent, #5b8cff);
-}
-
-.body {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.label {
-  font-size: var(--core-fs-sm, 12px);
-  line-height: 1.3;
-}
-
-.desc {
-  font-size: var(--core-fs-xs, 10px);
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-}
-
-.hint {
-  margin: 8px 0 0;
-  padding-top: 8px;
-  border-top: 1px solid var(--core-border, rgba(255, 255, 255, 0.08));
-  font-size: var(--core-fs-xs, 10px);
-  color: var(--core-text-faint, rgba(242, 244, 248, 0.38));
-}
-
-.hint b { color: var(--core-text-dim, rgba(242, 244, 248, 0.62)); font-weight: 600; }
-
+/* Only what Vue toggles itself; everything static lives in the template's utilities. */
 .menu-enter-active,
 .menu-leave-active { transition: opacity 0.12s ease; }
 

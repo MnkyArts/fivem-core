@@ -2,6 +2,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import tailwindcss from '@tailwindcss/vite'
 
 const uiDir = dirname(fileURLToPath(import.meta.url))   // core/ui
 const resourcesDir = resolve(uiDir, '../..')            // the folder core lives in
@@ -15,7 +16,7 @@ function assetName(info) {
 }
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],   // Tailwind v4: CSS-first, configured in src/styles.css
   base: './',
   build: {
     outDir: '../html',

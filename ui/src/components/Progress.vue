@@ -38,81 +38,28 @@ onMounted(paint)
 
 <template>
   <Transition name="prog">
-    <div v-if="store.progress.visible" class="progress">
-      <div class="head">
-        <span class="label">{{ store.progress.label }}</span>
-        <span v-if="store.progress.canCancel" class="hint"><b>X</b> to cancel</span>
+    <div
+      v-if="store.progress.visible"
+      class="progress fixed z-30 left-1/2 bottom-[7vh] w-[340px] -ml-[170px]
+             pt-[9px] px-[11px] pb-[10px]
+             bg-panel border border-border rounded-ui pointer-events-none"
+    >
+      <div class="head flex items-baseline justify-between gap-[10px] mb-[7px] text-ui-sm">
+        <span class="label text-fg truncate">{{ store.progress.label }}</span>
+        <span
+          v-if="store.progress.canCancel"
+          class="hint flex-none text-ui-xs tracking-[0.05em] uppercase text-fg-dim"
+        ><b class="inline-block min-w-[14px] mr-[3px] px-[4px] border border-border rounded-[4px] text-fg">X</b> to cancel</span>
       </div>
-      <div class="track">
-        <div ref="fillEl" class="fill"></div>
+      <div class="track h-[5px] rounded-[3px] bg-[rgba(255,255,255,0.08)] overflow-hidden">
+        <div ref="fillEl" class="fill w-0 h-full rounded-[3px] bg-accent"></div>
       </div>
     </div>
   </Transition>
 </template>
 
 <style scoped>
-.progress {
-  position: fixed;
-  z-index: 30;
-  left: 50%;
-  bottom: 7vh;
-  width: 340px;
-  margin-left: -170px;
-  padding: 9px 11px 10px;
-  background: var(--core-panel, rgba(14, 16, 20, 0.86));
-  border: 1px solid var(--core-border, rgba(255, 255, 255, 0.08));
-  border-radius: var(--core-radius, 8px);
-  pointer-events: none;
-}
-
-.head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 7px;
-  font-size: 12px;
-}
-
-.label {
-  color: var(--core-text, #f2f4f8);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.hint {
-  flex: 0 0 auto;
-  font-size: 10px;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--core-text-dim, rgba(242, 244, 248, 0.62));
-}
-
-.hint b {
-  display: inline-block;
-  min-width: 14px;
-  margin-right: 3px;
-  padding: 0 4px;
-  border: 1px solid var(--core-border, rgba(255, 255, 255, 0.08));
-  border-radius: 4px;
-  color: var(--core-text, #f2f4f8);
-}
-
-.track {
-  height: 5px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.08);
-  overflow: hidden;
-}
-
-.fill {
-  width: 0;
-  height: 100%;
-  border-radius: 3px;
-  background: var(--core-accent, #5b8cff);
-}
-
+/* Vue transition classes — not expressible as utilities. */
 .prog-enter-active,
 .prog-leave-active { transition: opacity 0.15s ease; }
 

@@ -16,9 +16,9 @@ import AlertDialog from './components/AlertDialog.vue'
 </script>
 
 <template>
-  <div class="core-root">
-    <!-- top-right rail: HUD, the stat bars under it, then the notification stack -->
-    <div class="rail-tr">
+  <div class="core-root pointer-events-none fixed inset-0 overflow-hidden text-fg antialiased">
+    <!-- top-right rail: HUD, the stat bars under it, then the notification stack (z 40) -->
+    <div class="rail-tr pointer-events-none absolute top-4 right-4 z-40 flex flex-col items-end gap-2.5">
       <Hud />
       <StatsBars />
       <Notifications />
@@ -41,26 +41,3 @@ import AlertDialog from './components/AlertDialog.vue'
     <AlertDialog />
   </div>
 </template>
-
-<style scoped>
-.core-root {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  color: var(--core-text, #f2f4f8);
-  -webkit-font-smoothing: antialiased;
-  overflow: hidden;
-}
-
-.rail-tr {
-  position: absolute;
-  top: 16px;
-  right: 16px;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 10px;
-  z-index: 40;
-  pointer-events: none;
-}
-</style>

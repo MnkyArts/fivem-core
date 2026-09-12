@@ -82,6 +82,57 @@ Need an extra runtime library (drag-and-drop, charts, …)? Copy `ui/package.jso
 `ui/package.json`, keep only that one dependency, and re-run `npm install` at the resources
 folder — the import is bundled into the same single dist. Never list `vue` there.
 
+### Styling — Tailwind CSS v4
+
+Nothing to install, nothing to configure, no CSS file of your own. Core's stylesheet is Tailwind v4
+(CSS-first, `@tailwindcss/vite`) and it scans **your** sources too — `@source "../../../*/ui/src/**/*.{vue,js}"`
+in `core/ui/src/styles.css` — so every utility your page uses is emitted into core's single bundle.
+
+```vue
+<div class="core-panel core-interactive w-[380px] font-sans text-fg">
+    <h1 class="core-title">my_plugin</h1>
+    <p class="text-ui-sm text-fg-dim">Plain utilities, plus core's own tokens.</p>
+    <button class="core-btn core-btn--primary mt-3" @click="close()">Close</button>
+</div>
+```
+
+The shell's design tokens are ordinary utilities (opacity modifiers such as `bg-accent/10` work too):
+
+| group | utilities |
+|---|---|
+| surfaces | `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-backdrop` |
+| hairlines | `border-border` `border-border-strong` |
+| text | `text-fg` `text-fg-dim` `text-fg-faint` |
+| accent and states | `text-accent` `bg-accent-soft` `text-success` `text-error` `text-warning` `text-info` |
+| shape | `rounded-ui` (8 px) `rounded-ui-sm` (5 px) `shadow-ui` `ease-ui` |
+| type | `font-sans` `font-mono` · `text-ui` (14 px) `text-ui-sm` (12 px) `text-ui-xs` (10 px) |
+
+The `.core-*` component classes give a page the exact look of the built-in menus and dialogs:
+`core-panel` `core-modal` `core-backdrop` `core-title` `core-text` `core-label`
+`core-btn` (+ `core-btn--primary` / `--ghost` / `--danger`) `core-field` `core-input` `core-select`
+`core-check` `core-key` `core-list` `core-item` (`.is-active` / `.is-disabled`) and `core-interactive`
+(`pointer-events: auto`, which a page needs because the shell is click-through).
+
+A scoped `<style>` block is compiled on its own, so `@apply` has to be pointed at the theme first —
+the path is relative to **your** `ui/src/`:
+
+```vue
+<style scoped>
+@reference "../../../core/ui/src/styles.css";   /* <plugin>/ui/src -> resources/ -> core */
+
+.card { @apply rounded-ui-sm border border-border bg-panel-raise px-2.5 py-2; }
+</style>
+```
+
+`@reference` only reads that file (tokens, `.core-*`, custom utilities) and emits nothing, so the
+bundle keeps one copy of the CSS. Utilities written in the template need no `@reference`.
+
+**Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities** —
+the game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a
+solid black box.
+
+New classes only reach the game after core's UI is rebuilt (`cd core/ui && npm run build`).
+
 ## 4. Where the APIs are documented
 
 `../../DESIGN.md` is the contract; `../../README.md` is the integrator guide and cheat sheet.
