@@ -1280,6 +1280,11 @@ within 100 m). Key: reuses `core_interact` when within 2.0 m of a registered doo
 `core:server:doorToggle (id)` (`Core.Net.on`, cooldown 500, distance ≤ 3.5). Text UI "[E] Lock/Unlock" while near
 a door the player may use. Hooks: `doorLocked (id, src|nil)`, `doorUnlocked (id, src|nil)`. Persisted `locked` on
 change (DB `doors`, `Doors.register` merges the stored state).
+Seeding (2026-09-12, in-game): state-bag change handlers only fire for keys written after the client script
+started, so a joining player or a core restart mid-session left the client without any door until the next
+change. The client now asks `core:doors:list` (callback, loaded players only, the GlobalState shape) once on
+`playerLoaded` and upserts the answer; `/doorfind` also lists every door the client knows with distance, lock
+state, whether the object of that model stands at the coords and what the door system reports.
 Model verification (2026-09-12): a wrong `model` makes the door system control nothing, silently, so the client
 checks once per session (within 40 m, `GetClosestObjectOfType` 2 m) that an object of that model exists at
 `coords` and warns in the console otherwise, and the client command `/doorfind` prints the model hash, coords

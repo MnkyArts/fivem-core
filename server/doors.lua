@@ -379,6 +379,22 @@ Core.Callback.register('core:doors:canUse', function(src, id)
     return Doors.canUse(src, id)
 end)
 
+--- Every runtime door in the GlobalState shape (DESIGN §16): a client that started after the keys
+--- were published (join, or a core restart mid-session) never sees a change event for them, so it
+--- asks once on load. Positions are public anyway; the answer is the same for everyone.
+Core.Callback.register('core:doors:list', function(src)
+    if Core.Player.isLoaded(src) ~= true then return {} end
+    local out = {}
+    for id, entry in pairs(doors) do
+        out[id] = {
+            locked = entry.locked,
+            model = entry.model,
+            x = entry.coords.x, y = entry.coords.y, z = entry.coords.z,
+        }
+    end
+    return out
+end)
+
 AddEventHandler('playerDropped', function()
     local src = source
     lastCanUse[src] = nil

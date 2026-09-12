@@ -357,6 +357,25 @@ end
 --- core door sits there — with its expected model, so a mismatch is spelled out. The printed
 --- `model = <hash>` line can be pasted into Core.Doors.register as it is.
 RegisterCommand('doorfind', function()
+    -- First the doors this client knows about: whether the server's entries arrived at all, and
+    -- what the game's door system says about each — the quickest answer to "is it broken?".
+    local here = GetEntityCoords(PlayerPedId(), false)
+    local count = 0
+    for id, entry in pairs(doors) do
+        count = count + 1
+        local inSystem = IsDoorRegisteredWithSystem(entry.hash)
+        local object = GetClosestObjectOfType(entry.coords.x, entry.coords.y, entry.coords.z, 2.0, entry.model,
+            false, false, false)
+        print(('[core] doorfind: registered door "%s" — %.1f m away, %s, model %d, object at coords: %s, '
+            .. 'door system: %s%s'):format(id, #(here - entry.coords), entry.locked and 'LOCKED' or 'unlocked',
+            entry.model, object ~= 0 and 'yes' or 'NO (wrong model or not streamed in)',
+            inSystem and 'registered' or 'not registered',
+            inSystem and (', state ' .. tostring(DoorSystemGetDoorState(entry.hash))) or ''))
+    end
+    if count == 0 then
+        print('[core] doorfind: this client knows NO registered core doors (no door:<id> entry has arrived)')
+    end
+
     local object, where = objectInFrontOrNearby()
     if object == 0 then
         Core.UI.notify('No object in front of you or within 3 m — stand closer and look at the door', 'error')
@@ -405,6 +424,22 @@ AddEventHandler('onClientResourceStop', function(resource)
         doors[id] = nil
     end
     for id in pairs(checks) do checks[id] = nil end
+end)
+
+--- Seed: change handlers only fire for keys written after this script started, so the doors that
+--- already exist (a join, or a core restart mid-session) are fetched once the session is loaded.
+--- Anything the GlobalState handler delivered in the meantime is simply upserted again.
+Core.onPlayerLoaded(function()
+    if stopping then return end
+    local list = Core.Callback.await('core:doors:list')
+    if type(list) ~= 'table' or stopping then return end
+    local here = GetEntityCoords(PlayerPedId(), false)
+    for id, value in pairs(list) do
+        if type(id) == 'string' and type(value) == 'table' then
+            local entry = upsert(id, value)
+            if entry and #(here - entry.coords) <= APPLY_RANGE then applyState(entry) end
+        end
+    end
 end)
 
 Core.Doors = Doors
