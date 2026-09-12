@@ -55,7 +55,7 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 | `Config.Chat.Mode` | `'global'` | `'proximity'` limits normal chat to `Config.Chat.ProximityRange` (20 m); `/ooc` stays global either way |
 | `Config.World.TimeScale` | `30` | game seconds per real second — `30` is a 48-minute day, `1` is real time, `0` freezes the clock |
 | `Config.Locale` | `'en'` | `'de'` ships too; adds `<resource>/locales/<lang>.json` lookups for `Core.Locale.t` (§26) |
-| `Config.DB.Adapter` | `'kvp'` | `'mysql'` switches to the oxmysql adapter — **untested**, see "DB tools" below |
+| `Config.DB.Adapter` | `'kvp'` | `'postgres'` is the production backend (setup under "Where data lives"); `'mysql'` switches to the oxmysql adapter — **untested**, see "DB tools" below |
 
 Discord logging is a convar, never a config value, so the URL never lands in git:
 
@@ -87,6 +87,47 @@ port 5173, plugin sources included) and `npm run storybook` run on the same file
 
 Collections (`accounts`, `characters`, `factions`, `vehicles`, `bans`) live in `Core.DB` — an in-memory document store backed by the server's KVP file, flushed every 5 s and on stop, so no database is needed to run.
 `Core.DB.setAdapter({ loadAll, put, remove, flush })` is the seam for MySQL/Redis; nothing else changes (§4.1).
+
+#### Postgres
+
+The recommended production backend (§33). Every document lands in one `core_documents` table
+(`collection`, `id`, `data jsonb`, `updated_at`), written through on each change; KVP stays the
+zero-setup default, so none of this is needed to run core.
+
+```bash
+docker run -d --name core-postgres --restart unless-stopped -e POSTGRES_USER=core -e POSTGRES_PASSWORD=<choose> -e POSTGRES_DB=core -p 127.0.0.1:5432:5432 -v core-pgdata:/var/lib/postgresql/data postgres:16-alpine
+```
+
+```cfg
+exec core_pg.cfg   # in server.cfg; core_pg.cfg holds one line and never leaves the server:
+set core_pg_url "postgres://core:<password>@127.0.0.1:5432/core"
+```
+
+Nothing to install on the server: the `pg` driver is bundled into `server/db_pg.js` (committed). Only when you
+change `server/pg/index.js` or upgrade the driver, rebuild it from the UI toolchain:
+
+```bash
+cd resources/core/ui && npm run build:server   # esbuild → server/db_pg.js (first line: fxlint-disable-file)
+```
+
+Do not put a `package.json` or `node_modules` into the resource folder: FXServer's Node sandbox refuses to read
+modules behind the symlinked resource path, and the server's `yarn` builder would run on every start.
+
+Migrating an existing KVP server, in this order (§33.4):
+
+1. on the running server: `/dbexport` — writes `data/export-<timestamp>.json`
+2. load it straight into Postgres, outside the server: `CORE_PG_URL="postgres://…" node scripts/pg-import.js data/export-<timestamp>.json --replace`
+3. set `Config.DB.Adapter = 'postgres'` in `shared/config.lua`, then `refresh` and `restart core` — every session
+   (players who are online included) reloads from Postgres and finds its data already there
+4. verify: `docker exec core-postgres psql -U core -d core -c "SELECT collection, count(*) FROM core_documents GROUP BY 1"`
+
+Order matters: `/dbimport … replace` from the console also works, but only while **no player is connected** —
+a session that loaded from the empty database before the import is autosaved over the imported rows.
+
+`server/db_pg.js` owns the pool (max 4, 10 s statement timeout) and refuses every resource but core;
+`server/db_pg.lua` is the adapter. An empty `core_pg_url` logs one error line and leaves core on KVP, and a
+backend that stops answering degrades the affected collection (empty reads, refused writes) instead of
+overwriting it. `CORE_PG_URL="…" node tests/pg_smoke.js` round-trips a document through a real server.
 
 ## Writing a plugin
 

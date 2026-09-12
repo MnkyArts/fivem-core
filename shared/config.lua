@@ -103,7 +103,8 @@ Config = {
         -- is the blur radius in CSS px, Scale the copy resolution (0.1-1, lower = cheaper).
         Blur = { Enabled = true, Strength = 4, Fps = 30, Scale = 0.5 },
     },
-    DB = { KeyPrefix = 'doc:', FlushIntervalMs = 5000, Adapter = 'kvp' },
+    -- Adapter: 'kvp' (no setup) | 'mysql' (oxmysql, untested) | 'postgres' (needs the core_pg_url convar)
+    DB = { KeyPrefix = 'doc:', FlushIntervalMs = 5000, Adapter = 'postgres' },
     Admin = { CarDefaultModel = 'adder' },
     Texts = {
         loading = 'Loading your character...', respawn_in = 'Respawn in %d s', respawn_now = 'Respawning...',

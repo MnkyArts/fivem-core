@@ -1,9 +1,14 @@
-# dependencies live in the npm workspace one level up (resources/node_modules); never here
+# dependencies live in the npm workspace one level up (resources/node_modules); never here.
+# The Postgres driver is bundled into server/db_pg.js by `npm run build:server` (DESIGN §33), so the
+# resource root must never get a package.json — the server's yarn builder would run on it.
 node_modules/
 ui/node_modules/
 ui/storybook-static/
 ui/.storybook/cache/
 # runtime artefacts
-data/
+data/*
 *.log
+.yarn.installed
+yarn.lock
 .DS_Store
+!data/.gitkeep

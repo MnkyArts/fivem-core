@@ -1,5 +1,6 @@
 fx_version 'cerulean'
 game 'gta5'
+node_version '22'   -- server-side Node runtime for server/db_pg.js (DESIGN §33); FXServer ships 16 (default) and 22
 
 author 'MnkyArts'
 description 'Framework core: shared APIs (player, money, factions, vehicles, interactions, markers, UI) for GTA-Online-style RP servers'
@@ -17,7 +18,8 @@ client_scripts {
 }
 
 server_scripts {
-    'server/api.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/notify.lua', 'server/perms.lua', 'server/player.lua',
+    'server/api.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/db_pg.js', 'server/db_pg.lua',
+    'server/notify.lua', 'server/perms.lua', 'server/player.lua',
     'server/money.lua', 'server/factions.lua', 'server/vehicles.lua',
     'server/getters.lua', 'server/globals.lua', 'server/services.lua', 'server/worldsync.lua', 'server/doors.lua',
     'server/environment.lua', 'server/cron.lua', 'server/stats.lua', 'server/weapons.lua', 'server/remote.lua',

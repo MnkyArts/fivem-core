@@ -1816,3 +1816,78 @@ README the config keys, and the checklist a step ("open /exmenu: the game behind
   Storybook backdrop gradient and the fallback gradient use the same colours so the glass looks coherent.
 - Wording fix everywhere the ban is documented (§7.1, README, template and example READMEs, Introduction.mdx,
   `styles.css` header): "`backdrop-filter` is banned — put `data-core-blur` on the panel instead (§32)".
+
+## 33. Postgres document store (`Config.DB.Adapter = 'postgres'`) — 2026-09-12, Liam's choice
+
+`Core.DB` keeps its document model (§4.1, §22): collections of JSON documents, cached in memory, written
+through to an adapter `{ loadAll, put, remove, flush }` (§27, `DB.setAdapter`). This section adds a Postgres
+adapter that is the recommended production backend; KVP stays the zero-setup default and the untested
+oxmysql adapter stays as it is.
+
+### 33.1 Pieces
+
+| file | runtime | role |
+|---|---|---|
+| `server/db_pg.js` | Node 22 (FXServer's) | one `pg.Pool` (max 4, idle 30 s, `statement_timeout` 10 s, `application_name` core) from the convar `core_pg_url`; exports `pgQuery(sql, params, cb)` and `pgStatus(cb)`; both refuse any invoking resource other than core itself (`GetInvokingResource() !== GetCurrentResourceName()` → `cb('forbidden')`) so no plugin can run SQL through it |
+| `server/db_pg.lua` | Lua | the `Core.DB` adapter, loaded right after `db_mysql.lua`; activates only when `Config.DB.Adapter == 'postgres'` |
+| `server/pg/index.js` + `server/db_pg.js` | esbuild | `index.js` is the source; `npm run build:server` (in `core/ui`, esbuild, target node22, `pg-native` external) bundles it WITH the `pg` driver into `server/db_pg.js`, the committed file the manifest loads (first line `// fxlint-disable-file`, which fxlint honours). No install step on the server: FXServer's Node sandbox refuses to read a `node_modules` folder behind the symlinked resource path ("Filesystem permission check … no device found"), and a `package.json` at the resource root would wake the server's yarn builder — exactly why screenshot-basic ships a webpack bundle |
+
+The URL (`postgres://user:password@host:5432/db`) lives in `server.cfg` as `set core_pg_url "…"` — a
+secret like every other convar of the framework: never in a file of the resource, never logged. The dev
+server runs Postgres 16 in Docker (`core-postgres`, volume `core-pgdata`, bound to 127.0.0.1).
+
+### 33.2 Schema and statements
+
+```sql
+CREATE TABLE IF NOT EXISTS core_documents (
+    collection text   NOT NULL,
+    id         text   NOT NULL,
+    data       jsonb  NOT NULL,
+    updated_at bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (collection, id)
+);
+```
+
+- `loadAll`: `SELECT id, data::text AS data FROM core_documents WHERE collection = $1` → `{ [id] = json }`.
+- `put`: `INSERT … VALUES ($1, $2, $3::jsonb, $4) ON CONFLICT (collection, id) DO UPDATE SET data = EXCLUDED.data,
+  updated_at = EXCLUDED.updated_at` (the document is the JSON string `Core.DB` already encoded).
+- `remove`: `DELETE FROM core_documents WHERE collection = $1 AND id = $2`.
+- `flush`: no-op (every write already went out).
+
+`jsonb` is deliberate: ad-hoc queries (`WHERE data @> '{"license":"…"}'`) and a GIN index later, without
+`Core.DB` knowing.
+
+### 33.3 Behaviour (same guarantees as §29/§30 gave the MySQL adapter)
+
+- The adapter is installed synchronously at load (`DB.setAdapter`), before any collection can be read, so a
+  player joining early never reads KVP by accident.
+- `ensureSchema` runs once, awaited by the first `loadAll` (a parked promise shared by concurrent callers), and
+  again by a start-up thread so a broken connection shows in the console at start, not on the first join.
+- `loadAll` awaits the query through a Lua promise (`promise.new()` + `Citizen.Await`, 10 s deadline). It
+  returns `nil, reason` on any failure — never `{}` — so `Core.DB` marks the collection degraded (reads empty,
+  writes refused, load retried on next access) instead of overwriting rows with an empty cache.
+- `put`/`remove` are fire-and-forget: the callback only reports errors, which mark the collection degraded.
+- The Lua ↔ Node bridge is the export-with-callback shape oxmysql uses: Lua passes a function, Node calls
+  `cb(err, rows)` exactly once. A refused or missing export (Node runtime not up yet) is treated like a
+  failed query, logged once.
+- Console: `DB: postgres adapter active (core_documents)` on success; `DB: Config.DB.Adapter is "postgres" but
+  core_pg_url is empty — staying on KVP` when the convar is missing (the only case where KVP is used).
+
+### 33.4 Migration from KVP, tests, docs
+
+- Procedure (done on the dev server 2026-09-12): on the running KVP server `/dbexport` (writes
+  `data/export-<ts>.json`; the `data/` folder must exist — `data/.gitkeep` is tracked for that), load it with
+  `scripts/pg-import.js` (plain Node + `pg`, `--replace`, one transaction, no FXServer involved), then set
+  `Config.DB.Adapter = 'postgres'`, `refresh`, `restart core`. Sessions of connected players reload from Postgres
+  and find their documents. `/dbimport … replace` from the console is only safe with no player connected: a
+  session that loaded from the empty database before the import is autosaved over the imported rows.
+- `fxmanifest.lua` declares `node_version '22'` (FXServer ships 16 by default and 22 on request; this server
+  build ships only 22).
+- `tests/server_tests.lua`: a `db_pg` suite that stubs `exports.core.pgQuery` (`stubs.exports`) and checks:
+  activation refuses without the convar; `loadAll` returns the id→json map; a query error yields `nil, reason`
+  and never `{}`; `put` on error degrades the collection; the schema is created once.
+- `tests/pg_smoke.js`: plain Node, shims the FiveM globals (`GetConvar`, `exports`, `GetInvokingResource`,
+  `GetCurrentResourceName`, `on`), requires `server/db_pg.js`, and round-trips a document through a real
+  server given by `CORE_PG_URL` (skips with a clear message when unset).
+- README: a "Postgres" subsection under "Where data lives" (Docker one-liner, convar, the bundle, the
+  migration) and the config table row; `templates/plugin` unchanged (plugins never touch adapters).

@@ -1096,6 +1096,144 @@ local function suiteUI()
     eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
 end
 
+--- The Postgres adapter (DESIGN §33): the activation gate, the id -> json map, and how a failing
+--- backend degrades a collection instead of letting it read as empty.
+local function suiteDbPg()
+    suite('db_pg')
+
+    local HANG <const> = {}          -- a stubbed statement that never answers
+    local DEADLINE_MS <const> = 10100
+
+    -- db_pg.lua decides everything at load time, so each case gets its own VM: config, convar and
+    -- the pgQuery stub have to be in place before the file runs.
+    local function newPgServer(opts)
+        stubs.resetServer()
+        stubs.newWorld()
+        stubs.clear()
+        clearFailures()
+        stubs.tick(1000)
+        local env = stubs.newEnv('server', 'core')
+        stubs.loadImport(env)
+        stubs.loadFile(env, 'shared/config.lua')
+        env.Config.DB.Adapter = opts.adapter or 'postgres'
+        env.GetConvar = function(name, fallback)
+            if name == 'core_pg_url' then return opts.url or '' end
+            return fallback
+        end
+        local own = stubs.exports.core or {}
+        stubs.exports.core = own
+        own.pgQuery = opts.pgQuery
+        stubs.loadFile(env, 'server/api.lua')
+        stubs.loadFile(env, 'server/db.lua')
+        stubs.loadFile(env, 'server/db_pg.lua')
+        return env, env.Core
+    end
+
+    --- A pgQuery stub: records every statement and answers per kind — rows on success, a string as
+    --- the error, HANG to never call back at all.
+    local function recorder(answers)
+        local seen = {}
+        return seen, function(sql, params, cb)
+            local kind = (sql:find('CREATE TABLE', 1, true) and 'schema')
+                or (sql:find('SELECT', 1, true) and 'select')
+                or (sql:find('INSERT', 1, true) and 'upsert')
+                or 'delete'
+            seen[#seen + 1] = { kind = kind, sql = sql, params = params }
+            local answer = answers[kind]
+            if answer == HANG then return end
+            if type(answer) == 'string' then return cb(answer) end
+            cb(nil, answer or {})
+        end
+    end
+
+    -- the gate: postgres without a convar stays on KVP
+    local _, noUrl = newPgServer({ url = '', pgQuery = function() end })
+    check(printed('core_pg_url is empty') ~= nil, 'an empty core_pg_url refuses activation')
+    check(printed('postgres adapter active') == nil, 'the adapter never announced itself')
+    noUrl.DB.create('widgets', { id = 'k-1' })
+    check(stubs.kvp['doc:widgets:k-1'] ~= nil, 'the writes still land in KVP')
+
+    -- the gate: another adapter never touches the bridge
+    local seenOff, pgOff = recorder({})
+    local _, kvp = newPgServer({ adapter = 'kvp', url = 'postgres://core@127.0.0.1/core', pgQuery = pgOff })
+    kvp.DB.create('widgets', { id = 'k-2' })
+    eq(#seenOff, 0, 'Adapter = "kvp" never queries postgres')
+
+    -- the happy path
+    local seen, pg = recorder({ select = {
+        { id = 'p-1', data = '{"name":"ann"}' },
+        { id = 'p-2', data = '{"name":"bob","nested":{"n":1}}' },
+    } })
+    local _, Core = newPgServer({ url = 'postgres://core@127.0.0.1/core', pgQuery = pg })
+    check(printed('postgres adapter active (core_documents)') ~= nil, 'the adapter announces itself')
+    eq(seen[1] and seen[1].kind, 'schema', 'the start-up thread creates the table')
+    eq(Core.DB.count('players'), 2, 'loadAll returns the id -> json map')
+    eq(Core.DB.get('players', 'p-1').name, 'ann', 'the documents come back decoded')
+    eq(Core.DB.get('players', 'p-2').nested.n, 1, 'nested tables survive the round trip')
+    eq(Core.DB.get('players', 'p-2').id, 'p-2', 'the id comes from the row, not from the json')
+    eq(seen[2] and seen[2].kind, 'select', 'the read is a SELECT')
+    eq(seen[2] and seen[2].params[1], 'players', 'the SELECT is parameterised with the collection')
+
+    Core.DB.count('vehicles')
+    local creates = 0
+    for i = 1, #seen do
+        if seen[i].kind == 'schema' then creates = creates + 1 end
+    end
+    eq(creates, 1, 'the schema is created once, not once per collection')
+
+    eq(Core.DB.create('players', { id = 'p-3' }), 'p-3', 'a write goes through')
+    local last = seen[#seen]
+    eq(last and last.kind, 'upsert', 'create upserts')
+    eq(last and last.params[1], 'players', 'the upsert carries the collection')
+    eq(last and last.params[2], 'p-3', 'the upsert carries the document id')
+    check(last and last.sql:find('ON CONFLICT', 1, true) ~= nil, 'the upsert resolves conflicts')
+    check(last and type(last.params[4]) == 'number', 'the upsert stamps updated_at')
+    eq(Core.DB.delete('players', 'p-3'), true, 'delete removes the document')
+    eq(seen[#seen].kind, 'delete', 'and reaches the backend')
+    eq(seen[#seen].params[2], 'p-3', 'the DELETE is parameterised with the id')
+    eq(Core.DB.flush(), true, 'flush is a no-op that still clears the pending flag')
+    eq(Core.DB.isDegraded('players'), false, 'nothing degraded on the happy path')
+
+    -- a failed SELECT: nil + reason, never an empty collection
+    local _, pgSelect = recorder({ select = 'connection refused' })
+    local _, failing = newPgServer({ url = 'postgres://core@127.0.0.1/core', pgQuery = pgSelect })
+    eq(failing.DB.count('players'), 0, 'a failed SELECT reads as empty')
+    eq(failing.DB.isDegraded('players'), true, 'and the collection is degraded, not "empty"')
+    check(printed('the SELECT failed') ~= nil, 'the reason reaches the console')
+    eq(failing.DB.create('players', { id = 'p-9' }), nil, 'a write into it is refused')
+
+    -- a failed upsert degrades the collection
+    local _, pgWrite = recorder({ upsert = 'deadlock detected' })
+    local _, writeFail = newPgServer({ url = 'postgres://core@127.0.0.1/core', pgQuery = pgWrite })
+    eq(writeFail.DB.isDegraded('players'), false, 'the collection starts healthy')
+    eq(writeFail.DB.create('players', { id = 'p-4' }), 'p-4', 'the document is created')
+    eq(writeFail.DB.isDegraded('players'), true, 'a failed upsert degrades the collection')
+    check(printed('upsert failed') ~= nil, 'the failed upsert is logged')
+    eq(writeFail.DB.create('players', { id = 'p-5' }), nil, 'the next write is refused')
+
+    -- no Node bridge at all (db_pg.js missing or the runtime not up yet)
+    local _, noBridge = newPgServer({ url = 'postgres://core@127.0.0.1/core', pgQuery = nil })
+    check(printed('pgQuery export is unusable') ~= nil, 'a missing bridge is logged at start')
+    eq(noBridge.DB.count('players'), 0, 'reads come back empty')
+    eq(noBridge.DB.isDegraded('players'), true, 'and the collection is degraded')
+
+    -- a query that never answers: the 10 s deadline releases the caller
+    local _, pgHang = recorder({ schema = HANG })
+    local hangEnv, stalled = newPgServer({ url = 'postgres://core@127.0.0.1/core', pgQuery = pgHang })
+    local answered
+    hangEnv.CreateThread(function()
+        answered = stalled.DB.count('players')
+    end)
+    eq(answered, nil, 'a read waits for the unanswered query instead of inventing an answer')
+    stubs.tick(DEADLINE_MS)
+    eq(answered, 0, 'the deadline releases the caller with an empty read')
+    eq(stalled.DB.isDegraded('players'), true, 'and degrades the collection')
+
+    eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
+    stubs.exports.core.pgQuery = nil
+    stubs.resetServer()
+end
+
 -- end of suites
 
 --------------------------------------------------------------------------------
@@ -1104,6 +1242,7 @@ end
 
 local suites = {
     { 'db', suiteDB },
+    { 'db_pg', suiteDbPg },
     { 'perms', suitePerms },
     { 'player', suitePlayer },
     { 'money', suiteMoney },
