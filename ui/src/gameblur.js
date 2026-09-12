@@ -41,15 +41,18 @@ const LIMITS = {
   scale: [0.1, 1],
 }
 
-// Screen-space copy. The game frame is top-down and GL texture space is bottom-up, so Y is
-// mirrored here: canvas (0, 0) is then the top-left of the game frame and every consumer can
+// Screen-space copy with the plain 0..1 mapping (clip -1,-1 → texel 0,0), exactly as FxDK's
+// GameView, the FiveM main menu and fivem-glsl draw it: the hooked texture is already
+// upright that way (row 0 is the bottom of the frame, GL style). Mirroring Y here — the
+// usual fix for texImage2D-uploaded images — turned every glass copy upside down in-game
+// (2026-09-12), so the drawn canvas's top row IS the top of the game frame, and consumers
 // crop with plain CSS viewport coordinates.
 const VERTEX_SRC = [
   'attribute vec2 aPosition;',
   'varying vec2 textureCoordinate;',
   'void main() {',
   '  gl_Position = vec4(aPosition, 0.0, 1.0);',
-  '  textureCoordinate = vec2(aPosition.x * 0.5 + 0.5, 0.5 - aPosition.y * 0.5);',
+  '  textureCoordinate = aPosition * 0.5 + 0.5;',
   '}',
 ].join('\n')
 
