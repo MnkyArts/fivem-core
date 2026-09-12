@@ -21,6 +21,8 @@
 // `store.shell.visible` on every tick, so nothing has to be plumbed through App.vue.
 import { watch } from 'vue'
 import { store, setBlur } from './store.js'
+import { post, isDev } from './bridge.js'
+import { runHookExperiments } from './gameblur.probe.js'
 
 // ---------------------------------------------------------------- constants
 
@@ -29,7 +31,14 @@ const PLACEHOLDER = { r: 0, g: 0, b: 255, tolerance: 8 }
 
 /** The probe is retried a few times after install: the NUI can be alive before the game has
  *  rendered its first frame, and the back buffer is only swapped in once it has. */
-const PROBE_RETRY_MS = [250, 1000, 3000]
+// Each retry re-issues the hook sequence (not just a redraw): nui-core binds the game frame at
+// the moment the sequence runs, and that bind can fail transiently (the game recreates its
+// shared texture whenever its back buffer changes; a NUI that starts inside that window sees
+// a stale handle). Seen in-game 2026-09-12: the same recipe bound on one restart and not the
+// next. After the list, a slow periodic retry keeps going while the source is still the
+// placeholder — four texParameterf calls every 30 s cost nothing.
+const PROBE_RETRY_MS = [250, 1000, 2000, 4000, 8000, 15000, 30000, 60000]
+const PROBE_PERIODIC_MS = 30000
 
 /** §32.1 budget. Going over is a page bug, not a reason to stop drawing — one console warning. */
 const CONSUMER_BUDGET = 12
@@ -105,6 +114,8 @@ let fbKey = ''
 
 /** 'live' (the hook answered), 'fallback' (painted gradient) or 'off' (no WebGL at all). */
 let sourceMode = 'off'
+let lastSamples = []             // the probe's RGBA reads, for the diagnostics report
+let lastProbeAt = 0
 
 /** element -> { wrapper, canvas, ctx, prevPosition, prevIsolation, strength, geom } */
 const consumers = new Map()
@@ -168,6 +179,22 @@ function compile(context, type, src) {
   return null
 }
 
+/** The "secret" sequence nui-core's glTexParameterf hook waits for (CLAMP_TO_EDGE →
+ *  MIRRORED_REPEAT → REPEAT on TEXTURE_WRAP_T, then CLAMP_TO_EDGE again): at the third call the
+ *  GPU process binds the game's shared back-buffer texture to whatever texture is bound. Safe to
+ *  issue again at any time — a previous binding for the same texture is released first. */
+function issueHookSequence(context, texture) {
+  context.activeTexture(context.TEXTURE0)
+  context.bindTexture(context.TEXTURE_2D, texture)
+  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_MAG_FILTER, context.NEAREST)
+  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_MIN_FILTER, context.NEAREST)
+  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_S, context.CLAMP_TO_EDGE)
+  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.CLAMP_TO_EDGE)
+  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.MIRRORED_REPEAT)
+  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.REPEAT)
+  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.CLAMP_TO_EDGE)
+}
+
 /** Builds the WebGL source. Returns false for every browser/CEF that has no usable context —
  *  mode `off`, no exception ever escapes into the shell. */
 function createGl() {
@@ -181,16 +208,25 @@ function createGl() {
   }
   let context = null
   try {
-    // The canvas is never inserted into the page: the hook runs on the GL call, not on
-    // compositing, and an off-DOM canvas cannot disturb the shell's layout.
+    // The source canvas IS in the page, like every known-working user of the hook (FxDK's
+    // GameView, the old main menu, fivem-glsl): 2×2 CSS px, nearly invisible, no pointer
+    // events — the backing size is the viewport at `scale` regardless of the CSS size.
     glCanvas = document.createElement('canvas')
     glCanvas.width = 1
     glCanvas.height = 1
+    glCanvas.className = 'core-glass-source'
+    glCanvas.setAttribute('aria-hidden', 'true')
+    Object.assign(glCanvas.style, {
+      position: 'fixed', left: '0', top: '0', width: '2px', height: '2px',
+      opacity: '0.01', pointerEvents: 'none', zIndex: '-1',
+    })
+    ;(document.body || document.documentElement).appendChild(glCanvas)
     context = glCanvas.getContext('webgl', options) || glCanvas.getContext('experimental-webgl', options)
   } catch (err) {
     context = null
   }
   if (!context) {
+    if (glCanvas && glCanvas.parentNode) glCanvas.parentNode.removeChild(glCanvas)
     glCanvas = null
     return false
   }
@@ -224,13 +260,7 @@ function createGl() {
     context.TEXTURE_2D, 0, context.RGBA, 1, 1, 0, context.RGBA, context.UNSIGNED_BYTE,
     new Uint8Array([PLACEHOLDER.r, PLACEHOLDER.g, PLACEHOLDER.b, 255])
   )
-  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_MAG_FILTER, context.NEAREST)
-  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_MIN_FILTER, context.NEAREST)
-  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_S, context.CLAMP_TO_EDGE)
-  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.CLAMP_TO_EDGE)
-  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.MIRRORED_REPEAT)
-  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.REPEAT)
-  context.texParameterf(context.TEXTURE_2D, context.TEXTURE_WRAP_T, context.CLAMP_TO_EDGE)
+  issueHookSequence(context, texture)
 
   gl = context
   glProgram = program
@@ -259,6 +289,7 @@ function onContextRestored() {
 }
 
 function destroyGl() {
+  if (glCanvas && glCanvas.parentNode) glCanvas.parentNode.removeChild(glCanvas)
   if (glCanvas) {
     glCanvas.removeEventListener('webglcontextlost', onContextLost, false)
     glCanvas.removeEventListener('webglcontextrestored', onContextRestored, false)
@@ -296,9 +327,56 @@ function drawGl(width, height) {
   return true
 }
 
+/** Everything needed to tell from the client log which path the glass is on: the mode, the
+ *  probe's pixel reads, the source size, and the centre pixel of the first consumer's copy
+ *  (a black copy with a live source points at drawImage, a gradient at the hook). */
+function diagnostics() {
+  let copy = null
+  let firstConsumer = null
+  for (const entry of consumers.values()) { firstConsumer = entry; break }
+  if (firstConsumer && firstConsumer.ctx && firstConsumer.canvas.width > 0) {
+    try {
+      const d = firstConsumer.ctx.getImageData(
+        Math.floor(firstConsumer.canvas.width / 2), Math.floor(firstConsumer.canvas.height / 2), 1, 1).data
+      copy = [d[0], d[1], d[2], d[3]]
+    } catch (err) { copy = 'unreadable' }
+  }
+  return {
+    mode: effectiveMode(),
+    source: sourceMode,
+    webgl: !!gl,
+    attached: !!(glCanvas && glCanvas.isConnected),
+    width: glCanvas ? glCanvas.width : 0,
+    height: glCanvas ? glCanvas.height : 0,
+    viewport: [window.innerWidth, window.innerHeight],
+    samples: lastSamples,
+    probeAgeMs: lastProbeAt ? Date.now() - lastProbeAt : -1,
+    consumers: consumers.size,
+    copy,
+    enabled: store.blur.enabled,
+    shell: store.shell.visible,
+    strength: store.blur.strength,
+    scale: store.blur.scale,
+    fps: store.blur.fps,
+  }
+}
+
+/** Posts the diagnostics to Lua (`blur_diag` → client console) — after every probe and on
+ *  request (`blur:diag`, i.e. `/uiblur diag`). Never throws. */
+function report(reason) {
+  try {
+    post('blur_diag', Object.assign({ reason }, diagnostics()))
+  } catch (err) { /* the dev shim or a closed bridge: nothing to do */ }
+}
+
+function onDiagRequest() { report('request') }
+
 /** §32.2: draw once, then read four points back. All four still the placeholder blue = the hook
  *  never bound the game frame (browser, Storybook, a build that dropped it) -> fallback. */
-function probeSource() {
+function probeSource(reissue) {
+  if (reissue && gl && glTexture && sourceMode !== 'live') {
+    try { issueHookSequence(gl, glTexture) } catch (err) { /* a lost context: handled below */ }
+  }
   if (!gl || !glCanvas) {
     // No context, or it was lost: the gradient is all there is — unless WebGL never existed
     // here at all, and then `off` has to stay `off`.
@@ -315,6 +393,8 @@ function probeSource() {
     [size.w * 0.5, size.h * 0.75],
   ]
   let live = false
+  lastSamples = []
+  lastProbeAt = Date.now()
   for (const point of points) {
     const x = Math.max(0, Math.min(size.w - 1, Math.round(point[0])))
     const y = Math.max(0, Math.min(size.h - 1, Math.round(point[1])))
@@ -323,6 +403,7 @@ function probeSource() {
     } catch (err) {
       return 'fallback'
     }
+    lastSamples.push([px[0], px[1], px[2], px[3]])
     const t = PLACEHOLDER.tolerance
     const placeholder = Math.abs(px[0] - PLACEHOLDER.r) <= t
       && Math.abs(px[1] - PLACEHOLDER.g) <= t
@@ -333,6 +414,7 @@ function probeSource() {
     }
   }
   sourceMode = live ? 'live' : 'fallback'
+  report('probe')
   if (live) {
     // The gradient is dead weight once the real frame arrives.
     fbCanvas = null
@@ -350,15 +432,35 @@ function clearProbeRetries() {
 
 /** The NUI can be up before the game drew its first frame, so the probe gets a few more tries.
  *  They stop the moment it answers `live` (or the module is destroyed). */
+function retryProbe() {
+  if (!controller || sourceMode !== 'fallback') return
+  if (probeSource(true) === 'live') applyConfig()
+}
+
+function schedulePeriodicProbe() {
+  probeTimers.push(setTimeout(() => {
+    if (!controller || sourceMode !== 'fallback') return
+    retryProbe()
+    if (sourceMode === 'fallback') schedulePeriodicProbe()
+  }, PROBE_PERIODIC_MS))
+}
+
 function scheduleProbeRetries() {
   clearProbeRetries()
-  for (const delay of PROBE_RETRY_MS) {
+  for (const delay of PROBE_RETRY_MS) probeTimers.push(setTimeout(retryProbe, delay))
+  probeTimers.push(setTimeout(() => {
+    if (controller && sourceMode === 'fallback') schedulePeriodicProbe()
+  }, PROBE_RETRY_MS[PROBE_RETRY_MS.length - 1] + 1000))
+  // Still on the placeholder inside a real NUI after the first re-issues: run the recipe
+  // experiment once so the client log says which variant this build accepts (gameblur.probe.js).
+  if (!isDev) {
     probeTimers.push(setTimeout(() => {
-      if (!controller || sourceMode !== 'fallback') return
-      if (probeSource() === 'live') applyConfig()
-    }, delay))
+      if (controller && sourceMode === 'fallback') runHookExperiments('auto')
+    }, 9000))
   }
 }
+
+function onTestRequest() { runHookExperiments('manual') }
 
 // ---------------------------------------------------------------- source: fallback gradient
 
@@ -643,6 +745,9 @@ function applyConfig() {
 
 function onResize() {
   fbKey = ''
+  // A resolution change makes the game recreate its shared texture; nui-core rebinds registered
+  // textures itself, but a source that never bound gets one more chance here.
+  if (sourceMode === 'fallback') retryProbe()
   kick()
 }
 
@@ -692,6 +797,8 @@ export function installGameBlur(root, initial) {
     /** True when this page can produce a source at all — the WebGL probe succeeded. It does
      *  not follow the config switch; `mode()` does. */
     isAvailable: () => sourceMode !== 'off',
+    /** The report `/uiblur diag` prints, as an object (see diagnostics()). */
+    diagnostics,
     /** Re-runs the probe (call it once the game is actually rendering) and the consumer scan. */
     refresh() {
       if (!controller) return 'off'
@@ -706,6 +813,8 @@ export function installGameBlur(root, initial) {
       if (observer) observer.disconnect()
       if (unwatch) unwatch()
       window.removeEventListener('resize', onResize)
+      window.removeEventListener('core:blur-diag', onDiagRequest)
+      window.removeEventListener('core:blur-test', onTestRequest)
       document.removeEventListener('visibilitychange', onVisibility)
       detachAll()
       destroyGl()
@@ -745,6 +854,8 @@ export function installGameBlur(root, initial) {
   )
 
   window.addEventListener('resize', onResize)
+  window.addEventListener('core:blur-diag', onDiagRequest)
+  window.addEventListener('core:blur-test', onTestRequest)
   document.addEventListener('visibilitychange', onVisibility)
 
   applyConfig()

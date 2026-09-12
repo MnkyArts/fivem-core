@@ -454,6 +454,8 @@ Core.UI.setBlur(false)   -- client; session-scoped override of Enabled, re-sent 
 Core.UI.setBlur(true)    -- back on; returns true
 Core.UI.setBlur(true, { strength = 3, scale = 0.5, fps = 30 })   -- numeric overrides of the tunables
 -- in-game tuning without a restart: /uiblur (prints), /uiblur off|on, /uiblur 3 [0.5] [30]
+-- /uiblur diag prints the shell's blur state to the F8 console (mode live|fallback|off, probe pixels,
+-- the first panel's copied pixel); /uiblur test runs the hook-recipe experiment (DESIGN §32.2)
 ```
 
 Outside the CEF (a browser, this repo's Storybook) there is no hook: core probes once and falls back

@@ -438,6 +438,13 @@ const actions = {
   // §32.2: `{ action = 'blur:set', enabled, strength, fps, scale }`. src/gameblur.js watches
   // `store.blur`, so a message is all it takes to turn the glass off or re-tune it live.
   'blur:set': (m) => setBlur(m),
+  // `/uiblur diag`: src/gameblur.js answers with a `blur_diag` post that Lua prints.
+  'blur:diag': () => {
+    try { window.dispatchEvent(new CustomEvent('core:blur-diag')) } catch (err) { /* no DOM */ }
+  },
+  'blur:test': () => {
+    try { window.dispatchEvent(new CustomEvent('core:blur-test')) } catch (err) { /* no DOM */ }
+  },
   focus: (m) => { store.focused = !!m.focused },
 }
 

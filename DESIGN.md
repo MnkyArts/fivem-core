@@ -1755,6 +1755,19 @@ mode() }`, installed once from `main.js` after mount and from `.storybook/previe
   `store.js` itself and reads `store.blur` and `store.shell.visible` every tick (no config plumbing through
   `App.vue`). `.storybook/preview.js` installs it on `document.body`. Controller: `{ mode(), isAvailable(),
   refresh(), destroy() }`, exposed as `window.CoreUI.gameBlur`.
+- **Binding reliability** (in-game finding, 2026-09-12): the same recipe bound on one restart and not the
+  next — the game recreates its shared texture whenever its back buffer changes and a NUI that issues the
+  sequence inside that window sees a stale handle. Every probe retry therefore re-issues the whole hook
+  sequence (bind + the seven `texParameterf` calls, `issueHookSequence`) before drawing, on the schedule
+  250 ms … 60 s, then every 30 s while the source is still the placeholder, plus once on `resize`. The
+  source canvas is in the page (2×2 px, opacity 0.01) like every known-working user of the hook.
+  Orientation: the plain 0..1 mapping is upright in the client (`RenderHooks.cpp` flips the shared texture);
+  FxDK's viewer flips because its producer does not — never copy that mirror into a resource NUI.
+- **Diagnostics**: the shell posts `blur_diag` to Lua after every probe and on `/uiblur diag` (mode, probe
+  pixels, source size, the centre pixel of the first consumer's copy); `client/ui.lua` prints it to the
+  client console (CitizenFX.log). `/uiblur test` (or 9 s of persistent fallback inside a real NUI) runs
+  `ui/src/gameblur.probe.js`: ten throw-away contexts with different recipes, each reporting what it read
+  back — the tool that showed the flakiness was timing, not the recipe.
 - **Config messages**: `{ action = 'blur:set', enabled, strength, fps, scale }` from Lua on `ui_ready` and
   on change; the store keeps `store.blur = { enabled: true, strength: 10, fps: 30, scale: 0.5 }` (partial
   merge, clamps: strength 0–40, fps 5–60, scale 0.1–1) and `resetExtras()` restores the defaults. The dev shim

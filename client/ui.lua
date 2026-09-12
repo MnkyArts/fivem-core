@@ -1149,6 +1149,12 @@ end
 --- value you like goes into Config.UI.Blur afterwards.
 RegisterCommand('uiblur', function(_, args)
     local first = args and args[1]
+    if first == 'diag' or first == 'test' then
+        -- diag: the current state; test: the hook recipe experiment (gameblur.probe.js).
+        -- Both are answered by the blur_diag callback below and printed to the console.
+        send({ action = first == 'diag' and 'blur:diag' or 'blur:test' })
+        return
+    end
     if first == 'off' or first == 'on' then
         UI.setBlur(first == 'on')
     elseif first ~= nil then
@@ -1238,6 +1244,35 @@ RegisterNuiCallback('ui_sound', function(data, cb)
         PlaySoundFrontend(-1, data.name, data.set, true)
     end
     cb({})
+end)
+
+--- Game-blur diagnostics (DESIGN §32): the shell reports after every probe and on
+--- `/uiblur diag`; printed to the client console so it lands in CitizenFX.log.
+RegisterNuiCallback('blur_diag', function(data, cb)
+    cb({})
+    if type(data) ~= 'table' then return end
+    if data.reason == 'variants' then
+        print(('[core] game blur experiment (%s), viewport %s:'):format(tostring(data.trigger),
+            type(data.viewport) == 'table' and json.encode(data.viewport) or '?'))
+        if type(data.results) == 'table' then
+            for i = 1, #data.results do
+                local r = data.results[i]
+                print(('[core]   %-28s now=%s later=%s glError=%s %s'):format(tostring(r.name),
+                    type(r.now) == 'table' and json.encode(r.now) or '-',
+                    type(r.later) == 'table' and json.encode(r.later) or '-',
+                    tostring(r.glError), r.error and ('error=' .. tostring(r.error)) or ''))
+            end
+        end
+        return
+    end
+    local samples = type(data.samples) == 'table' and json.encode(data.samples) or '?'
+    local copy = type(data.copy) == 'table' and json.encode(data.copy) or tostring(data.copy)
+    print(('[core] game blur (%s): mode=%s source=%s webgl=%s attached=%s size=%sx%s viewport=%s consumers=%s copy=%s enabled=%s shell=%s strength=%s scale=%s fps=%s samples=%s'):format(
+        tostring(data.reason), tostring(data.mode), tostring(data.source), tostring(data.webgl),
+        tostring(data.attached), tostring(data.width), tostring(data.height),
+        type(data.viewport) == 'table' and json.encode(data.viewport) or '?', tostring(data.consumers),
+        copy, tostring(data.enabled), tostring(data.shell), tostring(data.strength), tostring(data.scale),
+        tostring(data.fps), samples))
 end)
 
 --- Resolves the promise a built-in is awaiting; unknown ids are ignored.
