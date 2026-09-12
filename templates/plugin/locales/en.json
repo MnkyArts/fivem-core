@@ -1,0 +1,4 @@
+{
+  "greeting": "Hello {{name}}, welcome to my_plugin",
+  "shop_closed": "The shop is closed right now"
+}

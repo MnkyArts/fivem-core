@@ -1,0 +1,124 @@
+import { Meta } from '@storybook/addon-docs/blocks'
+
+<Meta title="Docs/Plugin Pages" />
+
+# Plugin pages (DESIGN §7.4)
+
+A plugin page is a normal Vue component that core's bundle renders inside `PageHost.vue`.
+The plugin ships **no** UI files (`files {}` stays empty in its `fxmanifest.lua`) — its page
+source is compiled into core's single dist at build time.
+
+Try it in **Built-ins → Page Host**: the shop panel there is a real plugin page, registered
+through `window.CoreUI.registerPage` and opened with a `page:open` message.
+
+## The three moving parts
+
+```
+<plugin>/client.lua        Core.UI.registerPage / open / send / on      (Lua side)
+<plugin>/ui/src/index.js   export const id + default component          (compiled into core)
+core/ui/src/plugins.js     globs */ui/src/index.js, registers each one  (before mount)
+```
+
+### 1. The page component
+
+```js
+// <plugin>/ui/src/index.js
+import Page from './Page.vue'
+
+export const id = 'bank'
+export default Page
+```
+
+`src/plugins.js` imports every match of `../../../*/ui/src/index.js` and calls
+`CoreUI.registerPage(id, component)` **before** the app mounts, so the component is already
+there when Lua says `page:open`. A page that is not compiled in (a prebuilt third-party
+bundle) can still be loaded by URL: give `Core.UI.registerPage` a `script` (and optional
+`style`) path inside the owning resource and `PageHost.vue` injects the tags once per id.
+
+### 2. Inside the component: `window.CoreUI.usePage(id)`
+
+```js
+import { h } from 'vue'
+
+export default {
+  name: 'BankPage',
+  props: { props: { type: Object, default: () => ({}) } },   // <- page:open props land here
+  setup (vm) {
+    const CoreUI = window.CoreUI
+    const page = CoreUI.usePage('bank')
+
+    // Lua -> page. Auto-unsubscribes with the component (onUnmounted).
+    page.on('balance', (data) => { balance.value = data.balance })
+
+    // page -> Lua: post('ui_event') -> TriggerEvent('core:ui:bank:withdraw', data)
+    const withdraw = (amount) => page.emit('withdraw', { amount })
+
+    return () => h('div', { class: 'core-backdrop' }, [
+      h('h2', { class: 'core-title' }, vm.props.title),
+      h('span', {}, 'Cash ' + CoreUI.hud.cash),              // readonly reactive HUD
+      h('button', { class: 'core-btn', onClick: () => withdraw(500) }, 'Withdraw $500'),
+      h('button', { class: 'core-btn', onClick: () => page.close() }, 'Close'),  // -> ui_close
+    ])
+  },
+}
+```
+
+| `window.CoreUI` | what it does |
+| --- | --- |
+| `Vue` | the one Vue instance the shell mounted with — never import a second one |
+| `registerPage(id, component)` | what a compiled-in page (or a loaded bundle) calls once |
+| `usePage(id)` | `{ id, props, emit(event, data), on(event, fn), close() }` for the component itself |
+| `emit(pageId, event, data)` | `post('ui_event', { page, event, data })` |
+| `on(pageId, event, fn) -> off` | receives `page:event` from Lua |
+| `close(pageId)` | `post('ui_close', { page })` |
+| `hud` | readonly reactive `{ visible, cash, bank, name, serverId, faction }` plus the live feed `health, armour, speed, street, zone, minimap` |
+| `state` | readonly reactive mirror of the replicated player state (`state:set`) |
+| `stats` | readonly reactive stat bars: `name -> { label, value, min, max }` |
+| `minimap` | the minimap's anchor rect `{ x, y, w, h }` in CSS pixels, or `null` before the client measured it — park a panel next to the minimap with this |
+| `lang` | the NUI's current language (`locale:set`) |
+| `t(key, vars)` | core's translation of `key` with `{{var}}` substitution; an unknown key comes back verbatim, exactly like `Core.Locale.t`. It is **core's** string table — a plugin page bundles its own |
+| `playSound(name, set)` | `PlaySoundFrontend` through Lua (`ui_sound`), for a click or an error blip |
+| `notify(message, type)` | a local toast, no Lua round trip |
+| `post(name, data)` | the raw NUI callback, for a plugin's own `RegisterNuiCallback` |
+
+`props` is **reactive and stable**: a second `page:open` (or `Core.UI.open` with new props)
+mutates the same object instead of remounting the component, so scroll position and local
+state survive.
+
+### 3. The Lua side
+
+```lua
+-- declare it once, on resource start
+Core.UI.registerPage('bank', { type = 'page', keepInput = false })
+
+-- page -> Lua  (Core.UI.on is sugar for AddEventHandler('core:ui:bank:withdraw', fn))
+Core.UI.on('bank', 'withdraw', function(data)
+    -- NEVER trust `data`: it comes from the player's browser.
+    Core.Net.emit('bank:withdraw', { amount = data.amount })
+end)
+
+-- Lua -> page
+Core.UI.send('bank', 'balance', { balance = 182450 })   -- -> page:event
+
+-- open / close
+Core.UI.open('bank', { title = 'Fleeca' })   -- SetNuiFocus(true, true) while it is open
+Core.UI.close('bank')                        -- or the page's own Escape -> ui_close
+```
+
+`Core.UI.open` returns a boolean (did it open), not a value — a page is a conversation, not a
+prompt. Use `Core.UI.menu.open` / `input.open` / `alert` when you want an answer.
+
+## Rules that bite
+
+* **`type = 'page'` is exclusive.** Opening a second page closes the first; `Core.UI.getOpenPage()`
+  tells you which one is up. `type = 'overlay'` is additive, never takes focus, and is ignored
+  by Escape — an overlay must be closed by Lua.
+* **Escape is free.** The player can always close a page (`ui_close`), so never leave game state
+  half-committed while a page is open.
+* **`keepInput = true`** keeps the game's keyboard alive next to the page (`SetNuiFocusKeepInput`)
+  — right for an overlay with a text field, wrong for anything that uses WASD.
+* **A `page:open` for an unregistered id waits 5 s**, then posts `ui_event { event = '__error' }`
+  and shows an error toast. In practice that means a typo in the id — see the
+  *Opened before the bundle registered* story.
+* **Everything crossing `ui_event` is untrusted input.** Validate it with `Core.Validate` on the
+  client and again on the server; the page is running in the player's own browser.

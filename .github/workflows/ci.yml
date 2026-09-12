@@ -1,0 +1,19 @@
+# CI for the `core` resource on its own (the resources-level workflow at ../.github covers the npm workspace).
+name: core
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lua 5.4
+        run: sudo apt-get update && sudo apt-get install -y lua5.4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Syntax
+        run: find . -name '*.lua' -not -path './ui/*' -print0 | xargs -0 -n1 luac5.4 -p
+      - name: Offline tests
+        run: lua5.4 tests/run_tests.lua && lua5.4 tests/server_tests.lua
+      - name: UI build (no workspace lockfile inside this repo, so npm install)
+        working-directory: ui
+        run: npm install --no-audit --no-fund && npm run build

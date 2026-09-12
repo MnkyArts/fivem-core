@@ -1,0 +1,105 @@
+import { Meta } from '@storybook/addon-docs/blocks'
+
+<Meta title="Docs/Introduction" />
+
+# The core NUI shell
+
+`core/ui` is the **only** user interface the players download. It is a Vue 3 + Vite app that
+Vite builds into `core/html` (`assets/app.js`, `assets/app.css`, no hashes, so the manifest's
+`files { 'html/**' }` stays stable), and `fxmanifest.lua` hands it to the CEF as
+`ui_page 'html/index.html'`.
+
+It is a **game overlay**: `html`, `body` and `.core-root` are transparent and
+`pointer-events: none`. Nothing in it reacts to the mouse unless a modal or a plugin page is
+open — otherwise the player could not shoot, drive or look around.
+
+Every story in this Storybook drives the same reactive store the game drives, with the same
+`SendNUIMessage` payloads. Nothing is faked with component props. The **Lua** panel
+(bottom right, next to Controls and Interactions) shows, per story:
+
+1. the `Core.UI.*` call a script would make,
+2. the message(s) that call puts on the wire,
+3. every NUI callback the shell posts back while you interact,
+4. what the awaiting Lua call therefore returns.
+
+## How Lua drives it
+
+There are exactly two directions, both defined in DESIGN §6.10.
+
+```
+client/ui.lua  --  SendNUIMessage({ action = 'menu:open', ... })  -->  bridge.js 'message'
+                                                                        |
+                                                            store.js actions[action](msg)
+                                                                        |
+                                                                Vue components render
+                                                                        |
+                                             player presses Enter / clicks / Esc
+                                                                        |
+client/ui.lua  <--  fetch('https://core/menu_result', { id, value })  --  bridge.post()
+                    RegisterNuiCallback resolves the pending promise
+```
+
+* **Lua → NUI** is `SendNUIMessage({ action = '<name>', ... })`. `src/bridge.js` dispatches the
+  `window 'message'` event by `action` to the handlers `src/store.js` registered; the store is
+  the single source of truth and the components are dumb renderers.
+* **NUI → Lua** is `post(name, body)` → `fetch('https://<resource>/<name>')`, answered by a
+  `RegisterNuiCallback`. The blocking helpers (`menu.open`, `input.open`, `alert`, `progress`)
+  park a promise under a request `id` and resolve it when the matching callback arrives.
+
+The shell is **optimistic**: `menuResult()` hides the menu and *then* posts, so the UI never
+waits a frame for Lua. The `menu:close` Lua sends afterwards is a deliberate no-op.
+
+Focus is Lua's job, not the page's: `client/ui.lua` calls `SetNuiFocus(true, true)` the moment
+a page or a built-in modal (menu / input / alert) is open and `SetNuiFocus(false, false)` the
+moment none is, with a 500 ms watchdog for the case where the page died with focus held.
+
+## What lives where
+
+| file | job |
+| --- | --- |
+| `src/bridge.js` | transport only: `post()`, `onMessage()`, the dev shim, and the `window.__core.onPost` / `onMessage` taps this Storybook listens on |
+| `src/store.js` | one `reactive()` state object + every `action` handler + the global keyboard rules |
+| `src/coreui.js` | `window.CoreUI`, the surface plugin pages talk to |
+| `src/App.vue` | mounts all eight built-ins; no logic |
+| `src/components/*.vue` | render store state, own their local keyboard (Tab / Enter / arrows) |
+
+Keyboard ownership is split on purpose: **Escape** and the progress cancel keys
+(`x` / `Backspace`) live in `store.handleKeydown` because they mean "cancel whatever is
+topmost", while `↑ ↓ Enter Tab` live in the component that is on screen.
+
+## One dist, many plugins (DESIGN §7.4)
+
+A plugin does **not** ship its own UI files. Its page lives in `<plugin>/ui/src/index.js`,
+`core/ui/src/plugins.js` globs `../../../*/ui/src/index.js` at build time, and the page is
+compiled straight into core's bundle — one download, one Vue instance, no duplicated runtime.
+
+```lua
+-- the plugin's client script only declares metadata
+Core.UI.registerPage('bank', { type = 'page', keepInput = false })
+Core.UI.open('bank', { balance = 182450 })
+```
+
+```js
+// <plugin>/ui/src/index.js — compiled into core's bundle by src/plugins.js
+import Page from './Page.vue'
+export const id = 'bank'
+export default Page
+```
+
+Besides the page plumbing, `window.CoreUI` hands a page the shell's own live data —
+`hud` (money plus health / armour / speed / street / zone), `state`, `stats`, `minimap`,
+`lang` / `t(key, vars)` for core's strings and `playSound(name, set)` — all readonly and
+reactive, so a page never has to ask Lua for something the HUD already knows.
+
+Dev dependencies are hoisted by the npm workspace at `resources/package.json`
+(`core/ui`, `*/ui`), so a plugin that needs an extra runtime library adds a minimal
+`ui/package.json`, `npm install` at `resources/` hoists it and Rollup bundles it into the one
+dist. The `script` / `style` URL loader in `PageHost.vue` still exists as a fallback for
+prebuilt third-party bundles — see **Docs → Plugin Pages**.
+
+## Working offline
+
+`window.GetParentResourceName` only exists inside the CEF. Without it the shell switches to
+dev mode: `post()` logs instead of fetching, and `window.__core.send({ action: … })` fakes an
+incoming message. That is how `core/ui/tests/shell-regression.js` drives `html/index.html`
+under `agent-browser`, and it is exactly what the `send()` helper in these stories uses.

@@ -1,0 +1,22 @@
+{
+  "loading": "Loading your character...",
+  "respawn_in": "Respawn in {{seconds}} s",
+  "respawn_now": "Respawning...",
+  "locked": "Vehicle locked",
+  "unlocked": "Vehicle unlocked",
+  "no_keys": "You have no keys for this vehicle",
+  "no_permission": "You are not allowed to do that",
+  "usage": "Usage: {{usage}}",
+  "insufficient": "Not enough money",
+
+  "door_locked": "Door locked",
+  "door_unlocked": "Door unlocked",
+  "door_no_access": "You do not have access to this door",
+  "door_prompt": "[{{key}}] Lock / unlock door",
+  "weapon_given": "Received {{weapon}}",
+  "weapon_removed": "Lost {{weapon}}",
+  "chat_cooldown": "Slow down - wait a moment before sending another message",
+  "chat_too_long": "Your message is too long (max {{max}} characters)",
+  "stat_low": "Your {{stat}} is getting low",
+  "stat_critical": "Your {{stat}} is critically low"
+}

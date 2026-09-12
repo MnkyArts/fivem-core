@@ -1,0 +1,9 @@
+{
+  "//": "OPTIONAL. Copy to package.json ONLY when this page needs an extra runtime library, then run `npm install` in the resources/ folder (the npm workspace root, next to core/). The library is bundled into core's single dist; `vue` never belongs here, the shell provides it.",
+  "name": "my-plugin-ui",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "sortablejs": "^1.15.6"
+  }
+}

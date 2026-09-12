@@ -1,0 +1,9 @@
+# dependencies live in the npm workspace one level up (resources/node_modules); never here
+node_modules/
+ui/node_modules/
+ui/storybook-static/
+ui/.storybook/cache/
+# runtime artefacts
+data/
+*.log
+.DS_Store

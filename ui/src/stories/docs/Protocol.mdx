@@ -1,0 +1,93 @@
+import { Meta } from '@storybook/addon-docs/blocks'
+
+<Meta title="Docs/Protocol" />
+
+# The NUI protocol (DESIGN §6.10)
+
+Two tables define everything the shell understands and everything it can say back. The
+**Lua** panel on every story shows both halves live for that story.
+
+## Lua → NUI: `SendNUIMessage({ action = ..., ... })`
+
+Dispatched by `src/bridge.js` on the `window 'message'` event and handled by the `actions`
+map in `src/store.js`. An unknown `action` is ignored; a message without a string `action` is
+dropped before it reaches any handler.
+
+| action | fields | effect in the store |
+| --- | --- | --- |
+| `notify` | `id, message, type, duration, title` (+ `count`) | pushes a toast, or bumps `count` on an identical visible one and restarts its timer; keeps at most 6 |
+| `textui:show` | `key, text, position` | fills `store.textui`; `position` is one of `bottom` (default), `top`, `left`, `right` |
+| `textui:hide` | — | `store.textui.visible = false` |
+| `progress:start` | `id, label, duration, canCancel` | replaces any running bar, stamps `startedAt`, and arms the timer that fires `progress_done` |
+| `progress:stop` | `id` | hides it silently — no callback; ignored when `id` is not the running bar |
+| `menu:open` | `id, title, items` | `items` = `{ label, description?, icon?, value, disabled? }` |
+| `menu:close` | — | closes without a callback |
+| `input:open` | `id, title, fields, submit, cancel` | `fields` = `{ name, label, type, options?, default?, required?, min?, max?, placeholder? }`; `type` is `text`, `number`, `select` or `checkbox`; `cancel = false` drops the button |
+| `input:close` | — | closes without a callback |
+| `alert:open` | `id, title, message, confirm, cancel` | `message` may be a string or an array of lines; `cancel = false` drops the button |
+| `alert:close` | — | closes without a callback |
+| `hud:set` | partial of `visible, cash, bank, name, serverId, faction` | copies only the keys present; `faction` is `{ name, tag, color }` or `false` |
+| `page:register` | `id, type, script, style, keepInput` | `type` is `page` or `overlay`; `script`/`style` are absolute `https://cfx-nui-<owner>/<path>` URLs, and are `null` for the normal compiled-in case |
+| `page:unregister` | `id` | drops the record, the overlay and the open page |
+| `page:open` | `id, props` | `type = 'page'` becomes the one `openPage`; `type = 'overlay'` joins `store.overlays` |
+| `page:close` | `id` | `id` omitted closes the open page |
+| `page:event` | `id, event, data` | calls every `CoreUI.on(id, event, fn)` handler |
+| `focus` | `focused` | mirrors `SetNuiFocus` into `store.focused` (informational) |
+
+## NUI → Lua: `RegisterNuiCallback`
+
+`bridge.post(name, body)` POSTs to `https://<resource>/<name>`. Every callback on the Lua side
+answers `cb({})` or `cb({ ok = true })`; the shell ignores the answer — it never blocks on one.
+
+| callback | body | what Lua does with it |
+| --- | --- | --- |
+| `ui_ready` | `{}` | sets `nuiReady`, re-sends every registered page and the HUD snapshot (survives an F8 `refresh`) |
+| `menu_result` | `id, value` | resolves the pending `Core.UI.menu.open` promise; `value = nil` means Esc |
+| `input_result` | `id, values` | resolves `Core.UI.input.open`; `values = nil` means cancelled |
+| `alert_result` | `id, confirmed` | resolves `Core.UI.alert` with the boolean |
+| `progress_cancel` | `id` | resolves `Core.UI.progress` with `false` |
+| `progress_done` | `id` | resolves `Core.UI.progress` with `true` |
+| `ui_close` | `page` | `Core.UI.close(page)` — Escape or a close button in the page |
+| `ui_event` | `page, event, data` | `TriggerEvent(('core:ui:%s:%s'):format(page, event), data)`; `page`/`event` are validated as id strings and `data` is capped at 16 KB of JSON |
+
+Results whose `id` no longer has a pending promise are ignored, so a late click after a
+timeout cannot resolve the next request.
+
+### The `menu_result` detail worth knowing
+
+`Core.UI.menu.open` does **not** put your `value` on the wire. `client/ui.lua` rewrites every
+item's `value` to its 1-based index, keeps the real values in a local table, and maps the
+posted index back before returning:
+
+```lua
+local choice = Core.UI.menu.open({
+    items = {
+        { label = 'Yes', value = true },
+        { label = 'No',  value = false },   -- `false` survives; `nil`/no value falls back to the label
+    },
+})
+```
+
+That is why a Lua value of `false`, a table or a function still round-trips through JSON.
+
+## Keyboard contract (DESIGN §7.3)
+
+| key | owner | result |
+| --- | --- | --- |
+| `Escape` | `store.handleKeydown` | topmost modal's cancel result, else `ui_close` for the open page |
+| `x` / `Backspace` | `store.handleKeydown` | `progress_cancel`, but only while a cancellable bar is up and the target is not a text field |
+| `↑` `↓` | `Menu.vue` | move the selection, skipping `disabled` rows, wrapping at the ends |
+| `Enter` | `Menu.vue` / `InputDialog.vue` / `AlertDialog.vue` | select / submit / answer with the focused button |
+| `Tab` | `InputDialog.vue` / `AlertDialog.vue` | cycle focus **inside** the panel (Shift+Tab backwards) |
+
+## Throughput and safety rails
+
+* **Notifications** are queued on the Lua side and flushed at most
+  `Config.UI.MaxNotifyPerSecond` per second on a 100 ms timer; the overflow is coalesced into
+  `count`, so a `while true do notify() end` bug cannot flood the CEF.
+* **`ui_event` data** is capped at 16 KB of JSON before it becomes a client event.
+* **Strings** (`title`, `label`, `description`, `icon`, …) are `Utils.sanitize`d with hard
+  length caps in `client/ui.lua`, so a server-supplied name cannot inject markup or blow up
+  the layout.
+* **One modal at a time**: `activeModal()` ranks alert over input over menu, and every
+  component checks it before touching the keyboard.

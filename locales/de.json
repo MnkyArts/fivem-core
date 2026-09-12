@@ -1,0 +1,22 @@
+{
+  "loading": "Dein Charakter wird geladen...",
+  "respawn_in": "Wiederbelebung in {{seconds}} s",
+  "respawn_now": "Du wirst wiederbelebt...",
+  "locked": "Fahrzeug verriegelt",
+  "unlocked": "Fahrzeug entriegelt",
+  "no_keys": "Du hast keinen Schlüssel für dieses Fahrzeug",
+  "no_permission": "Dazu hast du keine Berechtigung",
+  "usage": "Verwendung: {{usage}}",
+  "insufficient": "Nicht genug Geld",
+
+  "door_locked": "Tür abgeschlossen",
+  "door_unlocked": "Tür aufgeschlossen",
+  "door_no_access": "Du hast keinen Zugriff auf diese Tür",
+  "door_prompt": "[{{key}}] Tür auf- oder abschließen",
+  "weapon_given": "{{weapon}} erhalten",
+  "weapon_removed": "{{weapon}} verloren",
+  "chat_cooldown": "Nicht so schnell - warte kurz, bevor du wieder schreibst",
+  "chat_too_long": "Deine Nachricht ist zu lang (max. {{max}} Zeichen)",
+  "stat_low": "Dein {{stat}} wird langsam knapp",
+  "stat_critical": "Dein {{stat}} ist kritisch niedrig"
+}

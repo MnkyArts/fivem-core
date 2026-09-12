@@ -1,0 +1,162 @@
+/* core UI — design tokens + base (DESIGN §7.2)
+   Utilities the components share: .core-panel .core-backdrop .core-modal .core-title
+   .core-label .core-text .core-btn (--primary/--ghost/--danger) .core-field .core-input
+   .core-select .core-check .core-key .core-list .core-item (.is-active/.is-disabled)
+   .core-interactive (opts an element back into pointer events). */
+
+:root {
+  --core-panel: rgba(14, 16, 20, 0.86);
+  --core-panel-solid: rgb(14, 16, 20);
+  --core-panel-raise: rgba(255, 255, 255, 0.04);
+  --core-border: rgba(255, 255, 255, 0.08);
+  --core-border-strong: rgba(255, 255, 255, 0.16);
+  --core-backdrop: rgba(0, 0, 0, 0.28);
+  --core-accent: #5b8cff;
+  --core-accent-soft: rgba(91, 140, 255, 0.18);
+  --core-success: #3ddc84;
+  --core-error: #ff5d5d;
+  --core-warning: #ffb347;
+  --core-info: #5b8cff;
+  --core-text: #f2f4f8;
+  --core-text-dim: rgba(242, 244, 248, 0.62);
+  --core-text-faint: rgba(242, 244, 248, 0.38);
+  --core-radius: 8px;
+  --core-radius-sm: 5px;
+  --core-gap: 10px;
+  --core-pad: 14px;
+  --core-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  --core-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --core-mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  --core-fs: 14px;
+  --core-fs-sm: 12px;
+  --core-fs-xs: 10px;
+  --core-ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  color: var(--core-text);
+  font-family: var(--core-font);
+  font-size: var(--core-fs);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.core-interactive { pointer-events: auto; }
+
+.core-panel {
+  background: var(--core-panel);
+  border: 1px solid var(--core-border);
+  border-radius: var(--core-radius);
+  box-shadow: var(--core-shadow);
+  backdrop-filter: blur(6px);
+}
+
+.core-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--core-backdrop);
+  pointer-events: auto;
+}
+
+.core-modal { min-width: 320px; max-width: 460px; padding: var(--core-pad); }
+.core-title { margin: 0 0 6px; font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
+.core-text { margin: 0; color: var(--core-text-dim); font-size: var(--core-fs-sm); }
+.core-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--core-text-faint);
+  font-size: var(--core-fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+}
+
+.core-btn {
+  padding: 7px 14px;
+  border: 1px solid var(--core-border-strong);
+  border-radius: var(--core-radius-sm);
+  background: var(--core-panel-raise);
+  color: var(--core-text);
+  font: inherit;
+  font-size: var(--core-fs-sm);
+  cursor: pointer;
+  transition: background 0.12s var(--core-ease), border-color 0.12s var(--core-ease);
+}
+.core-btn:hover { background: rgba(255, 255, 255, 0.1); }
+.core-btn:focus-visible { outline: 1px solid var(--core-accent); outline-offset: 1px; }
+.core-btn--primary { border-color: var(--core-accent); background: var(--core-accent-soft); color: #dce6ff; }
+.core-btn--primary:hover { background: rgba(91, 140, 255, 0.3); }
+.core-btn--ghost { border-color: transparent; background: transparent; color: var(--core-text-dim); }
+.core-btn--danger { border-color: rgba(255, 93, 93, 0.5); color: var(--core-error); }
+.core-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+
+.core-field { margin-bottom: var(--core-gap); }
+.core-input, .core-select {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--core-border-strong);
+  border-radius: var(--core-radius-sm);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--core-text);
+  font: inherit;
+  font-size: var(--core-fs-sm);
+  user-select: text;
+}
+.core-input:focus, .core-select:focus { outline: none; border-color: var(--core-accent); }
+.core-input::placeholder { color: var(--core-text-faint); }
+.core-check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.core-check input { accent-color: var(--core-accent); width: 14px; height: 14px; }
+
+.core-key {
+  display: inline-block;
+  min-width: 20px;
+  padding: 1px 6px;
+  border: 1px solid var(--core-border-strong);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  font-family: var(--core-mono);
+  font-size: var(--core-fs-sm);
+  text-align: center;
+}
+
+.core-list { max-height: 60vh; overflow-y: auto; margin: 0; padding: 0; list-style: none; }
+.core-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--core-radius-sm);
+  border-left: 2px solid transparent;
+  cursor: pointer;
+}
+.core-item:hover { background: rgba(255, 255, 255, 0.05); }
+.core-item.is-active { background: var(--core-accent-soft); border-left-color: var(--core-accent); }
+.core-item.is-disabled { opacity: 0.35; cursor: not-allowed; }
+
+.core-list::-webkit-scrollbar { width: 6px; }
+.core-list::-webkit-scrollbar-thumb { background: var(--core-border-strong); border-radius: 3px; }
+.core-list::-webkit-scrollbar-track { background: transparent; }
+
+@keyframes core-slide-in { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: none; } }
+@keyframes core-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes core-pop-in { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: none; } }
