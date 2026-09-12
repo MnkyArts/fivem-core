@@ -10,8 +10,10 @@
    .core-modal .core-title .core-label .core-text .core-btn (--primary/--ghost/--danger) .core-field
    .core-input .core-select .core-check .core-key .core-list .core-item (.is-active/.is-disabled)
    .core-interactive. The legacy --core-* variables stay as aliases of the theme tokens.
-   Rule: never use backdrop filters (blur/saturate, Tailwind's backdrop-* utilities) in the shell or a plugin page — the game frame
-   is not part of the CEF compositing surface, so FiveM paints the filtered area as a solid black box. */
+   Rule: in the shell and in plugin pages, never use backdrop filters; a panel that should show the blurred
+   game behind it carries `data-core-blur` instead (DESIGN §32, src/gameblur.js paints the `.core-glass`
+   wrapper into it). The game frame is not part of the CEF compositing surface, so a filtered area is
+   painted as a solid black box, while the NUI render hook hands the frame to a canvas for real. */
 
 @import "tailwindcss";
 
@@ -26,6 +28,9 @@
   --font-mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
 
   --color-panel: rgba(14, 16, 20, 0.86);
+  /* §32: the tint a `.core-glass` panel wears over its blurred copy of the game — thinner than
+     --color-panel, because there is a real picture underneath it now. */
+  --color-panel-glass: rgba(14, 16, 20, 0.62);
   --color-panel-solid: rgb(14, 16, 20);
   --color-panel-raise: rgba(255, 255, 255, 0.04);
   --color-border: rgba(255, 255, 255, 0.08);
@@ -117,6 +122,28 @@
      fade, cutscene, `Core.UI.hide`). `visibility` keeps the layout and the components alive —
      no `display: none`, no unmount — so timers, the progress bar and the HUD carry on. */
   .core-root.is-hidden { visibility: hidden; pointer-events: none; }
+
+  /* §32: src/gameblur.js inserts this wrapper as the first child of every `data-core-blur`
+     element and keeps a blurred copy of the game in the canvas. Only the frame lives here — the
+     module sets the canvas inset, size and blur radius inline, per element strength. */
+  .core-glass {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    border-radius: inherit;
+    z-index: -1;
+    pointer-events: none;
+  }
+  .core-glass > canvas { position: absolute; display: block; }
+  /* Tint, not an alpha override: inside the isolated consumer a z-index -1 child paints ABOVE
+     the element's own background, so the panel colour is re-applied here, over the copy. A page
+     that wants another glass colour sets `--core-glass-tint` on its panel. */
+  .core-glass::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--core-glass-tint, var(--color-panel-glass));
+  }
 
   .core-panel {
     background: var(--core-panel);

@@ -411,9 +411,52 @@ first — relative to the file, which from a plugin is
 `@reference "../../../core/ui/src/styles.css";` (`<plugin>/ui/src` → the resources folder → core).
 It emits nothing; only the tokens are read. Utilities in the template need no `@reference`.
 
-**Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities**: the
+**Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities** — the
 game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
-black box. `core/ui/src/styles.css` documents the same rule.
+black box. That ban stays; for a glass panel put **`data-core-blur`** on the panel instead (next
+section). `core/ui/src/styles.css` documents the same rule.
+
+### Game blur (glass panels)
+
+A CSS filter cannot see the game, but FiveM's NUI core can: it hooks `glTexParameterf` and binds the
+game's back buffer to a WebGL texture — the same hook the FiveM main menu draws its own blurred
+background with. core copies that frame into one small hidden canvas `Fps` times a second, and behind
+every element carrying `data-core-blur` it inserts a `.core-glass` wrapper (`z-index: -1`, inset 0)
+holding a blurred crop of it. The wrapper paints the panel colour itself, so a glass panel looks like
+the normal one with the game showing through, border and all.
+
+```vue
+<section class="core-panel core-interactive" data-core-blur>   <!-- Config.UI.Blur.Strength -->
+<section class="core-panel" data-core-blur="18">               <!-- 18 px, this panel only -->
+<section class="core-panel" data-core-blur="0">                <!-- no glass on this panel -->
+<section class="core-panel" data-core-blur style="--core-glass-tint: rgba(20, 14, 14, 0.66)">
+```
+
+A page needs **no JavaScript at all** — the attribute is the whole API, and it works on an element
+that appears later. `--core-glass-tint` on the element overrides the panel colour the wrapper paints
+(default `--color-panel-glass`, `rgba(14,16,20,.62)`).
+
+Each consumer costs one small canvas copy per frame, so put it on **panels, never on list rows** or
+per-item elements, and keep **12 or fewer on screen** — core's own ten built-ins (the three modals,
+the HUD box, the stat bars, each toast, the text UI pill, the progress box, the key hints and the
+spinner) already carry it. The loop runs only while the blur is enabled, at least one consumer is
+visible, the shell is visible (§31) and the tab is not hidden; otherwise it stops completely.
+
+| `Config.UI.Blur` key | default | what it does |
+|---|---|---|
+| `Enabled` | `true` | draw the glass at all; `false` removes every wrapper and stops the loop |
+| `Strength` | `10` | blur radius in CSS px (0–40) — the default for an attribute without a value |
+| `Fps` | `30` | copies per second (5–60); `setTimeout`, never a full-rate `requestAnimationFrame` |
+| `Scale` | `0.5` | resolution of the copy (0.1–1). It is blurred anyway, so half is plenty |
+
+```lua
+Core.UI.setBlur(false)   -- client; session-scoped override of Enabled, re-sent on a NUI reload
+Core.UI.setBlur(true)    -- back on; returns true
+```
+
+Outside the CEF (a browser, this repo's Storybook) there is no hook: core probes once and falls back
+to a procedural gradient so the effect stays visible while you build a page. `<html>` reports which
+one is running — `data-game-blur="live" | "fallback" | "off"`.
 
 ## Hooks, events and state bags
 
@@ -707,6 +750,10 @@ UI visibility (§31). Step 22 is where the two keyboards meet: while the NUI hol
 
 21. **The shell hides behind the pause menu:** stand in the 24/7 marker so the HUD, the stat bars and the `[E]` pill are all up, raise a long notification, then press `ESC` → the moment the map opens *everything* core draws is gone, and it is all back unchanged (same values, the toast with its remaining time) when you close it. `Core.Screen.fade(<id>, 800)` does the same for a fade. Then hide it by hand: `Core.UI.hide('test')` from a throwaway **client** command in `core_example/client/main.lua` → the shell stays gone until `Core.UI.show('test')`, `Core.UI.isHidden()` is `true` and `Core.UI.hiddenReasons()` lists `core_example:test`; `restart core_example` while it still holds that reason → the shell comes straight back (the plugin's `uihide` registrations die with it).
 22. **A modal cancels instead of hiding:** run `/exmenu` and press `ESC` **once** while the menu is up → the NUI has focus, so the menu swallows the key, returns `nil` and closes; the pause menu does **not** open. Press `ESC` again → now the pause menu opens and the rest of the shell hides with it. Same rule from the server: `Core.UI.hide(<id>, 'cutscene')` with the menu open → the menu closes with `nil` and focus is released, no invisible cursor left behind (hiding with a modal open equals cancelling it).
+
+Game blur (§32).
+
+23. **Glass panels:** run `/exmenu` and look at the game *behind* the menu panel — it is blurred, and it keeps up as you turn the camera (the HUD box, the toasts and the `[E]` pill are glass too). `resmon 1` on `core` must not move measurably: the copy runs in the CEF, not in the script. Set `Config.UI.Blur.Enabled = false`, `restart core` → the panels are flat `bg-panel` again and nothing else changes; a throwaway client command calling `Core.UI.setBlur(false)` does the same without a restart, and `Core.UI.setBlur(true)` brings it back.
 
 ## Troubleshooting
 

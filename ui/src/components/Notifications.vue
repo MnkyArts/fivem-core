@@ -36,6 +36,7 @@ function typeOf (t) {
       class="notif flex items-stretch gap-[9px] py-[8px] pr-[10px] pl-0
              bg-panel border border-border rounded-ui overflow-hidden text-[13px] leading-[1.35]"
       :class="'is-' + typeOf(n.type)"
+      data-core-blur
     >
       <span class="bar flex-[0_0_3px] w-[3px] rounded-l-[3px]" :class="BAR[typeOf(n.type)]"></span>
       <div class="body flex-auto min-w-0">

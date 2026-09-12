@@ -27,6 +27,7 @@ const pos = computed(() => {
              bg-panel border border-border rounded-full text-fg text-ui leading-[1.2]
              pointer-events-none whitespace-nowrap"
       :class="['pos-' + pos, PLACEMENT[pos]]"
+      data-core-blur
     >
       <span
         v-if="store.textui.key"

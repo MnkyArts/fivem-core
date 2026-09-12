@@ -1091,6 +1091,47 @@ CreateThread(function()
     end
 end)
 
+-- ----------------------------------------------------------- game blur ----
+-- The shell draws a live, blurred copy of the game frame behind every panel that
+-- carries `data-core-blur` (DESIGN §32). Lua owns nothing but the config: one
+-- `blur:set` on ui_ready and one per UI.setBlur call, no per-frame work here.
+
+local blurOverride = nil        -- UI.setBlur value for this session, nil = follow Config
+
+--- Config.UI.Blur value with a default (the whole table may be absent).
+local function blurCfg(key, default)
+    local cfg = uiCfg('Blur', nil)
+    if type(cfg) ~= 'table' then return default end
+    local value = cfg[key]
+    if value == nil then return default end
+    return value
+end
+
+--- A tunable is forwarded only when it really is a number; otherwise the key stays
+--- out of the message and the shell keeps its own default (it clamps them anyway).
+local function blurNumber(key)
+    local value = blurCfg(key, nil)
+    return type(value) == 'number' and value or nil
+end
+
+--- Tells the shell whether to draw the glass, and how (flip, and ui_ready).
+local function sendBlur()
+    local enabled = blurOverride
+    if enabled == nil then enabled = blurCfg('Enabled', true) == true end
+    send({
+        action = 'blur:set', enabled = enabled,
+        strength = blurNumber('Strength'), fps = blurNumber('Fps'), scale = blurNumber('Scale'),
+    })
+end
+
+--- UI.setBlur(enabled) — session-scoped override of Config.UI.Blur.Enabled; only
+--- `true` enables. Re-sent on ui_ready, so a shell reload keeps the override.
+function UI.setBlur(enabled)
+    blurOverride = enabled == true
+    sendBlur()
+    return true
+end
+
 -- ------------------------------------------------------------ NUI → Lua ----
 -- Every callback answers cb(...) — a missing cb hangs the page's fetch().
 
@@ -1114,6 +1155,7 @@ RegisterNuiCallback('ui_ready', function(_, cb)
     local snapshot = { action = 'hud:set' }
     for key, value in pairs(hud) do snapshot[key] = value end
     send(snapshot)
+    sendBlur()                          -- the reloaded shell forgot the blur config too (§32.3)
     if textUI then
         send({ action = 'textui:show', key = textUI.key, text = textUI.text, position = textUI.position })
     end

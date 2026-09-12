@@ -144,9 +144,27 @@ A scoped `<style>` that uses `@apply` has to point Tailwind at the theme first, 
 relative to the file: `@reference "../../../core/ui/src/styles.css";` from `<plugin>/ui/src`. It
 reads the tokens and emits nothing.
 
-**Never use `backdrop-filter` / `-webkit-backdrop-filter` or the `backdrop-*` utilities.** The game
-frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
-black box — it looks fine in this Storybook and black in-game.
+**Never filter the backdrop** — neither the CSS property nor Tailwind's `backdrop-` utilities. The
+game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
+black box — it looks fine in this Storybook and black in-game. Put `data-core-blur` on the panel
+instead.
+
+(The literal property name is spelled out in core's README, not here: this file is inside `ui/src`,
+so Tailwind scans it and would emit the matching — dead — utility into the shipped bundle.)
+
+## Game blur (DESIGN §32)
+
+A CSS filter cannot see the game, but FiveM's NUI core can: it hooks `glTexParameterf` and binds
+the game's back buffer to a WebGL texture, which is how the FiveM main menu draws its own blurred
+background. `src/gameblur.js` does the same — one hidden source canvas holding the current frame at
+`Config.UI.Blur.Fps` (30) and `Scale` (0.5), and for every element carrying `data-core-blur` a
+`.core-glass` wrapper behind it (`z-index: -1`) whose canvas is a blurred crop of that source, tinted
+with `--core-glass-tint` so the panel keeps its own colour. A plugin page needs no JavaScript: the
+attribute is the whole API (`data-core-blur="18"` for a custom radius, `"0"` to opt out). It costs
+one small canvas copy per consumer per frame, so consumers are **panels, never list rows** — the
+shell's own ten built-ins keep the count at 12 or fewer. Outside the CEF there is no hook, so the
+module probes once and falls back to a procedural gradient (`<html data-game-blur="fallback">`),
+which is what every story in this Storybook shows. See **Shell → Game blur**.
 
 ## Working offline
 

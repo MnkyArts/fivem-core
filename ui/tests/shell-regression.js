@@ -269,6 +269,27 @@
       vis(root) === 'visible' && hasText('Survives the pause menu') && hasText('Hidden while paused'))
     send({ action: 'textui:hide' })
 
+    // ---- 10. game blur (DESIGN §32) ---------------------------------------
+    // A browser has no FiveM render hook, so the probe finds the 1x1 placeholder and the source
+    // becomes the painted dusk gradient. What a panel actually shows is the `.core-glass`
+    // wrapper and its canvas, and `blur:set` has to be able to take both away again.
+    const glassHost = root || document.body
+    const glassMode = () => document.documentElement.dataset.gameBlur || ''
+    check('game blur reports the fallback source in a browser', glassMode() === 'fallback')
+    const glassPanel = document.createElement('div')
+    glassPanel.setAttribute('data-core-blur', '')
+    glassPanel.style.cssText = 'width:260px;height:150px;margin:40px'
+    glassHost.appendChild(glassPanel)
+    check('a data-core-blur panel gets a .core-glass canvas',
+      await waitFor(() => !!glassPanel.querySelector('.core-glass > canvas'), 1500))
+    send({ action: 'blur:set', enabled: false })
+    await waitFor(() => !q('.core-glass') && glassMode() === 'off', 1500)
+    check('blur:set enabled=false drops every .core-glass and reports off',
+      !q('.core-glass') && glassMode() === 'off')
+    send({ action: 'blur:set', enabled: true })
+    await waitFor(() => glassMode() === 'fallback', 1500)
+    glassPanel.remove()
+
     say('PASS ' + pass + '/' + total)
     return out.join('\n')
   } finally {

@@ -46,6 +46,7 @@ const rows = computed(() => Object.keys(store.stats)
       v-if="rows.length"
       class="stats pointer-events-none min-w-[176px] px-[12px] py-[8px]
              bg-panel border border-border rounded-ui flex flex-col gap-[6px]"
+      data-core-blur
     >
       <div
         v-for="row in rows"

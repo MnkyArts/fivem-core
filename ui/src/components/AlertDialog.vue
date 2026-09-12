@@ -47,7 +47,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
     <div v-if="visible" class="core-backdrop alert-back z-50">
       <div
         ref="panel" class="core-panel core-modal alert w-[380px] max-w-[80vw] animate-[core-pop-in_0.12s_var(--ease-ui)]"
-        role="alertdialog" :aria-label="store.alert.title || 'Notice'"
+        role="alertdialog" :aria-label="store.alert.title || 'Notice'" data-core-blur
       >
         <h2 class="core-title">{{ store.alert.title || 'Notice' }}</h2>
         <p class="core-text msg mt-2 max-h-[50vh] overflow-y-auto leading-normal whitespace-pre-line">{{ message }}</p>

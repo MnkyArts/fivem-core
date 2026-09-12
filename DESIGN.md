@@ -1745,13 +1745,20 @@ mode() }`, installed once from `main.js` after mount and from `.storybook/previe
   `getBoundingClientRect()` of the wrapper (expanded by the margin), the canvas backing size = rect × scale
   (only reassigned when it changes), and `drawImage(source, sx, sy, sw, sh, 0, 0, w, h)` from the matching
   region of the source (clamped to its bounds).
-- **Panel alpha**: while mode is `live` or `fallback` the root override
-  `:root[data-game-blur="live"], :root[data-game-blur="fallback"] { --color-panel: var(--color-panel-glass) }`
-  applies (`--color-panel-glass: rgba(14, 16, 20, 0.62)` in `@theme`), so `bg-panel`/`.core-panel` become
-  glass instead of near-opaque. Without blur the 0.86 panel stays as it is today.
+- **Tint, not alpha override**: inside an isolated element a negative-z child paints *above* the element's own
+  background, so the blurred copy would hide `bg-panel`. The wrapper therefore carries the panel colour itself:
+  `.core-glass::after { inset: 0; background: var(--core-glass-tint, var(--color-panel-glass)) }` above the
+  canvas (`--color-panel-glass: rgba(14, 16, 20, 0.62)` in `@theme`); a plugin panel that wants another tint sets
+  `--core-glass-tint` on the element. The element's own background is simply covered; its border (outside the
+  padding box the wrapper covers) stays visible. Non-glass panels keep the 0.86 `--color-panel` unchanged.
+- **Install**: `main.js` calls `installGameBlur(document.getElementById('app'))` after mount; the module imports
+  `store.js` itself and reads `store.blur` and `store.shell.visible` every tick (no config plumbing through
+  `App.vue`). `.storybook/preview.js` installs it on `document.body`. Controller: `{ mode(), isAvailable(),
+  refresh(), destroy() }`, exposed as `window.CoreUI.gameBlur`.
 - **Config messages**: `{ action = 'blur:set', enabled, strength, fps, scale }` from Lua on `ui_ready` and
-  on change; the store keeps `store.blur` and `App.vue` forwards it to the controller with a `watchEffect`.
-  The dev shim can send it too (Storybook control).
+  on change; the store keeps `store.blur = { enabled: true, strength: 10, fps: 30, scale: 0.5 }` (partial
+  merge, clamps: strength 0–40, fps 5–60, scale 0.1–1) and `resetExtras()` restores the defaults. The dev shim
+  can send it too (Storybook control).
 
 ### 32.3 Lua side
 
@@ -1763,9 +1770,10 @@ README the config keys, and the checklist a step ("open /exmenu: the game behind
 
 ### 32.4 Tests and docs
 
-- `ui/tests/shell-regression.js` (+3): in the browser the root reports `data-game-blur="fallback"`; after
-  `menu:open` the menu panel contains a `.core-glass canvas`; after `blur:set { enabled: false }` no
-  `.core-glass` element exists and the root reports `off`.
+- `ui/tests/shell-regression.js` (+3): in the browser the root reports `data-game-blur="fallback"`; a
+  `<div data-core-blur>` with a size appended inside `.core-root` gets a `.core-glass > canvas` child within
+  a few frames; after `blur:set { enabled: false }` no `.core-glass` element exists and the root reports `off`
+  (the test re-enables and removes its element afterwards). The built-in panels are asserted by the story.
 - Storybook: a "Shell/Game blur" story (controls: enabled, strength, scale) over the HUD + a menu, its Lua
   panel showing the config block and `Core.UI.setBlur(false)`; one paragraph in Introduction.mdx. The
   Storybook backdrop gradient and the fallback gradient use the same colours so the glass looks coherent.

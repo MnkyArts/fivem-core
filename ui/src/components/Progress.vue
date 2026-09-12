@@ -43,6 +43,7 @@ onMounted(paint)
       class="progress fixed z-30 left-1/2 bottom-[7vh] w-[340px] -ml-[170px]
              pt-[9px] px-[11px] pb-[10px]
              bg-panel border border-border rounded-ui pointer-events-none"
+      data-core-blur
     >
       <div class="head flex items-baseline justify-between gap-[10px] mb-[7px] text-ui-sm">
         <span class="label text-fg truncate">{{ store.progress.label }}</span>

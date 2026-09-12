@@ -20,10 +20,12 @@ on('hello', (data) => console.log('my_plugin: from Lua ->', data))   // Core.UI.
          Shared component classes: core-panel core-modal core-backdrop core-title core-text
          core-label core-btn (--primary/--ghost/--danger) core-field core-input core-select
          core-check core-key core-list core-item core-interactive.
-         Never use backdrop-filter or Tailwind's backdrop-* utilities: FiveM's CEF paints the
-         filtered area as a solid black box. -->
+         CSS backdrop filters stay banned (FiveM's CEF paints the filtered area as a solid black
+         box). For a glass panel put `data-core-blur` on it instead — core draws a live, blurred
+         copy of the game frame behind every element carrying it (README "Game blur (glass
+         panels)"). Panels only, never list rows. -->
     <div class="pointer-events-none fixed inset-0 flex items-center justify-center font-sans text-fg">
-        <section class="core-panel core-modal core-interactive w-[380px]">
+        <section class="core-panel core-modal core-interactive w-[380px]" data-core-blur>
             <h1 class="core-title">my_plugin</h1>
             <p class="core-text mb-3">{{ hud.name || 'nobody' }} — {{ props.title || 'props from Lua show up here' }}</p>
             <div class="flex gap-2">

@@ -12,6 +12,7 @@ import { store } from '../store.js'
       class="keys fixed z-[28] right-[18px] bottom-[18px] flex flex-wrap items-center justify-end
              gap-x-[14px] gap-y-[6px] max-w-[64vw] px-[12px] py-[6px]
              bg-panel border border-border rounded-full pointer-events-none"
+      data-core-blur
     >
       <span
         v-for="(item, i) in store.keys.items"

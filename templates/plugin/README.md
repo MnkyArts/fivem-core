@@ -129,7 +129,10 @@ bundle keeps one copy of the CSS. Utilities written in the template need no `@re
 
 **Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities** —
 the game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a
-solid black box.
+solid black box. For a glass panel put **`data-core-blur`** on the panel element instead: core draws
+a live, blurred copy of the game frame behind it, no JavaScript needed (`data-core-blur="18"` for a
+custom radius, `--core-glass-tint` for a custom tint). Panels only — never list rows. See core's
+README, "Game blur (glass panels)".
 
 New classes only reach the game after core's UI is rebuilt (`cd core/ui && npm run build`).
 

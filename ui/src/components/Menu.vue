@@ -67,7 +67,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 <template>
   <Transition name="menu">
     <div v-if="visible" class="core-backdrop menu-back z-50">
-      <div class="core-panel core-modal menu w-[380px] max-w-[80vw] pb-1.5 animate-[core-pop-in_0.12s_var(--ease-ui)]">
+      <div class="core-panel core-modal menu w-[380px] max-w-[80vw] pb-1.5 animate-[core-pop-in_0.12s_var(--ease-ui)]" data-core-blur>
         <h2 class="core-title">{{ store.menu.title || 'Menu' }}</h2>
         <ul ref="listEl" class="core-list mt-2" role="menu">
           <li

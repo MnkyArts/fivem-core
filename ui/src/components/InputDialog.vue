@@ -109,7 +109,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
     <div v-if="visible" class="core-backdrop dlg-back z-50">
       <div
         ref="panel" class="core-panel core-modal dlg w-[380px] max-w-[80vw] animate-[core-pop-in_0.12s_var(--ease-ui)]"
-        role="dialog" :aria-label="store.input.title || 'Input'"
+        role="dialog" :aria-label="store.input.title || 'Input'" data-core-blur
       >
         <h2 class="core-title">{{ store.input.title || 'Input' }}</h2>
         <div class="fields mt-2.5 max-h-[52vh] overflow-y-auto">

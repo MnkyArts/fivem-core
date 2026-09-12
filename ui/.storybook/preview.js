@@ -1,22 +1,31 @@
 // Storybook preview for the core NUI shell.
-// Boots the same globals main.js does (window.Vue -> installCoreUI) so plugin pages
-// can register through window.CoreUI, paints a muted "game" backdrop behind the
-// translucent panels, hands every story a freshly reset store, and taps the Lua wire
-// (src/stories/luaBridge.js -> Actions panel + the custom "Lua" panel).
+// Boots the same globals main.js does (window.Vue -> installCoreUI, then installGameBlur)
+// so plugin pages can register through window.CoreUI and every `data-core-blur` panel gets
+// its glass, paints a muted "game" backdrop behind the translucent panels, hands every story
+// a freshly reset store, and taps the Lua wire (src/stories/luaBridge.js -> Actions panel +
+// the custom "Lua" panel).
 import * as Vue from 'vue'
 
 window.Vue = Vue // must be set before installCoreUI(), exactly like main.js
 
 import '../src/styles.css'
 import { installCoreUI } from '../src/coreui.js'
+import { installGameBlur } from '../src/gameblur.js'
 import { resetStore } from '../src/stories/storeHelpers.js'
 import { luaChannel, withoutLog } from '../src/stories/luaBridge.js'
 
 installCoreUI()
 
+// main.js installs this on #app; here it watches the whole preview body, so a story's panels
+// get their glass wherever the story mounts them. There is no FiveM render hook in a browser,
+// so the probe fails and the module falls back to its own gradient source
+// (root <html> reports data-game-blur="fallback") — the same colours as GAME_BG below.
+installGameBlur(document.body)
+
 // The NUI page itself is transparent over GTA. Without something behind it the
-// panels (rgba backgrounds + backdrop-filter) cannot be judged, so the preview gets a
-// dusk-street-ish gradient: cool key light top-left, warm sodium bounce bottom-right.
+// translucent panels (and the blurred copy `data-core-blur` puts behind them) cannot be
+// judged, so the preview gets a dusk-street-ish gradient: cool key light top-left, warm
+// sodium bounce bottom-right. The fallback blur source paints the same colours.
 const GAME_BG = [
   'radial-gradient(1200px 720px at 18% 12%, rgba(108, 138, 184, 0.34), rgba(0, 0, 0, 0) 62%)',
   'radial-gradient(900px 620px at 86% 82%, rgba(198, 128, 68, 0.20), rgba(0, 0, 0, 0) 58%)',

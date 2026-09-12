@@ -12,6 +12,7 @@ import { store } from '../store.js'
     <div
       v-if="store.spinner.visible"
       class="spinner pointer-events-none fixed right-[18px] bottom-[62px] z-28 flex max-w-[42vw] items-center gap-2.5 rounded-[999px] border border-border bg-panel py-1.5 pr-2 pl-[13px]"
+      data-core-blur
     >
       <span v-if="store.spinner.text" class="text truncate text-[13px] leading-[1.2] text-fg">{{ store.spinner.text }}</span>
       <span class="ring size-4 flex-none rounded-[50%] border-2 border-border-strong border-t-accent"></span>

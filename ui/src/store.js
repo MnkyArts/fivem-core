@@ -7,11 +7,19 @@ const NOTIFY_MAX_VISIBLE = 6
 const SHARD_DEFAULT_MS = 4000
 const SHARD_STYLES = ['wasted', 'success', 'info']
 
+// §32: the glass config `src/gameblur.js` reads on every tick (Config.UI.Blur on the Lua side,
+// pushed with `blur:set` on `ui_ready` and on change).
+const BLUR_DEFAULTS = { enabled: true, strength: 10, fps: 30, scale: 0.5 }
+const BLUR_LIMITS = { strength: [0, 40], fps: [5, 60], scale: [0.1, 1] }
+
 export const store = reactive({
   // §31: the whole shell is hidden while the client holds at least one hide reason
   // (pause menu, screen fade, player switch, warning, cutscene, or a plugin's
   // `Core.UI.hide`). Nothing unmounts — only `.core-root` stops painting.
   shell: { visible: true, reasons: [] },
+  // §32: `data-core-blur` panels show the blurred game behind them; src/gameblur.js reads this
+  // (and `shell.visible`) itself, so nothing is plumbed through App.vue.
+  blur: Object.assign({}, BLUR_DEFAULTS),
   notifications: [],
   textui: { visible: false, key: '', text: '', position: 'bottom' },
   progress: { visible: false, id: null, label: '', duration: 0, canCancel: false, startedAt: 0 },
@@ -165,10 +173,31 @@ function statEntry(name, raw) {
   return { name, label: def.label ? String(def.label) : name, value, min, max }
 }
 
-/** Story/test helper: back to a freshly loaded shell for everything §21 and §31 added. */
+// -------------------------------------------------------------------- game blur (§32)
+
+/** Keeps a `blur:set` value inside its documented range; a non-number keeps the old one. */
+function clampBlur(value, limit, current) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return current
+  return Math.min(limit[1], Math.max(limit[0], n))
+}
+
+/** `blur:set` (Lua on `ui_ready` + on change, the dev shim, the Storybook control): a PARTIAL
+ *  merge — a key the message leaves out keeps its current value. */
+export function setBlur(config) {
+  if (!config || typeof config !== 'object') return store.blur
+  if (config.enabled !== undefined) store.blur.enabled = !!config.enabled
+  if (config.strength !== undefined) store.blur.strength = clampBlur(config.strength, BLUR_LIMITS.strength, store.blur.strength)
+  if (config.fps !== undefined) store.blur.fps = clampBlur(config.fps, BLUR_LIMITS.fps, store.blur.fps)
+  if (config.scale !== undefined) store.blur.scale = clampBlur(config.scale, BLUR_LIMITS.scale, store.blur.scale)
+  return store.blur
+}
+
+/** Story/test helper: back to a freshly loaded shell for everything §21, §31 and §32 added. */
 export function resetExtras() {
   hideShard()
   Object.assign(store.shell, { visible: true, reasons: [] })
+  Object.assign(store.blur, BLUR_DEFAULTS)
   Object.assign(store.spinner, { visible: false, text: '' })
   Object.assign(store.keys, { visible: false, items: [] })
   for (const name of Object.keys(store.stats)) delete store.stats[name]
@@ -406,6 +435,9 @@ const actions = {
     visible: m.visible !== false,
     reasons: Array.isArray(m.reasons) ? m.reasons.map(String) : [],
   }),
+  // §32.2: `{ action = 'blur:set', enabled, strength, fps, scale }`. src/gameblur.js watches
+  // `store.blur`, so a message is all it takes to turn the glass off or re-tune it live.
+  'blur:set': (m) => setBlur(m),
   focus: (m) => { store.focused = !!m.focused },
 }
 

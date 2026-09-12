@@ -56,6 +56,7 @@ const factionColor = computed(() => (faction.value && faction.value.color) || 'v
       v-if="store.hud.visible"
       class="hud pointer-events-none min-w-[176px] pt-[10px] px-[12px] pb-[8px]
              bg-panel border border-border rounded-ui text-[13px] leading-[1.35] text-right"
+      data-core-blur
     >
       <div class="line flex items-baseline justify-between gap-[12px]">
         <span class="lbl text-ui-xs tracking-[0.08em] uppercase text-fg-dim">Cash</span>
