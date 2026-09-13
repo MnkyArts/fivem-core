@@ -426,8 +426,11 @@ function DB.migrate(collection, version, fn)
     end
     for i = 1, #list do
         if list[i].version == version then
-            Core.Log.warn('DB.migrate: %s v%d is already registered', collection, version)
-            return false
+            -- A plugin restart replays its Core.onReady and registers the same version again: keep the
+            -- newest function, quietly (documents below `version` were migrated on first load anyway).
+            list[i].fn = fn
+            Core.Log.debug('DB.migrate: %s v%d re-registered', collection, version)
+            return true
         end
     end
     list[#list + 1] = { version = version, fn = fn }

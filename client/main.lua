@@ -1,6 +1,9 @@
 --- core / client / main.lua
 --- Boot (DESIGN §6.11): auto-spawn off, character load request, death watch, spawn handling,
---- the /tpm client command and the synchronous stop cleanup.
+--- the /tpm client command, the idle-camera switch (§35) and the synchronous stop cleanup.
+--- Idle camera natives (client, fxref 2026-09-13): DisableIdleCamera, DisableVehiclePassengerIdleCamera (CFX,
+--- one-shot switches), InvalidateIdleCam, InvalidateVehicleIdleCam (reset the timers; covers the cinematic
+--- vehicle idle mode the switches leave alone).
 
 local Net = Core.Net
 local Log = Core.Log
@@ -11,6 +14,7 @@ local Player = Core.Player
 local LOAD_RETRY_MS <const> = 5000
 local MAX_LOAD_TRIES <const> = 12
 local DEATH_WATCH_MS <const> = 1000
+local IDLE_CAM_MS <const> = 5000     -- the idle timers are 30 s; resetting every 5 s keeps them dead
 local RESPAWN_RETRY_MS <const> = 5000
 local MAX_RESPAWN_TRIES <const> = 12
 local LOADING_KEY <const> = 'core:loading'
@@ -47,6 +51,22 @@ local function hideLoadingText()
     loadingShown = false
     UI.textUI.hide()
 end
+
+--- §35: GTA's idle cameras are off while `Config.Camera.DisableIdleCam` holds. The two CFX switches
+--- handle the on-foot and passenger AFK pans; the cinematic vehicle idle mode only listens to its timer
+--- being reset, so one 5 s thread keeps both timers at zero. No per-frame work (§9).
+local idleCamOff = false
+CreateThread(function()
+    if not (Config.Camera and Config.Camera.DisableIdleCam) then return end
+    idleCamOff = true
+    DisableIdleCamera(true)
+    DisableVehiclePassengerIdleCamera(true)
+    while idleCamOff do
+        InvalidateIdleCam()
+        InvalidateVehicleIdleCam()
+        Wait(IDLE_CAM_MS)
+    end
+end)
 
 CreateThread(function()
     -- spawnmanager is a base resource; a missing export raises, so the call is guarded
@@ -161,6 +181,11 @@ RegisterCommand('tpm', function()
 end, false)
 
 AddEventHandler('onClientResourceStop', function(resource)
+    if resource == Core.name and idleCamOff then
+        idleCamOff = false
+        DisableIdleCamera(false)
+        DisableVehiclePassengerIdleCamera(false)
+    end
     if resource ~= Core.name then return end
     -- synchronous: releases NUI focus and hides pages, overlays and text UI
     pcall(UI.closeAll)

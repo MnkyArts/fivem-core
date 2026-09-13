@@ -9,8 +9,8 @@ const POSITIONS = ['bottom', 'top', 'left', 'right']
 const PLACEMENT = {
   bottom: 'left-0 right-0 bottom-[14vh] w-max mx-auto justify-center',
   top: 'left-0 right-0 top-[12vh] w-max mx-auto justify-center',
-  left: 'left-[24px] top-1/2 -translate-y-1/2',
-  right: 'right-[24px] top-1/2 -translate-y-1/2',
+  left: 'left-[24px] top-1/2 [transform:translateY(-50%)]',
+  right: 'right-[24px] top-1/2 [transform:translateY(-50%)]',
 }
 
 const pos = computed(() => {

@@ -446,6 +446,12 @@ function Player.setModel(src, model, appearance)
     if type(appearance) == 'table' then session.data.appearance = Utils.jsonSafe(appearance) end
     touch(session)
     TriggerClientEvent('core:client:setModel', src, model, session.data.appearance or {})
+    -- Same hook `setData` emits (§22), so a plugin that mirrors the look (the inventory's clothing slots)
+    -- learns about a creator save without the creator knowing it exists (2026-09-13, for `inventory`).
+    Core.emitHook('playerDataChanged', src, 'model', model)
+    if type(appearance) == 'table' then
+        Core.emitHook('playerDataChanged', src, 'appearance', Utils.deepCopy(session.data.appearance))
+    end
     return true
 end
 

@@ -86,6 +86,11 @@ Config = {
     Http = { AllowPrivate = false, AllowHosts = nil },
     Doors = { InteractDistance = 2.0 },
     Hud = { ShowHealth = true, ShowArmour = true, ShowStats = true, ShowSpeed = true, ShowStreet = true },
+    -- GTA's idle cameras (DESIGN §35): the AFK pan after 30 s without input, the passenger pan and the
+    -- cinematic vehicle idle mode. They trip the §31 cinematic watcher (the shell hides, an open page
+    -- closes), so core switches them off. `false` keeps the game's behaviour.
+    Camera = { DisableIdleCam = true },
+
     UI = {
         NotifyDurationMs = 5000, MaxNotifyPerSecond = 10, HudEnabled = true,
         ModalTimeoutMs = 300000, CancelKey = 'X',

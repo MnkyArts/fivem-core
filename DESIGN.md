@@ -926,7 +926,7 @@ pattern is load-bearing, a `@source` path containing `*` is matched against *fil
 `../../../*/ui/src` matches nothing and plugin utilities silently never reach the bundle. A plugin installs and
 configures no CSS toolchain; a scoped `<style>` that uses `@apply` points Tailwind at the theme with
 `@reference "../../../core/ui/src/styles.css";` (relative to `<plugin>/ui/src`), which reads the tokens and emits
-nothing. `backdrop-filter` / `-webkit-backdrop-filter` and Tailwind's `backdrop-*` utilities are banned shell-wide:
+nothing. FiveM's CEF is **Chromium 103** (2026-09-13, `fivem/vendor/cef/cef_build_name.txt`): Tailwind v4's `translate-*`, `rotate-*` and `scale-*` utilities compile to the individual transform properties (`translate:`, `rotate:`, `scale:`, Chrome 104+) and are therefore banned in the shell and in plugin pages — use `[transform:translateX(-50%)]`-style arbitrary properties; the Popover API, `:has()` and `calc(infinity)` are unavailable as well. `backdrop-filter` / `-webkit-backdrop-filter` and Tailwind's `backdrop-*` utilities are banned shell-wide:
 the game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid black box.
 A panel that should show the blurred game behind it carries `data-core-blur` instead (§32: the shell draws the
 game frame through FiveM's NUI render hook and blurs that copy).
@@ -982,6 +982,11 @@ window.CoreUI = {
   usePage(id) -> { props (reactive), emit(event, data), on(event, fn), close() }   // composable for the page component
 }
 ```
+
+A plugin may register **more than one page** from the same `index.js` with `export const pages = { '<id>':
+Component, ... }` (2026-09-13, for the inventory's hotbar overlay): `plugins.js` registers every entry after the
+default export, with the same duplicate-id check; each id is still declared from Lua with
+`Core.UI.registerPage(id, { type })` and owned by the same resource.
 
 `page:register` handling in `PageHost`: create `<link rel="stylesheet" href=style>` (if any) and `<script
 src=script>` in `<head>` (once per id; re-register replaces); a bundle calls `CoreUI.registerPage(id,
@@ -1054,6 +1059,7 @@ Hooks (local events `core:hook:<name>`, cross-resource, same side):
 | death watch | client | 1000 ms | `IsPedDeadOrDying` |
 | entry guard (vehicle locks) | client | 500 ms only while `GetVehiclePedIsTryingToEnter ~= 0` | |
 | NUI focus watchdog | client | 500 ms | |
+| idle cam reset (§35) | client | 5000 ms | two natives; only while `Config.Camera.DisableIdleCam` |
 | notify flush | client | 100 ms timer only while queue non-empty | |
 | load request | client | 5000 ms until loaded | |
 | autosave | server | `Config.Player.SaveIntervalMs` (5 min) | |
@@ -1186,6 +1192,12 @@ These refine the sections above; where they differ, this section wins.
 - **Sub-namespace proxies are callable**: `Core.UI.progress({...})` and `Core.UI.progress.cancel()` both work from a
   plugin (`subProxy` has `__call`). Inside core, `Core.UI.progress` is the function and cancel lives under the flat
   key `Core.UI['progress.cancel']`.
+- **`Core.DB.migrate` accepts a re-registration of the same version** (2026-09-13): a plugin restart replays its
+  `Core.onReady`, so the same `(collection, version)` arriving again replaces the function quietly and returns `true`
+  instead of warning and returning `false`.
+- **`Core.Player.setModel` emits `playerDataChanged`** (2026-09-13, for the `inventory` plugin): `(src, 'model', model)`
+  and, when an appearance table was given, `(src, 'appearance', copy)` — the same hook `setData` fires (§22), so a
+  plugin mirroring the look (worn clothing as items) reconciles after a creator save.
 - **`Core.Player(src)` sugar inside core** is attached by `Core`'s `__newindex` when `server/player.lua` assigns the
   table; therefore no server file may *read* `Core.Player` at file scope before `server/player.lua` loads.
 - **Registry**: server exposes `Core.Registry.getOwned(owner)`, client exposes `Core.Registry.idsOf(kind, owner)`
@@ -1989,3 +2001,19 @@ props[id]      = { drawable = int, texture = int, collection = string?, localDra
 - Nothing else in core reads the pair. Who fills it in (the creator, from `GetPedCollectionNameFromDrawable`
   / `GetPedCollectionLocalIndexFromDrawable` and the prop analogues) and how a stale global index is refreshed
   from the pair (`GetPedDrawableGlobalIndexFromCollection`) is the plugin's business.
+
+---
+
+## 35. Idle cameras off (2026-09-13, Liam: "UIs close when the idle cam starts")
+
+GTA starts a cinematic pan after 30 s without input (on foot, as a passenger, and the cinematic vehicle idle
+mode). §31's `Cinematic` watcher sees `IsCinematicCamRendering()`, hides the shell and closes the focused
+page — correct for a real cutscene, wrong for an AFK pan. `client/main.lua` therefore switches the idle cameras
+off while `Config.Camera.DisableIdleCam` (default `true`) holds: `DisableIdleCamera(true)` and
+`DisableVehiclePassengerIdleCamera(true)` once at start (CFX one-shot switches, client apiset), plus one
+thread every 5000 ms calling `InvalidateIdleCam()` and `InvalidateVehicleIdleCam()` (the cinematic vehicle
+idle mode only listens to its timer being reset; the timers are 30 s, so 5 s keeps them dead — no per-frame
+work, §9). `onClientResourceStop` switches the two CFX toggles back on. The `Cinematic` watcher stays enabled
+for scripted cutscenes. Config: `Camera = { DisableIdleCam = true }` (§28). Perf table (§9): `idle cam reset ·
+client · 5000 ms · two natives`. README: config row + checklist step ("stand still 45 s → no camera pan, an
+open page stays").

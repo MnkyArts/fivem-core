@@ -7,6 +7,8 @@
 // A plugin's `ui/src/index.js`:
 //     export const id = 'my_plugin'          // the page id used by Core.UI.registerPage
 //     export { default } from './Page.vue'
+//     export const pages = { my_plugin_hud: HudOverlay }   // optional: extra page ids of the SAME plugin
+//                                                          // (an overlay next to the main page, DESIGN §7.4)
 //
 // The glob is relative to this file: ../../../ is the folder `core` lives in, so it matches
 // `<resource>/ui/src/index.js` for every resource next to core. It is resolved by Vite at
@@ -49,6 +51,25 @@ export function installPluginPages (CoreUI) {
 
     registered.set(id, path)
     CoreUI.registerPage(id, component)
+
+    // Extra pages of the same plugin (`export const pages = { id: Component }`): a plugin that
+    // needs a focus-taking page AND a click-through overlay registers both from one index.js.
+    const extra = mod.pages
+    if (extra && typeof extra === 'object') {
+      for (const extraId of Object.keys(extra).sort()) {
+        const extraComponent = extra[extraId]
+        if (!extraId || !extraComponent) {
+          console.warn('[core:ui] ignoring extra page', extraId, 'of', path, '- needs a component')
+          continue
+        }
+        if (registered.has(extraId)) {
+          console.warn('[core:ui] duplicate plugin page id "' + extraId + '"', path, 'already taken by', registered.get(extraId))
+          continue
+        }
+        registered.set(extraId, path)
+        CoreUI.registerPage(extraId, extraComponent)
+      }
+    }
   }
 
   return registered

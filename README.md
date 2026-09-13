@@ -52,6 +52,7 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 | key | default | why you would change it |
 |---|---|---|
 | `Config.Security.EntityLockdown` | `'inactive'` | `'relaxed'` (only known models) or `'strict'` (no client-created entities) on bucket 0 — turn it up once every plugin spawns through `Core.Vehicles`, or client-side props stop appearing |
+| `Config.Camera.DisableIdleCam` | `true` | switches GTA's AFK/idle cameras off (on foot, passenger, cinematic vehicle idle): they trip the cinematic auto-hide and closed open pages (§35); `false` restores the game's pans |
 | `Config.Chat.Mode` | `'global'` | `'proximity'` limits normal chat to `Config.Chat.ProximityRange` (20 m); `/ooc` stays global either way |
 | `Config.World.TimeScale` | `30` | game seconds per real second — `30` is a 48-minute day, `1` is real time, `0` freezes the clock |
 | `Config.Locale` | `'en'` | `'de'` ships too; adds `<resource>/locales/<lang>.json` lookups for `Core.Locale.t` (§26) |
@@ -406,6 +407,10 @@ on('greeting', d => { reply.value = d.text })
 emit('greet', { name: name.value })
 ```
 
+Two pages in one plugin (a focus-taking page plus a click-through overlay)? Add `export const pages = { my_plugin_hud: HudOverlay }`
+to the same `index.js`; every entry is registered like the default export and declared from Lua with its own
+`Core.UI.registerPage(id, { type = 'overlay' })`.
+
 Needs an extra runtime library (drag-and-drop, charts, …)? Give the plugin a `ui/package.json` with just that
 dependency and re-run `npm install` at the resources folder — the import is bundled into the same single dist.
 `vue` never belongs there: the shell provides it. (`registerPage` still accepts `script`/`style` paths for a
@@ -462,6 +467,8 @@ A scoped `<style>` block is compiled on its own, so `@apply` inside one needs th
 first — relative to the file, which from a plugin is
 `@reference "../../../core/ui/src/styles.css";` (`<plugin>/ui/src` → the resources folder → core).
 It emits nothing; only the tokens are read. Utilities in the template need no `@reference`.
+
+**FiveM's CEF is Chromium 103.** Tailwind's `translate-*` / `rotate-*` / `scale-*` utilities emit the individual transform properties (Chrome 104+) and silently do nothing in game — write `[transform:translateX(-50%)]` instead; no Popover API, `:has()` or `calc(infinity)` either.
 
 **Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities** — the
 game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
@@ -813,6 +820,10 @@ UI visibility (§31). Step 22 is where the two keyboards meet: while the NUI hol
 
 21. **The shell hides behind the pause menu:** stand in the 24/7 marker so the HUD, the stat bars and the `[E]` pill are all up, raise a long notification, then press `ESC` → the moment the map opens *everything* core draws is gone, and it is all back unchanged (same values, the toast with its remaining time) when you close it. `Core.Screen.fade(<id>, 800)` does the same for a fade. Then hide it by hand: `Core.UI.hide('test')` from a throwaway **client** command in `core_example/client/main.lua` → the shell stays gone until `Core.UI.show('test')`, `Core.UI.isHidden()` is `true` and `Core.UI.hiddenReasons()` lists `core_example:test`; `restart core_example` while it still holds that reason → the shell comes straight back (the plugin's `uihide` registrations die with it).
 22. **A modal cancels instead of hiding:** run `/exmenu` and press `ESC` **once** while the menu is up → the NUI has focus, so the menu swallows the key, returns `nil` and closes; the pause menu does **not** open. Press `ESC` again → now the pause menu opens and the rest of the shell hides with it. Same rule from the server: `Core.UI.hide(<id>, 'cutscene')` with the menu open → the menu closes with `nil` and focus is released, no invisible cursor left behind (hiding with a modal open equals cancelling it).
+
+Idle cameras (§35).
+
+24. **No AFK pan:** stand still for 45 s on foot, then as a passenger, then let a car roll without input — the camera never starts its cinematic pan and an open page (`/exmenu`, the inventory) stays open; set `Config.Camera.DisableIdleCam = false`, `restart core` → the pans are back.
 
 Game blur (§32).
 
