@@ -207,3 +207,11 @@ Natives to verify per file (names from the 2026-09-12 scouts where already verif
 | GB-1 | general-purpose (opus) | new `ui/src/gameblur.js`, `ui/src/main.js`, `ui/src/App.vue` (watchEffect only), `ui/src/store.js` (`store.blur`, `blur:set`), `ui/src/styles.css` (glass rules, `--color-panel-glass`, root override), `ui/tests/shell-regression.js` | verify: scratch vite build, regression over HTTP (+3 → 52), no CSS warnings |
 | GB-2 | general-purpose (opus) | `data-core-blur` on the built-in panels (Menu, InputDialog, AlertDialog, Hud, StatsBars, Notifications, TextUI, Progress, KeyHints, Spinner), `core_example/ui/src/Page.vue`, `templates/plugin/ui/src/Page.vue`, `.storybook/preview.js` (install), new `ui/src/stories/GameBlur.stories.js`, Introduction.mdx, README (Styling + Visibility wording + config + checklist step), template/example READMEs | verify: scratch vite build + storybook build |
 | GB-3 | fivem-implementer (opus) | `shared/config.lua` (`UI.Blur`), `client/ui.lua` (`blur:set` on ui_ready, `Core.UI.setBlur`), `types/core.lua`, `tests/server_tests.lua` untouched unless needed | no new natives |
+
+## 8. Full freemode appearance (DESIGN §34, 2026-09-12) — built with the `charcreator` plugin
+
+The plugin's own contract is `resources/charcreator/PLAN.md` (runs B–E there); this is the core half.
+
+| run | agent | owns | notes |
+|---|---|---|---|
+| A | fivem-implementer (opus) | `client/spawn.lua` (apply order §34.2), `types/core.lua` (`CoreAppearance`), `README.md` (cheat sheet + "Appearance" note) | natives: SetPedFaceFeature, SetPedHeadOverlay, SetPedHeadOverlayColor, SetPedHairTint, SetPedEyeColor — the FiveM runtime names, not the nativedb renames (`fxref` now prints the runtime name; see the kit fix of the same day) |

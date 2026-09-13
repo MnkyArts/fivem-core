@@ -201,6 +201,16 @@ end)
 
 `core_example/` is the same thing fully built out, page included. Prefix every event, callback and page id with your resource name so two plugins never collide.
 
+**Appearance.** A full freemode look — head blend, components, props, face features, head overlays, hair
+colour and eye colour (§34) — is stored with `Core.Player.setModel(src, model, appearance)` *after* your
+plugin validated the table; core checks the shape only, and clamps rather than rejects. Core then re-applies
+all seven groups on every spawn, respawn and model switch, so a character creator never hooks respawns. A
+partial table applies only the keys it carries — `Core.Spawn.applyAppearance(ped, { faceFeatures = { [3] = 0.4 } })`
+is the client-side live preview. A `components` or `props` entry may also carry `collection` + `localDrawable`,
+FiveM's collection-local ids, which stay valid across title updates where a global `drawable` index shifts
+(§34.5). Core prefers that pair whenever the game reports it as valid and falls back to the global `drawable`
+otherwise, so `drawable` stays mandatory.
+
 ## API cheat sheet
 
 ### Shared libs — compiled into *your* VM, no export hop (§3)
@@ -291,6 +301,7 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 | namespace | functions |
 |---|---|
 | `Core.Spawn` §6.1 | `spawnPlayer(opts)` `applyAppearance(ped, appearance)` `teleport(coords, heading?)` `setModel(model, appearance?)` |
+| | `appearance` (§34, every group optional, applied in this order): `headBlend` `components` `props` `faceFeatures` `headOverlays` `hairColor` `eyeColor` |
 | `Core.Player` §6.2 | `getData(key)` `refresh()` (on top of the lib reads above) |
 | `Core.Markers` §6.4 | `add(opts)` `update(id, partial)` `remove(id)` `removeAll()` |
 | `Core.TextLabels` §6.5 | `add(opts)` `setText(id, text)` `update(id, partial)` `remove(id)` `removeAll()` |

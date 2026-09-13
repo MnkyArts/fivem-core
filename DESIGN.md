@@ -704,7 +704,7 @@ Each handler validates its args with `Core.Validate.check` first (`'string'`, `'
 
 ```lua
 Spawn.spawnPlayer({ coords = vector3, heading = 0.0, model = 'mp_m_freemode_01', appearance = {}, fade = true, resurrect = true }) -> bool
-Spawn.applyAppearance(ped, appearance)      -- appearance = { components = { [componentId] = { drawable, texture, palette } }, props = { [propId] = { drawable, texture } | false }, headBlend = {...}? } (all optional)
+Spawn.applyAppearance(ped, appearance)      -- appearance = { components, props, headBlend, faceFeatures, headOverlays, hairColor, eyeColor } (all optional; the full shape and the apply order are §34)
 Spawn.teleport(coords, heading?)            -- fade out → RequestCollisionAtCoord + wait → SetEntityCoords(ped, x, y, z, false, false, false, false) → heading → fade in
 Spawn.setModel(model, appearance?) -> bool  -- Streaming.requestModel → SetPlayerModel(PlayerId(), hash) → SetPedDefaultComponentVariation → applyAppearance → SetModelAsNoLongerNeeded
 ```
@@ -1891,3 +1891,101 @@ CREATE TABLE IF NOT EXISTS core_documents (
   server given by `CORE_PG_URL` (skips with a clear message when unset).
 - README: a "Postgres" subsection under "Where data lives" (Docker one-liner, convar, the bundle, the
   migration) and the config table row; `templates/plugin` unchanged (plugins never touch adapters).
+
+---
+
+## 34. Full freemode appearance (2026-09-12, for the `charcreator` plugin)
+
+§6.1's `appearance` carried only `components`, `props` and `headBlend`. A character creator also needs
+face features, head overlays (with their colours), hair colour and eye colour — and they must be
+re-applied by **core** on every path that dresses the ped (`core:client:loaded`, `core:client:spawn`,
+`core:client:setModel`, `Spawn.spawnPlayer`, `Spawn.setModel`), so no plugin has to hook respawns to keep
+a face. This section is binding for `client/spawn.lua`, `types/core.lua` (`CoreAppearance`) and the
+README; the creator itself stays a plugin (§13).
+
+### 34.1 Shape
+
+Every key is optional; a table with only some keys applies only those (that is how the creator previews
+a slider: `Spawn.applyAppearance(ped, { faceFeatures = { [3] = 0.4 } })`). Integer keys may arrive as
+**strings** after a JSON round trip (§34.3) — every reader goes through the existing `toInt`.
+
+```lua
+appearance = {
+  components   = { [0..11] = { drawable = int, texture = int, palette = int?, collection = string?, localDrawable = int? } },  -- pair: §34.5
+  props        = { [0..7]  = { drawable = int, texture = int, collection = string?, localDrawable = int? } | false },
+  headBlend    = { shapeFirst, shapeSecond, shapeThird = 0, skinFirst, skinSecond, skinThird = 0,
+                   shapeMix = 0..1, skinMix = 0..1, thirdMix = 0, isParent = false },      -- as before
+  faceFeatures = { [0..19] = -1.0..1.0 },                                                 -- SetPedFaceFeature
+  headOverlays = { [0..12] = { index = 0..N | 255, opacity = 0..1,                         -- SetPedHeadOverlay
+                               colorType = 0|1|2, color = int, color2 = int } },          -- + SetPedHeadOverlayColor when colorType > 0
+  hairColor    = { color = int, highlight = int },                                        -- SetPedHairTint
+  eyeColor     = 0..31,                                                                   -- SetPedEyeColor
+}
+```
+
+Overlay ids: 0 blemishes, 1 facial hair, 2 eyebrows, 3 ageing, 4 makeup, 5 blush, 6 complexion, 7 sun
+damage, 8 lipstick, 9 moles/freckles, 10 chest hair, 11 body blemishes, 12 add body blemishes. `index 255`
+means "none". `colorType` 1 = hair colours (facial hair, eyebrows, chest hair), 2 = makeup colours
+(makeup, blush, lipstick), 0 = no colour call. Face features 0..19 in GTA's order (nose width … neck
+width).
+
+### 34.2 Apply order and tolerance (`Spawn.applyAppearance`)
+
+`headBlend` → `components` → `props` → `faceFeatures` → `headOverlays` (`SetPedHeadOverlay`, then
+`SetPedHeadOverlayColor` when `colorType > 0`) → `hairColor` → `eyeColor`. Head blend first, because
+freemode overlays and features only render once blend data exists. Values are clamped, never rejected:
+feature scale to `[-1, 1]`, opacity to `[0, 1]`, head blend parent ids to `[0, 45]` and mixes to `[0, 1]`,
+every other id to `>= 0` (`math.tointeger` on `n // 1`); a wrong type skips that entry with no error. Core validates *shape* here only; **semantic** validation
+(ranges that depend on the model, name rules, who may change what) is the calling plugin's job before
+`Player.setModel(src, model, appearance)` stores the table.
+
+Native names: the FiveM Lua runtime generates these as `SetPedFaceFeature`, `SetPedHeadOverlayColor`,
+`SetPedEyeColor` and `SetPedHairTint` (`natives.json` names `_SET_PED_FACE_FEATURE`,
+`_SET_PED_HEAD_OVERLAY_COLOR`, `_SET_PED_EYE_COLOR`, `SET_PED_HAIR_TINT`). The newer nativedb names
+(`SetPedMicroMorph`, `SetPedHeadOverlayTint`, `SetHeadBlendEyeColor`) are **not** emitted by the runtime
+and must not be used.
+
+### 34.3 JSON round trip
+
+The runtime `json.encode` (dkjson) treats a table as an array only when every key is an integer `>= 1`,
+so every group above — keyed from `0` — is stored as a JSON **object** with string keys and comes back
+that way from KVP and Postgres alike. A plugin that stores a group without key `0` (say `components =
+{ [11] = … }`) gets an array with `null` holes instead; it still decodes, but plugins should always
+write complete groups or string keys. `Utils.jsonSafe` is unchanged.
+
+### 34.4 Docs and tests
+
+`types/core.lua`: the four new `CoreAppearance` fields. README: the "Appearance" block in the client cheat
+sheet and the plugin note under "Writing a plugin". No server logic changed, so `tests/server_tests.lua`
+stays as is; `scripts/check.sh` must stay green. The in-game check is the `charcreator` plugin's
+checklist (its README).
+
+### 34.5 Collections (2026-09-12, second charcreator round)
+
+Global drawable and prop indexes are positions in one long list of collections (base game `""`, then every
+official DLC pack in release order, then custom packs). FiveM's collection natives address an item as
+`(collection name, local index)` instead, and that pair survives title updates while the global index of every
+custom pack shifts (docs: *Work with Drawable Components and Props Using Collections*). Core therefore accepts
+the pair on every component and prop entry and prefers it when it is there:
+
+```lua
+components[id] = { drawable = int, texture = int, palette = int?, collection = string?, localDrawable = int? }
+props[id]      = { drawable = int, texture = int, collection = string?, localDrawable = int? } | false
+```
+
+- `applyComponents`: when `collection` is a string and `localDrawable` an integer `>= 0` and
+  `IsPedCollectionComponentVariationValid(ped, id, collection, localDrawable, texture)` holds →
+  `SetPedCollectionComponentVariation(ped, id, collection, localDrawable, texture, palette)`; otherwise the
+  global `SetPedComponentVariation(ped, id, drawable, texture, palette)` as before (a pack that is no longer
+  streamed falls back to whatever the global index points at instead of leaving the slot unset).
+- `applyProps`: the same with `GetPedPropGlobalIndexFromCollection(ped, id, collection, localDrawable) ~= -1`
+  as the validity test and `SetPedCollectionPropIndex(ped, id, collection, localDrawable, texture, true)`.
+- The empty string is a real collection (the base game); `nil` means "not known, use the global index".
+  `drawable` stays mandatory: it is what UIs show and what older documents carry.
+- When the pair is present it is the authority: `drawable` is what UIs show and what older documents carry,
+  and a plugin that persists a look re-derives the global index from the pair on load (the creator's
+  `refreshGlobals`). Prop textures are bounded with `GetNumberOfPedCollectionPropTextureVariations` because
+  no `IsPedCollectionPropValid` exists.
+- Nothing else in core reads the pair. Who fills it in (the creator, from `GetPedCollectionNameFromDrawable`
+  / `GetPedCollectionLocalIndexFromDrawable` and the prop analogues) and how a stale global index is refreshed
+  from the pair (`GetPedDrawableGlobalIndexFromCollection`) is the plugin's business.

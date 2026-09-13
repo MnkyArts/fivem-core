@@ -236,9 +236,13 @@
 --------------------------------------------------------------------------------
 
 ---@class CoreAppearance
----@field components? table<integer, { drawable: integer, texture: integer, palette: integer? }>
----@field props? table<integer, { drawable: integer, texture: integer }|false>
+---@field components? table<integer, { drawable: integer, texture: integer, palette: integer?, collection: string?, localDrawable: integer? }> collection + localDrawable are preferred when valid (DESIGN §34.5)
+---@field props? table<integer, { drawable: integer, texture: integer, collection: string?, localDrawable: integer? }|false> same pair; '' is the base-game collection, nil means "use drawable"
 ---@field headBlend? table head blend data as GTA expects it
+---@field faceFeatures? table<integer, number> [0..19] = scale -1.0..1.0, GTA's order (DESIGN §34.1)
+---@field headOverlays? table<integer, { index: integer, opacity: number, colorType: integer, color: integer, color2: integer }> [0..12], index 255 = none, colorType 0 none / 1 hair / 2 makeup
+---@field hairColor? { color: integer, highlight: integer } hair tint indices
+---@field eyeColor? integer freemode eye colour index (0..31)
 
 ---@class CoreSpawnOptions
 ---@field coords vector3 where the ped ends up
