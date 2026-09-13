@@ -9,6 +9,7 @@ import Progress from './components/Progress.vue'
 import KeyHints from './components/KeyHints.vue'
 import Spinner from './components/Spinner.vue'
 import Shard from './components/Shard.vue'
+import Chat from './components/Chat.vue'
 import PageHost from './components/PageHost.vue'
 import Menu from './components/Menu.vue'
 import InputDialog from './components/InputDialog.vue'
@@ -34,6 +35,9 @@ import { store } from './store.js'
 
     <TextUI />
     <Progress />
+
+    <!-- top left: the CEF chat feed and input (DESIGN §30.3) -->
+    <Chat />
 
     <!-- bottom right: instructional buttons with the busy spinner above them (§21) -->
     <KeyHints />

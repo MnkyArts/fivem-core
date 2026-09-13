@@ -80,7 +80,10 @@ Config = {
             'GetPlayerWantedLevel', 'GetEntityVelocity', 'GetStreetNameAtCoord', 'GetNameOfZone', 'IsPedArmed',
         },
     },
-    Chat = { Mode = 'global', ProximityRange = 20.0, MaxLength = 200, CooldownMs = 800, Format = '{tag}{name} ({id}): {msg}' },
+    Chat = { Mode = 'proximity', ProximityRange = 20.0, MaxLength = 200, CooldownMs = 800,
+        -- Format = '{tag}{name}: {msg}', -- optional custom format; nil keeps structured name/message styling
+        ScreamRange = 60.0, ScreamCommand = 's', History = 80, HideDelayMs = 8000, VisibleLines = 8,
+        FadeMeters = { near = 20.0, far = 90.0 } },
     Security = { EntityLockdown = 'inactive', EnforceLoadout = true, BlockExplosions = false, MaxWeaponDamageMultiplier = 1.0,
         WeaponDamage = {}, KickOnDetect = false, ExemptWeapons = nil },   -- ExemptWeapons nil = the built-in melee/vehicle/environment list
     Http = { AllowPrivate = false, AllowHosts = nil },

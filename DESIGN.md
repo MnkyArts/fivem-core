@@ -988,6 +988,14 @@ Component, ... }` (2026-09-13, for the inventory's hotbar overlay): `plugins.js`
 default export, with the same duplicate-id check; each id is still declared from Lua with
 `Core.UI.registerPage(id, { type })` and owned by the same resource.
 
+`usePage(id).props` is **the same reactive object for the life of the shell** (2026-09-13, found when the
+inventory opened empty after `restart inventory`): `page:unregister` + `page:register` — what a plugin restart
+does — hand the id a fresh record, but the record reuses the id's props object, so a module-level page store that
+captured `props` once keeps seeing every later `page:open`. Two rules for such stores: bind to the current record
+on every mount anyway when you can (`inventory/ui/src/inventory.js bindPage`), and create watchers in a detached
+`effectScope(true)` — a `watch` made inside a component's setup stops when that component unmounts, and the first
+`useX()` call usually happens inside one (`ui/tests/shell-regression.js` covers the identity).
+
 `page:register` handling in `PageHost`: create `<link rel="stylesheet" href=style>` (if any) and `<script
 src=script>` in `<head>` (once per id; re-register replaces); a bundle calls `CoreUI.registerPage(id,
 component)` when it runs; `page:open` before registration waits up to 5 s (then posts `ui_event { page:id,
@@ -1460,22 +1468,56 @@ DB.export(path?) -> path (SaveResourceFile('core', 'data/export-<timestamp>.json
 Player hook additions: playerDataChanged (src, topKey, value) emitted by setData; Player.setReplicated (§20)
 ```
 
-## 23. Chat (`Core.Chat`) — Rebar `useMessenger`
+## 23. Chat (`Core.Chat`) — CEF messenger
 
-File: `server/chat.lua`. Intercepts the default `chat` resource: `AddEventHandler('chatMessage', function(src, name, msg)
-... CancelEvent() ... end)` (chat's own broadcast is cancelled; core re-broadcasts with its format). Config `Chat = {
-Mode = 'global' | 'proximity', ProximityRange = 20.0, MaxLength = 200, CooldownMs = 800, Format = '{tag}{name} ({id}): {msg}' }`.
+Files: `server/chat.lua` (routing, channels, permissions) + `client/chat.lua` (NUI bridge) + the shell's
+`Chat.vue` (feed and input). The stock `chat` resource is **not** needed for rendering: core cancels its
+`chatMessage` (kept for servers that still run it) and the shell renders the feed itself, exactly like the
+rest of §7. `chatResult`-style command execution is mirrored: non-commands go to the server as
+`core:server:chat:send`, `/commands` use **client** `ExecuteCommand` (without the slash). Server commands
+retain the player's identity and §3.7 checks — never execute them as server console (src 0).
+
+Config `Chat = { Mode = 'global'|'proximity', ProximityRange = 20.0, MaxLength = 200, CooldownMs = 800,
+ScreamRange = 60.0, ScreamCommand = 's', History = 80, FadeMeters = { near = 20.0, far = 90.0 } }`.
+
+Channels (server-truth; the client only renders):
 
 ```lua
-Chat.send(src, message, opts?)   -- opts = { color = {r,g,b}, prefix = 'SYSTEM', multiline = false } → TriggerClientEvent('chat:addMessage', src, { color, multiline, args = { prefix, message } })
-Chat.broadcast(message, opts?)  -- -1; announcements only
-Chat.sendNear(coords, range, message, opts?)
-Chat.registerChannel(name, { command = 'ooc', permission = nil, format = '(OOC) {name}: {msg}', global = true }) -- built-ins: ooc (global), me ('* {name} {msg}', proximity), a ('[STAFF] {name}: {msg}', permission core.mod, staff only), pm via /pm <id> <msg>
+Chat.registerChannel(name, { command, permission?, format?, global?, staffOnly?, color?, range?,
+                             description?, proximity?, fade? })
+-- built-ins: local ('{tag}{name}: {msg}', proximity, default), ooc (global), faction
+--   ('[FAC] {name}: {msg}', faction members only), a (staff, core.mod), me, and /pm <id> <msg>.
+Chat.send(src, message, opts?)      -- opts = { color?, prefix?, channel? } → one CEF line
+Chat.broadcast(message, opts?)      -- announcements, one core CEF broadcast
+Chat.sendNear(coords, range, message, opts?) -> count
+Chat.setFilter(fn(src, channel, msg) -> bool)   -- false vetoes
+Chat.clear(src)                     -- wipe one player's feed (client-side only)
 ```
 
-Sanitizes (`Utils.sanitize`, strips `^n`), per-src cooldown, hook `chatMessage (src, channel, msg)` (a handler may
-`CancelEvent()`-style veto by returning false through `Core.Chat.setFilter(fn(src, channel, msg) -> bool)`).
-Faction tag `{tag}` from the session's faction summary (`[TST] `).
+Delivery is one `TriggerClientEvent('core:client:chat', target, payload)` per recipient, payload
+`{ action = 'add', line = { id, seq, channel, name, text, tag?, color?, kind, opacity } }` where `kind` is
+`message|me|system|pm|scream` and `opacity` is 0..1: proximity lines arrive with the **sender distance**
+(the client only applies it — the server computes `1 - (dist - near) / (far - near)`, clamped, so distant
+speakers genuinely fade). Global/system lines arrive at 1. Scream (`/s <msg>`, also `+scream` keybind-free
+command) doubles the effective range and arrives at opacity 1.
+
+Client: `Core.Keys.register` maps **T** to open the CEF input (KeyHints-free; the input is a third
+focus owner in `client/ui.lua` — keyboard only, never a cursor, refused while a page/modal holds it,
+closed by every §31 hide). The shell stores history (`Config.Chat.History` lines) and offers a command
+list, caret-aware argument hints and idle fading as specified in **§30.3**. Suggestions come from the
+server-pushed snapshot and each plugin's command VM; Ctrl+TAB cycles permitted channels. The client keeps
+**no** authority: every send is validated server-side (schema, cooldown, channel permission, loaded
+session). Chat is Registry-tracked as kind `chat`; `restart core` re-seeds suggestions.
+
+A `/command` typed into the CEF input runs through the ENGINE's command path, exactly like the stock
+chat's NUI: the client calls `ExecuteCommand` locally (client-registered commands run in their VM) and
+the engine forwards unknown-to-client commands to the server as `__cfx_internal:commandFallback` with
+the player's identity — core's permission wrapper applies as if typed anywhere else. `ExecuteCommand`
+is never called on the SERVER from chat input (that would run as console, src 0). Core re-registers
+console `say` as a SYSTEM broadcast and sends join/leave system lines itself.
+
+Formats understand `{tag}`, `{name}`, `{id}`, `{msg}`. Sanitizing: `Utils.sanitize` + all carets stripped
+(cleanText). Hook `chatMessage (src, channel, msg)` fires once a message passed the filter, before delivery.
 
 ## 24. HTTP (`Core.Http`) — Rebar `useProxyFetch`, `useHono`
 
@@ -1574,7 +1616,10 @@ DefaultWeather = 'CLEAR', WeatherCycle = nil }`, `Stats` (§18), `Weapons = { Al
   resource are dropped.
 - **Chat**: `chatMessage` arrives as `(playerSrc, name, message)` arguments (verified in the stock resource);
   channels may declare `staffOnly`, `color`, `range`, `description`; console `say` re-broadcasts as `SYSTEM`; a
-  mistyped `/command` is answered privately; channels are not Registry-tracked.
+  mistyped `/command` is answered privately; channels are not Registry-tracked. §23 rebuild (2026-09-13): the
+  shell renders the feed (Chat.vue), delivery is `core:client:chat (action = 'add')` per recipient, proximity
+  lines carry a per-recipient `opacity`, `/s` screams (doubled range, opacity 1), TAB suggestions are pushed
+  on `playerLoaded`, and `/commands` from the CEF input run through `Core.Commands.execute` (§30.2).
 - **Http**: routes live under `/core<path>` (per-resource handler); `Http.fetch` returns `nil, reason` on failure;
   bodies are collected with a 5 s fallback; detections in `security.lua` (audit/hook/kick) are throttled to one per
   src per kind per 5 s while the cancel itself never is; `BlockExplosions` cancels + audits without `cheatDetected`.
@@ -1635,6 +1680,57 @@ entity out of scope, so a server writing a bag on a far-away ped every 2 s spamm
 every `entity:` bag handler parses the id and checks `NetworkDoesEntityExistWithNetworkId` (warning-free)
 before resolving (`entityFromBag` in client/vehicles.lua), and `NetworkGetEntityFromNetworkId` is only
 ever called behind that same check (blips, interactions, vehicles).
+
+### 30.2 Chat is CEF-first (2026-09-13, chat rebuild)
+
+The §23 rebuild replaces the stock chat's NUI with core's own shell component:
+- Suggestions, channel chips and the history length come from a **server-pushed**
+  `core:client:chat (action = 'suggestions')` snapshot on `playerLoaded` and on the `ui_ready` re-seed —
+  the client never enumerates commands itself, so a permission-refused command never appears as a
+  suggestion and a factionless player never sees the faction chip.
+- `/commands` typed into the CEF input go through the engine's command path: client `ExecuteCommand`,
+  server-side execution arrives as `__cfx_internal:commandFallback` with the player's identity, so
+  core's permission wrapper applies. `ExecuteCommand` is never called on the SERVER from chat input
+  (that would run as console, src 0, bypassing Core.Perms).
+- The stock `chatMessage` interceptor is kept so servers that still show chat's own NUI stay consistent,
+  but the shell never renders `chat:addMessage` — one renderer, no double feed. Remove `ensure chat`.
+
+### 30.3 Chat usability and lifecycle (2026-09-13, supersedes §23/§30.2 presentation)
+
+- Top-left, unboxed text feed with an explicit space after `name:` and between faction tag/name.
+  A slim input and command helper are the only panels; no idle border, channel chips or TAB badge.
+- `Config.Chat.HideDelayMs = 8000` fades the feed after inactivity (0 disables auto-hide).
+  New messages and closing the input restart one CEF timeout; no polling or per-frame Lua work.
+  `VisibleLines = 8` limits the idle feed, `History = 80` bounds both received and sent history
+  (1–200). Opening chat restores the retained feed at full opacity, scrolls to the latest line,
+  and allows PageUp/PageDown reading. Closed proximity lines retain the server's distance opacity.
+  `MaxLength` is passed to the shell and enforced as a UTF-8 byte limit (1–256); commands allow 512 bytes.
+- Typing `/` shows a filtered, scrollable list **below** the input: command, description and signature.
+  Up/Down selects without changing the draft; Tab accepts, Shift+Tab selects the previous match.
+  Enter completes a partial/explicitly selected command without executing it; otherwise Enter sends.
+  A known command followed by whitespace shows its signature with the argument at the caret highlighted,
+  plus its help/type/required status. Quoted words count as one slot; a `rest` argument stays active
+  across words. Command completion preserves existing arguments and never replaces ordinary text.
+  With no command list, Up/Down recalls sent history and restores the unsent draft on returning down;
+  Ctrl+Tab / Ctrl+Shift+Tab cycles the permitted channels. IME composition never submits a line.
+- Suggestion params retain `name`, `help`, `type`, `optional`. Channel suggestions include their message
+  param. The shell deduplicates command/channel metadata; it does not invent player-name completions.
+  Permission/faction filtering applies to the merged snapshot, not just the channel list. Each open
+  requests a refreshed snapshot (server cooldown); no engine command enumeration or authority in CEF.
+  Each plugin's `Core.Commands` VM contributes a permission-filtered server snapshot and/or local
+  client snapshot through internal `chatSuggestionsRequested` / `chatSuggestions` hooks. Client
+  snapshots are Registry-owned (`chatSuggestions`), replaced on refresh and removed on owner stop.
+  This includes plugin commands without relying on the stock chat's suggestion event listeners.
+- One `uiReady` hook restores the actual chat typing state, never generic page focus. Opening is
+  refused while hidden or another focus owner is active; closing is immediate in CEF. A page/modal
+  taking focus cancels chat. Async focus replies cannot reopen chat after Escape/hide.
+- Client startup and `uiReady` call `SetTextChatEnabled(false)` and `DisableMultiplayerChat(true)`;
+  resource stop restores them. This suppresses GTA's native multiplayer chat without a frame loop.
+  The separate stock FiveM `chat` resource must still be stopped/removed from startup; cancelling its
+  server event cannot hide its independent NUI. Core does not silently stop other resources.
+- Slash input is stripped of its leading `/` before **client** `ExecuteCommand`, never executed as
+  server console. Offline coverage: Lua bridge/metadata/routing, pure JS caret/completion tests,
+  shell keyboard/fade/focus/history regressions and interactive Chat stories.
 
 ## 31. UI visibility — auto-hide on game states, `Core.UI.hide/show` (2026-09-12, after Liam's report)
 

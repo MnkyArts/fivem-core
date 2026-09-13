@@ -21,9 +21,9 @@ Exactly what the dev server runs (`server.cfg`, applied 2026-09-12):
 
 ```cfg
 ensure mapmanager
-ensure chat
 ensure spawnmanager
 # ensure basic-gamemode   # disabled: core spawns players itself
+# ensure chat             # REMOVED 2026-09-13: core's CEF chat replaces it (DESIGN §23)
 ensure core               # always above every plugin that depends on it
 ensure core_example       # the reference plugin (optional)
 
@@ -53,7 +53,13 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 |---|---|---|
 | `Config.Security.EntityLockdown` | `'inactive'` | `'relaxed'` (only known models) or `'strict'` (no client-created entities) on bucket 0 — turn it up once every plugin spawns through `Core.Vehicles`, or client-side props stop appearing |
 | `Config.Camera.DisableIdleCam` | `true` | switches GTA's AFK/idle cameras off (on foot, passenger, cinematic vehicle idle): they trip the cinematic auto-hide and closed open pages (§35); `false` restores the game's pans |
-| `Config.Chat.Mode` | `'global'` | `'proximity'` limits normal chat to `Config.Chat.ProximityRange` (20 m); `/ooc` stays global either way |
+| `Config.Chat.Mode` | `'proximity'` | `'global'` makes plain chat reach the whole server; with `'proximity'` (the default) plain chat fades with distance — see "Chat (§23)" |
+| `Config.Chat.FadeMeters` | `{ near = 20, far = 90 }` | full opacity inside `near`, fading to 0 at `far`; proximity lines deliver out to `far` |
+| `Config.Chat.HideDelayMs` | `8000` | fade the feed after inactivity; `0` keeps it visible. Opening chat restores retained history |
+| `Config.Chat.VisibleLines` | `8` | recent lines shown while closed (1–30); opening shows retained history |
+| `Config.Chat.History` | `80` | received/sent history cap (1–200) |
+| `Config.Chat.MaxLength` | `200` | plain message limit in UTF-8 bytes (1–256); the input uses the same limit |
+| `Config.Chat.Format` | `nil` | optional custom format, e.g. `'{tag}{name}: {msg}'`; unset preserves separate name/message styling |
 | `Config.World.TimeScale` | `30` | game seconds per real second — `30` is a 48-minute day, `1` is real time, `0` freezes the clock |
 | `Config.Locale` | `'en'` | `'de'` ships too; adds `<resource>/locales/<lang>.json` lookups for `Core.Locale.t` (§26) |
 | `Config.DB.Adapter` | `'kvp'` | `'postgres'` is the production backend (setup under "Where data lives"); `'mysql'` switches to the oxmysql adapter — **untested**, see "DB tools" below |
@@ -407,6 +413,11 @@ on('greeting', d => { reply.value = d.text })
 emit('greet', { name: name.value })
 ```
 
+A page store that lives outside the component (a module singleton, like the inventory's) may keep
+`usePage(id).props`: the object survives close/re-open and even a plugin restart (`page:unregister` +
+`page:register`). Create its watchers in a detached `effectScope(true)`, though — a `watch` made during a
+component's setup is stopped when that component unmounts.
+
 Two pages in one plugin (a focus-taking page plus a click-through overlay)? Add `export const pages = { my_plugin_hud: HudOverlay }`
 to the same `index.js`; every entry is registered like the default export and declared from Lua with its own
 `Core.UI.registerPage(id, { type = 'overlay' })`.
@@ -707,18 +718,45 @@ never for per-frame work. A table leaves `Api.get` the moment its owning resourc
 
 ### Chat (§23)
 
-Core intercepts the default `chat` resource's `chatMessage`, cancels its broadcast and re-sends with
-its own format, cooldown and sanitising.
+Core's chat is its own CEF feed + input (shell `Chat.vue`, `client/chat.lua`, `server/chat.lua`); the stock
+`chat` resource is **not needed**. Stop it with `stop chat` in the server console and remove its startup
+entry (including any resource-group startup that includes it). Its independent NUI competes for `T`;
+cancelling `chatMessage` cannot hide it. Core separately disables **GTA's native multiplayer text chat**
+on startup/NUI reload and restores it when core stops. No per-frame control polling is used.
+
+The feed is top-left, unboxed, and fades after eight seconds without activity. `T` restores history
+at full opacity and opens a slim keyboard-only input. New messages wake the feed. Controls:
+
+- `/` opens a filtered command list **below** the input, with descriptions and argument signatures.
+- `↑` / `↓` selects a command without changing your text; `Tab` accepts, `Shift+Tab` selects backwards.
+- `Enter` completes a partial/selected command first; otherwise it sends. `Esc` cancels.
+- After `/command `, the argument at your caret is highlighted with help, type and optional/required
+  status. Quoted arguments and multiword `rest` parameters are supported; Tab never overwrites plain text.
+- Without a command list, `↑` / `↓` recalls sent history, restoring your unsent draft when returning down.
+  `PageUp` / `PageDown` scrolls received history. `Ctrl+Tab` / `Ctrl+Shift+Tab` changes channels.
+
+Core and plugin `Core.Commands` registrations supply the metadata; server permissions still decide
+which commands/channels are shown and allowed. Each open refreshes the snapshot (rate-limited), and
+stopped plugins lose their suggestions. Raw `RegisterCommand` registrations need `Core.Commands.register`
+to appear with typed hints; the engine still executes them normally. No guessed player-name completion.
 
 | function | purpose |
 |---|---|
-| `Core.Chat.send(src, message, opts?)` | `opts = { color = {r,g,b}, prefix = 'SYSTEM', multiline = false }` |
-| `Core.Chat.broadcast(message, opts?)` · `sendNear(coords, range, message, opts?)` | announcements / proximity |
-| `Core.Chat.registerChannel(name, { command, permission?, format, global, staffOnly?, color?, range? })` | adds the `/command` for you |
+| `Core.Chat.send(src, message, opts?)` | `opts = { color = {r,g,b}, prefix = 'SYSTEM', channel? }` — one CEF line |
+| `Core.Chat.broadcast(message, opts?)` · `sendNear(coords, range?, message, opts?)` | announcements / proximity (each recipient gets their own opacity) |
+| `Core.Chat.registerChannel(name, { command, permission?, format, global?, staffOnly?, faction?, color?, range?, description? })` | adds the `/command` for you |
 | `Core.Chat.setFilter(fn(src, channel, msg) -> bool)` | returning `false` vetoes the message |
+| `Core.Chat.clear(src)` | wipes one player's feed |
+| `Core.Chat.suggestions(src)` | permitted channel commands with descriptions and message-argument metadata |
+| `Core.Commands.get(name)` · `execute(name, src, args, raw)` (server) · `suggestions(src)` | the command seam the CEF input uses (§30.2) |
 
-Built-ins: `/ooc` (global), `/me` (`* {name} {msg}`, nearby only), `/a` (staff, needs `core.mod`) and
-`/pm <id> <message…>`. Normal chat follows `Config.Chat.Mode`. Hook: `chatMessage (src, channel, msg)`.
+Built-in channels: plain text → **local** (proximity, fades with distance), `/ooc` (global), `/fc`
+(faction members only — the chip only appears for faction members), `/s` scream (doubled range, always
+full opacity, rendered louder), `/me` (nearby action), `/a` staff (needs `core.mod`) and `/pm <id>
+<message…>`. A `/command` typed into the input runs through the engine's command path (client
+`ExecuteCommand`; server commands execute with the player's identity and core's permission wrapper —
+never as console). Core also sends join/leave system lines and owns console `say`. Hook:
+`chatMessage (src, channel, msg)`.
 
 ### Http and Webhook (§24)
 
@@ -813,7 +851,7 @@ Wave 2 (§15–§26). Steps 13 and 15 are the negative tests — same rule: they
 16. **Weapons persist:** `/weapon <your id> WEAPON_PISTOL 50` → the pistol appears with 50 rounds. Fire ~10, wait for the 60 s snapshot (or die), then `/quit` and reconnect → the pistol is back with the *reduced* ammo. `/weapons clear <your id>` → it is gone and stays gone after a relog. Bonus negative: `/weapon` as a non-admin → "You are not allowed to do that".
 17. **Time and weather for everyone:** with a second player connected, `Core.World.setTime(2, 0)` and `Core.World.setWeather('THUNDER', 5)` → **both** clients go to 02:00 and roll into thunder within ~5 s. `Core.World.setWeatherFor(<id>, 'XMAS', 2)` changes that one player only, `clearWeatherFor` puts them back, and `Core.World.freezeTime(true)` stops the clock for everyone.
 18. **Stats decay and thresholds:** watch the hunger/thirst bars in the HUD — they drop by `decayPerMinute` every `TickMs`. Put one just above a threshold (`Core.Stats.set(<id>, 'hunger', 26)`) and let it decay past 25 → the threshold notification fires **once**, not every tick. Buy a snack → hunger jumps +20 and the bar follows immediately.
-19. **Chat channels:** `/ooc hello` reaches everyone; `/me waves` shows `* <name> waves` only to players within 20 m; `/a test` is visible to `core.mod` staff only and rejected for everyone else; `/pm <id> hi` reaches exactly that player and echoes to you. Spam any of them → the cooldown drops the extras silently. Set `Config.Chat.Mode = 'proximity'`, `restart core` → plain chat is now range-limited while `/ooc` stays global.
+19. **Chat channels (CEF):** stop the stock `chat` resource, then press `T` → only core's slim top-left input opens, keyboard-only, no GTA chat. Send plain text → `Name: message` has a visible space. After eight seconds the feed fades; `T` restores history. Type `/p`, navigate with arrows and complete `/pm` with Tab → `<target>` is highlighted; enter an id and a space → `<message>` is highlighted, including across words. Move the caret back → the hint follows. Check `/car`'s optional plate hint as an admin, plugin commands after plugin restart, PageUp/PageDown, unsent draft restoration, Escape, and pause/menu focus takeover. A second player within ~20 m sees local text at full opacity, one at ~50 m sees it faded, one 300 m away sees nothing. `/s WRENCH` reaches ~60 m at full opacity. `/fc warehouse run` reaches only your faction, `/a test` only `core.mod` staff, `/pm <id> hi` only that player, `/ooc hi` everyone. Spam → cooldown drops extras. F8 `TriggerServerEvent('core:server:chat:send', 'hi', 'a')` as non-staff → nothing is delivered. Confirm no duplicate chat opens with `T` or the GTA team-chat key, and check idle resmon; offline tests cannot verify these native/game behaviours.
 20. **Server-opened menu, key hints and shard:** run `/exmenu` → a menu opens on *your* screen although `server/main.lua` called it; pick "Heal me" → health goes to 200 and a green **HEALED** shard slides in; press `ESC` instead → the menu returns `nil` and nothing happens. Walk into the 24/7 marker → the `[E]` key hints appear on `onEnter` and go on `onExit`; `restart core_example` while they are up → they disappear with it, no leftovers.
 
 UI visibility (§31). Step 22 is where the two keyboards meet: while the NUI holds focus the game never sees `ESC`.

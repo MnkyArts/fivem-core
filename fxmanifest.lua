@@ -13,7 +13,7 @@ client_scripts {
     'client/interactions.lua', 'client/ui.lua', 'client/vehicles.lua', 'client/raycast.lua',
     'client/spawn.lua', 'client/player.lua',
     'client/worldsync.lua', 'client/doors.lua', 'client/environment.lua', 'client/stats.lua', 'client/weapons.lua',
-    'client/remote.lua', 'client/ui_remote.lua', 'client/hudfeed.lua',
+    'client/remote.lua', 'client/ui_remote.lua', 'client/hudfeed.lua', 'client/chat.lua',
     'client/main.lua',
 }
 

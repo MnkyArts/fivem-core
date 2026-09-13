@@ -740,6 +740,7 @@ function stubs.newEnv(side, resourceName)
         return handle
     end
     env.AddEventHandler = addHandler
+    env.CancelEvent = function() rec.cancelled = true end   -- shared apiset (chat/security interceptors)
     env.RegisterNetEvent = function(name, fn)
         rec.netEvents[name] = true
         return addHandler(name, fn)

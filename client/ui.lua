@@ -66,6 +66,8 @@ local nuiReady = false
 local uiReadyAt = nil               -- last accepted ui_ready, for the 1/s rate limit
 local focusOwned = false
 local focusKeepInput = false
+local focusCursor = true            -- pages/modals take the cursor; the chat input never does
+local chatTyping = false            -- §23: the CEF chat input owns keyboard while open
 local requestSeq = 0
 
 -- Sub-namespace tables (§2.2): every function is stored BOTH as UI.menu.open and
@@ -129,21 +131,45 @@ local function resolveAllPending()
 end
 
 --- Exactly SetNuiFocus(true, true) while a page or a built-in modal is open,
---- SetNuiFocus(false, false) the moment none is (DESIGN §6.10).
+--- SetNuiFocus(false, false) the moment none is (DESIGN §6.10). The CEF chat input
+--- (§23) is a third owner: keyboard only, never a cursor.
 local function applyFocus()
-    local want = (openPage ~= nil) or (modal ~= nil)
+    if chatTyping and (openPage ~= nil or modal ~= nil) then
+        chatTyping = false
+        send({ action = 'chat:open', open = false })
+    end
+    local want = (openPage ~= nil) or (modal ~= nil) or chatTyping
     local page = (modal == nil) and openPage and pages[openPage] or nil
     local keep = want and page ~= nil and page.keepInput == true
-    if want == focusOwned and keep == focusKeepInput then return end
-    focusOwned, focusKeepInput = want, keep
+    local cursor = (openPage ~= nil) or (modal ~= nil)   -- chat typing never takes the cursor
+    if want == focusOwned and keep == focusKeepInput and cursor == focusCursor then return end
+    focusOwned, focusKeepInput, focusCursor = want, keep, cursor
     if want then
-        SetNuiFocus(true, true)
+        SetNuiFocus(true, cursor)
         SetNuiFocusKeepInput(keep)
     else
         SetNuiFocusKeepInput(false)
         SetNuiFocus(false, false)
     end
     send({ action = 'focus', focused = want })
+end
+
+--- Internal seam for client/chat.lua (§23): the chat input is open. Not part of the
+--- public UI API — core's own chat drives it, plugins use pages.
+local function setChatTyping(open)
+    local want = open == true
+    if chatTyping == want then return false end
+    chatTyping = want
+    applyFocus()
+    return true
+end
+
+UI['chat.setTyping'] = setChatTyping
+
+--- Internal getter for client/chat.lua (§23): is the chat input's keyboard held right
+--- now. Distinct from UI.isFocused(), which is also true for pages and modals.
+UI['chat.isTyping'] = function()
+    return chatTyping
 end
 
 --- Sends `message` and suspends the calling coroutine until the NUI answers.
@@ -965,6 +991,7 @@ local function applyVisibility()
     if not visible then
         closeModal()
         if openPage then closeOne(openPage) end
+        if chatTyping then setChatTyping(false) end   -- §23: a hidden shell cannot keep the keyboard
         applyFocus()
     end
     sendVisible()
@@ -1362,7 +1389,7 @@ AddEventHandler('onResourceStop', function(resource)
     SetNuiFocusKeepInput(false)
     SetNuiFocus(false, false)
     focusOwned, focusKeepInput = false, false
-    openPage, textUI = nil, nil
+    openPage, textUI, chatTyping = nil, nil, false
     resolveAllPending()
 end)
 

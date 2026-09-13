@@ -125,6 +125,8 @@ local function suggestionParams(entry)
         out[i] = {
             name = p.optional and ('[' .. p.name .. ']') or ('<' .. p.name .. '>'),
             help = p.help or '',
+            type = p.type,
+            optional = p.optional == true,
         }
     end
     return out
@@ -194,6 +196,7 @@ function ns.register(name, opts, handler)
         params = params,
         permission = type(opts.permission) == 'string' and opts.permission or nil,
         allowConsole = opts.allowConsole ~= false,
+        handler = handler,        -- kept for Commands.execute (§23): the same handler, same checks
     }
     registered[name] = entry
 
@@ -227,6 +230,103 @@ function ns.unregister(name)
     registered[name] = nil
     return true
 end
+
+--- The registry entry for `name` (§23 TAB completion), copied — the caller cannot
+--- reach the live handler or mutate the params. nil for an unknown name.
+function ns.get(name)
+    if type(name) ~= 'string' then return nil end
+    local entry = registered[name:lower()] or registered[name]
+    if not entry then return nil end
+    local params = {}
+    for i = 1, #entry.params do
+        local p = entry.params[i]
+        params[i] = {
+            name = p.name, type = p.type, help = p.help, optional = p.optional,
+        }
+    end
+    return {
+        name = entry.name,
+        description = entry.description,
+        params = params,
+        permission = entry.permission,
+        allowConsole = entry.allowConsole,
+        usage = usageOf(entry),
+    }
+end
+
+--- Runs `name` AS IF `src` had typed it (§23, §30.2): the same permission check, the same
+--- param parsing and the same handler the engine command would run. Server side only —
+--- client-side commands are local to their VM and cannot be reached from the server.
+--- Returns true when the command ran. Never throws: a failing handler is logged like the
+--- engine path. args are the parsed-by-position words (raw words, not typed values).
+function ns.execute(name, src, args, raw)
+    if not IS_SERVER then
+        Core.Log.error('Commands.execute: server only (use the local command registry client-side)')
+        return false
+    end
+    if type(name) ~= 'string' or name == '' or #name > 64 then return false end
+    local entry = registered[name:lower()] or registered[name]
+    if not entry then return false end
+    if src == nil or src == 0 then
+        if not entry.allowConsole then return false end
+        src = 0
+    end
+    if entry.permission and not Core.Perms.has(src, entry.permission) then
+        reply(src, text('no_permission', 'You are not allowed to do that'))
+        return false
+    end
+    local wordList = {}
+    if type(args) == 'table' then
+        for i = 1, math.min(#args, 32) do
+            if type(args[i]) == 'string' then wordList[#wordList + 1] = args[i] end
+        end
+    end
+    local parsed, failed = parseParams(entry.params, wordList)
+    if not parsed then
+        reply(src, usageOf(entry))
+        return false
+    end
+    -- the registered handler runs exactly as the engine wrapper would run it (same pcall,
+    -- same log shape), so behaviour is IDENTICAL to typing /name into the chat input
+    local ok, err = pcall(entry.handler, src, parsed, raw)
+    if not ok then
+        Core.Log.error('command /%s failed: %s', entry.name, tostring(err))
+    end
+    return ok
+end
+
+--- Everything `src` may use, for the CEF TAB completer (§23): { command, description,
+--- params = { { name, help, type, optional } } }. Commands the caller lacks permission for are left out,
+--- so a suggestion is never a permission leak.
+function ns.suggestions(src)
+    local out = {}
+    for name, entry in pairs(registered) do
+        if IS_SERVER and entry.permission and not Core.Perms.has(src or 0, entry.permission) then
+            -- skip silently
+        else
+            out[#out + 1] = {
+                command = '/' .. name,
+                description = entry.description,
+                params = suggestionParams(entry),
+            }
+        end
+    end
+    table.sort(out, function(a, b) return a.command < b.command end)
+    return out
+end
+
+-- Internal chat snapshot seam: every plugin has its own command VM. Do not enumerate
+-- engine commands (that would expose permission-hidden names without useful metadata).
+Core.on('chatSuggestionsRequested', function(src)
+    if IS_SERVER then
+        if Core.name == 'core' or type(src) ~= 'number' or src <= 0 then return end
+        TriggerClientEvent('core:client:chat', src, {
+            action = 'commandSuggestions', owner = Core.name, items = ns.suggestions(src),
+        })
+    else
+        Core.emitHook('chatSuggestions', Core.name, ns.suggestions())
+    end
+end)
 
 if IS_SERVER then
     -- suggestions are pushed per player once their session exists, never broadcast to -1

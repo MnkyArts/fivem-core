@@ -5,6 +5,8 @@ Plain Lua 5.4, no FiveM, no server. From the resource directory (or from here):
 ```sh
 lua5.4 tests/run_tests.lua       # import.lua + lib/**   -- prints "N passed, M failed"
 lua5.4 tests/server_tests.lua    # server/**             -- same output, exit code 1 on any failure
+lua5.4 tests/client_chat_tests.lua # chat bridge, focus lifecycle and native-call contract (stubbed)
+node --test ui/tests/chat-model.test.js # pure completion, caret, quoting and UTF-8 helpers
 ```
 
 ## Files
@@ -19,6 +21,11 @@ lua5.4 tests/server_tests.lua    # server/**             -- same output, exit co
 - `run_tests.lua` — the loader and lib suites, plus a small assertion helper.
 - `server_tests.lua` — the same helper over one core server VM per suite (`import.lua`,
   `shared/config.lua`, then the `server/*.lua` modules in manifest order).
+- `client_chat_tests.lua` — runs the real chat bridge with captured NUI/native calls; checks
+  startup/stop, focus refusal, reload/hide, slash execution, config and plugin suggestion ownership.
+- `../ui/tests/chat-model.test.js` — dependency-free Node tests for chat presentation helpers.
+  `../ui/tests/shell-regression.js` additionally exercises fading, spacing, command navigation,
+  argument hints, history, IME and focus in the built shell using `agent-browser` (see README).
 
 ## Covered
 `import.lua` (lib loading, export proxy incl. `Core.UI.menu.open` and `Core.Player(src)`
@@ -39,7 +46,7 @@ records and `spawnRecord`) and `server/api.lua` (the block list, the per-corouti
 the owner sweep).
 
 ## Not covered
-Everything that needs the engine: `client/**`, drawing, NUI, real KVP, real
+Everything that needs the engine: native client behaviour, drawing, in-game NUI focus, real KVP, real
 networking, OneSync and entity behaviour. The natives here are stubs with hand-written
 semantics — a green run means the Lua contracts hold, **not** that the resource works in
 game. Use the in-game checklist in the resource README for that.

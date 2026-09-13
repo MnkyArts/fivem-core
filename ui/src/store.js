@@ -1,6 +1,7 @@
 // core UI — one reactive store for every built-in widget (DESIGN §6.10, §7.2, §7.3)
 import { reactive, markRaw } from 'vue'
 import { post, onMessage } from './bridge.js'
+import { CHAT_DEFAULTS, bounded } from './chat.js'
 
 const NOTIFY_DEFAULT_MS = 5000
 const NOTIFY_MAX_VISIBLE = 6
@@ -35,6 +36,11 @@ export const store = reactive({
   shard: { visible: false, seq: 0, title: '', subtitle: '', style: 'info', duration: 0 },
   spinner: { visible: false, text: '' },
   keys: { visible: false, items: [] },
+  // §23: the CEF chat — lines carry a server-computed opacity (0..1); `suggestions`
+  // is the TAB completer snapshot pushed by client/chat.lua; `channels` are the chips
+  // the server says this player may use; `channel` is the selected chip (the server
+  // still validates every send).
+  chat: { ...CHAT_DEFAULTS, lines: [], suggestions: [], channels: [], channel: 'local', open: false, activity: 0 },
   stats: {},      // name -> { name, label, value, min, max } (Config.Stats defs with hud = true)
   state: {},      // replicated player state, read by pages through CoreUI.state
   locale: { lang: 'en', strings: {} },
@@ -203,6 +209,9 @@ export function resetExtras() {
   for (const name of Object.keys(store.stats)) delete store.stats[name]
   for (const key of Object.keys(store.state)) delete store.state[key]
   Object.assign(store.hud, { health: null, armour: null, speed: null, street: '', zone: '', minimap: null })
+  store.chat.lines.splice(0, store.chat.lines.length)
+  store.chat.suggestions = []
+  Object.assign(store.chat, CHAT_DEFAULTS, { channels: [], channel: 'local', open: false, activity: store.chat.activity + 1 })
 }
 
 /** Escape / close button on a page or overlay -> Lua decides, we hide right away. */
@@ -216,12 +225,26 @@ export function closePage(id) {
 
 // ---------------------------------------------------------------- plugin pages
 
+// The props object of an id is stable for the life of the shell (DESIGN §7.4): a plugin restart
+// unregisters and re-registers its pages, which replaces the record, and a page store that
+// captured `usePage(id).props` once must keep receiving every later `page:open`.
+const propsById = new Map()
+
+function propsFor(id) {
+  let props = propsById.get(id)
+  if (!props) {
+    props = {}
+    propsById.set(id, props)
+  }
+  return props
+}
+
 /** A fresh page record that keeps a component already registered for this id — pages
  *  compiled into the shell (src/plugins.js) register once, Lua may re-register any time. */
 function newPage(id, extra) {
   const component = components.get(id) || null
   return Object.assign(
-    { id, type: 'page', script: null, style: null, keepInput: false, component, registered: !!component, props: {} },
+    { id, type: 'page', script: null, style: null, keepInput: false, component, registered: !!component, props: propsFor(id) },
     extra
   )
 }
@@ -396,6 +419,28 @@ const actions = {
     const strings = m.strings && typeof m.strings === 'object' ? m.strings : {}
     store.locale.strings = Object.assign({}, strings)
   },
+  // §23: one CEF line from client/chat.lua. The line is server-truth (opacity, channel,
+  // color arrive validated); the shell only trims its own history length.
+  'chat:add': (m) => {
+    const line = m && typeof m.line === 'object' && m.line ? m.line : null
+    if (!line || typeof line.text !== 'string') return
+    store.chat.lines.push({ ...line, id: 'chat' + ++seq })
+    store.chat.activity++
+    if (store.chat.lines.length > store.chat.history) store.chat.lines.splice(0, store.chat.lines.length - store.chat.history)
+  },
+  'chat:clear': () => { store.chat.lines.splice(0, store.chat.lines.length); store.chat.activity++ },
+  'chat:suggestions': (m) => {
+    store.chat.suggestions = Array.isArray(m.items) ? m.items : []
+    if (Array.isArray(m.channels)) store.chat.channels = m.channels
+    if (!store.chat.channels.some(c => c.id === store.chat.channel)) store.chat.channel = 'local'
+    store.chat.history = bounded(m.history, store.chat.history, 1, 200)
+    store.chat.hideDelayMs = bounded(m.hideDelayMs, store.chat.hideDelayMs, 0, 600000)
+    store.chat.visibleLines = bounded(m.visibleLines, store.chat.visibleLines, 1, 30)
+    store.chat.maxLength = bounded(m.maxLength, store.chat.maxLength, 1, 256)
+    if (store.chat.lines.length > store.chat.history) store.chat.lines.splice(0, store.chat.lines.length - store.chat.history)
+  },
+  // T (Lua) opens the input, ESC/submit closes it; Chat.vue watches the flag.
+  'chat:open': (m) => { store.chat.open = m.open === true },
   'page:register': (m) => {
     const script = m.script || null
     const prev = store.pages[m.id]

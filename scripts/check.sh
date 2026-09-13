@@ -67,6 +67,7 @@ command -v lua5.4 >/dev/null 2>&1 || fail 'lua5.4 is not on PATH'
 
 step '3/6  lua5.4 tests/run_tests.lua'
 lua5.4 tests/run_tests.lua || fail 'tests/run_tests.lua'
+lua5.4 tests/client_chat_tests.lua || fail 'tests/client_chat_tests.lua'
 
 step '4/6  lua5.4 tests/server_tests.lua'
 if [ -f tests/server_tests.lua ]; then
@@ -78,6 +79,7 @@ fi
 # --- 5. UI build ------------------------------------------------------------
 
 step '5/6  cd ui && npm run build'
+node --test ui/tests/chat-model.test.js || fail 'chat presentation helpers'
 command -v npm >/dev/null 2>&1 || fail 'npm is not on PATH (Node 22+)'
 [ -d "$RESOURCES_DIR/node_modules" ] \
     || fail "no hoisted node_modules -- run 'cd $RESOURCES_DIR && npm install' first"

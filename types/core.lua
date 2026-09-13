@@ -405,7 +405,7 @@
 ---@field multiline? boolean
 
 ---@class CoreChatChannel
----@field command string the slash command that writes into the channel
+---@field command? string|false the slash command; false disables it, nil defaults to the channel name
 ---@field permission? string perm required to use it
 ---@field format? string e.g. '(OOC) {name}: {msg}'
 ---@field global? boolean false routes the message by proximity (default true)
@@ -482,7 +482,7 @@
 ---@field Stats { Enabled: boolean, TickMs: integer, Defs: table<string, CoreStatDef> }
 ---@field Weapons { Allowed: string[]|nil, SnapshotIntervalMs: integer }
 ---@field Native { Allow: string[]|nil }
----@field Chat table Mode, ProximityRange, MaxLength, CooldownMs, Format
+---@field Chat table Mode, ProximityRange, MaxLength (UTF-8 bytes, 1–256), CooldownMs, Format?, History (1–200), HideDelayMs (0 disables idle fade), VisibleLines (1–30), FadeMeters, ScreamRange, ScreamCommand
 ---@field Security table EntityLockdown, EnforceLoadout, BlockExplosions, WeaponDamage, …
 ---@field Doors { InteractDistance: number }
 ---@field Hud table ShowHealth, ShowArmour, ShowStats, ShowSpeed, ShowStreet
@@ -937,6 +937,24 @@ function Core.Commands.register(name, opts, handler) end
 ---@param name string
 ---@return boolean removed
 function Core.Commands.unregister(name) end
+---The registry entry for `name`, copied (handler omitted): name, description, params,
+---permission, allowConsole, usage. nil for an unknown name.
+---@param name string
+---@return table|nil entry
+function Core.Commands.get(name) end
+---(server) Runs `name` AS IF `src` had typed it: same permission check, same param
+---parsing, same handler as the engine command. Never throws. false on refusal.
+---@param name string
+---@param src integer
+---@param args string[] raw words, by position
+---@param raw? string the raw line, as the handler's third argument
+---@return boolean ran
+function Core.Commands.execute(name, src, args, raw) end
+---Everything `src` may use, for the CEF TAB completer (§23): { command, description,
+---params = { { name, help, type, optional } } }. Commands the caller lacks permission for are left out.
+---@param src integer
+---@return table[]
+function Core.Commands.suggestions(src) end
 
 --------------------------------------------------------------------------------
 -- Core.Keys (lib/keys/client.lua, DESIGN §3.8) — (client) key bindings
@@ -2831,11 +2849,20 @@ function Core.Chat.broadcast(message, opts) end
 ---@param opts? CoreChatOptions
 ---@return integer reached
 function Core.Chat.sendNear(coords, range, message, opts) end
----(server) Registers a chat channel and its command. Built-ins: ooc, me, a, pm.
+---(server) Registers a chat channel and its command. Built-ins: local, ooc, faction, me, a, pm.
 ---@param name string
 ---@param def CoreChatChannel
 ---@return boolean ok
 function Core.Chat.registerChannel(name, def) end
+---(server) Wipes one player's CEF feed (§23).
+---@param src integer
+---@return boolean ok
+function Core.Chat.clear(src) end
+---(server) The TAB completer's channel half (§23): every channel `src` may use, as
+---{ command, channel, description, params = { { name, help, type, optional } } }.
+---@param src integer
+---@return table[]
+function Core.Chat.suggestions(src) end
 ---(server) `fn(src, channel, msg) -> false` vetoes a message; nil clears the filter.
 ---@param fn fun(src: integer, channel: string, msg: string): boolean|nil
 ---@return boolean ok

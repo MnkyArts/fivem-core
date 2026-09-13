@@ -843,6 +843,9 @@ local function suiteCommands()
     eq(suggestion and suggestion.args[2], 'Give money', 'the suggestion carries the description')
     eq(suggestion and suggestion.args[3][1].name, '<target>', 'required params render as <name>')
     eq(suggestion and suggestion.args[3][3].name, '[reason]', 'optional params render as [name]')
+    eq(suggestion and suggestion.args[3][1].type, 'player', 'suggestions retain the player argument type')
+    eq(suggestion and suggestion.args[3][3].type, 'rest', 'suggestions retain multiword arguments')
+    eq(suggestion and suggestion.args[3][3].optional, true, 'suggestions retain optional status')
     eq(broadcast, nil, 'suggestions are never broadcast to -1')
     granted['1|core.admin'] = false
     stubs.clear()
@@ -852,6 +855,20 @@ local function suiteCommands()
         if stubs.sent[i].args[1] == '/give' then hidden = true end
     end
     eq(hidden, false, 'a command the player may not use is not suggested')
+
+    stubs.clear()
+    stubs.triggerOn(server, 'core:hook:chatSuggestionsRequested', 0, 1)
+    local snapshot
+    for _, packet in ipairs(stubs.sent) do
+        if packet.name == 'core:client:chat' then snapshot = packet end
+    end
+    eq(snapshot and snapshot.target, 1, 'plugin command snapshots are targeted')
+    eq(snapshot and snapshot.args[1].owner, 'core_example', 'plugin snapshot identifies its owner')
+    local leaks = false
+    for _, item in ipairs(snapshot and snapshot.args[1].items or {}) do
+        if item.command == '/give' then leaks = true end
+    end
+    eq(leaks, false, 'plugin command snapshots also enforce permissions')
 end
 
 --------------------------------------------------------------------------------
