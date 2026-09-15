@@ -189,6 +189,7 @@ Natives to verify per file (names from the 2026-09-12 scouts where already verif
 - `client/weapons.lua`: GiveWeaponToPed, RemoveWeaponFromPed, RemoveAllPedWeapons, SetPedAmmo, GetAmmoInPedWeapon, HasPedGotWeapon, GiveWeaponComponentToPed, SetPedWeaponTintIndex, GetHashKey, PlayerPedId.
 - `client/remote.lua` + `lib/audio/client.lua`: PlaySoundFrontend, PlaySoundFromCoord, GetSoundId, ReleaseSoundId, StopSound, AttachEntityToEntity, CreateObject, DeleteEntity, GetPedBoneIndex, SetNewWaypoint, DeleteWaypointsFromThisPlayer, GetFirstBlipInfoId, GetBlipInfoIdCoord, IsWaypointActive, GetPlayerFromServerId, GetPlayerPed, NetworkGetNetworkIdFromEntity, GetActivePlayers, GetEntityCoords, PlayerPedId + the §6.9 raycast natives.
 - `client/hudfeed.lua`: GetEntityHealth, GetEntityMaxHealth, GetPedArmour, GetEntitySpeed, GetStreetNameAtCoord, GetNameOfZone, GetFilenameForAudioConversation (label text), GetSafeZoneSize, GetAspectRatio, GetActualScreenResolution, PlayerPedId, GetEntityCoords.
+- `client/interiors.lua` (§36, 2026-09-15): RequestIpl, RemoveIpl, IsIplActive, GetInteriorAtCoords, IsValidInterior, IsInteriorReady, ActivateInteriorEntitySet, DeactivateInteriorEntitySet, IsInteriorEntitySetActive, RefreshInterior, GetGameBuildNumber, IsDlcPresent (all client/shared apiset, verified with fxref).
 - `server/getters.lua`: GetPlayerPed, GetEntityCoords (1-arg), GetVehiclePedIsIn, GetPedInVehicleSeat, GetVehicleMaxNumberOfPassengers (verify apiset), GetPlayerName.
 - `server/http.lua`: PerformHttpRequest (helper), SetHttpHandler (verify), GetConvar. `server/security.lua`: SetRoutingBucketEntityLockdownMode, CancelEvent; event handlers weaponDamageEvent/explosionEvent (runtime-facts §9 signatures `(sender, data)`).
 - `server/environment.lua`, `server/stats.lua`, `server/weapons.lua`, `server/remote.lua`, `server/ui.lua`, `server/globals.lua`, `server/services.lua`, `server/chat.lua`, `server/cron.lua`, `server/worldsync.lua`: no GTA natives beyond GetGameTimer/GetPlayerPed/GetEntityCoords/GetHashKey; `os.date`/`os.time` allowed server-side.
@@ -215,3 +216,25 @@ The plugin's own contract is `resources/charcreator/PLAN.md` (runs B–E there);
 | run | agent | owns | notes |
 |---|---|---|---|
 | A | fivem-implementer (opus) | `client/spawn.lua` (apply order §34.2), `types/core.lua` (`CoreAppearance`), `README.md` (cheat sheet + "Appearance" note) | natives: SetPedFaceFeature, SetPedHeadOverlay, SetPedHeadOverlayColor, SetPedHairTint, SetPedEyeColor — the FiveM runtime names, not the nativedb renames (`fxref` now prints the runtime name; see the kit fix of the same day) |
+
+## Vehicle system finalization — 2026-09-15
+
+| Run | Owner | Files | Status |
+|---|---|---|---|
+| C1 | main (native-scout role unavailable in this environment; all calls verified with local `fxref`) | `server/vehicles.lua`, `client/vehicles.lua`, `DESIGN.md`, `README.md` | complete |
+| C2 | main | `types/core.lua`, `tests/server_tests.lua` | complete (718 server tests) |
+
+Contract: preserve Core.Vehicles compatibility with virtual keys, add persisted item-key mode for the vehicle_system plugin, and accept the bounded 0-based property maps Core.Vehicles.getProps already produces. See `../vehicle_system/PLAN.md` for complete native/API and test lists.
+
+| C3 | main | `shared/config.lua`, `server/vehicles.lua`, `client/vehicles.lua`, `DESIGN.md`, `README.md`, `types/core.lua`, `tests/server_tests.lua` | complete — global stored/live plate uniqueness, `LS-` plates and complete condition props; `scripts/check.sh` passed |
+
+## Interiors / IPL loader (DESIGN §36) — 2026-09-15
+
+| Run | Owner | Files | Status |
+|---|---|---|---|
+| I1 | main | `DESIGN.md` (§36 contract), `client/interiors_data.lua` (new, 27 groups / 369 IPLs), `client/interiors.lua` (new, loader + API), `shared/config.lua` (`Config.Interiors`), `fxmanifest.lua`, `types/core.lua`, `README.md` (cheat sheet + config + checklist step 25), `tests/client_interiors_tests.lua` (new, 999 checks), `scripts/check.sh` | complete — `lua5.4` suites + `fxlint .` green |
+
+Contract: port the IPL layer of Bob74/bob74_ipl (MIT, researched from master + DurtyFree dumps; own code and
+grouping, attribution in the data file) as boot-loaded groups with build/DLC gates; per-interior entity-set
+styling stays plugin-side via `Core.Interiors.activateSet`. Natives verified with local `fxref` (STREAMING +
+INTERIOR client, CFX shared GetGameBuildNumber, DLC client IsDlcPresent).

@@ -68,6 +68,7 @@ command -v lua5.4 >/dev/null 2>&1 || fail 'lua5.4 is not on PATH'
 step '3/6  lua5.4 tests/run_tests.lua'
 lua5.4 tests/run_tests.lua || fail 'tests/run_tests.lua'
 lua5.4 tests/client_chat_tests.lua || fail 'tests/client_chat_tests.lua'
+lua5.4 tests/client_interiors_tests.lua || fail 'tests/client_interiors_tests.lua'
 
 step '4/6  lua5.4 tests/server_tests.lua'
 if [ -f tests/server_tests.lua ]; then

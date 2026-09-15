@@ -9,7 +9,7 @@ version '1.0.0'
 shared_scripts { 'import.lua', 'shared/config.lua' }
 
 client_scripts {
-    'client/api.lua', 'client/world.lua', 'client/markers.lua', 'client/textlabels.lua', 'client/blips.lua',
+    'client/api.lua', 'client/world.lua', 'client/interiors_data.lua', 'client/interiors.lua', 'client/markers.lua', 'client/textlabels.lua', 'client/blips.lua',
     'client/interactions.lua', 'client/ui.lua', 'client/vehicles.lua', 'client/raycast.lua',
     'client/spawn.lua', 'client/player.lua',
     'client/worldsync.lua', 'client/doors.lua', 'client/environment.lua', 'client/stats.lua', 'client/weapons.lua',

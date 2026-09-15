@@ -3,6 +3,10 @@
      (core vehicles only), the entry guard that re-applies locks while the player tries to get in, and
      the Config.Vehicles.LockKey binding.
      Nothing here is authoritative: locking and prop saving go through the server (DESIGN §5).
+     Extended condition natives (fxref verified 2026-09-15): GetVehicleDoorAngleRatio,
+     SetVehicleDoorOpen/Shut, IsVehicleWindowIntact, SmashVehicleWindow, FixVehicleWindow,
+     Get/SetVehicleLights, SetVehicleFullbeam, Get/SetVehicleIndicatorLights,
+     Get/SetVehicleWheelHealth.
 ]]
 
 local Vehicles = {}
@@ -11,6 +15,8 @@ local TOGGLE_MODS <const> = { 17, 18, 19, 20, 22 }   -- turbo, xenon (legacy), .
 local MAX_MOD_TYPE <const> = 49
 local MAX_EXTRA <const> = 20
 local MAX_WHEEL <const> = 7
+local MAX_DOOR <const> = 7
+local MAX_WINDOW <const> = 7
 local MAX_SEAT <const> = 6
 local CONTROL_TIMEOUT_MS <const> = 1000
 local TOGGLE_DISTANCE <const> = 8.0
@@ -143,7 +149,8 @@ function Vehicles.isLocked(veh)
     return Entity(veh).state.locked == true
 end
 
---- Owner or key holder of a core vehicle (state bag read; false for any other vehicle).
+--- Explicit virtual-key holder of a core vehicle (state bag read; false for any other vehicle).
+--- Item-key vehicles deliberately carry no virtual owner key; their plugin verifies its physical item.
 ---@param veh integer
 ---@return boolean
 function Vehicles.hasKeys(veh)
@@ -152,7 +159,6 @@ function Vehicles.hasKeys(veh)
     if not state.coreVeh then return false end
     local charId = Core.Player.get('charId')
     if not charId then return false end
-    if state.owner == charId then return true end
     local keys = state.keys
     return type(keys) == 'table' and keys[charId] == true
 end
@@ -236,11 +242,20 @@ function Vehicles.getProps(veh)
     end
     props.modToggles = toggles
 
-    local burst = {}
+    local burst, tyreHealth = {}, {}
     for wheel = 0, MAX_WHEEL do
         if IsVehicleTyreBurst(veh, wheel, false) then burst[wheel] = true end
+        tyreHealth[wheel] = Core.Utils.round(GetVehicleWheelHealth(veh, wheel), 1)
     end
-    props.burstTyres = burst
+    props.burstTyres, props.tyreHealth = burst, tyreHealth
+
+    local doors, windows = {}, {}
+    for door = 0, MAX_DOOR do doors[door] = GetVehicleDoorAngleRatio(veh, door) > 0.05 end
+    for window = 0, MAX_WINDOW do windows[window] = IsVehicleWindowIntact(veh, window) and true or false end
+    props.doors, props.windows = doors, windows
+
+    local _, lightsOn, highBeams = GetVehicleLightsState(veh)
+    props.lights = { lightsOn == true, highBeams == true, GetVehicleIndicatorLights(veh) }
 
     return props
 end
@@ -332,6 +347,37 @@ local function applyCondition(veh, props)
                 SetVehicleTyreFixed(veh, wheel)
             end
         end
+    end
+    if type(props.tyreHealth) == 'table' then
+        for wheel = 0, MAX_WHEEL do
+            local health = props.tyreHealth[wheel] or props.tyreHealth[tostring(wheel)]
+            if type(health) == 'number' then SetVehicleWheelHealth(veh, wheel, health + 0.0) end
+        end
+    end
+    if type(props.doors) == 'table' then
+        for door = 0, MAX_DOOR do
+            if props.doors[door] == true or props.doors[tostring(door)] == true then
+                SetVehicleDoorOpen(veh, door, false, true)
+            else
+                SetVehicleDoorShut(veh, door, true)
+            end
+        end
+    end
+    if type(props.windows) == 'table' then
+        for window = 0, MAX_WINDOW do
+            if props.windows[window] == true or props.windows[tostring(window)] == true then
+                FixVehicleWindow(veh, window)
+            else
+                SmashVehicleWindow(veh, window)
+            end
+        end
+    end
+    if type(props.lights) == 'table' then
+        SetVehicleLights(veh, props.lights[1] == true and 3 or 4)
+        SetVehicleFullbeam(veh, props.lights[2] == true)
+        local indicators = tonumber(props.lights[3]) or 0
+        SetVehicleIndicatorLights(veh, 1, (indicators & 1) ~= 0)
+        SetVehicleIndicatorLights(veh, 0, (indicators & 2) ~= 0)
     end
 end
 

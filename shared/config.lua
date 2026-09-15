@@ -44,7 +44,7 @@ Config = {
         },
     },
     Vehicles = {
-        SpawnTimeoutMs = 5000, LockKey = 'U', LockDistance = 20.0, PlatePrefix = 'LS',
+        SpawnTimeoutMs = 5000, LockKey = 'U', LockDistance = 20.0, PlatePrefix = 'LS-',
         MaxPropsBytes = 16384,
     },
     Interactions = {
@@ -88,6 +88,18 @@ Config = {
         WeaponDamage = {}, KickOnDetect = false, ExemptWeapons = nil },   -- ExemptWeapons nil = the built-in melee/vehicle/environment list
     Http = { AllowPrivate = false, AllowHosts = nil },
     Doors = { InteractDistance = 2.0 },
+    -- Map interiors (DESIGN §36): one toggle per IPL group from client/interiors_data.lua.
+    -- Missing key = the group's default; north_yankton, ufo and red_carpet default off.
+    Interiors = {
+        Enabled = true,
+        base = true, north_yankton = false, ufo = false, red_carpet = false,
+        heists = true, highlife = true, executive = true, finance = true,
+        bikers = true, import = true, gunrunning = true, smuggler = true,
+        doomsday = true, afterhours = true, casino = true, cayoperico = true,
+        tuner = true, security = true, criminal_enterprise = true, drugwars = true,
+        mercenaries = true, chopshop = true, bounties = true, agents = true,
+        money_fronts = true, mansions = true, kortz = true,
+    },
     Hud = { ShowHealth = true, ShowArmour = true, ShowStats = true, ShowSpeed = true, ShowStreet = true },
     -- GTA's idle cameras (DESIGN §35): the AFK pan after 30 s without input, the passenger pan and the
     -- cinematic vehicle idle mode. They trip the §31 cinematic watcher (the shell hides, an open page

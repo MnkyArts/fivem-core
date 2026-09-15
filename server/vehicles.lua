@@ -19,7 +19,8 @@ local PLATE_MAX <const> = 8
 local PROPS_MAX_KEYS <const> = 96
 local PROPS_MAX_KEY_LEN <const> = 32
 local PROPS_MAX_STRING <const> = 32
-local PROPS_MAX_ARRAY <const> = 32
+local PROPS_MAX_MAP_ENTRIES <const> = 64
+local PROPS_MAX_MAP_INDEX <const> = 64
 local PROPS_DISTANCE <const> = 10.0
 local COLLECTION <const> = 'vehicles'
 local RECORDS_COOLDOWN_MS <const> = 1000
@@ -34,6 +35,7 @@ local SPAWN_SCHEMA <const> = {
     ownerCharId = 'id?',
     keys = { 'array', of = 'id', max = 32, optional = true },
     props = 'table?',
+    keyMode = { 'enum', 'virtual', 'item', optional = true },
     locked = 'boolean?',
     persistent = 'boolean?',
     bucket = { 'integer', min = 0, max = 65535, optional = true },
@@ -65,22 +67,34 @@ local function forget(netId)
     return true
 end
 
---- `^[%w ]{1,8}$` (Lua patterns have no counted repeats, so the length is checked separately).
-local function normalizePlate(plate)
+--- Normalises a persistent plate. Hyphens support real registration layouts such as LS-48291.
+--- A plate is globally unique across **stored and live** Core.Vehicles records, not only within the
+--- current process. `recordId` is used solely by spawnRecord when restoring that same record.
+local function plateTaken(plate, recordId)
+    if usedPlates[plate] then return true end
+    local records = Core.DB.find(COLLECTION, { plate = plate })
+    for i = 1, #records do
+        if records[i].id ~= recordId then return true end
+    end
+    return false
+end
+
+local function normalizePlate(plate, recordId)
     if type(plate) ~= 'string' then return nil, 'bad_plate' end
+    plate = Utils.trim(plate):upper()
     if #plate < 1 or #plate > PLATE_MAX then return nil, 'bad_plate' end
-    if not plate:match('^[%w ]+$') then return nil, 'bad_plate' end
-    if usedPlates[plate] then return nil, 'plate_taken' end
+    if not plate:match('^[%w %-]+$') then return nil, 'bad_plate' end
+    if plateTaken(plate, recordId) then return nil, 'plate_taken' end
     return plate
 end
 
-local function randomPlate()
-    for _ = 1, 20 do
+local function randomPlate(recordId)
+    for _ = 1, 1000 do
         local plate = (Config.Vehicles.PlatePrefix or 'LS') .. Utils.randomString(5, PLATE_ALPHABET)
-        plate = plate:sub(1, PLATE_MAX)
-        if not usedPlates[plate] then return plate end
+        plate = plate:sub(1, PLATE_MAX):upper()
+        if not plateTaken(plate, recordId) then return plate end
     end
-    return (Config.Vehicles.PlatePrefix or 'LS') .. Utils.randomString(5, PLATE_ALPHABET)
+    return nil
 end
 
 local function charIdOf(src)
@@ -92,14 +106,15 @@ end
 local function publicInfo(info)
     return {
         netId = info.netId, model = info.model, plate = info.plate,
-        ownerCharId = info.ownerCharId, keys = Utils.deepCopy(info.keys),
+        ownerCharId = info.ownerCharId, keys = Utils.deepCopy(info.keys), keyMode = info.keyMode,
         locked = info.locked, vehId = info.vehId, spawnedBy = info.spawnedBy,
         createdAt = info.createdAt,
     }
 end
 
---- Deep-checks a client-supplied props table (DESIGN §5): string keys ≤ 32, values
---- number/boolean/string ≤ 32 or an array ≤ 32 of numbers, ≤ MaxPropsBytes encoded.
+--- Deep-checks a client-supplied props table (DESIGN §5): string keys ≤ 32, scalar values
+--- and bounded numeric maps. Core.Vehicles.getProps deliberately uses zero-based native ids for
+--- extras/mods/tyres, and JSON can round those ids into numeric strings, so both forms are legal.
 local function validateProps(props)
     if type(props) ~= 'table' then return false, 'props must be a table' end
     local count = 0
@@ -116,10 +131,18 @@ local function validateProps(props)
             local n = 0
             for index, entry in pairs(value) do
                 n = n + 1
-                if math.type(index) ~= 'integer' or index < 1 or n > PROPS_MAX_ARRAY then
-                    return false, 'bad array: ' .. key
+                local mapIndex = math.type(index) == 'integer' and index or math.tointeger(tonumber(index))
+                if mapIndex == nil or mapIndex < 0 or mapIndex > PROPS_MAX_MAP_INDEX or n > PROPS_MAX_MAP_ENTRIES then
+                    return false, 'bad prop map: ' .. key
                 end
-                if type(entry) ~= 'number' or entry ~= entry then return false, 'bad array value: ' .. key end
+                local entryKind = type(entry)
+                if entryKind == 'number' then
+                    if entry ~= entry or entry == math.huge or entry == -math.huge then
+                        return false, 'bad prop map value: ' .. key
+                    end
+                elseif entryKind ~= 'boolean' then
+                    return false, 'bad prop map value: ' .. key
+                end
             end
         elseif kind ~= 'boolean' then
             return false, 'bad prop type: ' .. key
@@ -134,7 +157,9 @@ end
 
 --- Spawns a vehicle server-side and tracks it. Yields while the entity materialises,
 --- so it must be called from a thread/event handler. Returns netId | nil, err.
-function Vehicles.spawn(opts)
+--- Internal spawn path. `restoreRecordId` is deliberately not exposed in the public options schema: otherwise
+--- an arbitrary resource could pretend to restore somebody else's record and bypass global plate uniqueness.
+local function spawn(opts, restoreRecordId)
     if type(opts) ~= 'table' then return nil, 'bad_opts' end
     local ok, err = Validate.checkTable(SPAWN_SCHEMA, opts)
     if not ok then return nil, err end
@@ -170,28 +195,33 @@ function Vehicles.spawn(opts)
     end
 
     local ownerCharId = opts.ownerCharId or (opts.ownerSrc and charIdOf(opts.ownerSrc)) or nil
+    local keyMode = opts.keyMode or 'virtual'
     local keys = {}
     if opts.keys then
         for i = 1, #opts.keys do keys[opts.keys[i]] = true end
     end
-    if ownerCharId then keys[ownerCharId] = true end
+    if ownerCharId and keyMode == 'virtual' then keys[ownerCharId] = true end
 
     -- an explicitly requested plate must be honoured or refused, never silently replaced
     local plate
     if opts.plate ~= nil then
-        plate, err = normalizePlate(opts.plate)
+        plate, err = normalizePlate(opts.plate, restoreRecordId)
         if not plate then
             DeleteEntity(entity)
             return nil, err
         end
     else
-        plate = randomPlate()
+        plate = randomPlate(restoreRecordId)
+        if not plate then
+            DeleteEntity(entity)
+            return nil, 'plate_exhausted'
+        end
     end
     SetVehicleNumberPlateText(entity, plate)
 
     local info = {
         netId = netId, entity = entity, model = model, plate = plate,
-        ownerCharId = ownerCharId, keys = keys, locked = opts.locked == true,
+        ownerCharId = ownerCharId, keys = keys, keyMode = keyMode, locked = opts.locked == true,
         vehId = nil, spawnedBy = owner, createdAt = os.time(),
         vehType = vehType, props = opts.props and Utils.jsonSafe(opts.props) or nil,
     }
@@ -204,6 +234,7 @@ function Vehicles.spawn(opts)
     state:set('locked', info.locked, true)
     state:set('owner', ownerCharId or false, true)
     state:set('keys', keys, true)
+    state:set('keyMode', keyMode, true)
     state:set('plate', plate, true)
 
     if opts.bucket then SetEntityRoutingBucket(entity, opts.bucket) end
@@ -216,6 +247,11 @@ function Vehicles.spawn(opts)
     end
     Core.emitHook('vehicleSpawned', netId, publicInfo(info))
     return netId
+end
+
+function Vehicles.spawn(opts)
+    if type(opts) == 'table' and opts.recordId ~= nil then return nil, 'reserved_option' end
+    return spawn(opts)
 end
 
 --- Deletes a tracked vehicle (and untracks it). Returns true when something was removed.
@@ -283,13 +319,15 @@ function Vehicles.removeKeys(netId, charId)
     return true
 end
 
---- True when `src`'s character owns the vehicle or holds a key for it.
+--- True when `src`'s character has an explicit virtual key. Item-key vehicles intentionally
+--- have no such key: their owning plugin validates the physical inventory stack before calling
+--- Vehicles.setLocked. Virtual-mode ownership remains compatible because spawn inserts its owner.
 function Vehicles.hasKeys(src, netId)
     local info = spawned[netId]
     if not info then return false end
     local charId = charIdOf(src)
     if not charId then return false end
-    return info.ownerCharId == charId or info.keys[charId] == true
+    return info.keys[charId] == true
 end
 
 function Vehicles.setOwner(netId, charId)
@@ -297,9 +335,9 @@ function Vehicles.setOwner(netId, charId)
     if not info then return false end
     if charId ~= nil and not Validate.value('id', charId) then return false end
     local previous = info.ownerCharId
-    if previous and previous ~= charId then info.keys[previous] = nil end -- keys follow ownership for the old owner
+    if previous and previous ~= charId then info.keys[previous] = nil end -- virtual keys follow ownership
     info.ownerCharId = charId
-    if charId then info.keys[charId] = true end
+    if charId and info.keyMode == 'virtual' then info.keys[charId] = true end
     local entity = entityOf(netId)
     if entity ~= 0 then
         local state = Entity(entity).state
@@ -347,7 +385,7 @@ function Vehicles.persist(netId)
     local vehId = Core.DB.create(COLLECTION, {
         ownerCharId = info.ownerCharId or false, model = info.model, plate = info.plate,
         props = info.props or {}, stored = false, position = positionOf(entity),
-        meta = { vehType = info.vehType },
+        meta = { vehType = info.vehType, keyMode = info.keyMode },
     })
     if not vehId then return nil end
     info.vehId = vehId
@@ -374,12 +412,12 @@ function Vehicles.spawnRecord(vehId, coords, heading, ownerSrc)
     for _, tracked in pairs(spawned) do
         if tracked.vehId == vehId then return nil, 'already_spawned' end
     end
-    local netId, err = Vehicles.spawn({
+    local netId, err = spawn({
         model = record.model, coords = coords, heading = heading or 0.0,
-        type = record.meta and record.meta.vehType or nil, plate = record.plate,
-        ownerCharId = record.ownerCharId or nil, ownerSrc = ownerSrc,
+        type = record.meta and record.meta.vehType or nil, keyMode = record.meta and record.meta.keyMode or nil,
+        plate = record.plate, ownerCharId = record.ownerCharId or nil, ownerSrc = ownerSrc,
         props = record.props, persistent = true,
-    })
+    }, vehId)
     if not netId then return nil, err end
     local info = spawned[netId]
     info.vehId = vehId
@@ -489,9 +527,16 @@ end)
 
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= Core.name then return end
-    -- synchronous teardown: no Wait, the resource is already stopping
+    -- Synchronous teardown: no Wait. A persisted vehicle must be retrievable after a core restart,
+    -- not left as `stored = false` after the entity core is about to delete has disappeared.
     for _, info in pairs(spawned) do
-        if info.entity and DoesEntityExist(info.entity) then DeleteEntity(info.entity) end
+        local entity = info.entity
+        if info.vehId then
+            local patch = { stored = true, props = info.props or {} }
+            if entity and DoesEntityExist(entity) then patch.position = positionOf(entity) end
+            Core.DB.update(COLLECTION, info.vehId, patch)
+        end
+        if entity and DoesEntityExist(entity) then DeleteEntity(entity) end
     end
     spawned = {}
     byEntity = {}

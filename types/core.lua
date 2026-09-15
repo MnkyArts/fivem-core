@@ -275,11 +275,12 @@
 ---@field coords vector3 spawn position
 ---@field heading? number default 0.0
 ---@field type? string CreateVehicleServerSetter type (default 'automobile')
----@field plate? string 1..8 chars of [%w ]; generated from Config.Vehicles.PlatePrefix otherwise
+---@field plate? string 1..8 chars of [%w %-]; normalized upper-case and globally unique across stored/live records
 ---@field ownerSrc? integer player the props are applied on
 ---@field ownerCharId? string character that owns the vehicle
 ---@field keys? string[] charIds that may unlock it
 ---@field props? CoreVehicleProps appearance/condition applied through ownerSrc's client
+---@field keyMode? 'virtual'|'item' default 'virtual'; item mode grants no core virtual owner key
 ---@field locked? boolean default false
 ---@field persistent? boolean keep the entity alive without a nearby owner (default false)
 ---@field bucket? integer routing bucket for the entity
@@ -289,7 +290,8 @@
 ---@field model integer|string
 ---@field plate string
 ---@field ownerCharId string|nil
----@field keys table<string, boolean>
+---@field keys table<string, boolean> explicit virtual keys; empty for an item-key vehicle
+---@field keyMode 'virtual'|'item'
 ---@field locked boolean
 ---@field vehId string|nil persistence record id, when the vehicle was persisted
 ---@field spawnedBy string resource that called Core.Vehicles.spawn
@@ -303,7 +305,7 @@
 ---@field props CoreVehicleProps
 ---@field stored boolean true while the vehicle sits in a garage
 ---@field position { x: number, y: number, z: number, heading: number }
----@field meta table plugin scratch space (Core.Vehicles.setData/getData)
+---@field meta table includes core `vehType`/`keyMode`; plugins use the remaining keys through Core.Vehicles.setData/getData
 
 ---JSON-safe vehicle appearance and condition (DESIGN §6.8). Every key is optional.
 ---@class CoreVehicleProps
@@ -336,6 +338,10 @@
 ---@field fuelLevel? number
 ---@field dirtLevel? number
 ---@field burstTyres? table<integer, boolean>
+---@field tyreHealth? table<integer, number> wheel 0..7 → native wheel health
+---@field doors? table<integer, boolean> door 0..7 → open
+---@field windows? table<integer, boolean> window 0..7 → intact (GTA reports false for a lowered or broken window)
+---@field lights? { [1]: boolean, [2]: boolean, [3]: integer } lights on, high beam, indicators (0..3)
 
 ---@class CoreAttachmentDef
 ---@field id string unique per player; re-adding the same id replaces the entry
@@ -485,6 +491,7 @@
 ---@field Chat table Mode, ProximityRange, MaxLength (UTF-8 bytes, 1–256), CooldownMs, Format?, History (1–200), HideDelayMs (0 disables idle fade), VisibleLines (1–30), FadeMeters, ScreamRange, ScreamCommand
 ---@field Security table EntityLockdown, EnforceLoadout, BlockExplosions, WeaponDamage, …
 ---@field Doors { InteractDistance: number }
+---@field Interiors table Enabled + one boolean per IPL group (base, casino, tuner, …; §36)
 ---@field Hud table ShowHealth, ShowArmour, ShowStats, ShowSpeed, ShowStreet
 ---@field UI table NotifyDurationMs, MaxNotifyPerSecond, HudEnabled, ModalTimeoutMs, CancelKey
 ---@field DB { KeyPrefix: string, FlushIntervalMs: integer, Adapter: string }
@@ -1837,7 +1844,7 @@ function Core.Vehicles.giveKeys(netId, charId) end
 ---@param charId string
 ---@return boolean ok
 function Core.Vehicles.removeKeys(netId, charId) end
----(client) `hasKeys(veh)` for the local player. (server) `hasKeys(src, netId)`.
+---(client/server) Explicit virtual-key check. `keyMode = 'item'` vehicles intentionally answer false; their domain plugin validates a physical key then calls `setLocked`.
 ---@param veh integer client: an entity handle; server: the player's src
 ---@param netId? integer server only
 ---@return boolean
@@ -2016,6 +2023,48 @@ function Core.Raycast.getEntityInFront(distance) end
 ---@return vector3|nil coords
 ---@return integer entityNetId 0 when nothing networked was hit
 function Core.Raycast.fromPlayer(src, distance) end
+
+--------------------------------------------------------------------------------
+-- Core.Interiors (client/interiors.lua §36) — (client) only
+--------------------------------------------------------------------------------
+
+---@class Core.Interiors
+Core.Interiors = {}
+
+---(client) Request one IPL; tracked under the caller, unloaded on plugin stop.
+---@param ipl string
+---@return boolean ok
+function Core.Interiors.request(ipl) end
+---(client) Remove one IPL the caller added. Base-set IPLs are refused (except to core).
+---@param ipl string
+---@return boolean ok
+function Core.Interiors.remove(ipl) end
+---(client) Whether an IPL is currently active.
+---@param ipl string
+---@return boolean active
+function Core.Interiors.isActive(ipl) end
+---(client) Activate an interior entity set at coords (resolves + refreshes). Yields up to 5 s.
+---@param coords vector3
+---@param set string
+---@return boolean ok
+function Core.Interiors.activateSet(coords, set) end
+---(client) Deactivate an interior entity set at coords. Yields up to 5 s.
+---@param coords vector3
+---@param set string
+---@return boolean ok
+function Core.Interiors.deactivateSet(coords, set) end
+---(client) Entity-set state; nil when no interior streams at coords.
+---@param coords vector3
+---@param set string
+---@return boolean|nil active
+function Core.Interiors.isSetActive(coords, set) end
+---(client) Refresh the interior at coords. Yields up to 5 s.
+---@param coords vector3
+---@return boolean ok
+function Core.Interiors.refreshAt(coords) end
+---(client) Groups with their effective state (a copy).
+---@return table list of { id, label, count, enabled, gated }
+function Core.Interiors.listGroups() end
 
 --------------------------------------------------------------------------------
 -- Core.Spawn (client/spawn.lua §6.1) — (client) only

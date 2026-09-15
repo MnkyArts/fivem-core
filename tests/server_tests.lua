@@ -790,6 +790,8 @@ local function suiteVehicles()
         'a plate already in use is refused')
     eq(errOf(V.spawn({ model = 'adder', coords = vector3(0, 0, 0), plate = 'BAD!' })), 'bad_plate',
         'a plate with punctuation is refused')
+    eq(errOf(V.spawn({ model = 'adder', coords = vector3(0, 0, 0), recordId = 'cross_resource' })), 'reserved_option',
+        'a public spawn cannot impersonate a record to bypass plate uniqueness')
     eq(errOf(V.spawn({ model = 'adder', coords = vector3(0, 0, 0), plate = 'TOOLONGPLATE' })),
         'field "plate": expected string (len <= 8), got "TOOLONGPLATE"', 'an over-long plate is refused')
     stubs.spawnFails = true
@@ -801,9 +803,32 @@ local function suiteVehicles()
     local netId2 = V.spawn({ model = 'adder', coords = vector3(0.0, 0.0, 0.0) })
     local plate2 = V.getInfo(netId2).plate
     check(plate2 ~= 'LSTEST1', 'a generated plate never collides')
-    eq(plate2:sub(1, 2), Core.Config.Vehicles.PlatePrefix, 'the generated plate carries the configured prefix')
+    eq(plate2:sub(1, #Core.Config.Vehicles.PlatePrefix), Core.Config.Vehicles.PlatePrefix,
+        'the generated plate carries the configured prefix')
     check(#plate2 <= 8, 'the generated plate fits the 8 character limit')
     eq(stubs.entityState(env, V.getEntity(netId2)).owner, false, 'an unowned vehicle replicates owner = false')
+    local hyphenated = V.spawn({ model = 'adder', coords = vector3(10.0, 0.0, 0.0), plate = 'ls-48291' })
+    eq(V.getInfo(hyphenated).plate, 'LS-48291', 'hyphenated plates are normalized for registration')
+    eq(V.delete(hyphenated), true, 'hyphenated test vehicle is removed')
+
+    -- item-key mode leaves core's virtual map empty, then survives persist/store/spawnRecord.
+    local itemNetId = V.spawn({ model = 'adder', coords = vector3(20.0, 20.0, 20.0), ownerSrc = 1, keyMode = 'item' })
+    check(math.type(itemNetId) == 'integer', 'item-key mode spawns')
+    local itemEntity = V.getEntity(itemNetId)
+    local itemState = stubs.entityState(env, itemEntity)
+    eq(itemState.keyMode, 'item', 'item-key mode is replicated')
+    eq(itemState.keys[charId], nil, 'item-key mode does not create a virtual owner key')
+    eq(V.hasKeys(1, itemNetId), false, 'item-key owner is not accepted by the core virtual lock route')
+    local itemVehId = V.persist(itemNetId)
+    eq(V.getRecord(itemVehId).meta.keyMode, 'item', 'item-key mode is persisted')
+    eq(V.store(itemNetId), true, 'an item-key vehicle stores')
+    local itemRespawned = V.spawnRecord(itemVehId, vector3(21.0, 21.0, 21.0), 0.0, 1)
+    check(math.type(itemRespawned) == 'integer', 'an item-key vehicle respawns')
+    eq(V.getInfo(itemRespawned).keyMode, 'item', 'item-key mode is restored')
+    eq(V.hasKeys(1, itemRespawned), false, 'restored item-key vehicle still has no virtual key')
+    eq(V.delete(itemRespawned), true, 'item-key test entity is removed')
+    eq(V.deleteRecord(itemVehId), true, 'item-key test record is removed')
+    deletedHook = {} -- isolate the existing record lifecycle assertion below
 
     -- keys
     eq(V.hasKeys(1, netId), true, 'the owner holds the keys')
@@ -894,6 +919,8 @@ local function suiteVehicles()
     eq(V.getRecord(vehId).stored, true, 'the record is marked stored')
     eq(V.getRecord(vehId).position.x, 100.0, 'the last position was written')
     eq(#deletedHook, 1, 'store emitted vehicleDeleted')
+    eq(errOf(V.spawn({ model = 'adder', coords = vector3(9.0, 9.0, 9.0), plate = 'LSTEST1' })), 'plate_taken',
+        'a stored record reserves its plate globally')
 
     local respawned = V.spawnRecord(vehId, vector3(5.0, 5.0, 5.0), 10.0, 1)
     check(math.type(respawned) == 'integer', 'spawnRecord brings the vehicle back')
@@ -908,6 +935,18 @@ local function suiteVehicles()
     eq(V.saveProps(respawned, { modEngine = 3, colour = 'red', extras = { 1, 2 }, on = true }), true,
         'saveProps accepts a well-formed props table')
     eq(V.getRecord(vehId).props.modEngine, 3, 'the props reached the record')
+    local nativeMaps = {
+        modEngine = 3, mods = { [0] = 3, ['1'] = 2 }, extras = { [0] = true, ['1'] = false },
+        modToggles = { [17] = true }, burstTyres = { [0] = true }, tyreHealth = { [0] = 850.0 },
+        doors = { [0] = true }, windows = { ['0'] = false }, lights = { true, false, 1 }, neonColor = { 10, 20, 30 },
+    }
+    eq(V.saveProps(respawned, nativeMaps), true, 'saveProps accepts zero-based and JSON-round-tripped native maps')
+    eq(V.getRecord(vehId).props.mods[0], 3, 'the zero-based mod survived')
+    eq(V.getRecord(vehId).props.extras['0'] or V.getRecord(vehId).props.extras[0], true,
+        'the zero-based extra survived')
+    eq(V.getRecord(vehId).props.tyreHealth[0], 850.0, 'wheel health survives the props validator')
+    check(V.getRecord(vehId).props.windows['0'] == false or V.getRecord(vehId).props.windows[0] == false,
+        'window condition survives JSON-safe props')
     eq(V.saveProps(respawned, { [1] = 'no numeric keys' }), false, 'a numeric prop key is refused')
     eq(V.saveProps(respawned, { bad = { 'not a number' } }), false, 'a non-numeric array value is refused')
     eq(V.saveProps(respawned, { bad = print }), false, 'a function value is refused')
@@ -923,6 +962,15 @@ local function suiteVehicles()
     eq(V.deleteRecord(vehId), true, 'deleteRecord removes the document')
     eq(V.getRecord(vehId), nil, 'the record is gone')
     eq(V.deleteRecord('nope'), false, 'deleteRecord of an unknown id is false')
+
+    -- Core restart: tracked persisted vehicles are marked stored before synchronous deletion,
+    -- so their records can be retrieved after the new core VM starts.
+    local restartNetId = V.spawn({ model = 'adder', coords = vector3(77.0, 88.0, 20.0), ownerSrc = 1 })
+    local restartVehId = V.persist(restartNetId)
+    stubs.triggerOn(env, 'onResourceStop', 0, Core.name)
+    eq(V.getRecord(restartVehId).stored, true, 'core stop marks a persisted vehicle stored')
+    eq(V.getRecord(restartVehId).position.x, 77.0, 'core stop saves final vehicle position')
+    eq(V.exists(restartNetId), false, 'core stop deletes the live entity after storing it')
     eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
 end
 

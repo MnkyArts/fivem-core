@@ -43,7 +43,7 @@ and stops a client forging `cash`, `faction` or a vehicle's `locked`.
 
 **Operating it**: FXServer caches manifests — after adding or removing script files run `refresh` before
 `ensure core`, otherwise the restart silently runs the old file list. `ensure core` also restarts every
-resource that declares `dependency 'core'`. Status (2026-09-12): fxlint clean, 379 lib + 554 server offline
+resource that declares `dependency 'core'`. Status (2026-09-15): fxlint clean, 385 lib + 718 server + 999 interiors offline
 checks green, UI regression 49/49, Storybook 37 play functions green, both resources start clean on the dev
 server; **the in-game checklist below has not been run yet**.
 
@@ -63,6 +63,8 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 | `Config.World.TimeScale` | `30` | game seconds per real second — `30` is a 48-minute day, `1` is real time, `0` freezes the clock |
 | `Config.Locale` | `'en'` | `'de'` ships too; adds `<resource>/locales/<lang>.json` lookups for `Core.Locale.t` (§26) |
 | `Config.DB.Adapter` | `'kvp'` | `'postgres'` is the production backend (setup under "Where data lives"); `'mysql'` switches to the oxmysql adapter — **untested**, see "DB tools" below |
+| `Config.Interiors.Enabled` | `true` | master switch for the §36 IPL loader (`false` loads nothing — only for debugging map issues) |
+| `Config.Interiors.<group>` | per-group | `base heists bikers casino tuner …` default on; `north_yankton ufo red_carpet` default off; newer DLC groups self-gate on the game build / DLC (`/interiors` prints the effective state) |
 
 Discord logging is a convar, never a config value, so the URL never lands in git:
 
@@ -297,7 +299,7 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 | | `invite` `acceptInvite` `declineInvite` `leave` `kick(src, charId)` `setRank` `setRankDef` `addRank` `removeRank` `setOwner` `update` |
 | | `deposit(src, amount)` `withdraw` `getBank(id)` `setMeta(id, k, v)` `getMeta(id, k)` |
 | `Core.Vehicles` §4.6 | `spawn(opts)` `delete(netId)` `exists` `getEntity` `getInfo` `setLocked` `isLocked` `list()` |
-| | `giveKeys(netId, charId)` `removeKeys` `hasKeys(src, netId)` `setOwner` `getOwner` `getPlayerVehicles(src)` |
+| | `giveKeys(netId, charId)` `removeKeys` `hasKeys(src, netId)` `setOwner` `getOwner` `getPlayerVehicles(src)` — `keyMode = 'virtual'` is default; `'item'` leaves virtual keys empty for a domain plugin's physical-key check |
 | | `persist(netId)` `getRecords(charId)` `getRecord(vehId)` `spawnRecord` `store(netId)` `saveProps` `deleteRecord` |
 | `Core.Notify` §4.7 | `send(src, message, type?, duration?)` `broadcast(message, type?)` — types `info` `success` `error` `warning` |
 
@@ -317,6 +319,7 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 | `Core.Vehicles` §6.8 | `getClosest(coords?, radius?)` `getCurrent()` `isDriver()` `getSeat()` `getNetId(veh)` `fromNetId(netId, timeout?)` |
 | | `getProps(veh)` `setProps` `getPlate` `getDisplayName` `hasKeys(veh)` `isLocked` `toggleLock(veh?)` `setEngine` `repair` `saveProps` |
 | `Core.Raycast` §6.9 | `fromCamera(distance?, flags?, ignoreEntity?)` `between(from, to, …)` `getEntityInFront(distance?)` |
+| `Core.Interiors` §36 | `request(ipl)` `remove(ipl)` `isActive(ipl)` — owner-tracked IPLs; `activateSet(coords, set)` `deactivateSet` `isSetActive` `refreshAt(coords)` — interior entity sets; `listGroups()` |
 | `Core.UI` §6.10 | `registerPage` `unregisterPage` `open(id, props?)` `close(id?)` `closeAll()` `isOpen(id)` `getOpenPage()` `isFocused()` `send(id, event, data)` |
 | | `notify` · `textUI.show/hide/isShown` · `progress` + `progress.cancel` · `menu.open/close` · `input.open` · `alert` · `hud.set/setVisible` |
 | | §31 `hide(reason?)` `show(reason?)` `isHidden()` `hiddenReasons()` `setAutoHide(name, bool)` — auto-hide over the pause menu, fades and cutscenes; hook `uiVisibility (visible, reasons)` |
@@ -552,7 +555,7 @@ State bags are server-written, client-read. Read them with `Core.Player.get(key)
 | bag | keys |
 |---|---|
 | `player:<src>` | `loaded` `name` `charId` `group` `cash` `bank` `faction` (summary or `false`) `dead` |
-| `entity:<netId>` (core vehicles) | `coreVeh` `locked` `owner` `keys` `plate` `vehId` |
+| `entity:<netId>` (core vehicles) | `coreVeh` `locked` `owner` `keys` `keyMode` `plate` `vehId` |
 | `GlobalState` | `core:ready`, `faction:<id>` = `{ name, tag, color, memberCount }` or `false` |
 
 ## Commands
@@ -713,6 +716,10 @@ also shows health, armour, speed, street/zone and a bar per `hud = true` stat.
 
 Core registers `notification`, `currency`, `death`, `time` and `weather` itself; `items` stays empty until
 an inventory plugin fills it — write against `Core.Services.get('items')` and any inventory works.
+
+### Vehicle records and key modes
+
+`Core.Vehicles` owns the live entity and its generic record, including the complete property payload (custom colors, extras, liveries, wheel/mod/toggle maps, dirt, tyre health/bursts, doors, window intactness and lights). On a core restart it marks every persisted live record stored and captures its final server position before deleting the old entities, so records are retrievable rather than stranded out of garage. Property maps use GTA's zero-based native ids and safely survive JSON round trips. Plates are trimmed/uppercased and unique across both stored records and live entities; the default `LS-` prefix produces values such as `LS-48291`. GTA cannot distinguish a lowered window from a broken one through `IsVehicleWindowIntact`, so both persist as non-intact. `spawn` defaults to `keyMode = 'virtual'`, which inserts the owner into the replicated `keys` map and keeps existing `U` lock behaviour. A domain plugin that issues a physical inventory key must spawn with `keyMode = 'item'`: core still records the owner, but grants no virtual key, so that plugin validates the actual item before it calls `Core.Vehicles.setLocked`.
 `Core.Api` hands a live table across resources, so **every call costs two msgpack hops**: fine for wiring,
 never for per-frame work. A table leaves `Api.get` the moment its owning resource stops.
 
@@ -862,6 +869,10 @@ UI visibility (§31). Step 22 is where the two keyboards meet: while the NUI hol
 Idle cameras (§35).
 
 24. **No AFK pan:** stand still for 45 s on foot, then as a passenger, then let a car roll without input — the camera never starts its cinematic pan and an open page (`/exmenu`, the inventory) stays open; set `Config.Camera.DisableIdleCam = false`, `restart core` → the pans are back.
+
+Interiors (§36).
+
+25. **The map is whole:** fly to the heist carrier (`3082, -4717`), the casino (`926, 45`), a tuner shop (`-1350, 160`) and the Cayo gate area — exteriors and shells are streamed, no holes. `/interiors` lists every group as `on` except `north_yankton ufo red_carpet` (`off`) and any group your game build gates out (`gated`). Set `Config.Interiors.casino = false`, `restart core` → the casino doors row is gone from the list; set it back → it loads again.
 
 Game blur (§32).
 

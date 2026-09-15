@@ -591,18 +591,18 @@ character; on create/update/disband → `GlobalState['faction:' .. id] = { name,
 Vehicles.spawn(opts) -> netId | nil, err
 -- opts = { model = 'adder' | hash, coords = vector3, heading = 0.0, type = 'automobile' (CreateVehicleServerSetter type),
 --          plate = 'ABC123'?, ownerSrc = src?, ownerCharId = id?, keys = { charId, ... }?, props = table?,
---          locked = false, persistent = false, bucket = nil }
+--          keyMode = 'virtual'|'item' (default virtual), locked = false, persistent = false, bucket = nil }
 Vehicles.delete(netId) -> bool
 Vehicles.exists(netId) -> bool, Vehicles.getEntity(netId) -> entity|0
 Vehicles.getInfo(netId) -> { netId, model, plate, ownerCharId, keys, locked, vehId, spawnedBy, createdAt } | nil
 Vehicles.setLocked(netId, locked) -> bool          -- state 'locked' + SetVehicleDoorsLocked(veh, locked and 2 or 1) (RPC, best effort)
 Vehicles.isLocked(netId) -> bool
 Vehicles.giveKeys(netId, charId) / Vehicles.removeKeys(netId, charId) -> bool
-Vehicles.hasKeys(src, netId) -> bool               -- owner or keys[charId]
+Vehicles.hasKeys(src, netId) -> bool               -- explicit virtual key in keys[charId]
 Vehicles.setOwner(netId, charId|nil), Vehicles.getOwner(netId) -> charId|nil
 Vehicles.getPlayerVehicles(src) -> array of netId  -- spawned vehicles owned by the player's charId
 Vehicles.list() -> array of netId
--- persistence (collection 'vehicles': { id, ownerCharId, model, plate, props = {}, stored = false, position = {x,y,z,heading}, meta = {} })
+-- persistence (collection 'vehicles': { id, ownerCharId, model, plate, props = {}, stored = false, position = {x,y,z,heading}, meta = { vehType, keyMode } })
 Vehicles.persist(netId) -> vehId | nil             -- creates the record for a spawned vehicle, writes state vehId
 Vehicles.getRecords(charId) -> array of records
 Vehicles.getRecord(vehId) -> record | nil
@@ -614,13 +614,19 @@ Vehicles.deleteRecord(vehId) -> bool
 
 `spawn`: hash the model, `CreateVehicleServerSetter(hash, type, x, y, z, heading)`, `0` → `nil, 'create_failed'`;
 wait for `DoesEntityExist` up to `Config.Vehicles.SpawnTimeoutMs` (`Wait(50)` polling); plate =
-`opts.plate` (validated `^[%w ]{1,8}$`) or `Config.Vehicles.PlatePrefix .. random 5 alnum` (unique among
-spawned); `SetVehicleNumberPlateText`; state: `coreVeh = true`, `locked`, `owner`, `keys`, `plate`,
-`vehId`; `SetEntityRoutingBucket` if `bucket`; `SetEntityOrphanMode(veh, 2)` when `persistent` or an owner is
+`opts.plate` (trimmed/uppercased and validated `^[%w %-]{1,8}$`) or `Config.Vehicles.PlatePrefix .. random 5 alnum`.
+Every plate is unique across **all stored records and live entities**, not merely this process; `spawnRecord` passes
+its own record id so it alone may restore that plate. The default prefix `LS-` produces registration-shaped values
+such as `LS-48291`. `SetVehicleNumberPlateText`; state: `coreVeh = true`, `locked`, `owner`, `keys`, `keyMode`, `plate`,
+`vehId`; `keyMode = 'virtual'` (the compatibility default) inserts the owner into `keys`, while
+`'item'` intentionally does not so a domain plugin can make a physical inventory key authoritative; `SetEntityRoutingBucket` if `bucket`; `SetEntityOrphanMode(veh, 2)` when `persistent` or an owner is
 set (otherwise leave default); track `spawned[netId]`; props → `TriggerClientEvent('core:client:applyVehicleProps',
-ownerSrc, netId, props)` if `ownerSrc`; hook `vehicleSpawned (netId, info)`. `delete`: `DeleteEntity` + untrack +
-hook `vehicleDeleted (netId)`. `onResourceStop`: delete every spawned vehicle (synchronous loop).
-`entityRemoved` (AddEventHandler): untrack if it was ours.
+ownerSrc, netId, props)` if `ownerSrc`; `persist` saves `vehType` and `keyMode` in `meta`, and
+`spawnRecord` restores both; hook `vehicleSpawned (netId, info)`. `delete`: `DeleteEntity` + untrack +
+hook `vehicleDeleted (netId)`. On core's own `onResourceStop`, every persisted live record is first
+updated with `stored = true`, its cached props and final server position, then its entity is deleted
+synchronously; it is therefore retrievable after core restarts. `entityRemoved` (AddEventHandler):
+untrack if it was ours.
 
 ### 4.7 `Core.Notify` server (`server/notify.lua`)
 
@@ -804,7 +810,7 @@ Vehicles.getCurrent() -> veh|0, Vehicles.isDriver() -> bool, Vehicles.getSeat() 
 Vehicles.getNetId(veh) -> netId, Vehicles.fromNetId(netId, timeoutMs = 5000) -> veh|0   -- waits for NetworkDoesEntityExistWithNetworkId
 Vehicles.getProps(veh) -> props, Vehicles.setProps(veh, props) -> bool   -- requests control first (NetworkRequestControlOfEntity, ≤ 1 s)
 Vehicles.getPlate(veh) -> string (trimmed), Vehicles.getDisplayName(vehOrModel) -> string
-Vehicles.hasKeys(veh) -> bool           -- Entity(veh).state: owner == my charId or keys[charId]; false if not a coreVeh
+Vehicles.hasKeys(veh) -> bool           -- Entity(veh).state: explicit keys[charId] (not item-key vehicles); false if not a coreVeh
 Vehicles.isLocked(veh) -> bool          -- state 'locked'
 Vehicles.toggleLock(veh?) -> nil        -- veh or current/closest (≤ 8 m) with keys → Net.emit('core:server:vehicleLock', netId)
 Vehicles.setEngine(veh, on), Vehicles.repair(veh), Vehicles.saveProps(veh)   -- saveProps → Net.emit('core:server:vehicleProps', netId, getProps(veh))
@@ -814,8 +820,12 @@ Vehicles.setEngine(veh, on), Vehicles.repair(veh), Vehicles.saveProps(veh)   -- 
 {r,g,b}|false, customSecondary, pearlescentColor, wheelColor, interiorColor, dashboardColor, wheels, windowTint,
 livery, livery2, xenonColor, neonEnabled = {b,b,b,b}, neonColor = {r,g,b}, tyreSmokeColor, extras = { [id] = bool },
 mods = { [modType 0..49] = index }, modToggles = { [17,18,19,20,22] = bool }, modVariations?, engineHealth,
-bodyHealth, tankHealth, fuelLevel, dirtLevel, burstTyres = { [wheel] = true }`. `setProps` calls `SetVehicleModKit(veh,
-0)` first and applies only keys present.
+bodyHealth, tankHealth, fuelLevel, dirtLevel, burstTyres = { [wheel] = true }, tyreHealth = { [wheel] = health },
+doors = { [door] = open }, windows = { [window] = intact }, lights = { on, highBeam, indicators 0..3 }`.
+Nested maps accept bounded integer ids including zero or their JSON string form; values are finite numbers or
+booleans. GTA's `IsVehicleWindowIntact` reports false for a lowered window as well as a broken one, so that one
+visual distinction cannot be reconstructed after persistence. `setProps` calls `SetVehicleModKit(veh, 0)` first and
+applies only keys present.
 
 Built-in behaviour: `AddStateBagChangeHandler('locked', nil, ...)` → only for entities with state `coreVeh` →
 `SetVehicleDoorsLocked(veh, value and 2 or 1)` (+ on stream-in via `Core.Vehicles` checking `Entity(veh).state.locked`
@@ -1122,7 +1132,7 @@ Config = {
             { name = 'Leader',  perms = { invite = true, kick = true, manage_ranks = true, bank = true, manage = true } },
         },
     },
-    Vehicles = { SpawnTimeoutMs = 5000, LockKey = 'U', LockDistance = 20.0, PlatePrefix = 'LS', MaxPropsBytes = 16384 },
+    Vehicles = { SpawnTimeoutMs = 5000, LockKey = 'U', LockDistance = 20.0, PlatePrefix = 'LS-', MaxPropsBytes = 16384 },
     Interactions = { Key = 'E', ScanIntervalMs = 300, FarScanIntervalMs = 1000, NearRange = 60.0, MaxModels = 8 },
     World = { ScanIntervalMs = 500, GridSize = 100.0 },
     UI = { NotifyDurationMs = 5000, MaxNotifyPerSecond = 10, HudEnabled = true, ModalTimeoutMs = 300000, CancelKey = 'X' },
@@ -2113,3 +2123,59 @@ work, §9). `onClientResourceStop` switches the two CFX toggles back on. The `Ci
 for scripted cutscenes. Config: `Camera = { DisableIdleCam = true }` (§28). Perf table (§9): `idle cam reset ·
 client · 5000 ms · two natives`. README: config row + checklist step ("stand still 45 s → no camera pan, an
 open page stays").
+
+## 36. Interiors and IPLs (`Core.Interiors`) — 2026-09-15, Liam: "core is missing lots of IPLs"
+
+Without requested IPLs the map has holes (missing collision, sand/water gaps, absent exteriors) and whole
+DLC locations never stream (carrier, yacht, bunkers, casino shell, tuner shops, ...). The researched,
+up-to-date IPL set is Bob74's `bob74_ipl` (MIT licensed, © 2024 Bob74 — attribution in
+`client/interiors_data.lua`; IPL name strings themselves are Rockstar map data, cross-checked against
+DurtyFree's `gta-v-data-dumps/ipls.json`). Core ports its IPL layer (the "map exists" part) in core's own
+shape; per-interior styling (office decor, clubhouse walls, bunker tiers, casino themes — entity sets chosen
+per faction) stays plugin territory and goes through the API below. Never copy `bob74_ipl`'s code: the data
+table and loader here are written for core's conventions (AGENTS §6 "Rebar" rule applies to any foreign code).
+
+Files: `client/interiors_data.lua` (pure data, no natives — offline-testable), `client/interiors.lua`
+(loader + API). Client only: IPLs are per-client streaming state, there is no server truth to own.
+
+```lua
+-- data: one row per group (bob74's client.lua sections, same defaults)
+{ id = 'base', label = '...', default = true, minBuild = 2060?, dlc = 'mp2025_01'?,
+  remove = { 'dt1_05_hc_end', ... }, ipls = { 'FINBANK', ... } }
+-- config: Config.Interiors = { Enabled = true, base = true, ..., north_yankton = false, ufo = false, red_carpet = false }
+-- API (client, through the proxy):
+Interiors.request(ipl) -> bool                  -- RequestIpl; tracked under the caller for cleanup
+Interiors.remove(ipl) -> bool                   -- RemoveIpl; untracks the caller's entry
+Interiors.isActive(ipl) -> bool                 -- IsIplActive
+Interiors.activateSet(coords, set) -> bool      -- resolve interior at coords, ActivateInteriorEntitySet + RefreshInterior; yields (≤ 5 s)
+Interiors.deactivateSet(coords, set) -> bool    -- DeactivateInteriorEntitySet + RefreshInterior; yields
+Interiors.isSetActive(coords, set) -> bool|nil  -- IsInteriorEntitySetActive; nil when no interior at coords
+Interiors.refreshAt(coords) -> bool             -- RefreshInterior at coords; false when no interior there
+Interiors.listGroups() -> array                 -- { { id, label, enabled, gated } } (a copy)
+```
+
+Boot: one thread at client start (after `ready`, before the load request — interiors must stream before the
+player spawns). For each group with `Config.Interiors[id]` not `false` (missing key = the row's `default`),
+master switch `Config.Interiors.Enabled` on, and the gate satisfied (`minBuild` vs `GetGameBuildNumber()`,
+`dlc` vs `IsDlcPresent`), it runs that group's `remove` list through `RemoveIpl` then the `ipls` list through
+`RequestIpl`, and logs one debug line per group (`loaded <id>: <n> ipls`). No thread or loop survives boot
+(§9): after the requests the module is idle until a plugin calls it.
+
+Validation: IPL/set names must match `^[%w_]+$` and be ≤ 96 chars (the longest researched IPL is 65;
+anything else returns `false`/`nil`, never errors); `coords` must be `vector3`. Interior resolution polls `GetInteriorAtCoords` + `IsValidInterior` /
+`IsInteriorReady` every 100 ms up to 5000 ms, then gives up with `false` — the only yields in the module, and
+only inside explicit API calls (proxy-safe, never per frame).
+
+Ownership (§2.3): `request()` tracks kind `'ipl'` (`ipl name → owner`); `activateSet()` tracks kind
+`'iplset'` (`coords .. ':' .. set → owner`). The sweep remover drops what the stopping resource added: IPLs
+back through `RemoveIpl` (except names the base set owns — core's own boot entries are never removed
+underneath a running client), entity sets through `DeactivateInteriorEntitySet` + `RefreshInterior`. A plugin
+that styles a faction interior therefore needs no `onResourceStop` cleanup (K005).
+
+Perf table (§9): `interiors boot · client · once · ~370 RequestIpl + 2 RemoveIpl` and nothing afterwards.
+Natives (client, fxref 2026-09-15): RequestIpl, RemoveIpl, IsIplActive (STREAMING), GetInteriorAtCoords,
+IsValidInterior, IsInteriorReady, ActivateInteriorEntitySet, DeactivateInteriorEntitySet,
+IsInteriorEntitySetActive, RefreshInterior (INTERIOR), GetGameBuildNumber (CFX shared), IsDlcPresent (DLC).
+README: cheat-sheet row + config rows + checklist step ("carrier off the coast, casino doors closed,
+tuner shop exteriors present; `/interiors` prints counts"). Diagnostics: client command `/interiors`
+lists groups with loaded counts (console + chat).
