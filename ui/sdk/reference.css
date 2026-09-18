@@ -17,7 +17,12 @@
 
    Prefer utilities on the tag (`class="bg-panel rounded-ui"`) — they land in the utilities layer and
    beat the kit's component classes. `@apply` is for what a class attribute cannot express
-   (pseudo-elements, keyframed state, a selector a parent controls). */
+   (pseudo-elements, keyframed state, a selector a parent controls).
+
+   Resolution: `@core/ui` has to be findable from the SFC. Inside the npm workspace it is (the
+   workspace links it); a plugin that lives outside the workspace installs `@core/ui` as a
+   devDependency. The two `tailwindcss/*` imports below resolve from THIS file's folder, i.e. from
+   core's own install — a plugin never needs Tailwind next to itself for them. */
 
 @import "tailwindcss/theme.css" theme(reference);
 @import "./theme.css" theme(reference);

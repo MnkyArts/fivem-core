@@ -7,7 +7,7 @@
 
 import { after, before, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPlugin, cleanupAll, makePlugin } from './helpers.mjs'
+import { buildPlugin, cleanupAll, hasPackage, makePlugin } from './helpers.mjs'
 
 describe('coreUI() build output', () => {
   let out
@@ -108,7 +108,9 @@ describe('coreUI() build output', () => {
     for (const f of out.manifest.preload) assert.ok(statics.includes(f), `${f} is preloaded but not statically imported by the entry`)
   })
 
-  it('lists a statically imported vendor chunk for preload', async () => {
+  // `@lucide/vue` reaches this repo through the inventory plugin's own dependencies, so it exists in
+  // the npm workspace and NOT in a lone checkout of core (CI installs `ui/package.json` only).
+  it('lists a statically imported vendor chunk for preload', { skip: hasPackage('@lucide/vue') ? false : '@lucide/vue is not installed in this layout' }, async () => {
     const withVendor = makePlugin({
       resource: 'delta',
       files: {

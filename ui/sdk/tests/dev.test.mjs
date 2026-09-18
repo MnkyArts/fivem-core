@@ -89,11 +89,13 @@ describe('dev modes', () => {
     await resolve(p.uiDir, 'build', 'production')
     const css = fs.readFileSync(path.join(p.uiDir, '.core-ui/entry.css'), 'utf8')
     assert.match(css, /@layer properties, theme, base, components, utilities;/)
-    assert.match(css, /@import "tailwindcss\/theme\.css" theme\(reference\);/)
-    assert.match(css, /theme\.css" theme\(reference\)/)
+    // Tailwind's own files are named by ABSOLUTE path, resolved from the SDK: `.core-ui/` is not
+    // next to the install in a plugin outside the workspace (or in CI, or in a temp fixture).
+    assert.match(css, /@import "\/[^"]*tailwindcss\/theme\.css" theme\(reference\);/)
+    assert.match(css, /@import "\/[^"]*sdk\/theme\.css" theme\(reference\);/)
     // `source(none)`: only the explicit @source below may contribute candidates, so a stale file
     // under .core-ui/ or dist/ can never change the sheet (or its content hash).
-    assert.match(css, /@import "tailwindcss\/utilities\.css" layer\(utilities\) source\(none\);/)
+    assert.match(css, /@import "\/[^"]*tailwindcss\/utilities\.css" layer\(utilities\) source\(none\);/)
     assert.match(css, /@source not ".*\.core-ui\/\*\*";/)
     assert.match(css, /@source not ".*\/dist\/\*\*";/)
     assert.ok(!css.includes('preflight'), 'the plugin sheet must never pull preflight')

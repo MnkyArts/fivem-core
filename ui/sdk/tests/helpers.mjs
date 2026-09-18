@@ -1,14 +1,21 @@
 // Shared plumbing for the @core/ui build tests.
 //
 // A fixture is copied into a throw-away `<tmp>/<resource>/ui` so the layout the plugin insists on
-// (`<resource>/ui`) is real, and `<tmp>/node_modules` is symlinked at the workspace's hoisted
-// node_modules so bare imports and `@reference "@core/ui/…"` resolve exactly as in a plugin repo.
+// (`<resource>/ui`) is real, and `<tmp>/node_modules` is filled with symlinks to the packages a
+// plugin needs, so bare imports and `@reference "@core/ui/…"` resolve exactly as in a plugin repo.
 // Nothing is ever written inside the repository.
+//
+// The links are RESOLVED, never guessed: this repo is built in two layouts — inside the npm
+// workspace (`resources/node_modules`, `@core/ui` linked by npm) and checked out ALONE, where CI
+// installs into `<repo>/ui/node_modules` and nothing links `@core/ui` at all. Symlinking a guessed
+// workspace root produced a dangling link in the second layout and every build failed with
+// "Can't resolve 'tailwindcss/theme.css'".
 
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { build as viteBuild, createServer } from 'vite'
 import { coreUI } from '../vite/index.mjs'
@@ -16,7 +23,53 @@ import { coreUI } from '../vite/index.mjs'
 export const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url))
 export const FIXTURES = path.join(TESTS_DIR, 'fixtures')
 export const SDK_DIR = path.dirname(TESTS_DIR)
-export const WORKSPACE = path.resolve(SDK_DIR, '../../..')
+
+const sdkRequire = createRequire(path.join(SDK_DIR, 'noop.js'))
+
+/** Where a package REALLY is, seen from the SDK. `null` when it is not installed at all. */
+export function packageDir(name) {
+  try {
+    return path.dirname(sdkRequire.resolve(name + '/package.json'))
+  } catch { /* its exports map may hide package.json — walk up from the resolved entry */ }
+  try {
+    let dir = path.dirname(sdkRequire.resolve(name))
+    for (let i = 0; i < 8; i++) {
+      if (fs.existsSync(path.join(dir, 'package.json'))) return dir
+      const up = path.dirname(dir)
+      if (up === dir) break
+      dir = up
+    }
+  } catch { /* not installed */ }
+  return null
+}
+
+/** What a fixture plugin imports. `@core/ui` is the SDK itself — no install links it in CI. */
+const LINKED = ['vue', 'vite', '@vitejs/plugin-vue', 'tailwindcss', '@tailwindcss/vite']
+const OPTIONAL = ['@lucide/vue']
+
+/** True when an optional package is installed here (the workspace has it, a lone checkout may not). */
+export function hasPackage(name) {
+  return packageDir(name) !== null
+}
+
+function linkNodeModules(tmp) {
+  const root = path.join(tmp, 'node_modules')
+  fs.mkdirSync(root, { recursive: true })
+  const link = (name, target) => {
+    if (!target) return
+    const dest = path.join(root, name)
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.symlinkSync(target, dest, 'dir')
+  }
+  for (const name of LINKED) {
+    const dir = packageDir(name)
+    if (!dir) throw new Error(`[core-ui tests] cannot resolve ${name} from ${SDK_DIR} — run npm install first`)
+    link(name, dir)
+  }
+  for (const name of OPTIONAL) link(name, packageDir(name))
+  // Transitive dependencies resolve through each link's REAL path, so nothing else is needed.
+  link('@core/ui', SDK_DIR)
+}
 
 const temps = []
 
@@ -24,7 +77,7 @@ const temps = []
 export function makePlugin({ from = 'alpha', resource = from, files = {}, remove = [] } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'core-ui-test-'))
   temps.push(tmp)
-  fs.symlinkSync(path.join(WORKSPACE, 'node_modules'), path.join(tmp, 'node_modules'), 'dir')
+  linkNodeModules(tmp)
   const dir = path.join(tmp, resource)
   fs.cpSync(path.join(FIXTURES, from), dir, { recursive: true })
   for (const rel of remove) fs.rmSync(path.join(dir, rel), { recursive: true, force: true })
