@@ -75,6 +75,11 @@
 /* The `/ 30.0` half of a capacity readout stays quiet — only the current value is bright. */
 .core-progress__max { color: var(--color-fg-dim); }
 
+/* Under `dangerBelow` the whole row is the warning, not just the bar: a 4 px stripe at 7 % is
+   nearly gone, so the caption is what a player actually sees turn red (the shell's stat bars,
+   §37.6). Only the danger tone does this — warning amber on 12 px display type is unreadable. */
+.core-progress.core-tone-danger .core-progress__label { color: var(--tone); }
+
 .core-progress__track {
   position: relative;
   overflow: hidden;
@@ -323,6 +328,8 @@
   animation: core-spin 0.8s linear infinite;
 }
 
+/* The label is the flexible half: `min-width: 0` lets it shrink inside the inline-flex row so a
+   long busy text ellipses instead of pushing the ring out of a capped plate (§37.6). */
 .core-spinner__label {
   font-family: var(--font-display);
   font-weight: 600;
@@ -331,6 +338,9 @@
   text-transform: uppercase;
   letter-spacing: var(--tracking-label);
   color: var(--color-fg-dim);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

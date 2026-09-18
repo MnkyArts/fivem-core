@@ -7,7 +7,7 @@
 // and no cancel key, so every `show` NEEDS a matching `hide` (wrap it in a finally).
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
-import Spinner from '../components/Spinner.vue'
+import Spinner from '../shell/Spinner.vue'
 import { resetExtras } from '../store.js'
 import { send, liveScene, note } from './storeHelpers.js'
 
@@ -70,7 +70,7 @@ export const Default = {
   play: async ({ canvasElement, args }) => {
     const canvas = within(canvasElement)
     await waitFor(() => expect(canvas.getByText(args.text)).toBeInTheDocument())
-    expect(canvasElement.querySelector('.spinner .ring')).not.toBeNull()
+    expect(canvasElement.querySelector('.spinner .core-spinner__ring')).not.toBeNull()
     expect(getComputedStyle(canvasElement.querySelector('.spinner')).pointerEvents).toBe('none')
   },
 }
@@ -86,7 +86,7 @@ export const NoText = {
   },
   play: async ({ canvasElement }) => {
     await waitFor(() => expect(canvasElement.querySelector('.spinner')).not.toBeNull())
-    expect(canvasElement.querySelector('.spinner .text')).toBeNull()
+    expect(canvasElement.querySelector('.spinner .core-spinner__label')).toBeNull()
   },
 }
 

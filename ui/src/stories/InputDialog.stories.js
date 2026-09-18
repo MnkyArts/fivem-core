@@ -6,7 +6,7 @@
 // thread simply stays parked until the player fixes the form or backs out.
 import { h, nextTick } from 'vue'
 import { within, userEvent, expect, waitFor } from 'storybook/test'
-import InputDialog from '../components/InputDialog.vue'
+import InputDialog from '../shell/InputDialog.vue'
 import { send, liveScene, clone } from './storeHelpers.js'
 import { lastPost } from './luaBridge.js'
 

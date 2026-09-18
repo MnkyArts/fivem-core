@@ -5,7 +5,7 @@
 // all resolve `false`, so `if not ok then return end` is always safe.
 import { h } from 'vue'
 import { within, userEvent, expect, waitFor } from 'storybook/test'
-import AlertDialog from '../components/AlertDialog.vue'
+import AlertDialog from '../shell/AlertDialog.vue'
 import { send, liveScene, clone } from './storeHelpers.js'
 import { lastPost } from './luaBridge.js'
 

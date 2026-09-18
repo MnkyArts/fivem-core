@@ -7,7 +7,7 @@
 // `duration`, 4 s when Lua omits it) and no callback ever comes back.
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
-import Shard from '../components/Shard.vue'
+import Shard from '../shell/Shard.vue'
 import { resetExtras } from '../store.js'
 import { send, liveScene, HOLD_MS } from './storeHelpers.js'
 
@@ -158,7 +158,7 @@ export const TitleOnly = {
   play: async ({ canvasElement, args }) => {
     const canvas = within(canvasElement)
     await waitFor(() => expect(canvas.getByText(args.title)).toBeInTheDocument())
-    expect(canvasElement.querySelector('.shard .sub')).toBeNull()
+    expect(canvasElement.querySelector('.shard .core-shard__subtitle')).toBeNull()
   },
 }
 

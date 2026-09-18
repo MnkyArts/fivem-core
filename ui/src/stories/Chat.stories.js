@@ -1,7 +1,7 @@
 // Chat stories exercise the same messages and keyboard path as the CEF shell (§30.3).
 import { h } from 'vue'
 import { expect, waitFor } from 'storybook/test'
-import Chat from '../components/Chat.vue'
+import Chat from '../shell/Chat.vue'
 import { resetExtras } from '../store.js'
 import { send, liveScene, clone } from './storeHelpers.js'
 

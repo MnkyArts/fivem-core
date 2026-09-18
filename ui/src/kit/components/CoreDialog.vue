@@ -8,6 +8,8 @@
 //     own: a popover opened inside the dialog must eat the first Escape (§37.4);
 //   * `persistent` and `closable: false` still REGISTER the layer — swallowing Escape is the
 //     point, otherwise the store would close the page behind the modal.
+// `escape: false` / `trap: false` / `role` exist for the shell's built-ins (§37.6), where store.js
+// owns Escape and the widget owns focus and Tab; all three default to today's behaviour.
 import { computed, onMounted, ref, useAttrs, useSlots } from 'vue'
 import { TONES, oneOf, toneClass, blurAttr, overlayTarget, useEscapeLayer, useFocusTrap, useId } from '../use.js'
 
@@ -36,6 +38,12 @@ const props = defineProps({
   blur: { type: [Boolean, Number, String], default: true },
   /** false: render where it is written instead of in `#core-overlays`. */
   teleport: { type: Boolean, default: true },
+  /** false: register no Escape layer at all — someone else (store.js, §7.3) owns the key. */
+  escape: { type: Boolean, default: true },
+  /** false: no focus trap — the caller focuses and cycles Tab itself (the shell's modals). */
+  trap: { type: Boolean, default: true },
+  /** `dialog` | `alertdialog` — the ARIA role of the panel. */
+  role: { type: String, default: 'dialog', validator: oneOf(['dialog', 'alertdialog']) },
 })
 
 const emit = defineEmits(['update:open', 'close'])
@@ -79,8 +87,9 @@ function onBackdropDown (event) {
   requestClose('backdrop')
 }
 
-useEscapeLayer(isOpen, () => requestClose('escape'))
-useFocusTrap(panelRef, isOpen)
+// Both layers are opt-out (never conditional calls: the flags stay reactive this way).
+useEscapeLayer(computed(() => props.escape && isOpen.value), () => requestClose('escape'))
+useFocusTrap(panelRef, computed(() => props.trap && isOpen.value))
 </script>
 
 <template>
@@ -97,7 +106,7 @@ useFocusTrap(panelRef, isOpen)
             v-bind="panelBind"
             class="core-dialog"
             :class="[toneClass(tone), 'core-dialog--' + size]"
-            role="dialog"
+            :role="role"
             aria-modal="true"
             :aria-labelledby="title ? titleId : undefined"
           >

@@ -570,3 +570,90 @@
   padding: 12px;
   color: var(--color-fg-dim);
 }
+
+/* ---- CoreShard — the centre-screen banner ----------------------------------------------------
+   The base game's "WASTED" card: a full-bleed dark band that fades out towards both screen edges,
+   a tinted hairline along its top and bottom, the title in the display voice and an eyebrow-voice
+   line under it. The tint is the tone (`core-tone-danger | success | accent`), so a re-themed
+   server re-colours it with everything else.
+   The hairlines fade with the band (a gradient, not a border) so neither end draws a hard line
+   across the HUD, and they are inset 8 % so they stop before the band's own fade does.
+   No position of its own: the caller places the band (the shell hangs it at 24vh, z 45), which is
+   also what lets a gallery stack three of them. Output only, so it never takes the mouse (§37.4).
+   `vw`-based type: the shard is the one element that scales with the screen instead of the layout,
+   exactly like the game's own. */
+
+.core-shard {
+  position: relative;
+  width: 100%;
+  text-align: center;
+  pointer-events: none;
+}
+
+.core-shard__band {
+  position: relative;
+  padding: 22px 6vw 24px;
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0) 0%,
+    rgba(0, 0, 0, 0.74) 20%,
+    rgba(0, 0, 0, 0.74) 80%,
+    rgba(0, 0, 0, 0) 100%
+  );
+}
+
+.core-shard__band::before,
+.core-shard__band::after {
+  content: '';
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  height: 1px;
+  opacity: 0.55;
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0) 0%,
+    var(--tone) 18%,
+    var(--tone) 82%,
+    rgba(0, 0, 0, 0) 100%
+  );
+}
+
+.core-shard__band::before { top: 0; }
+.core-shard__band::after { bottom: 0; }
+
+.core-shard__title {
+  margin: 0 auto;
+  max-width: 86vw;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(38px, 7vw, 74px);
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--tone);
+  text-shadow: 0 2px 20px rgba(0, 0, 0, 0.7);
+  overflow-wrap: anywhere;
+}
+
+.core-shard__subtitle {
+  margin: 14px auto 0;
+  max-width: 72vw;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: clamp(12px, 1.25vw, 16px);
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  color: var(--color-fg-dim);
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.8);
+  overflow-wrap: anywhere;
+}
+
+/* `<Transition name="core-shard" mode="out-in">`: the card lands from slightly too big and leaves
+   by shrinking a hair — the same motion the base game uses, and the reason the shell needs no
+   style block of its own (§37.6). */
+.core-shard-enter-active { transition: opacity 0.16s ease, transform 0.3s var(--ease-ui); }
+.core-shard-leave-active { transition: opacity 0.22s ease, transform 0.22s ease; }
+.core-shard-enter-from { opacity: 0; transform: scale(1.08); }
+.core-shard-leave-to { opacity: 0; transform: scale(0.99); }

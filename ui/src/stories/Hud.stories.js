@@ -6,7 +6,7 @@
 // moved. Nothing comes back; the HUD is output only (`pointer-events: none`).
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
-import Hud from '../components/Hud.vue'
+import Hud from '../shell/Hud.vue'
 import { send, liveScene, rail, note, clone } from './storeHelpers.js'
 
 // Hud.vue has no positioning of its own — App.vue hangs it in the top-right rail.

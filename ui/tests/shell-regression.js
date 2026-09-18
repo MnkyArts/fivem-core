@@ -86,6 +86,41 @@
   const setCheck = (el, on) => { el.checked = on; el.dispatchEvent(new Event('change', { bubbles: true })) }
   const send = (msg) => window.__core.send(msg)
 
+  // ---- kit select helpers (DESIGN §37.5 CoreSelect, §37.6) ----------------
+  // The input dialog's select is no longer a native <select>: it is a combobox BUTTON whose
+  // listbox is teleported into #core-overlays and only exists while it is open. So the option
+  // rows have to be clicked — `setValue()` has nothing to write to.
+  const selectTrigger = (name) => {
+    const host = q('[data-field="' + name + '"]')
+    return host ? host.querySelector('.core-selectbox__trigger') : null
+  }
+  const selectOptions = () => Array.from(document.querySelectorAll('#core-overlays .core-selectbox__option'))
+  const optionLabel = (el) => {
+    const l = el.querySelector('.core-selectbox__option-label')
+    return ((l || el).textContent || '').trim()
+  }
+  async function openSelect (name) {
+    const t = selectTrigger(name)
+    if (!t) return []
+    t.click()
+    await waitFor(() => selectOptions().length > 0, 900)
+    return selectOptions()
+  }
+  async function closeSelect (name) {
+    const t = selectTrigger(name)
+    if (t && selectOptions().length) t.click()
+    await waitFor(() => selectOptions().length === 0, 900)
+  }
+  /** Open the list and click the row whose label reads `label`; true when it took. */
+  async function pickOption (name, label) {
+    const rows = await openSelect(name)
+    const row = rows.filter((r) => optionLabel(r).toLowerCase() === String(label).toLowerCase())[0]
+    if (!row) { await closeSelect(name); return false }
+    row.click()
+    await waitFor(() => selectOptions().length === 0, 900)
+    return true
+  }
+
   try {
     // ---- 0. shell ---------------------------------------------------------
     if (typeof shim.send !== 'function') {
@@ -140,6 +175,11 @@
     const selHas = (s) => sel().toLowerCase().indexOf(s.toLowerCase()) !== -1
     check('menu:open renders every item', hasText('First item') && hasText('Locked item'))
     check('menu renders the description', hasText('with description'))
+    // Lua may put ANY short text in `icon` ('A', an emoji); it is not a registry name, so the
+    // shell routes it to CoreMenu's `glyph` and the kit draws it as text (DESIGN §37.6).
+    const glyphBox = q('.core-menu__item[data-index="0"] .core-menu__icon')
+    check('a text icon renders as a glyph in the row',
+      !!glyphBox && (glyphBox.textContent || '').trim() === 'A')
     check('menu highlights the first item on open', selHas('First item'))
     key('ArrowDown'); await tick()
     check('ArrowDown moves the highlight', selHas('Second item'))
@@ -164,8 +204,10 @@
     ] })
     await waitFor(() => !!q('[data-field="plate"]'))
     check('input:open renders every field', ['plate', 'amount', 'colour', 'agree'].every((n) => !!q('[data-field="' + n + '"]')))
-    check('select takes object and plain-string options',
-      Array.from(document.querySelectorAll('[data-field="colour"] option')).map((o) => o.textContent).join(',') === 'Red,blue')
+    const colourLabels = (await openSelect('colour')).map(optionLabel)
+    check('select takes object and plain-string options', colourLabels.join(',') === 'Red,blue')
+    await closeSelect('colour')
+    q('[data-field="plate"]').focus() // the list refocuses the trigger on close; Enter belongs to the form
     check('number field takes its default', q('[data-field="amount"]').value === '5')
     key('Enter'); await tick()
     check('a required field blocks submit', !has(m, 'input_result'))
@@ -176,7 +218,7 @@
     key('Enter'); await tick()
     check('number max blocks submit and shows an error', !has(m, 'input_result') && !!q('[data-error="amount"]'))
     setValue(q('[data-field="amount"]'), '7')
-    setValue(q('[data-field="colour"]'), 'blue')
+    check('a select option is chosen by clicking its row', await pickOption('colour', 'blue'))
     setCheck(q('[data-field="agree"]'), true)
     await tick()
     q('[data-field="plate"]').focus()

@@ -25,7 +25,7 @@ const props = defineProps({
   message: { type: String, default: '' },
   /** Registry name or raw path. Defaults to the tone's glyph; `icon=""` removes it. */
   icon: { type: String, default: undefined },
-  /** How often the same notification arrived while the card was up (`x3`); < 2 hides the pill. */
+  /** How often the same notification arrived while the card was up (`×3`); < 2 hides the pill. */
   count: { type: Number, default: 0 },
   /** 0-1 of life left. `null`/undefined leaves the bar out. */
   progress: { type: Number, default: undefined },
@@ -62,7 +62,9 @@ const lifeWidth = computed(() => clamp(props.progress, 0, 1) * 100 + '%')
         </div>
       </div>
 
-      <span v-if="count > 1" class="core-toast__count">x{{ count }}</span>
+      <!-- The multiplication sign, not the letter: `x4` next to a 12 px display face reads as a
+           word, `×4` as a count (and the shell has shipped `×` since §7.2). -->
+      <span v-if="count > 1" class="core-toast__count">×{{ count }}</span>
 
       <button
         v-if="dismissible"

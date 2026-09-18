@@ -5,7 +5,7 @@
 // state, it never takes input (`pointer-events: none`) and never posts a callback.
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
-import TextUI from '../components/TextUI.vue'
+import TextUI from '../shell/TextUI.vue'
 import { send, liveScene, note } from './storeHelpers.js'
 
 const view = () => h(TextUI)

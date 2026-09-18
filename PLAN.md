@@ -277,10 +277,13 @@ group via SendMessage, then a contract-review pass (R1) whose seven findings wen
 | T1 tests | opus | `ui/tests/kit-regression.js` | complete — `PASS 195/195` on the build |
 | D1 docs | opus | `README.md`, `AGENTS.md`, `stories/docs/DesignSystem.mdx`, `templates/plugin/{README.md,ui/src/Page.vue}`, `../core_example/{README.md,ui/src/Page.vue}` | complete |
 | R1 reconcile | opus | `DESIGN.md` §37 rewritten from the shipped sources (58 entries) | complete |
+| K10 | opus | `CoreInteractionDot` (+ game.css block, gallery, story) — Liam's "interaction dot" | complete |
+| S3A/S3B/S3C | opus | **the shell is kit only** — `ui/src/shell/` replaces `ui/src/components/` (deleted): every Lua-driven widget is a composition of kit components (§37.6); new `CoreShard`; additive kit props CoreDialog `escape/trap/role`, CoreMenu `keyboard/rowAttrs/glyph`, CoreProgress `fillEl`, CoreKeyValue `lastRule`/`label-<i>` | complete |
+| T2 | opus | `ui/tests/{shell,kit}-regression.js`, the 15 shell stories (imports + moved hooks), CoreToast `×`, HUD glass tint, danger caption, spinner ellipsis | complete — shell 101/101, kit 195/195 |
 
-Size: 61 components (5.3k lines), 10 CSS partials (5.7k), foundation JS (1.2k), 110 story/scene files (11.4k),
-two suites (1.45k). Final gate: `scripts/check.sh` green (fxlint 0/0, Lua 385 + 764), shell regression 99/99,
-kit regression 195/195, Storybook builds (250+ stories). Open: in-game pass (the CEF's real blur, fonts and
+Size: 62 components (5.4k lines), 10 CSS partials (5.7k), foundation JS (1.2k), 110 story/scene files (11.4k),
+two suites (1.5k). Final gate: `scripts/check.sh` green (fxlint 0/0, Lua 385 + 764), shell regression 101/101,
+kit regression 195/195, Storybook builds (265 stories). Open: in-game pass (the CEF's real blur, fonts and
 pointer behaviour); the existing plugin pages (inventory, charcreator, trucking) still use their own elements
 — migrating them to the kit is the next run; a global UI scale decision (the kit is calibrated to the mockups'
 1672 px frame, ~13 % small at 1080p).

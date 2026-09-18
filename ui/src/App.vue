@@ -1,19 +1,19 @@
 <script setup>
 // Root of the core UI shell (DESIGN §7.2).
 // Everything is pointer-events: none; only open pages and modals take input.
-import Hud from './components/Hud.vue'
-import StatsBars from './components/StatsBars.vue'
-import Notifications from './components/Notifications.vue'
-import TextUI from './components/TextUI.vue'
-import Progress from './components/Progress.vue'
-import KeyHints from './components/KeyHints.vue'
-import Spinner from './components/Spinner.vue'
-import Shard from './components/Shard.vue'
-import Chat from './components/Chat.vue'
-import PageHost from './components/PageHost.vue'
-import Menu from './components/Menu.vue'
-import InputDialog from './components/InputDialog.vue'
-import AlertDialog from './components/AlertDialog.vue'
+import Hud from './shell/Hud.vue'
+import StatsBars from './shell/StatsBars.vue'
+import Notifications from './shell/Notifications.vue'
+import TextUI from './shell/TextUI.vue'
+import Progress from './shell/Progress.vue'
+import KeyHints from './shell/KeyHints.vue'
+import Spinner from './shell/Spinner.vue'
+import Shard from './shell/Shard.vue'
+import Chat from './shell/Chat.vue'
+import PageHost from './shell/PageHost.vue'
+import Menu from './shell/Menu.vue'
+import InputDialog from './shell/InputDialog.vue'
+import AlertDialog from './shell/AlertDialog.vue'
 import { store } from './store.js'
 </script>
 

@@ -157,7 +157,9 @@ export const Glass = {
   render: liveScene(blurScene, view),
   play: async ({ canvasElement, args }) => {
     const canvas = within(canvasElement)
-    const panel = () => canvasElement.querySelector('.core-panel.menu')
+    // The menu is a CoreDialog now (§37.6) — its root is `.core-dialog`, and `class="menu"`
+    // falls through onto that panel (CoreDialog is `inheritAttrs: false`).
+    const panel = () => canvasElement.querySelector('.core-dialog.menu')
     const glasses = () => document.querySelectorAll('.core-glass')
 
     await waitFor(() => expect(canvas.getByText(args.menuTitle)).toBeInTheDocument())

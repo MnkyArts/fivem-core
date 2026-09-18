@@ -262,6 +262,20 @@
   height: var(--core-menu-icon);
 }
 
+/* `item.glyph`: a short TEXT mark (an emoji, a letter) in the same box an MDI path would fill.
+   A glyph is drawn by the font, so it needs the box's own type: 80 % of the icon size lands an
+   emoji on the cap height of the label next to it, and the sans face keeps a letter from picking
+   up the label's uppercase tracking. */
+.core-menu__icon--glyph {
+  font-family: var(--font-sans);
+  font-size: calc(var(--core-menu-icon) * 0.8);
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: none;
+  overflow: hidden;
+}
+
 .core-menu__body {
   display: flex;
   flex-direction: column;

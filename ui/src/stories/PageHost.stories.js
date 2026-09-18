@@ -10,8 +10,8 @@
 // Vue build, so a real plugin page cannot use a template string either.
 import { h, ref } from 'vue'
 import { within, userEvent, expect, waitFor } from 'storybook/test'
-import PageHost from '../components/PageHost.vue'
-import Notifications from '../components/Notifications.vue'
+import PageHost from '../shell/PageHost.vue'
+import Notifications from '../shell/Notifications.vue'
 import { send, liveScene, rail, clone } from './storeHelpers.js'
 import { lastPost } from './luaBridge.js'
 

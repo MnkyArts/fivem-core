@@ -7,7 +7,7 @@
 // survives the round trip through JSON.
 import { h } from 'vue'
 import { within, userEvent, expect, waitFor } from 'storybook/test'
-import Menu from '../components/Menu.vue'
+import Menu from '../shell/Menu.vue'
 import { send, liveScene, clone } from './storeHelpers.js'
 import { lastPost } from './luaBridge.js'
 
@@ -185,8 +185,8 @@ export const LongList = {
     },
     docs: {
       description: {
-        story: '`.core-list` caps at 60vh and scrolls; arrow selection pulls the active row into '
-          + 'view (`scrollIntoView({ block: "nearest" })`). Lua puts no cap on `items`.',
+        story: 'The dialog caps at `100vh - 64px` and its body scrolls; arrow selection pulls the '
+          + 'active row into view (`scrollIntoView({ block: "nearest" })`). Lua puts no cap on `items`.',
       },
     },
   },

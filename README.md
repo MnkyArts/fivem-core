@@ -44,7 +44,7 @@ and stops a client forging `cash`, `faction` or a vehicle's `locked`.
 **Operating it**: FXServer caches manifests — after adding or removing script files run `refresh` before
 `ensure core`, otherwise the restart silently runs the old file list. `ensure core` also restarts every
 resource that declares `dependency 'core'`. Status (2026-09-15): fxlint clean, 385 lib + 720 server + 999 interiors offline
-checks green, shell regression 99/99 (2026-09-18), Storybook play functions green, both resources start clean on the dev
+checks green, shell regression 101/101 (2026-09-18), Storybook play functions green, both resources start clean on the dev
 server; **the in-game checklist below has not been run yet**.
 
 The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
@@ -465,7 +465,7 @@ Grouped as in DESIGN §37.5, which is the full API (props · slots · emits · c
 | data — meters | **CoreProgress** linear bar (`inline`, `segments`, threshold tones) · **CoreRing** radial · **CoreStatBar** HUD vital · **CoreStatRow** detail stat between hairlines · **CoreSpinner** · **CoreSkeleton** |
 | data — display | **CoreBadge** count pip · **CoreTag** small chip (tones + rarities) · **CoreAvatar** · **CorePlayerChip** avatar · name · level · XP · **CoreTable** · **CoreKeyValue** ruled label/value rows · **CoreEmpty** empty state |
 | game | **CoreSlot** item slot · **CoreSlotGrid** the inventory grid · **CoreHotbar** · **CoreList** / **CoreListItem** rich rows · **CoreObjective** · **CoreTracker** HUD quest card · **CoreCompass** heading strip · **CoreInteractionDot** world interaction dot → key prompt |
-| feedback | **CoreAlert** inline banner · **CoreToast** notification card · **CoreDialog** modal (focus trap, escape layers) · **CoreDrawer** side sheet · **CorePopover** anchored panel · **CoreContextMenu** right-click menu · **CoreTooltip** |
+| feedback | **CoreAlert** inline banner · **CoreToast** notification card · **CoreDialog** modal (focus trap, escape layers) · **CoreDrawer** side sheet · **CorePopover** anchored panel · **CoreContextMenu** right-click menu · **CoreTooltip** · **CoreShard** centre-screen banner |
 
 Props follow one vocabulary: `size` (`sm|md|lg`), `tone` (`accent|neutral|success|warning|danger|info`,
 plus the meter tones `health|armour|stamina|hunger|thirst|oxygen|stress` where a meter takes one),

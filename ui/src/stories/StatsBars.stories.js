@@ -8,8 +8,8 @@
 // back with `Core.Stats.get(name)`; the bars follow on their own. Output only.
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
-import StatsBars from '../components/StatsBars.vue'
-import Hud from '../components/Hud.vue'
+import StatsBars from '../shell/StatsBars.vue'
+import Hud from '../shell/Hud.vue'
 import { resetExtras } from '../store.js'
 import { send, liveScene, rail, note, clone } from './storeHelpers.js'
 
@@ -81,7 +81,7 @@ export const Default = {
     await waitFor(() => expect(canvasElement.querySelectorAll('.stats .stat').length).toBe(2))
     expect(canvas.getByText('hunger')).toBeInTheDocument()
     // sorted by name, never in Lua table order
-    expect(Array.from(canvasElement.querySelectorAll('.stats .lbl')).map((e) => e.textContent))
+    expect(Array.from(canvasElement.querySelectorAll('.stats .core-progress__label')).map((e) => e.textContent))
       .toEqual(['hunger', 'thirst'])
     expect(canvasElement.querySelector('.stats .stat').classList.contains('is-ok')).toBe(true)
   },
@@ -119,7 +119,7 @@ export const Thresholds = {
     expect(level(0)).toContain('is-warning')  // hunger 22 %
     expect(level(1)).toContain('is-ok')       // stamina 80 %
     expect(level(2)).toContain('is-error')    // thirst 7 %
-    expect(canvasElement.querySelectorAll('.stats .fill')[2].style.width).toBe('7%')
+    expect(canvasElement.querySelectorAll('.stats .core-progress__fill')[2].style.width).toBe('7%')
   },
 }
 
@@ -144,7 +144,7 @@ export const CustomRange = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     await waitFor(() => expect(canvas.getByText('Plates')).toBeInTheDocument())
-    expect(canvasElement.querySelector('.stats .fill').style.width).toBe('50%')
+    expect(canvasElement.querySelector('.stats .core-progress__fill').style.width).toBe('50%')
   },
 }
 
@@ -196,7 +196,7 @@ export const UnderTheHud = {
     expect(canvas.getByText('Vespucci Boulevard')).toBeInTheDocument()
     // health 68 % is fine, armour is always accent-blue
     expect(canvasElement.querySelector('.hud .bar').className).toContain('is-ok')
-    expect(canvasElement.querySelectorAll('.hud .fill')[0].style.width).toBe('68%')
+    expect(canvasElement.querySelectorAll('.hud .core-statbar__fill')[0].style.width).toBe('68%')
   },
 }
 

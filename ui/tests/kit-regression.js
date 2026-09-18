@@ -175,7 +175,8 @@
       'CoreBadge', 'CoreTag', 'CoreAvatar', 'CorePlayerChip', 'CoreTable', 'CoreKeyValue', 'CoreEmpty',
       'CoreSlot', 'CoreSlotGrid', 'CoreHotbar', 'CoreList', 'CoreListItem', 'CoreObjective', 'CoreTracker',
       'CoreCompass', 'CoreInteractionDot',
-      'CoreAlert', 'CoreToast', 'CoreDialog', 'CoreDrawer', 'CorePopover', 'CoreContextMenu', 'CoreTooltip',
+      'CoreAlert', 'CoreToast', 'CoreShard', 'CoreDialog', 'CoreDrawer', 'CorePopover', 'CoreContextMenu',
+      'CoreTooltip',
     ]
     const missing = CATALOGUE.filter((n) => !K.components[n])
     const extra = NAMES.filter((n) => CATALOGUE.indexOf(n) === -1)
@@ -250,6 +251,7 @@
       CoreRing: [{ value: 40 }],
       CoreScreen: [{ background: 'scrim' }, () => 'body'],
       CoreSelect: [{ items: ITEMS, modelValue: 'a' }],
+      CoreShard: [{ title: 'WASTED', variant: 'wasted' }],
       CoreSkeleton: [{ lines: 2 }],
       CoreSlider: [{ modelValue: 40, label: 'FOV', showValue: true }],
       CoreSlot: [{ count: 3, rarity: 'rare', hotkey: '1', durability: 0.4 }],
@@ -1081,6 +1083,7 @@
         ['CoreInteractionDot', { keys: 'E', label: 'Search' }, '.core-interaction-dot'],
         ['CoreStatBar', { icon: 'check', value: 60 }, '.core-statbar'],
         ['CoreToast', { tone: 'info', title: 'Saved', message: 'ok' }, '.core-toast'],
+        ['CoreShard', { title: 'WASTED', variant: 'wasted' }, '.core-shard'],
         ['CorePlayerChip', { name: 'Ada', level: 5, progress: 0.4 }, '.core-playerchip'],
       ]
       const INTERACTIVE = [

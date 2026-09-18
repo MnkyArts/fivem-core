@@ -49,6 +49,10 @@
   border-color: var(--color-border-strong);
   border-radius: var(--radius-ui-sm);
   box-shadow: var(--shadow-ui-sm);
+  /* Glass (§32) paints `--core-glass-tint` over the sampled game frame, and the default is the
+     PANEL tint — which is a shade a HUD plate never wears. Pinning it here means `variant="hud"`
+     plus `blur` is the HUD colour in both states, with no utility on the call site. */
+  --core-glass-tint: var(--color-hud);
 }
 
 .core-panel--hud .core-panel__footer {

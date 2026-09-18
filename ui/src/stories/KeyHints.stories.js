@@ -7,7 +7,7 @@
 // in sync is the caller's job.
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
-import KeyHints from '../components/KeyHints.vue'
+import KeyHints from '../shell/KeyHints.vue'
 import { resetExtras } from '../store.js'
 import { send, liveScene, note, clone } from './storeHelpers.js'
 
@@ -104,7 +104,7 @@ export const Several = {
   },
   play: async ({ canvasElement, args }) => {
     const canvas = within(canvasElement)
-    await waitFor(() => expect(canvasElement.querySelectorAll('.keys .hint').length).toBe(args.items.length))
+    await waitFor(() => expect(canvasElement.querySelectorAll('.keys .core-keyhint').length).toBe(args.items.length))
     for (const item of args.items) {
       expect(canvas.getByText(item.key)).toBeInTheDocument()
       expect(canvas.getByText(item.label)).toBeInTheDocument()
@@ -122,8 +122,8 @@ export const KeysOnly = {
     docs: { description: { story: '`label` is optional — a bare cap row, for a minigame that only needs to show the controls.' } },
   },
   play: async ({ canvasElement }) => {
-    await waitFor(() => expect(canvasElement.querySelectorAll('.keys .cap').length).toBe(4))
-    expect(canvasElement.querySelector('.keys .label')).toBeNull()
+    await waitFor(() => expect(canvasElement.querySelectorAll('.keys .core-key').length).toBe(4))
+    expect(canvasElement.querySelector('.keys .core-keyhint__label')).toBeNull()
   },
 }
 

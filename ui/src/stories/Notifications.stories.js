@@ -7,7 +7,7 @@
 // that spams notify cannot flood the NUI. There is no callback: nothing comes back.
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
-import Notifications from '../components/Notifications.vue'
+import Notifications from '../shell/Notifications.vue'
 import { send, liveScene, rail, HOLD_MS, clone } from './storeHelpers.js'
 
 // Notifications.vue is the lower half of App.vue's top-right rail.

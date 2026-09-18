@@ -5,7 +5,7 @@
 // than a colour, so a re-themed server still owns the palette; `segments` masks the TRACK, which
 // carries the fill with it (css partial); and the `18.5 / 30.0` fraction only appears when the
 // caller really passed a `max` — the prop has a default, so only the raw vnode can tell.
-import { computed, getCurrentInstance, useSlots } from 'vue'
+import { computed, getCurrentInstance, ref, useSlots } from 'vue'
 import { METER_TONES, oneOf, toPercent, toneClass } from '../use.js'
 
 const props = defineProps({
@@ -103,6 +103,12 @@ const readout = computed(() => {
   return { text: Number(props.value).toFixed(digits), max: ' / ' + Number(props.max).toFixed(digits) }
 })
 
+// The shell's progress bar (§37.6) animates the fill with a seeded CSS width transition rather
+// than with `value`, which needs the element itself: `ref.fillEl` is that escape hatch. Nothing
+// inside the component writes to it — a caller that takes it over also owns `style.width`.
+const fillEl = ref(null)
+defineExpose({ fillEl })
+
 const slots = useSlots()
 const hasValue = computed(() => props.showValue || !!slots.value)
 const hasLabel = computed(() => !!props.label || !!slots.label)
@@ -132,7 +138,7 @@ const hasHead = computed(() => !props.inline && (hasLabel.value || hasValue.valu
       :aria-valuenow="indeterminate ? null : value"
       :aria-label="label || null"
     >
-      <div class="core-progress__fill" :style="fillStyle"></div>
+      <div ref="fillEl" class="core-progress__fill" :style="fillStyle"></div>
     </div>
 
     <span v-if="inline && hasValue" class="core-progress__value">

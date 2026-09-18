@@ -961,9 +961,10 @@ ui/src/main.js            creates the app, exposes window.Vue and window.CoreUI,
 ui/src/bridge.js          post(name, data) → fetch('https://' + resource + '/' + name) (JSON); dev shim when GetParentResourceName is missing; onMessage(action, fn) dispatcher for window 'message' events
 ui/src/store.js           reactive state: notifications[], textui, progress, menu, input, alert, hud, pages{}, openPage, overlays{}
 ui/src/coreui.js          window.CoreUI implementation (§7.4)
-ui/src/App.vue            root: <Hud/> <TextUI/> <Progress/> <Notifications/> <PageHost/> <Menu/> <InputDialog/> <AlertDialog/>
-ui/src/components/Notifications.vue, TextUI.vue, Progress.vue, Menu.vue, InputDialog.vue, AlertDialog.vue, Hud.vue, PageHost.vue
-ui/src/styles.css         design tokens + base (dark glass panels, one accent colour, system font stack)
+ui/src/App.vue            root: <Hud/> <StatsBars/> <Notifications/> <TextUI/> <Progress/> <Chat/> <KeyHints/> <Spinner/> <PageHost/> <Shard/> <Menu/> <InputDialog/> <AlertDialog/> + #core-overlays
+ui/src/shell/*.vue        the Lua-driven widgets: store state → kit components, no drawing of their own (§37.6; 2026-09-18 — `ui/src/components/` is gone)
+ui/src/kit/               the design system (§37): tokens → css partials → Core*.vue components
+ui/src/styles.css         design tokens (§37.2) + base + the structural shell classes
 ```
 
 Visual direction: minimal, dark translucent panels (rgba(14,16,20,.86)), 8 px radius, 1 px hairline border
@@ -2566,9 +2567,12 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   underline is a per-tab `::after` that only fades, so nothing measures the DOM. ←/→ (and ↑/↓) move selection
   and focus together, Home/End jump to the first/last enabled tab, Enter/Space is the button's own click.
 - **CoreMenu** — vertical menu (main menu, category sidebar, the shell's keyboard menu). `v-model` (active
-  value), `items: [{ value, label, icon?, description?, trailing?, badge?, disabled?, danger? }]`, `size`
+  value), `items: [{ value, label, icon?, glyph?, description?, trailing?, badge?, disabled?, danger? }]` (`icon`
+  is a registry name; `glyph` is a short text — an emoji — drawn in the icon box when there is no icon), `size`
   (row 38 / 56 / 70 px; text 15 / 18 / 25), `fade` (true: the active row dissolves), `selectOnHover`,
-  `loop` (true) · `item` ({ item, active }), `trailing` ({ item, active }) · `update:modelValue`, `select`
+  `loop` (true), `keyboard` (true; `false` = the caller owns ↑/↓/Enter, as the shell's menu does), `rowAttrs`
+  (`(item, index) → attrs` merged onto each row: `data-index`, `role`, hook classes) · `item` ({ item, active }),
+  `trailing` ({ item, active }) · `update:modelValue`, `select`
   (item: click or Enter) · `core-menu core-menu--<size> is-fade`, `core-menu__item is-active is-disabled
   is-danger` + `__icon __body __label __desc __badge __trailing` · display
   600 uppercase 0.07 em `fg-dim`, icon box 30 px (sm 22, lg 34 — a size up from the mark, because an MDI path
@@ -2695,7 +2699,8 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   `label`, `icon`, `showValue`, `valueText`, `format` (value, max), `inline` (icon · label · bar · value on one
   row — the capacity bar), `segments`, `indeterminate`, `warnBelow`, `dangerBelow` (percent → the tone CLASS
   switches, so a re-themed server still owns the palette) · `label`,
-  `value` · — · `core-progress core-progress--<size> core-tone-<tone> core-progress--inline is-segmented
+  `value` · — (exposes `fillEl`, the fill element, for a caller that animates the width itself — the shell's
+  progress bar) · `core-progress core-progress--<size> core-tone-<tone> core-progress--inline is-segmented
   is-indeterminate` + `__head __caption __icon __label __value __max __track __fill` · track white
   12 %, radius 2; fill `--core-grad-accent` (accent), `#dfe3e7 → #c9cfd5` (neutral), the tone colour otherwise;
   width eases 250 ms. Value display 600 15 px; the dimmed `/ 30.0` half is only printed when the caller really
@@ -2762,8 +2767,9 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   `accent-soft` + a 2 px inset bar on the first cell (a collapsed table discards an inset shadow put on the
   `<tr>`). The
   `<tbody>` is the tab stop: ↑/↓ and Home/End move the selection, Enter/Space re-fires `row-click`.
-- **CoreKeyValue** — `items: [{ label, value, icon?, tone? }]`, `columns` (1) · `value-<i>` ({ item, value }) ·
-  — · `core-kv` (a `<dl>`) + `__item is-toned __label __icon __value` · rows ≥ 32 px under a white 6 %
+- **CoreKeyValue** — `items: [{ label, value, icon?, tone? }]`, `columns` (1), `lastRule` (true; `false` drops
+  the last row's hairline so a block can sit flush on a panel edge) · `value-<i>` ({ item, value }), `label-<i>`
+  ({ item }) · — · `core-kv` (a `<dl>`) + `__item is-toned __label __icon __value` · rows ≥ 32 px under a white 6 %
   hairline, label voice left, value display 600 15 px tabular right; an item `tone` paints the value and its
   glyph; `columns` only splits the same rows into a grid (32 px column gap).
 - **CoreEmpty** — `icon`, `title`, `text` · default (actions) · — · `core-empty` + `__icon __title __text
@@ -2852,8 +2858,14 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   · tone
   10 % fill (*outline*: a `panel-sunken` well behind the same frame), tone 35 % border, 3 px tone bar on the
   left, title display 600 14 px uppercase, text 14 px `fg-dim`.
+- **CoreShard** — the centre-screen banner (GTA's WASTED / MISSION PASSED; the shell's `shard:show`). `title`,
+  `subtitle`, `variant: 'wasted'|'success'|'info'` (`info`; not `style` — Vue normalises a `style` prop away)
+  · — · — · `core-shard core-shard--<variant> core-tone-<danger|success|accent>` + `__band __title __subtitle`
+  · a full-bleed band (ink 74 % fading to nothing at both screen edges) with a tinted hairline top and bottom,
+  the title in the display voice (clamp 38–74 px, 0.07 em, tinted), the subtitle in the eyebrow voice;
+  click-through, no position of its own (the shell parks it at 24 vh).
 - **CoreToast** — notification card. `tone` (`info`), `title`, `message`, `icon` (auto by tone), `count`
-  (`x3`; under 2 hides the pill), `progress` (0–1 life bar; omit it and there is no bar),
+  (`×3`; under 2 hides the pill), `progress` (0–1 life bar; omit it and there is no bar),
   `dismissible`, `blur` · default · `dismiss` · `core-toast core-tone-<tone> core-toast--<tone>` + `__bar
   __main __icon __body __title __message __count __close __life __lifefill` · 340 px, panel fill, hairline,
   radius 4, `--shadow-ui-sm`, 3 px tone bar down the left, 20 px tone icon, title display 700 13 px uppercase
@@ -2861,8 +2873,10 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   14 px `fg`. Click-through — only the ✕ takes the mouse, so a stack of toasts can never swallow a click.
 - **CoreDialog** — modal. `v-model:open`, `title`, `subtitle`, `icon`, `tone` (`accent`), `size:
   'sm'|'md'|'lg'|'xl'` (360 / 460 / 640 / 860), `closable` (true: ✕, Escape, backdrop click), `persistent`
-  (blocks Escape and the backdrop; the ✕ and the footer still work),
-  `backdrop` (true), `blur` (true), `teleport` (true) · default, `header`, `footer` · `update:open`, `close`
+  (blocks Escape and the backdrop; the ✕ and the footer still work), `escape` (true; `false` registers no
+  escape layer — the shell's modals leave Escape to the store), `trap` (true; `false` = no focus trap, the
+  caller owns focus), `role` (`dialog` | `alertdialog`), `backdrop` (true), `blur` (true), `teleport` (true)
+  · default, `header`, `footer` · `update:open`, `close`
   (reason: `escape` | `backdrop` | `button`) · backdrop `core-backdrop core-backdrop--clear`, panel
   `core-dialog core-tone-<tone> core-dialog--<size>` + `__header __icontile __titles __title __subtitle __close
   __body __footer` ·
@@ -2903,30 +2917,35 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   padding 12, max-width 280. Never takes the mouse, and it does NOT register an escape layer (§37.4): Escape
   and any pointer-down dismiss it without stopping the event for whatever is under it.
 
-### 37.6 The shell's built-ins wear the kit
+### 37.6 The shell is kit only (`ui/src/shell/`, 2026-09-18 — Liam: "remove all the old components, we only use kit")
 
-The Lua-driven built-ins (§6.10, §21) keep their **protocol, store logic, keyboard handling, timers and hook
-classes** (everything `ui/tests/shell-regression.js` and the stories read: `.hud .bar.is-ok`, `.stats .stat`,
-`.core-item[data-index]`, `[data-role]`, `[data-field]`, `[data-error]`, `.notif.is-<type>`, `.pos-<p>`, …) and
-change only their skin: they render kit classes / kit components, so `Core.UI.alert` looks like a CoreDialog and
-a toast like a CoreToast.
+The Lua-driven built-ins (§6.10, §21, §30.3) live in `ui/src/shell/` and are **compositions of kit components**:
+a shell widget holds store bindings, the behaviour the protocol needs (keyboard rules, focus, timers, the
+progress bar's seeded width transition, the chat's IME/byte-clamp logic) and layout utilities for placement —
+and draws nothing itself: no colours, borders, radii or backgrounds outside the kit. The old
+`ui/src/components/` folder no longer exists. Kit components are imported by path inside the shell (never
+resolved through global registration), and the store, `bridge.js`, `coreui.js`, `plugins.js`, `gameblur.js`,
+`chat.js` and `PageHost.vue` are unchanged.
 
-| built-in | becomes |
+| widget | composed from |
 |---|---|
-| `Notifications` | CoreToast cards (tone = type, `count`), same slide-in |
-| `TextUI` | a CorePrompt (`key` → cap, `text` → label), same four positions |
-| `Progress` | a small glass panel: label (display voice) · cancel CoreKeyHint · CoreProgress `md` accent |
-| `KeyHints` | CoreKeyHints (solid caps) bottom right |
-| `Spinner` | glass pill: text + CoreSpinner |
-| `Menu` | dialog panel: CoreHeading + the `core-menu` rows (`sm`/`md`) + a CoreKeyHints footer |
-| `InputDialog` | dialog panel: CoreField + CoreInput / CoreSelect / CoreCheckbox / CoreSlider, footer buttons |
-| `AlertDialog` | dialog panel with the accent top line; confirm = primary, cancel = secondary |
-| `Hud` | mockup HUD card: money block in display voice, vitals as CoreStatBar rows, place/faction/identity rows |
-| `StatsBars` | CoreProgress rows with threshold tones |
-| `Shard` | display voice title, eyebrow voice subtitle |
-| `Chat` | tokens + box look on the composer; feed text in Barlow |
+| `Hud` | `CorePanel variant="hud"` (glass) · CoreKeyValue money rows in the display voice · CoreStatBar health/armour (tone by threshold, `iconTone`) · CoreKeyValue speed/place · CoreTag faction (tone from its colour) · CoreDivider |
+| `StatsBars` | `CorePanel variant="hud"` · one inline CoreProgress per stat (vital tone, warning/danger thresholds) |
+| `Notifications` | TransitionGroup of CoreToast (tone = type, `count`) |
+| `Shard` | CoreShard (a kit component: the full-bleed band, `style` wasted/success/info), keyed by `seq` |
+| `TextUI` | CorePrompt (`key` → cap, `text` → label) in the four `pos-*` placements |
+| `Progress` | `CorePanel variant="hud"` · CoreKeyHint (cancel) · CoreProgress whose exposed `fillEl` carries the seeded transition |
+| `KeyHints` | CoreKeyHints (the store's `{ key, label }` items) |
+| `Spinner` | `CorePanel variant="hud"` · CoreSpinner |
+| `Menu` | CoreDialog (`escape: false`, `trap: false` — the store owns Escape and the widget owns focus) · CoreMenu `sm` (`keyboard: false`, `rowAttrs` puts `data-index`/`role` on the rows; `item.icon` is a registry name, `item.glyph` a text glyph) · CoreKeyHints footer |
+| `InputDialog` | the same dialog · CoreField around CoreInput (text/number) / CoreSelect / CoreCheckbox · CoreButton footer; hooks `[data-field]`, `[data-error]`, `[data-role]` on the kit tags |
+| `AlertDialog` | the same dialog (`role="alertdialog"`) · CoreButton secondary + primary |
+| `Chat` | composer = `core-inputbox` classes around the raw `<input>` the byte clamp needs · CoreButton ghost channel · CorePanel solid suggestion/argument panels with `core-menu__item` rows · CoreKeyHints footer; the feed keeps its text shadow |
 
-`gameblur.js`, `bridge.js`, the store and `PageHost` are untouched.
+Additive kit props that came out of it: CoreDialog `escape`, `trap`, `role`; CoreMenu `keyboard`, `rowAttrs`,
+`item.glyph`; CoreProgress exposes `fillEl`; CoreShard is new. The legacy bare-class aliases (`.core-list`,
+`.core-item`, `.core-modal`, element-level `.core-input`/`.core-select`) stay in the partials only for the
+plugin pages that predate the kit (inventory, charcreator, trucking) and are deleted with their migration.
 
 ### 37.7 Stories, tests, docs
 

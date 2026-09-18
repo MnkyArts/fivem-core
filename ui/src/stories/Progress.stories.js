@@ -6,7 +6,7 @@
 // started. The NUI owns the clock — Lua only starts and awaits.
 import { h } from 'vue'
 import { within, userEvent, expect, waitFor } from 'storybook/test'
-import Progress from '../components/Progress.vue'
+import Progress from '../shell/Progress.vue'
 import { send, liveScene, store } from './storeHelpers.js'
 import { lastPost } from './luaBridge.js'
 

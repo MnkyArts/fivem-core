@@ -25,6 +25,7 @@ server/*.lua            stateful modules (api, db, db_pg, player, money, faction
 client/*.lua            world scan, interactions, markers, doors, ui shell bridge, blur, visibility, …
 server/pg/index.js      Node source of the Postgres bridge → bundled into server/db_pg.js (committed)
 ui/                     Vite 7 + Vue 3.5 + Tailwind v4 shell, Storybook 10, tests/shell-regression.js
+ui/src/shell/           the Lua-driven widgets (HUD, toasts, prompts, menu/input/alert…) as kit compositions — no drawing of their own
 ui/src/kit/             the design system (§37): styles.css tokens → css/*.css classes → components/Core*.vue
                         (globally registered), plus icons.js, use.js, fonts/ (bundled Barlow, OFL)
 ui/kit-preview.html     dev-only harness: ?scene=<SceneName>&bg=game|keyart|menu|ink mounts one kit scene
@@ -129,7 +130,7 @@ interaction, door, cron, locale, a compiled page).
 | rulebook lint | `fxlint resources/core` (and the plugin) | `0 error(s), 0 warning(s)` |
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
-| shell regression | serve `html/` over HTTP (`python3 -m http.server 8765 --directory html`), `agent-browser open http://127.0.0.1:8765/index.html`, `agent-browser eval --stdin < ui/tests/shell-regression.js` | `PASS 99/99` (file:// blocks ES modules) |
+| shell regression | serve `html/` over HTTP (`python3 -m http.server 8765 --directory html`), `agent-browser open http://127.0.0.1:8765/index.html`, `agent-browser eval --stdin < ui/tests/shell-regression.js` | `PASS 101/101` (file:// blocks ES modules) |
 | kit regression | same recipe with `ui/tests/kit-regression.js` (mounts every component, drives models/keys/popups/focus, lints the built CSS) | `PASS 195/195` (the CSS lint needs the build; the dev page reports a few fewer) |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
