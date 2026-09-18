@@ -6,18 +6,23 @@ one-line stub or a commented example — nothing runs until you uncomment it.
 
 ## 1. Copy and rename
 
+`core/scripts/new-plugin.sh shop_robbery` does all of this for you. By hand it is:
+
 ```bash
 cp -r core/templates/plugin resources/my_plugin        # next to core/, not inside it
 cd resources/my_plugin
-grep -rl my_plugin . | xargs sed -i 's/my_plugin/shop_robbery/g'   # your resource name
+grep -rlI -e my_plugin -e MyPlugin . \
+  | xargs sed -i -e 's/MyPlugin/ShopRobbery/g' -e 's/my_plugin/shop_robbery/g'
 ```
+
+(`MyPlugin` is the TypeScript half of the placeholder: `MyPluginPage`, `MyPluginProps`, …)
 
 The name you pick must match in three places (the `grep`/`sed` above covers all of them):
 
 | Place | What it is |
 |---|---|
 | the folder name | the resource name FXServer starts |
-| `ui/src/index.js` → `export const id = 'my_plugin'` | the page id |
+| `ui/src/index.ts` → `pages: { my_plugin: … }` | the page id |
 | `client/main.lua` → `Core.UI.registerPage('my_plugin', …)` | the same page id |
 
 Event names (`my_plugin:server:doThing`) are yours; prefix them with the resource name so two
@@ -46,44 +51,57 @@ Split into more files when it grows — `client/*.lua` and `server/*.lua` are gl
 
 ## 3. Add a UI page (optional)
 
-Only if the plugin shows a page — and it ships **no UI files**: no Vite config, no `dist`, no
-`node_modules`, no `files {}` entry. `ui/src/index.js` names the page and exports the component;
-core's shell compiles it into its own bundle, so players download `core/html` and nothing else.
+Only if the plugin shows a page. This resource **owns and builds its own frontend** (core
+`DESIGN.md` §38): `ui/src/index.ts` is the entry, `npm run build` writes `ui/dist/`, the manifest
+opts in with `core_ui 'ui/dist'` and packs it with `files { 'ui/dist/**' }`, and core imports the
+module at runtime from `https://cfx-nui-my_plugin/ui/dist/`. Commit `ui/dist` — that is what
+players download.
 
-```js
-// ui/src/index.js
-export const id = 'my_plugin'
-export { default } from './Page.vue'
+```ts
+// ui/src/index.ts
+import { defineUIPlugin, definePage } from '@core/ui'
+import Page from './Page.vue'
+
+export default defineUIPlugin({
+    pages: { my_plugin: definePage<MyPluginProps>({ component: Page }) },
+    setup(ctx) { /* every side effect lives here — it is disposed when the resource stops */ },
+})
 ```
 
 The toolchain is installed **once for the whole resources folder** — it is an npm workspace, so
-there is a single hoisted `node_modules` next to `core/`:
+there is a single hoisted `node_modules` next to `core/` and `@core/ui` is a link into it:
 
 ```bash
-cd /path/to/resources && npm install    # once
-cd core/ui && npm run build             # -> core/html, with every plugin page inside
+cd /path/to/resources && npm install    # once, and after adding a ui dependency
+cd my_plugin/ui && npm run build        # -> my_plugin/ui/dist  (~1 s)
+npm run typecheck                       # vue-tsc over src/
 ```
 
 Then:
 
 1. uncomment the `Core.UI.registerPage('my_plugin', { type = 'page' })` call in `client/main.lua`
-   (no `script`/`style` paths — core already has the component);
-2. open it from Lua with `Core.UI.open('my_plugin', { title = 'Hi' })` and receive the page's
-   events with `Core.UI.on('my_plugin', 'hello', function(data) end)`.
+   (no `script`/`style` paths — those are gone; the resource serves its own module);
+2. open it from Lua with `Core.UI.open('my_plugin', { title = 'Hi' })`, push into it with
+   `Core.UI.send`/`Core.UI.patch`, receive the page's events with
+   `Core.UI.on('my_plugin', 'hello', function(data) end)` and answer its `nui.invoke` requests with
+   `Core.UI.onRequest(name, function(data) return result end)`.
 
-Rebuild **core's** UI after every page change, then `refresh; restart core`. While developing,
-`cd core/ui && npm run dev` (Vite, port 5173) and `npm run storybook` serve these sources live.
+Deploy loop: `npm run build` here, then `refresh; restart my_plugin` in the server console. **Core
+is neither rebuilt nor restarted and the CEF never reloads** — the new bundle has a new content
+hash, so it is a new module URL.
 
-Inside the page, `window.CoreUI.usePage(id)` gives `{ props, emit, on, close }` and
-`window.CoreUI.hud` is the live HUD snapshot; `import ... from 'vue'` resolves to the one Vue
-instance the shell owns. No external fonts or CDNs: the CEF has no network.
+Inside the page, everything comes from `@core/ui`: `usePage()` gives `{ props, emit, on, close }`
+for the page being rendered, `useHud()` / `usePlayerState()` / `useStats()` are the live read-only
+shell state, `useNui()` is this plugin's own event + request channel, and `notify`/`playSound`/`t`
+are core's services. `import … from 'vue'` resolves to the one Vue instance the shell owns — never
+a second copy. No external fonts or CDNs: the CEF has no network.
 
 `ui/src/Page.vue` in this template is a working page built from the kit (next section) — read its
 comments, keep the shape, replace the content.
 
-Need an extra runtime library (drag-and-drop, charts, …)? Copy `ui/package.json.example` to
-`ui/package.json`, keep only that one dependency, and re-run `npm install` at the resources
-folder — the import is bundled into the same single dist. Never list `vue` there.
+Need an extra runtime library (drag-and-drop, charts, …)? Add it to `dependencies` in
+`ui/package.json` and re-run `npm install` at the resources folder — it is bundled into **this**
+plugin's `ui/dist`, not into core. Never list `vue` there.
 
 ### Styling — the UI kit
 
@@ -112,16 +130,18 @@ writes the tags and looks like the rest of the server:
 | data | `CoreProgress` `CoreRing` `CoreStatBar` `CoreStatRow` `CoreSpinner` `CoreSkeleton` `CoreBadge` `CoreTag` `CoreAvatar` `CorePlayerChip` `CoreTable` `CoreKeyValue` `CoreEmpty` |
 | game | `CoreSlot` `CoreSlotGrid` `CoreHotbar` `CoreList` `CoreListItem` `CoreObjective` `CoreTracker` `CoreCompass` |
 | feedback | `CoreAlert` `CoreToast` `CoreDialog` `CoreDrawer` `CorePopover` `CoreContextMenu` `CoreTooltip` |
-| foundation | `CoreIcon` (185 glyphs; `window.CoreUI.kit.registerIcons({ 'my-icon': 'M…' })` adds yours) |
+| foundation | `CoreIcon` (185 glyphs; `registerIcons({ 'my-icon': 'M…' })` from `@core/ui` adds yours) |
 
 Props follow one vocabulary: `size` (`sm|md|lg`), `tone`, `icon`, `disabled`, `v-model`, `items`.
 The full API is `DESIGN.md` §37.5, the live version is core's Storybook (**Kit → …**, plus
 **Docs → Design System**), and core's README has the same list with a page example.
 
-For the bits the kit does not cover, Tailwind v4 is there (CSS-first, no config file): core's
-stylesheet scans **your** sources — `@source "../../../*/ui/src/**/*.{vue,js}"` in
-`core/ui/src/styles.css` — so every utility your page uses lands in core's single bundle. Layout
-utilities (`flex`, `gap-*`, `w-*`, `mt-*`) on a kit tag always win over the kit's own rule.
+For the bits the kit does not cover, Tailwind v4 is there (CSS-first, no config file and no CSS
+entry of your own): `coreUI()` generates one against core's tokens and emits **only the utilities
+this folder uses**, inside `@layer utilities`, into `ui/dist/plugin.<hash>.css` — a stylesheet core
+links while the plugin is loaded and removes with it. No preflight, no `:root` block, no kit class:
+those stay global in core's `app.css`, and the document's layer order makes your utility win anyway.
+Layout utilities (`flex`, `gap-*`, `w-*`, `mt-*`) on a kit tag always beat the kit's own rule.
 **Colours, fonts and radii come from core's tokens, never from a literal value:**
 
 | group | utilities |
@@ -139,18 +159,20 @@ Class names work too — `core-panel` `core-btn` `core-input` `core-key` `core-l
 your own needs because the shell is click-through).
 
 A scoped `<style>` block is compiled on its own, so `@apply` has to be pointed at the theme first —
-the path is relative to **your** `ui/src/`:
+one fixed line, the same in every plugin:
 
 ```vue
 <style scoped>
-@reference "../../../core/ui/src/styles.css";   /* <plugin>/ui/src -> resources/ -> core */
+@reference "@core/ui/reference.css";
 
 .card { @apply rounded-ui-sm border border-border bg-panel-raise px-2.5 py-2; }
 </style>
 ```
 
-`@reference` only reads that file (tokens, `.core-*`, custom utilities) and emits nothing, so the
-bundle keeps one copy of the CSS. Utilities written in the template need no `@reference`.
+`@reference` compiles that file and throws the output away (it only teaches `@apply` which tokens
+and utilities exist), so nothing of it reaches your bundle. Utilities written in the template need
+no `@reference` at all. Keep every block **scoped**: your stylesheet is a document-wide `<link>`, so
+an unscoped selector leaks into core's shell and every other plugin.
 
 **FiveM's CEF is Chromium 103**: no `:has()`, no `color-mix()`, no CSS nesting, no container
 queries, no `dvh`, no Popover API, and Tailwind's `translate-*` / `rotate-*` / `scale-*` utilities
@@ -164,7 +186,8 @@ own element): core draws a live, blurred copy of the game frame behind it, no Ja
 rows, and 12 or fewer on screen. See core's README, "Game blur (glass panels)".
 
 Check the page without a build: `node ../core/ui/tests/kit-compile-check.mjs ui/src/Page.vue`.
-New classes only reach the game after core's UI is rebuilt (`cd core/ui && npm run build`).
+New classes only reach the game after **this** plugin is rebuilt (`cd ui && npm run build`,
+then `restart my_plugin`).
 
 ## 4. Where the APIs are documented
 
@@ -182,7 +205,7 @@ New classes only reach the game after core's UI is rebuilt (`cd core/ui && npm r
 | What a net event is allowed to do (security table) | §5 |
 | `Core.Spawn`, markers, text labels, blips, interactions, raycast (client) | §6.1–§6.9 |
 | `Core.UI` (notify, text UI, progress, menu, input, alert, pages) | §6.10 |
-| Page bundles and `window.CoreUI` | §7.4 |
+| The UI platform: what a plugin ships, `@core/ui`, transport, focus, state, builds | §38 |
 | State bags and `GlobalState` keys | §8 |
 | Performance budget | §9 |
 | A full worked example | `core_example/` and §11 |

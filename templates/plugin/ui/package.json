@@ -1,0 +1,16 @@
+{
+  "//": "The plugin's own frontend build (core DESIGN §38.3). `@core/ui` is the workspace link that brings the typed facade, the Vite config and core's tokens; add a runtime library this page imports to `dependencies` and re-run `npm install` in the resources/ folder. `vue` NEVER belongs here — the shell hands the plugin its one Vue at runtime.",
+  "name": "my_plugin-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:game": "vite --mode game",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@core/ui": "*"
+  }
+}

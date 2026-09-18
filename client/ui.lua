@@ -1,14 +1,18 @@
---- core / client/ui.lua — Core.UI: the NUI bridge (DESIGN §6.10).
---- Owns the page registry (one exclusive page + overlays), the focus rules, the
---- built-ins (notify, textUI, progress, menu, input, alert, hud), every NUI
---- callback and the focus watchdog.
---- Natives verified with fxref on 2026-09-12: SetNuiFocus, SetNuiFocusKeepInput,
---- RegisterNuiCallback, RegisterKeyMapping, PlaySoundFrontend (client),
+--- core / client/ui.lua — Core.UI: the NUI bridge (DESIGN §6.10, §38).
+--- Owns the page registry (one exclusive page + overlays + plugin modals), the
+--- focus stack (§38.9), page state (snapshot/patch/feed, §38.10), the NUI↔Lua
+--- request pair (§38.8), the built-ins (notify, textUI, progress, menu, input,
+--- alert, hud), every NUI callback and the focus watchdog.
+--- Natives verified with fxref on 2026-09-12 and 2026-09-18: SetNuiFocus,
+--- SetNuiFocusKeepInput, PlaySoundFrontend, RegisterKeyMapping (client),
 --- RegisterCommand, AddStateBagChangeHandler (shared), GetGameTimer (client+server),
 --- GetCurrentResourceName (shared).
---- Runtime helpers: SendNUIMessage (table form), promise, Citizen.Await, SetTimeout.
+--- Runtime helpers: SendNUIMessage (table form), RegisterNuiCallback, promise,
+--- Citizen.Await, SetTimeout.
 --- Note: `UI.progress` is the function itself, so inside core its canceller is only
 --- reachable through the flat key — `UI['progress.cancel']()`, not `UI.progress.cancel()`.
+--- `Core.UIInternal` is the seam client/ui_plugins.lua uses; it is blocked from the
+--- export (client/api.lua INTERNAL_NS), so no plugin can reach it.
 
 local UI = Core.UI                  -- lib namespace from lib/ui/client.lua (UI.on/UI.off) — extend, never replace
 local Registry = Core.Registry
@@ -26,19 +30,28 @@ local MAX_NOTIFY_QUEUE <const> = 50
 local NOTIFY_TICK_MS <const> = 100
 local HUD_TICK_MS <const> = 100
 local PROGRESS_GRACE_MS <const> = 5000
-local PAGE_TYPES <const> = { page = true, overlay = true }
--- A page with no script/style is resolved from the shell's own bundle: send an
--- explicit null (dkjson's json.null encodes to `null`, falsy in JS like false).
-local NO_URL <const> = (type(json) == 'table' and json.null) or false
+local PAGE_TYPES <const> = { page = true, overlay = true, modal = true }
+local MAX_PATCH_OPS <const> = 64          -- more than this costs less as one snapshot (§38.10)
+local MAX_PATH_DEPTH <const> = 8
+local MAX_PATH_LEN <const> = 160
+local FEED_MIN_MS <const> = 16            -- one frame at 60 fps; never faster
+local FEED_MAX_MS <const> = 1000
+local MAX_REQUEST_NAME <const> = 64
+local REQUEST_NAME_PATTERN <const> = '^[%w_%-%.:]+$'
+local REQUEST_MIN_MS <const> = 1000
+-- An explicit JSON null (dkjson's json.null encodes to `null`, falsy in JS like
+-- false): a key the page must DROP, as opposed to one that simply did not change.
+local JSON_NULL <const> = (type(json) == 'table' and json.null) or false
 local NOTIFY_TYPES <const> = { info = true, success = true, error = true, warning = true }
 local SHARD_STYLES <const> = { wasted = true, success = true, info = true }
 -- replicated keys forwarded to the page as `state:set` (§21); bulky ones stay in Lua
 local STATE_SKIP <const> = { stats = true, attachments = true }
 local STATE_KEYS <const> = { 'loaded', 'name', 'charId', 'cash', 'bank', 'faction', 'group', 'dead' }
 
-local pages = {}                    -- id -> { owner, type, script, style, keepInput, registered }
+local pages = {}                    -- id -> { owner, type, keepInput, registered, props }
 local overlays = {}                 -- id -> true (visible overlays)
 local openPage = nil                -- id of the exclusive page, or nil
+local modals = {}                   -- open plugin modals (type = 'modal'), top last (§38.9)
 local pending = {}                  -- requestId -> { kind, promise }
 local modal = nil                   -- { kind = 'menu'|'input'|'alert', id = requestId }
 local progressReq = nil             -- requestId of the running progress bar
@@ -67,8 +80,21 @@ local uiReadyAt = nil               -- last accepted ui_ready, for the 1/s rate 
 local focusOwned = false
 local focusKeepInput = false
 local focusCursor = true            -- pages/modals take the cursor; the chat input never does
+local focusSignature = nil          -- last stack the shell was told about ('' = empty)
 local chatTyping = false            -- §23: the CEF chat input owns keyboard while open
 local requestSeq = 0
+local patchQueue = {}               -- page id -> { snapshot, ops } waiting for the next tick
+local feedDirty = {}                -- channel -> { key = value } waiting for the feed flush
+local feedTimer = false
+local feedActive = {}               -- channel -> true while a mounted component reads it
+local requestHandlers = {}          -- owner -> { [name] = handler } for ui_request
+local heldRequests = {}             -- key -> { owner, answer } — NUI cb's held until answered
+local uiRequests = {}               -- rid -> { promise } — Lua → NUI awaits
+
+--- The seam client/ui_plugins.lua uses; never part of Core.UI, which any plugin
+--- can call through the export. Filled in from both files.
+local UIInternal = {}
+Core.UIInternal = UIInternal
 
 -- Sub-namespace tables (§2.2): every function is stored BOTH as UI.menu.open and
 -- as the flat dotted key UI['menu.open'], which is what exports.core:call looks up.
@@ -130,28 +156,73 @@ local function resolveAllPending()
     modal, progressReq, progressCancellable = nil, nil, false
 end
 
---- Exactly SetNuiFocus(true, true) while a page or a built-in modal is open,
---- SetNuiFocus(false, false) the moment none is (DESIGN §6.10). The CEF chat input
---- (§23) is a third owner: keyboard only, never a cursor.
+--- The focus stack, top last (DESIGN §38.9): chat (1) < page (2) < modal (3) <
+--- system (4). Derived on every change instead of stored, so no path can leave a
+--- stale entry behind — removing a page removes its entry by construction.
+local function focusStack()
+    local stack = {}
+    if chatTyping then
+        stack[#stack + 1] = { key = 'chat', layer = 'chat', owner = 'core' }
+    end
+    if openPage then
+        local page = pages[openPage]
+        stack[#stack + 1] = { key = 'page:' .. openPage, layer = 'page', id = openPage,
+            owner = page and page.owner or 'core' }
+    end
+    for i = 1, #modals do
+        local id = modals[i]
+        local page = pages[id]
+        stack[#stack + 1] = { key = 'modal:' .. id, layer = 'modal', id = id,
+            owner = page and page.owner or 'core' }
+    end
+    if modal then
+        stack[#stack + 1] = { key = 'system:' .. modal.kind, layer = 'system', owner = 'core' }
+    end
+    return stack
+end
+
+--- Cheap identity of a stack: only the keys can change what the shell draws.
+local function stackSignature(stack)
+    local keys = {}
+    for i = 1, #stack do keys[i] = stack[i].key end
+    return table.concat(keys, '|')
+end
+
+--- The top entry alone decides focus: SetNuiFocus(true, cursor) +
+--- SetNuiFocusKeepInput(keepInput), an empty stack releases both (§38.9). The
+--- natives are called only when that triple changes; the `focus` message also goes
+--- out when only the stack moved, because the shell mirrors it for z-order and
+--- `inert`. The CEF chat input never takes a cursor and loses the keyboard the
+--- moment anything above it appears (§23).
 local function applyFocus()
-    if chatTyping and (openPage ~= nil or modal ~= nil) then
+    if chatTyping and (openPage ~= nil or modal ~= nil or #modals > 0) then
         chatTyping = false
         send({ action = 'chat:open', open = false })
     end
-    local want = (openPage ~= nil) or (modal ~= nil) or chatTyping
-    local page = (modal == nil) and openPage and pages[openPage] or nil
-    local keep = want and page ~= nil and page.keepInput == true
-    local cursor = (openPage ~= nil) or (modal ~= nil)   -- chat typing never takes the cursor
-    if want == focusOwned and keep == focusKeepInput and cursor == focusCursor then return end
-    focusOwned, focusKeepInput, focusCursor = want, keep, cursor
-    if want then
-        SetNuiFocus(true, cursor)
-        SetNuiFocusKeepInput(keep)
-    else
-        SetNuiFocusKeepInput(false)
-        SetNuiFocus(false, false)
+    local stack = focusStack()
+    local top = stack[#stack]
+    local want = top ~= nil
+    local cursor = want and top.layer ~= 'chat'
+    local keep = false
+    if want and (top.layer == 'page' or top.layer == 'modal') then
+        local page = pages[top.id]
+        keep = page ~= nil and page.keepInput == true
     end
-    send({ action = 'focus', focused = want })
+    local signature = stackSignature(stack)
+    local sameTriple = want == focusOwned and keep == focusKeepInput and cursor == focusCursor
+    if sameTriple and signature == focusSignature then return end
+    if not sameTriple then
+        focusOwned, focusKeepInput, focusCursor = want, keep, cursor
+        if want then
+            SetNuiFocus(true, cursor)
+            SetNuiFocusKeepInput(keep)
+        else
+            SetNuiFocusKeepInput(false)
+            SetNuiFocus(false, false)
+        end
+    end
+    focusSignature = signature
+    send({ action = 'focus', focused = want, stack = stack })
 end
 
 --- Internal seam for client/chat.lua (§23): the chat input is open. Not part of the
@@ -217,19 +288,6 @@ local function closeModal()
     resolvePending(id, kind == 'alert' and false or nil)
 end
 
---- 'ui/dist/page.js' inside resource `owner` → 'https://cfx-nui-owner/ui/dist/page.js' (§7.4).
---- Only relative paths inside the owning resource are accepted: an absolute URL or a
---- traversal would let a page pull an arbitrary remote script into the NUI.
-local function urlFor(owner, path)
-    if type(path) ~= 'string' or path == '' then return nil end
-    if path:find('://', 1, true) or path:find('..', 1, true)
-        or path:sub(1, 1) == '/' or path:find('[^%w%._%-/]') then
-        Log.error("UI.registerPage: '%s' is not a relative path inside '%s'", path, tostring(owner))
-        return nil
-    end
-    return ('https://cfx-nui-%s/%s'):format(owner, path)
-end
-
 --- Stricter than Validate's 'id': no ':' at all, so a forged page/event pair from
 --- the NUI cannot address another page's local event (core:ui:<page>:<event>).
 local function isPlainId(value)
@@ -248,25 +306,158 @@ local function payloadTooBig(payload)
     return false
 end
 
+-- ------------------------------------------------------- page state (§38.10) ----
+-- `update`/`patch` queue per page and leave as ONE `page:patch` on the next tick;
+-- every other message for that page flushes the queue first, so the page never sees
+-- an event before the state change that preceded it in Lua. The same ops are applied
+-- to `pages[id].props` (the replay copy), so a shell reload restores CURRENT state.
+
+--- Is `id` open as a plugin modal right now, and at which position.
+local function modalIndex(id)
+    for i = 1, #modals do
+        if modals[i] == id then return i end
+    end
+    return nil
+end
+
+--- 'slots.12.count' → { 'slots', '12', 'count' }, or nil when the path is not
+--- `seg(.seg){0,7}` of [%w_%-] (a forged deep path must never walk a props table).
+local function splitPath(path)
+    if type(path) ~= 'string' or path == '' or #path > MAX_PATH_LEN then return nil end
+    local segs = {}
+    for seg in path:gmatch('[^%.]+') do
+        if #segs >= MAX_PATH_DEPTH or not seg:find('^[%w_%-]+$') then return nil end
+        segs[#segs + 1] = seg
+    end
+    -- gmatch swallows empty segments, so 'a..b' and 'a.' are caught here
+    if #segs == 0 or #segs ~= select(2, path:gsub('%.', '')) + 1 then return nil end
+    return segs
+end
+
+--- The Lua key a path segment means for `container` — LUA's view of the data, so
+--- `patch(id, 'slots.' .. slot, v)` with a Lua index hits that very element (§38.10).
+--- R1 list element: the container is a list (a sequence, or an empty table — JSON
+--- had to pick one) and the segment is an integer 1..#t+1, which is `t[n]` (#t+1
+--- appends). R2 map key: everything else — an integer key the map already has, else
+--- the plain string key. The second return marks an integer index that fell OUTSIDE
+--- a non-empty list: still applied as a map key, but it leaves a hole the shell has
+--- to mirror, so the caller warns.
+local function keyFor(container, seg)
+    local n = math.tointeger(tonumber(seg))
+    local len = #container
+    local isList = len > 0 or next(container) == nil
+    if n and isList and n >= 1 and n <= len + 1 then return n, false end
+    if n and container[n] ~= nil then return n, len > 0 end
+    return seg, n ~= nil and len > 0
+end
+
+--- One Log.warn per page and path: a hole in a list is a design mistake, not an
+--- error, and the same loop would otherwise print it every frame.
+local function warnHole(id, path, why)
+    local page = pages[id]
+    if not page then return end
+    local seen = page.patchWarned
+    if not seen then
+        seen = {}
+        page.patchWarned = seen
+    end
+    if seen[path] then return end
+    seen[path] = true
+    Log.warn("UI.patch('%s', '%s'): %s — send the list whole with UI.update instead", id, path, why)
+end
+
+--- Applies one op to the replay copy. Intermediate tables are created on the way
+--- for a write; a delete stops as soon as the path is missing.
+local function applyOp(id, props, segs, path, value, hasValue)
+    local container = props
+    for i = 1, #segs - 1 do
+        local key, outside = keyFor(container, segs[i])
+        if outside then warnHole(id, path, ('segment %d is outside its list'):format(i)) end
+        local child = container[key]
+        if type(child) ~= 'table' then
+            if not hasValue then return end
+            child = {}
+            container[key] = child
+        end
+        container = child
+    end
+    local key, outside = keyFor(container, segs[#segs])
+    if outside then warnHole(id, path, 'the index is outside the list') end
+    local len = #container
+    if not hasValue and math.type(key) == 'integer' and len > 0 and key < len then
+        warnHole(id, path, 'deleting in the middle of a list leaves a hole')
+    end
+    container[key] = hasValue and value or nil
+end
+
+--- Sends whatever is queued for `id`. Nothing is sent for a page that went away;
+--- a queue that overflowed leaves as one `page:open` snapshot of the replay copy.
+local function flushPage(id)
+    local queue = patchQueue[id]
+    if not queue then return end
+    patchQueue[id] = nil
+    local page = pages[id]
+    if not page then return end
+    if queue.snapshot then
+        if openPage == id or overlays[id] or modalIndex(id) then
+            send({ action = 'page:open', id = id, props = page.props or {} })
+        end
+    elseif #queue.ops > 0 then
+        send({ action = 'page:patch', id = id, ops = queue.ops })
+    end
+end
+
+--- Queues one wire op (`{ p = path, v = value }`; no `v` deletes) for the next tick.
+local function queueOp(id, op)
+    local queue = patchQueue[id]
+    if not queue then
+        queue = { snapshot = false, ops = {} }
+        patchQueue[id] = queue
+        SetTimeout(0, function() flushPage(id) end)
+    end
+    if queue.snapshot then return end
+    queue.ops[#queue.ops + 1] = op
+    if #queue.ops > MAX_PATCH_OPS then
+        queue.snapshot, queue.ops = true, {}
+    end
+end
+
+--- Every page message but `page:patch` itself flushes that page's queue first.
+local function sendFor(id, message)
+    flushPage(id)
+    send(message)
+end
+
 -- ---------------------------------------------------------------- pages ----
 
---- Hides one page/overlay without touching focus. Returns whether it was shown.
+--- Hides one page/overlay/modal without touching focus. Returns whether it was shown.
 local function closeOne(id)
     if overlays[id] then
         overlays[id] = nil
     elseif openPage == id then
         openPage = nil
     else
-        return false
+        local index = modalIndex(id)
+        if not index then return false end
+        table.remove(modals, index)
     end
-    send({ action = 'page:close', id = id })
+    sendFor(id, { action = 'page:close', id = id })
     return true
 end
 
---- UI.registerPage(id, { type = 'page'|'overlay', script?, style?, keepInput? })
---- Without `script` the shell resolves the component from its own bundle. When
---- `script`/`style` ARE given they must be relative paths inside the CALLING
---- resource and become cfx-nui URL fallbacks.
+--- Closes every open plugin modal, top first, without touching focus.
+local function closeModals()
+    for i = #modals, 1, -1 do
+        local id = modals[i]
+        modals[i] = nil
+        sendFor(id, { action = 'page:close', id = id })
+    end
+end
+
+--- UI.registerPage(id, { type = 'page'|'overlay'|'modal', keepInput? })
+--- The component comes from the owning resource's UI plugin (§38): Lua declares
+--- the id, its type and who owns it, the shell resolves it. `modal` pages stack
+--- above the exclusive page, any number of them (§38.9).
 function UI.registerPage(id, opts)
     local owner = Registry.getCaller()
     if not Validate.value('id', id) then
@@ -282,20 +473,14 @@ function UI.registerPage(id, opts)
         Log.error("UI.registerPage('%s'): id already registered by '%s'", id, existing.owner)
         return false
     end
-    local script, style = nil, nil
-    if opts.script ~= nil then
-        script = urlFor(owner, opts.script) -- a bad path fails the whole registration
-        if not script then return false end
-    end
-    if opts.style ~= nil then
-        style = urlFor(owner, opts.style)
-        if not style then return false end
+    if opts.script ~= nil or opts.style ~= nil then
+        Log.error("UI.registerPage('%s'): script/style were removed — a page's code now comes "
+            .. "from its own resource's UI plugin (core_ui '<dir>' + ui/dist, DESIGN §38)", id)
+        return false
     end
     local entry = {
         owner = owner,
         type = PAGE_TYPES[opts.type] and opts.type or 'page',
-        script = script,
-        style = style,
         keepInput = opts.keepInput == true,
         registered = true,
     }
@@ -303,7 +488,7 @@ function UI.registerPage(id, opts)
     Registry.track('page', id, owner)
     send({
         action = 'page:register', id = id, type = entry.type,
-        script = entry.script or NO_URL, style = entry.style or NO_URL, keepInput = entry.keepInput,
+        keepInput = entry.keepInput, owner = owner,
     })
     return true
 end
@@ -313,6 +498,7 @@ function UI.unregisterPage(id)
     if not page then return false end
     closeOne(id)
     pages[id] = nil
+    patchQueue[id] = nil            -- nothing queued can outlive its page
     Registry.untrack('page', id)
     send({ action = 'page:unregister', id = id })
     applyFocus()
@@ -332,32 +518,44 @@ function UI.open(id, props)
     end
     if page.type == 'overlay' then
         overlays[id] = true
-    else
-        if openPage and openPage ~= id then closeOne(openPage) end
+    elseif page.type == 'modal' then
+        if not modalIndex(id) then modals[#modals + 1] = id end   -- re-open = props only
+    elseif openPage ~= id then
+        -- a different exclusive page replaces the whole layer, modals included
+        closeModals()
+        if openPage then closeOne(openPage) end
         openPage = id
     end
     page.props = props or {}            -- kept so ui_ready can restore the page after a shell reload
+    -- a snapshot supersedes whatever was queued: the ops are already in props
+    patchQueue[id] = nil
     send({ action = 'page:open', id = id, props = page.props })
     applyFocus()
     return true
 end
 
---- UI.close(id?) — nil closes the exclusive page that is currently open.
+--- UI.close(id?) — nil closes the top plugin modal, or the exclusive page when
+--- no modal is open.
 function UI.close(id)
     if id == nil then
-        if openPage then closeOne(openPage) end
+        if #modals > 0 then
+            closeOne(modals[#modals])
+        elseif openPage then
+            closeOne(openPage)
+        end
     else
         closeOne(id)
     end
     applyFocus()
 end
 
---- Closes every page, overlay and built-in, then releases focus.
+--- Closes every page, overlay, plugin modal and built-in, then releases focus.
 function UI.closeAll()
+    closeModals()
     if openPage then closeOne(openPage) end
     for id in pairs(overlays) do
         overlays[id] = nil
-        send({ action = 'page:close', id = id })
+        sendFor(id, { action = 'page:close', id = id })
     end
     closeModal()
     UI['progress.cancel']()
@@ -368,7 +566,7 @@ function UI.closeAll()
 end
 
 function UI.isOpen(id)
-    return openPage == id or overlays[id] == true
+    return openPage == id or overlays[id] == true or modalIndex(id) ~= nil
 end
 
 function UI.getOpenPage()
@@ -379,12 +577,276 @@ function UI.isFocused()
     return focusOwned
 end
 
---- Pushes an event into a page: NUI 'page:event' → CoreUI.on(pageId, event, fn).
+--- Pushes an event into a page or a plugin channel: NUI 'page:event' →
+--- CoreUI.on(id, event, fn) / the SDK's `page.on` / `nui.on` (§38.8).
 function UI.send(id, event, data)
-    if not pages[id] or not Validate.value('id', event) then return false end
+    local known = pages[id] ~= nil
+        or (isPlainId(id) and type(UIInternal.hasPlugin) == 'function' and UIInternal.hasPlugin(id))
+    if not known or not Validate.value('id', event) then return false end
     if data ~= nil and type(data) ~= 'table' then return false end
-    send({ action = 'page:event', id = id, event = event, data = data or {} })
+    sendFor(id, { action = 'page:event', id = id, event = event, data = data or {} })
     return true
+end
+
+-- --------------------------------------------------- update / patch / feed ----
+
+--- The page `fn` may write to, or nil. Only the resource that registered a page —
+--- or core itself — may change its state (§2.3). A page that is not SHOWING is a
+--- silent no-op: a producer may push blindly, the wire stays quiet, and the next
+--- `open` carries fresh props anyway (§38.10).
+local function pageForWrite(fn, id)
+    local page = pages[id]
+    if not page then
+        Log.error("UI.%s: page '%s' is not registered", fn, tostring(id))
+        return nil
+    end
+    local caller = Registry.getCaller()
+    if caller ~= 'core' and caller ~= page.owner then
+        Log.error("UI.%s('%s'): '%s' does not own that page ('%s' does)", fn, id, caller, page.owner)
+        return nil
+    end
+    if not UI.isOpen(id) then return nil end
+    page.props = page.props or {}
+    return page
+end
+
+--- What a page state value may be. These come from trusted Lua, exactly like the
+--- props of `UI.open`, so they are type-checked but NOT size-bounded (§38.10).
+local function patchValueOk(value)
+    local kind = type(value)
+    return kind == 'boolean' or kind == 'number' or kind == 'string' or kind == 'table'
+end
+
+--- Telemetry stays small, so a feed value keeps the shallow payload bound.
+local function feedValueOk(value)
+    local kind = type(value)
+    if kind == 'boolean' or kind == 'number' then return true end
+    if kind == 'string' then return #value <= MAX_EVENT_BYTES end
+    return kind == 'table' and not payloadTooBig(value)
+end
+
+--- UI.update(id, { key = value, ... }) — shallow merge of top-level keys into the
+--- page's props: one queued op per key, one `page:patch` on the next tick (§38.10).
+function UI.update(id, partial)
+    local page = pageForWrite('update', id)
+    if not page then return false end
+    if type(partial) ~= 'table' then
+        Log.error("UI.update('%s'): partial must be a table", tostring(id))
+        return false
+    end
+    for key, value in pairs(partial) do       -- validate everything before touching props
+        if type(key) ~= 'string' or not key:find('^[%w_%-]+$') then
+            Log.error("UI.update('%s'): '%s' is not a valid top-level key", id, tostring(key))
+            return false
+        end
+        if not patchValueOk(value) then
+            Log.error("UI.update('%s'): value of '%s' is not a boolean, number, string or table", id, key)
+            return false
+        end
+    end
+    for key, value in pairs(partial) do
+        page.props[key] = value
+        queueOp(id, { p = key, v = value })
+    end
+    return true
+end
+
+--- UI.patch(id, 'slots.12.count', value) — one deep op; a nil value deletes the key.
+--- Segments are map keys or 1-BASED list indexes: Lua's view of the props table
+--- (§38.10), so a Lua index addresses that very element on both sides.
+function UI.patch(id, path, value)
+    local page = pageForWrite('patch', id)
+    if not page then return false end
+    local segs = splitPath(path)
+    if not segs then
+        Log.error("UI.patch('%s'): '%s' is not a path of at most %d [%%w_%%-] segments",
+            tostring(id), tostring(path), MAX_PATH_DEPTH)
+        return false
+    end
+    if value ~= nil and not patchValueOk(value) then
+        Log.error("UI.patch('%s', '%s'): value is not a boolean, number, string or table", id, path)
+        return false
+    end
+    applyOp(id, page.props, segs, path, value, value ~= nil)
+    queueOp(id, { p = path, v = value })      -- a nil value drops `v`: that IS the delete
+    return true
+end
+
+--- Config.UI.FeedIntervalMs, clamped: telemetry must never approach one message
+--- per frame, and never be slower than a second either.
+local function feedInterval()
+    local ms = tonumber(uiCfg('FeedIntervalMs', 50)) or 50
+    return Utils.clamp(ms, FEED_MIN_MS, FEED_MAX_MS)
+end
+
+--- ONE `feed` message for every dirty channel, then no timer until the next write.
+local function flushFeed()
+    feedTimer = false
+    local channels, any = {}, false
+    for channel, values in pairs(feedDirty) do
+        channels[channel] = values
+        feedDirty[channel] = nil
+        any = true
+    end
+    if any then send({ action = 'feed', c = channels }) end
+end
+
+--- UI.feed({ speed = 132 }) — telemetry on the CALLING resource's channel — or
+--- UI.feed('inventory', { … }). Latest value per key wins; the shell copies the
+--- buffer into its reactive feed objects once per frame (§38.10).
+function UI.feed(channel, values)
+    if values == nil and type(channel) == 'table' then
+        channel, values = Registry.getCaller(), channel
+    end
+    if not isPlainId(channel) then
+        Log.error('UI.feed: invalid channel (%s)', tostring(channel))
+        return false
+    end
+    if type(values) ~= 'table' then
+        Log.error("UI.feed('%s'): values must be a table", channel)
+        return false
+    end
+    for key, value in pairs(values) do
+        if type(key) ~= 'string' or not key:find('^[%w_%-]+$') then
+            Log.error("UI.feed('%s'): '%s' is not a valid key", channel, tostring(key))
+            return false
+        end
+        if not feedValueOk(value) then
+            Log.error("UI.feed('%s'): value of '%s' is not a scalar or a bounded table", channel, key)
+            return false
+        end
+    end
+    local bucket = feedDirty[channel]
+    if not bucket then
+        bucket = {}
+        feedDirty[channel] = bucket
+    end
+    for key, value in pairs(values) do bucket[key] = value end
+    if not feedTimer then
+        feedTimer = true
+        SetTimeout(feedInterval(), flushFeed)
+    end
+    return true
+end
+
+--- True while a mounted component reads that feed (the shell reports it through
+--- `ui_feed`), so a producer loop can sleep when nobody looks.
+function UI.isFeedActive(channel)
+    if channel == nil then channel = Registry.getCaller() end
+    return isPlainId(channel) and feedActive[channel] == true
+end
+
+-- ------------------------------------------------------ requests (§38.8) ----
+
+local function isRequestName(name)
+    return type(name) == 'string' and #name >= 1 and #name <= MAX_REQUEST_NAME
+        and name:find(REQUEST_NAME_PATTERN) ~= nil
+end
+
+--- Both directions clamp the caller's timeout into the same window.
+local function clampTimeout(ms)
+    local value = tonumber(ms) or uiCfg('RequestTimeoutMs', 10000)
+    return Utils.clamp(value, REQUEST_MIN_MS, uiCfg('RequestMaxMs', 30000))
+end
+
+--- UI.onRequest(name, fn(data) -> result) — answers `nui.invoke(name, data)` on the
+--- CALLER's channel. The handler crosses the export as a callable table (§2.2) and
+--- may yield (Core.Callback.await), because the NUI cb is simply held open.
+function UI.onRequest(name, fn)
+    local owner = Registry.getCaller()
+    if not isRequestName(name) then
+        Log.error('UI.onRequest: invalid request name (%s)', tostring(name))
+        return false
+    end
+    if not Utils.isCallable(fn) then
+        Log.error("UI.onRequest('%s'): handler must be callable", name)
+        return false
+    end
+    local byName = requestHandlers[owner]
+    if not byName then
+        byName = {}
+        requestHandlers[owner] = byName
+    end
+    byName[name] = fn
+    Registry.track('uirpc', owner .. '|' .. name, owner)
+    return true
+end
+
+function UI.offRequest(name)
+    local owner = Registry.getCaller()
+    local byName = requestHandlers[owner]
+    if not isRequestName(name) or not byName or byName[name] == nil then return false end
+    byName[name] = nil
+    if next(byName) == nil then requestHandlers[owner] = nil end
+    Registry.untrack('uirpc', owner .. '|' .. name)
+    return true
+end
+
+--- Answers every held `ui_request` of `owner` and forgets them. Called before the
+--- handlers go away, from both cleanup paths (the registry sweep and onResourceStop),
+--- so the page's fetch never hangs on a resource that stopped mid-request.
+function UIInternal.failRequestsOf(owner, code)
+    for key, entry in pairs(heldRequests) do
+        if entry.owner == owner then
+            heldRequests[key] = nil
+            entry.answer({ ok = false, error = { code = code,
+                message = ("resource '%s' stopped"):format(owner) } })
+        end
+    end
+end
+
+--- Everything a stopping resource left in this file. Idempotent: it runs from
+--- client/ui.lua's own onResourceStop AND from the 'uirpc' registry remover,
+--- whichever the engine dispatches first.
+function UIInternal.dropOwner(owner)
+    UIInternal.failRequestsOf(owner, 'resource_stopped')
+    requestHandlers[owner] = nil
+    feedDirty[owner], feedActive[owner] = nil, nil
+end
+
+Registry.onOwnerStop('uirpc', function(id)
+    local owner, name = id:match('^(.-)|(.+)$')
+    if not owner then return end
+    UIInternal.failRequestsOf(owner, 'resource_stopped')
+    local byName = requestHandlers[owner]
+    if not byName then return end
+    byName[name] = nil
+    if next(byName) == nil then requestHandlers[owner] = nil end
+end)
+
+--- Resolves one Lua → NUI request; unknown/late rids are ignored.
+local function resolveUiRequest(rid, ok, value)
+    local entry = uiRequests[rid]
+    if not entry then return false end
+    uiRequests[rid] = nil
+    entry.promise:resolve({ ok = ok, value = value })
+    return true
+end
+
+--- UI.request(idOrChannel, name, data?, timeoutMs?) -> ok, result|errorCode.
+--- Yields until the shell answers (`ui_response`), the timeout fires, the shell
+--- reloads ('shell_reloaded') or it was never there ('not_ready'). Unlike the
+--- built-ins this takes no focus and opens no modal.
+function UI.request(target, name, data, timeoutMs)
+    if not isPlainId(target) or not isRequestName(name)
+        or (data ~= nil and type(data) ~= 'table') then
+        Log.error('UI.request: invalid target/name/data (%s/%s)', tostring(target), tostring(name))
+        return false, 'bad_request'
+    end
+    local known = pages[target] ~= nil
+        or (type(UIInternal.hasPlugin) == 'function' and UIInternal.hasPlugin(target))
+    if not known then
+        Log.error("UI.request: '%s' is neither a registered page nor a UI plugin", target)
+        return false, 'no_target'
+    end
+    if not nuiReady then return false, 'not_ready' end
+    local rid = newRequestId()
+    local p = promise.new()
+    uiRequests[rid] = { promise = p }
+    SetTimeout(clampTimeout(timeoutMs), function() resolveUiRequest(rid, false, 'timeout') end)
+    sendFor(target, { action = 'page:request', id = target, rid = rid, name = name, data = data or {} })
+    local answer = Citizen.Await(p)
+    return answer.ok, answer.value
 end
 
 -- ------------------------------------------------- notify / textUI / progress ----
@@ -859,7 +1321,7 @@ local function stateSet(key, value)
     if not Validate.value('id', key) then return false end
     local kind = type(value)
     if value == nil then
-        value = NO_URL                      -- JSON null: the key is gone, not unchanged
+        value = JSON_NULL                   -- JSON null: the key is gone, not unchanged
     elseif kind == 'table' then
         if payloadTooBig(value) then return false end
     elseif kind ~= 'string' and kind ~= 'number' and kind ~= 'boolean' then
@@ -990,6 +1452,7 @@ local function applyVisibility()
     shellVisible = visible
     if not visible then
         closeModal()
+        closeModals()                                 -- §38.9: plugin modals go with the page
         if openPage then closeOne(openPage) end
         if chatTyping then setChatTyping(false) end   -- §23: a hidden shell cannot keep the keyboard
         applyFocus()
@@ -1207,11 +1670,20 @@ RegisterNuiCallback('ui_ready', function(_, cb)
     nuiReady = true
     resolveAllPending()                 -- the reloaded shell forgot every open modal
     clearServerReasons()                -- ... and the server's hide reasons, which nobody re-sends
+    for rid in pairs(uiRequests) do resolveUiRequest(rid, false, 'shell_reloaded') end
+    for key, entry in pairs(heldRequests) do   -- their fetches died with the old document
+        heldRequests[key] = nil
+        entry.answer({ ok = false, error = { code = 'shell_reloaded', message = 'the NUI shell reloaded' } })
+    end
+    feedActive = {}                     -- nothing is mounted yet, so nothing subscribes
     applyFocus()
+    -- Plugins FIRST: the shell must know which module owns a page before the page
+    -- is declared, so a `page:register` is never orphaned (§38.4).
+    if type(UIInternal.replayPlugins) == 'function' then UIInternal.replayPlugins() end
     for id, page in pairs(pages) do
         send({
             action = 'page:register', id = id, type = page.type,
-            script = page.script or NO_URL, style = page.style or NO_URL, keepInput = page.keepInput,
+            keepInput = page.keepInput, owner = page.owner,
         })
     end
     local snapshot = { action = 'hud:set' }
@@ -1232,7 +1704,13 @@ RegisterNuiCallback('ui_ready', function(_, cb)
     if current then
         send({ action = 'page:open', id = openPage, props = current.props or {} })
     end
-    send({ action = 'focus', focused = focusOwned })
+    for i = 1, #modals do                       -- plugin modals in stack order, bottom first
+        local page = pages[modals[i]]
+        if page then send({ action = 'page:open', id = modals[i], props = page.props or {} }) end
+    end
+    local stack = focusStack()
+    focusSignature = stackSignature(stack)
+    send({ action = 'focus', focused = focusOwned, stack = stack })
     if not shellVisible then sendVisible() end   -- a shell mounted while hidden starts hidden (§31.4)
     Core.emitHook('uiReady')
     cb({ ok = true })
@@ -1263,6 +1741,74 @@ RegisterNuiCallback('ui_event', function(data, cb)
     end
     TriggerEvent(('core:ui:%s:%s'):format(data.page, data.event), payload or {})
     cb({ ok = true })
+end)
+
+--- NUI → Lua request (§38.8): `c` channel, `n` name, `d` payload, `t` timeout ms.
+--- The cb is HELD — FiveM simply keeps the POST open — until the handler returns,
+--- the timeout fires or the owning resource stops, so a handler may await the
+--- server. Every path answers exactly once: `answer` is the only writer.
+RegisterNuiCallback('ui_request', function(data, cb)
+    if type(data) ~= 'table' or not isPlainId(data.c) or not isRequestName(data.n)
+        or (data.d ~= nil and type(data.d) ~= 'table')
+        or (data.t ~= nil and type(data.t) ~= 'number') then
+        cb({ ok = false, error = { code = 'bad_request', message = 'malformed ui_request' } })
+        return
+    end
+    if data.d and payloadTooBig(data.d) then
+        cb({ ok = false, error = { code = 'bad_request', message = 'payload too large' } })
+        return
+    end
+    local byName = requestHandlers[data.c]
+    local handler = byName and byName[data.n]
+    if not handler then
+        cb({ ok = false, error = { code = 'no_handler',
+            message = ("no handler '%s' on channel '%s'"):format(data.n, data.c) } })
+        return
+    end
+    local key = newRequestId()
+    local answered = false
+    local function answer(payload)
+        if answered then return end
+        answered = true
+        heldRequests[key] = nil
+        -- cb JSON-encodes: a result the page could never receive answers as an error
+        -- instead of throwing inside the callback and hanging the fetch forever
+        if not pcall(cb, payload) then
+            pcall(cb, { ok = false, error = { code = 'bad_result',
+                message = 'the handler returned a value that cannot be sent to the page' } })
+        end
+    end
+    heldRequests[key] = { owner = data.c, answer = answer }
+    SetTimeout(clampTimeout(data.t), function()
+        answer({ ok = false, error = { code = 'timeout', message = 'the Lua handler did not answer in time' } })
+    end)
+    local ok, result = pcall(handler, data.d or {})
+    if ok then
+        answer({ ok = true, data = result })
+    else
+        answer({ ok = false, error = { code = 'handler_error', message = tostring(result) } })
+    end
+end)
+
+--- The shell's answer to UI.request. An unknown rid (already timed out, or forged)
+--- is ignored; the awaiting coroutine is resumed exactly once either way.
+RegisterNuiCallback('ui_response', function(data, cb)
+    cb({ ok = true })
+    if type(data) ~= 'table' then return end
+    local rid = math.tointeger(tonumber(data.rid) or 0)
+    if not rid or not uiRequests[rid] then return end
+    if data.ok == true then
+        local value = data.data
+        if type(value) == 'table' and payloadTooBig(value) then
+            resolveUiRequest(rid, false, 'bad_result')
+        else
+            resolveUiRequest(rid, true, value)
+        end
+        return
+    end
+    local code = type(data.error) == 'table' and type(data.error.code) == 'string'
+        and data.error.code or 'error'
+    resolveUiRequest(rid, false, code)
 end)
 
 RegisterNuiCallback('ui_sound', function(data, cb)
@@ -1332,6 +1878,20 @@ Registry.onOwnerStop('page', function(id)
     UI.unregisterPage(id)
 end)
 
+-- The rest of the seam client/ui_plugins.lua uses (§38.4). `replayPlugins` and
+-- `hasPlugin` are installed there; everything here is what that file needs FROM
+-- this one, so neither has to reach into the other's state.
+UIInternal.send = send
+UIInternal.isNuiReady = function() return nuiReady end
+
+--- The shell reports the first subscriber and the last unsubscribe of a feed
+--- (`ui_feed`), so UI.isFeedActive can tell a producer loop to sleep.
+function UIInternal.setFeedActive(channel, active)
+    if not isPlainId(channel) then return false end
+    feedActive[channel] = active and true or nil
+    return true
+end
+
 Core.Net.on('core:client:notify', { 'table' }, function(data)
     UI.notify(data)
 end)
@@ -1377,19 +1937,30 @@ CreateThread(function()
         Wait(500)
         -- only ever release focus core itself took: NUI focus is global client
         -- state, so touching it while another resource holds it steals the cursor
-        if focusOwned and not openPage and not modal then
+        if focusOwned and not openPage and not modal and #modals == 0 and not chatTyping then
             applyFocus()
         end
     end
 end)
 
 AddEventHandler('onResourceStop', function(resource)
-    if resource ~= GetCurrentResourceName() then return end
+    if resource ~= GetCurrentResourceName() then
+        -- a plugin that stops: answer its held page requests before anything else
+        -- drops the handlers, then forget its feed channel (§38.4)
+        if type(resource) == 'string' then UIInternal.dropOwner(resource) end
+        return
+    end
     -- synchronous: focus first, then unblock every coroutine still awaiting the shell
     SetNuiFocusKeepInput(false)
     SetNuiFocus(false, false)
     focusOwned, focusKeepInput = false, false
     openPage, textUI, chatTyping = nil, nil, false
+    for i = #modals, 1, -1 do modals[i] = nil end
+    for rid in pairs(uiRequests) do resolveUiRequest(rid, false, 'shell_reloaded') end
+    for key, entry in pairs(heldRequests) do
+        heldRequests[key] = nil
+        entry.answer({ ok = false, error = { code = 'resource_stopped', message = 'core stopped' } })
+    end
     resolveAllPending()
 end)
 

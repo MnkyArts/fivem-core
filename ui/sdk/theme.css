@@ -1,0 +1,98 @@
+/* @core/ui/theme.css — core's design tokens (DESIGN §37.2), the ONE copy.
+   core's shell imports it from src/styles.css; every plugin build imports it as
+   `@import "…/theme.css" theme(reference)` so plugin utilities compile against the same values
+   without re-emitting a single variable (DESIGN §38.3, §38.13).
+   ONLY `@theme` blocks may live in this file — Tailwind refuses `theme(reference)` on anything
+   else ("Files imported with @import '…' theme(reference) must only contain @theme blocks").
+   The `:root` recipes (gradients, rgb triplets, control heights, legacy --core-* aliases) are
+   host-only and stay in core's src/styles.css. */
+
+/* `static`: emit EVERY token as a CSS variable even when no utility references it yet — plugin CSS,
+   inline styles and a server's re-theme read them at runtime (Tailwind would otherwise drop the
+   unused ones, e.g. --color-accent-lo). */
+@theme static {
+  /* Both families are bundled as woff2 in src/kit/fonts (src/kit/fonts.css) — the CEF cannot
+     fetch the web, so the fallbacks only ever show in a browser before the file lands. */
+  --font-sans: 'Barlow', 'Segoe UI', system-ui, -apple-system, Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-display: 'Barlow Condensed', 'Barlow', 'Arial Narrow', 'Segoe UI', sans-serif;
+  --font-mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+
+  --color-ink: #060b0f;
+  --color-panel: rgba(11, 17, 22, 0.90);
+  /* §32: the tint a `.core-glass` panel wears over its blurred copy of the game — thinner than
+     --color-panel, because there is a real picture underneath it now. */
+  --color-panel-glass: rgba(11, 17, 22, 0.64);
+  --color-panel-solid: #0d1419;
+  --color-panel-raise: rgba(255, 255, 255, 0.035);
+  --color-panel-sunken: rgba(0, 0, 0, 0.30);
+  /* Popups (select list, context menu, tooltip) sit over other panels, so they are nearly opaque. */
+  --color-panel-popup: rgba(11, 17, 22, 0.98);
+  /* HUD plates (player chip, tracker, clock chip, stat plate) float over the live game with no
+     glass behind them (§32.1 budget), so they are thinner than a panel — the mockups measure ~0.6. */
+  --color-hud: rgba(8, 12, 16, 0.68);
+  --color-border: rgba(255, 255, 255, 0.12);
+  --color-border-strong: rgba(255, 255, 255, 0.22);
+  --color-backdrop: rgba(4, 8, 11, 0.62);
+
+  --color-accent: #f6503f;
+  --color-accent-hi: #ff6351;
+  --color-accent-lo: #d53e2f;
+  --color-accent-soft: rgba(246, 80, 63, 0.16);
+  --color-on-accent: #ffffff;
+
+  --color-success: #3fd67f;
+  --color-warning: #f5a623;
+  --color-error: #ff4560;
+  --color-info: #55b6f7;
+
+  --color-health: #fa5246;
+  --color-armour: #5dbbf7;
+  --color-stamina: #5de395;
+  --color-hunger: #f5a623;
+  --color-thirst: #4fd1e8;
+  --color-oxygen: #9fd8ff;
+  --color-stress: #b68cff;
+
+  --color-rarity-common: #aeb6bf;
+  --color-rarity-uncommon: #5de395;
+  --color-rarity-rare: #5dbbf7;
+  --color-rarity-epic: #b68cff;
+  --color-rarity-legendary: #f5a623;
+
+  --color-fg: #f3f5f7;
+  --color-fg-dim: rgba(231, 237, 243, 0.66);
+  --color-fg-faint: rgba(231, 237, 243, 0.40);
+  --color-key: #fbfbfb;
+  --color-key-fg: #11161b;
+
+  --radius-ui: 6px;
+  --radius-ui-sm: 4px;
+  --radius-ui-xs: 3px;
+  --shadow-ui: 0 14px 40px rgba(0, 0, 0, 0.50);
+  --shadow-ui-sm: 0 4px 14px rgba(0, 0, 0, 0.40);
+  --shadow-ui-lg: 0 30px 80px rgba(0, 0, 0, 0.60);
+  --shadow-glow: 0 0 0 1px #ff6351, 0 0 22px rgba(246, 80, 63, 0.42), inset 0 0 26px rgba(246, 80, 63, 0.12);
+  --shadow-glow-sm: 0 0 0 1px #ff6351, 0 0 16px rgba(246, 80, 63, 0.32);
+  --ease-ui: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  --text-ui-xs: 11px;
+  --text-ui-sm: 13px;
+  --text-ui: 15px;
+  --text-ui-lg: 17px;
+  --text-display-sm: 18px;
+  --text-display: 24px;
+  --text-display-lg: 34px;
+  --text-display-xl: 48px;
+  --tracking-display: 0.04em;
+  --tracking-label: 0.14em;
+  --tracking-eyebrow: 0.32em;
+
+  /* Keyframes live in src/kit/css/base.css. */
+  --animate-core-slide-in: core-slide-in 0.18s var(--ease-ui);
+  --animate-core-fade-in: core-fade-in 0.15s var(--ease-ui);
+  --animate-core-pop-in: core-pop-in 0.16s var(--ease-ui);
+  --animate-core-slide-up: core-slide-up 0.2s var(--ease-ui);
+  --animate-core-spin: core-spin 0.8s linear infinite;
+  --animate-core-shimmer: core-shimmer 1.4s linear infinite;
+  --animate-core-pulse: core-pulse 1.6s var(--ease-ui) infinite;
+}

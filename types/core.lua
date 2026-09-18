@@ -43,9 +43,12 @@
 ---| '"chatMessage"'        # (server) (src, channel, message)
 ---| '"uiReady"'            # (client) () — the NUI shell (re)loaded and re-registered its pages
 ---| '"uiVisibility"'       # (client) (visible, reasons) — the shell was hidden or shown again (§31)
+---| '"uiPluginReady"'      # (client) (resource) — that resource's UI plugin finished loading (§38.4)
+---| '"uiPluginFailed"'     # (client) (resource, error) — its manifest or its module was rejected
 
 ---@alias CoreNotifyType '"info"' | '"success"' | '"error"' | '"warning"'
----@alias CorePageType '"page"' | '"overlay"'
+---@alias CorePageType '"page"' | '"overlay"' | '"modal"'
+---@alias CoreUIPluginState '"registered"' | '"loading"' | '"ready"' | '"failed"' | '"incompatible"'
 ---@alias CoreAutoHideWatcher '"pause"' | '"fade"' | '"switch"' | '"warning"' | '"hud"' | '"cinematic"'
 ---@alias CoreShardStyle '"wasted"' | '"success"' | '"info"'
 ---@alias CoreInputFieldType '"text"' | '"number"' | '"select"' | '"checkbox"'
@@ -155,10 +158,30 @@
 --------------------------------------------------------------------------------
 
 ---@class CorePageOptions
----@field type? CorePageType 'page' is exclusive and takes focus, 'overlay' does not (default 'page')
+---@field type? CorePageType 'page' is exclusive, 'overlay' takes no focus, 'modal' stacks above
+---the open page (any number, §38.9). Default 'page'.
 ---@field keepInput? boolean keep game input alive while the page is focused (default false)
----@field script? string fallback bundle path inside the CALLING resource
----@field style? string fallback stylesheet path inside the CALLING resource
+
+---@class CoreUIPluginInfo
+---@field id string the owning resource
+---@field state CoreUIPluginState
+---@field generation integer activation counter; a restart is n+1
+---@field build string the `build` field of its manifest.json ('' when it has none)
+---@field error? string why it is failed/incompatible
+---@field ms? integer how long the shell took to load the module
+---@field dev? string the `/uidev` origin it is served from, when one is pinned
+
+---@class CoreUIManifest
+---@field id string the owning resource
+---@field apiVersion integer must equal `UIManifest.API_VERSION`
+---@field entry string the ES module, relative to the `core_ui` folder
+---@field css string[] stylesheets shipped with it (at most 8)
+---@field build string content stamp ('' when the manifest has none)
+---@field load '"eager"'|'"lazy"'
+---@field preload string[] chunks worth fetching early (at most 16)
+---@field pages string[] page ids the build found (tooling only; Lua stays the authority)
+---@field sdk? string the `@core/ui` version it was built with
+---@field vue? string the Vue version it was built against
 
 ---@class CoreNotifyOptions
 ---@field message string required text
@@ -548,6 +571,8 @@ Core = {}
 ---@overload fun(hook: '"chatMessage"', fn: fun(src: integer, channel: string, message: string)): any
 ---@overload fun(hook: '"uiReady"', fn: fun()): any
 ---@overload fun(hook: '"uiVisibility"', fn: fun(visible: boolean, reasons: string[])): any
+---@overload fun(hook: '"uiPluginReady"', fn: fun(resource: string)): any
+---@overload fun(hook: '"uiPluginFailed"', fn: fun(resource: string, error: string)): any
 function Core.on(hook, fn) end
 
 ---Fires a hook on this side (`TriggerEvent('core:hook:<hook>', ...)`). Plugins may emit their own.
@@ -1498,7 +1523,8 @@ function Core.UI.on(pageId, event, fn) end
 ---(client) Removes a subscription created by `Core.UI.on`.
 ---@param handle any
 function Core.UI.off(handle) end
----(client) Declares a page. Without `script` the component is resolved from core's own bundle.
+---(client) Declares a page: Lua owns the id, the type and the owner, the shell resolves the
+---component from the owning resource's UI plugin (DESIGN §38). `script`/`style` were removed.
 ---@param id string 1..64 chars of [%w_%-:]
 ---@param opts? CorePageOptions
 ---@return boolean ok
@@ -1539,6 +1565,69 @@ function Core.UI.isFocused() end
 ---@param serverData? table server only
 ---@return boolean ok
 function Core.UI.send(id, event, data, serverData) end
+---(client) `update(id, partial)` shallow-merges top-level keys into that page's props.
+---(server) `update(src, id, partial)` does the same on that player's client.
+---Queued per page and flushed on the next tick as ONE `page:patch`; core keeps its replay
+---copy in step, so a shell reload restores current state (DESIGN §38.10). A page that is
+---not showing returns false and sends nothing. Values are type-checked, not size-bounded.
+---@param id string|integer client: the page id; server: the player's src
+---@param partial table|string client: the keys to merge; server: the page id
+---@param serverPartial? table server only
+---@return boolean ok
+function Core.UI.update(id, partial, serverPartial) end
+---(client) `patch(id, path, value)` sets one value inside the page's props; a nil value
+---deletes the key. (server) `patch(src, id, path, value)`. Path segments address the LUA
+---table the page was opened with: a list element is its 1-BASED index (`#t + 1` appends),
+---anything else is a map key. At most 8 deep, charset [%w_%-]. An index outside a list, or
+---a delete in its middle, still applies but warns — send such a list whole with `update`.
+---@param id string|integer client: the page id; server: the player's src
+---@param path string|any client: 'slots.12.count'; server: the page id
+---@param value? any client: the new value (nil deletes); server: the path
+---@param serverValue? any server only
+---@return boolean ok
+function Core.UI.patch(id, path, value, serverValue) end
+---(client) Coalesced telemetry: `feed({ speed = 132 })` uses the CALLING resource as the
+---channel, `feed('inventory', { … })` names it. Latest value per key wins and at most one
+---`feed` message per `Config.UI.FeedIntervalMs` leaves Lua (DESIGN §38.10).
+---@param channel table|string the values, or the channel id
+---@param values? table the values when a channel was given
+---@return boolean ok
+function Core.UI.feed(channel, values) end
+---(client) True while a mounted component reads that feed, so a producer loop can sleep
+---when nobody looks. Defaults to the calling resource's channel.
+---@param channel? string
+---@return boolean
+function Core.UI.isFeedActive(channel) end
+---(client) Answers `nui.invoke(name, data)` from the page on the CALLER's channel. The
+---handler may yield (it runs in the NUI callback's coroutine and the page's fetch is simply
+---held open) and its return value is sent back as `{ ok = true, data }` (DESIGN §38.8).
+---Tracked by `Core.Registry`, so it dies with the resource that registered it.
+---@param name string 1..64 chars of [%w_%-%.:]
+---@param fn fun(data: table): any
+---@return boolean ok
+function Core.UI.onRequest(name, fn) end
+---(client) Removes a handler registered with `Core.UI.onRequest`.
+---@param name string
+---@return boolean ok
+function Core.UI.offRequest(name) end
+---(client) Asks the shell a question and waits for the answer. Yields. The target is a
+---registered page id or a UI plugin's channel (its resource name). On failure the second
+---return value is the error code: `timeout`, `not_ready`, `shell_reloaded`, `bad_request`,
+---`no_target`, `bad_result` or whatever the page answered (DESIGN §38.8).
+---@param target string page id or plugin channel
+---@param name string 1..64 chars of [%w_%-%.:]
+---@param data? table
+---@param timeoutMs? integer clamped to 1000..Config.UI.RequestMaxMs
+---@return boolean ok, any resultOrErrorCode
+function Core.UI.request(target, name, data, timeoutMs) end
+---(client) Every UI plugin core knows about, sorted by id (tooling; `/uiplugins` prints it).
+---@return CoreUIPluginInfo[]
+function Core.UI.plugins() end
+---(client) Is that resource's UI plugin loaded and running in the shell right now?
+---Defaults to the calling resource.
+---@param resource? string
+---@return boolean
+function Core.UI.isPluginReady(resource) end
 ---(client) `notify({ message, type, duration, title })` or `notify(message, type)`.
 ---(server) `notify(src, message, type?, duration?)` — an alias of `Core.Notify.send`.
 ---@param data CoreNotifyOptions|string|integer

@@ -1,0 +1,32 @@
+{
+  "name": "@core/ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SDK for core UI plugins: the typed host contract, the <2 KB facade, the Vite plugin and core's tokens (DESIGN §38.7)",
+  "exports": {
+    ".": "./src/index.ts",
+    "./contract": "./src/contract.ts",
+    "./vite": {
+      "types": "./vite/index.d.ts",
+      "default": "./vite/index.mjs"
+    },
+    "./dev": "./src/dev/index.ts",
+    "./theme.css": "./theme.css",
+    "./reference.css": "./reference.css",
+    "./tsconfig.plugin.json": "./tsconfig.plugin.json",
+    "./client": "./src/client.d.ts",
+    "./package.json": "./package.json"
+  },
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "node --test 'tests/*.test.mjs'"
+  },
+  "peerDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-vue": "^6.0.0",
+    "tailwindcss": "^4.3.3",
+    "vite": "^7.0.0",
+    "vue": "^3.5.13"
+  }
+}

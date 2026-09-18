@@ -1,7 +1,17 @@
 // core UI — one reactive store for every built-in widget (DESIGN §6.10, §7.2, §7.3)
-import { reactive, markRaw } from 'vue'
-import { post, onMessage } from './bridge.js'
+//
+// §38 split this file in two: the STATE stays here (one reactive object the whole shell reads), the
+// page/plugin/focus/feed LOGIC moved into `src/runtime/*.ts` and is delegated to below. The store
+// hands the runtime its own slices (`pages`, `openPage`, `overlays`, `modals`, `focusStack`,
+// `plugins`) so there is still exactly one reactive graph and every existing import keeps working.
+import { reactive } from 'vue'
+import { post, onMessage } from './runtime/transport.ts'
 import { CHAT_DEFAULTS, bounded } from './chat.js'
+import * as Pages from './runtime/pages.ts'
+import * as Plugins from './runtime/plugins.ts'
+import * as Layers from './runtime/layers.ts'
+import * as Feeds from './runtime/feeds.ts'
+import * as Errors from './runtime/errors.ts'
 
 const NOTIFY_DEFAULT_MS = 5000
 const NOTIFY_MAX_VISIBLE = 6
@@ -44,16 +54,26 @@ export const store = reactive({
   stats: {},      // name -> { name, label, value, min, max } (Config.Stats defs with hud = true)
   state: {},      // replicated player state, read by pages through CoreUI.state
   locale: { lang: 'en', strings: {} },
-  pages: {},      // id -> { id, type, script, style, keepInput, component, registered, props }
+  // §38.6: the page slice is owned by runtime/pages.ts (it is attached below) — the records live
+  // here so every widget, story and test keeps reading one store.
+  pages: {},      // id -> { id, type, owner, keepInput, component, registered, props, ... }
   openPage: null, // exclusive, type === 'page'
-  overlays: {},   // id -> true
+  overlays: {},   // id -> true (click-through, never focusable)
+  modals: [],     // §38.9: plugin modals, in open order, above the page
+  focusStack: [], // §38.9: the mirror of client/ui.lua's stack ({ key, layer, id?, owner })
+  plugins: {},    // §38.2: resource -> { state, generation, build, ms, error, pages } (inspector)
+  dev: { enabled: false, log: false, inspector: false },
   focused: false,
 })
 
+// One reactive graph: the runtime mutates THESE objects, never copies of them.
+Pages.attachPageStore(store)
+Plugins.attachPluginStore(store)
+Layers.attachLayerStore(store)
+Layers.setModalSource(() => store.modals)
+Errors.setNotify((msg) => notify(msg))
+
 const timers = new Map()          // non-reactive: notification + progress timeouts
-const pageListeners = new Map()   // `${page}|${event}` -> Set<fn>
-const waiters = new Map()         // page id -> Set<resolve>  (open before the bundle registered)
-const components = new Map()      // page id -> component, so a re-register never drops it
 let seq = 0
 
 function setTimer(key, ms, fn) {
@@ -214,113 +234,22 @@ export function resetExtras() {
   Object.assign(store.chat, CHAT_DEFAULTS, { channels: [], channel: 'local', open: false, activity: store.chat.activity + 1 })
 }
 
-/** Escape / close button on a page or overlay -> Lua decides, we hide right away. */
-export function closePage(id) {
-  const page = id || store.openPage
-  if (!page) return
-  if (store.openPage === page) store.openPage = null
-  if (store.overlays[page]) delete store.overlays[page]
-  post('ui_close', { page })
-}
+// ---------------------------------------------------------------- plugin pages (§38.6)
+//
+// Everything below is `runtime/pages.ts`, re-exported under its old name: 34 files import these
+// from `store.js` and nothing about their behaviour changed. The props object of an id is still
+// stable for the life of the shell (§7.4).
 
-// ---------------------------------------------------------------- plugin pages
-
-// The props object of an id is stable for the life of the shell (DESIGN §7.4): a plugin restart
-// unregisters and re-registers its pages, which replaces the record, and a page store that
-// captured `usePage(id).props` once must keep receiving every later `page:open`.
-const propsById = new Map()
-
-function propsFor(id) {
-  let props = propsById.get(id)
-  if (!props) {
-    props = {}
-    propsById.set(id, props)
-  }
-  return props
-}
-
-/** A fresh page record that keeps a component already registered for this id — pages
- *  compiled into the shell (src/plugins.js) register once, Lua may re-register any time. */
-function newPage(id, extra) {
-  const component = components.get(id) || null
-  return Object.assign(
-    { id, type: 'page', script: null, style: null, keepInput: false, component, registered: !!component, props: propsFor(id) },
-    extra
-  )
-}
-
-export function ensurePage(id) {
-  let page = store.pages[id]
-  if (!page) {
-    page = newPage(id)
-    store.pages[id] = page
-  }
-  return page
-}
-
-function setProps(page, props) {
-  for (const key of Object.keys(page.props)) delete page.props[key]
-  if (props && typeof props === 'object') Object.assign(page.props, props)
-}
-
+/** Escape / close button on a page, overlay or modal -> Lua decides, we hide right away. */
+export const closePage = Pages.closePage
+export const ensurePage = Pages.ensurePage
 /** Called by a plugin bundle through CoreUI.registerPage — resolves pending opens. */
-export function setPageComponent(id, component) {
-  const raw = component ? markRaw(component) : null
-  if (raw) components.set(id, raw)
-  else components.delete(id)
-  const page = ensurePage(id)
-  page.component = raw
-  page.registered = !!raw
-  const set = waiters.get(id)
-  if (!set) return page
-  waiters.delete(id)
-  for (const resolve of Array.from(set)) resolve(page.component)
-  return page
-}
-
+export const setPageComponent = Pages.setPageComponent
 /** Resolves with the component, or null once `timeoutMs` passes (DESIGN §7.4: 5 s). */
-export function whenRegistered(id, timeoutMs = 5000) {
-  const page = store.pages[id]
-  if (page && page.component) return Promise.resolve(page.component)
-  return new Promise((resolve) => {
-    let set = waiters.get(id)
-    if (!set) {
-      set = new Set()
-      waiters.set(id, set)
-    }
-    const done = (component) => {
-      set.delete(done)
-      resolve(component || null)
-    }
-    set.add(done)
-    setTimeout(() => {
-      if (set.has(done)) done(null)
-    }, timeoutMs)
-  })
-}
-
-export function onPageEvent(page, event, fn) {
-  const key = page + '|' + event
-  let set = pageListeners.get(key)
-  if (!set) {
-    set = new Set()
-    pageListeners.set(key, set)
-  }
-  set.add(fn)
-  return () => set.delete(fn)
-}
-
-function emitPageEvent(page, event, data) {
-  const set = pageListeners.get(page + '|' + event)
-  if (!set) return
-  for (const fn of Array.from(set)) {
-    try {
-      fn(data)
-    } catch (err) {
-      console.error('[core:ui] page event failed', page, event, err)
-    }
-  }
-}
+export const whenRegistered = Pages.whenRegistered
+export const onPageEvent = Pages.onPageEvent
+/** The one props object of a page id (DESIGN §7.4). */
+export const pageProps = Pages.propsFor
 
 // ---------------------------------------------------------------- Lua -> NUI actions
 
@@ -441,37 +370,30 @@ const actions = {
   },
   // T (Lua) opens the input, ESC/submit closes it; Chat.vue watches the flag.
   'chat:open': (m) => { store.chat.open = m.open === true },
-  'page:register': (m) => {
-    const script = m.script || null
-    const prev = store.pages[m.id]
-    // Same source keeps the live record. `script: null` is the normal case now: the page is
-    // compiled into this bundle, so it is registered before Lua ever says hello (DESIGN §7.4).
-    if (prev && prev.script === script) {
-      Object.assign(prev, { type: m.type || 'page', style: m.style || null, keepInput: !!m.keepInput })
-      return
-    }
-    store.pages[m.id] = newPage(m.id, {
-      type: m.type || 'page', script, style: m.style || null, keepInput: !!m.keepInput,
-    })
+  // §38.5: a page is DECLARED by Lua (id, type, keepInput, owner); its component comes from the
+  // owner's plugin. The `script`/`style` URL loader of §7.4 is gone.
+  'page:register': (m) => Pages.registerPage(m),
+  'page:unregister': (m) => Pages.unregisterPage(m.id),
+  'page:open': (m) => Pages.openPage(m),
+  'page:close': (m) => Pages.closePageAction(m),
+  'page:patch': (m) => Pages.applyPatch(m.id, m.ops),
+  'page:event': (m) => Pages.emitPageEvent(m.id, m.event, m.data),
+  // §38.2: one activation of a resource's UI module. `page:request` is answered by runtime/host.ts,
+  // which subscribes itself once the host object exists.
+  'plugin:register': (m) => Plugins.register(m),
+  'plugin:unregister': (m) => Plugins.unregister(m.id),
+  // §38.10: coalesced telemetry — one rAF per frame, nothing while idle.
+  feed: (m) => Feeds.applyFeed(m),
+  // §38.11/§38.14: verbose lifecycle logs, the inspector and the page load deadline.
+  'dev:set': (m) => {
+    store.dev.enabled = !!m.enabled
+    store.dev.log = !!m.log
+    store.dev.inspector = !!m.inspector
+    Plugins.setDevOptions({ enabled: store.dev.enabled, log: store.dev.log, loadTimeoutMs: m.loadTimeoutMs })
   },
-  'page:unregister': (m) => {
-    if (store.openPage === m.id) store.openPage = null
-    delete store.overlays[m.id]
-    delete store.pages[m.id]
+  'inspector:toggle': () => {
+    store.dev.inspector = !store.dev.inspector
   },
-  'page:open': (m) => {
-    const page = ensurePage(m.id)
-    setProps(page, m.props)
-    if (page.type === 'overlay') store.overlays[m.id] = true
-    else store.openPage = m.id
-  },
-  'page:close': (m) => {
-    const id = m.id || store.openPage
-    if (!id) return
-    if (store.openPage === id) store.openPage = null
-    delete store.overlays[id]
-  },
-  'page:event': (m) => emitPageEvent(m.id, m.event, m.data),
   // §31.4: one message per hidden<->visible flip (never per reason change), re-sent on
   // `ui_ready` while hidden so a NUI reload lands in the right state. Hiding only stops the
   // paint: timers, the progress bar and the HUD keep running underneath. `reasons` is
@@ -490,7 +412,9 @@ const actions = {
   'blur:test': () => {
     try { window.dispatchEvent(new CustomEvent('core:blur-test')) } catch (err) { /* no DOM */ }
   },
-  focus: (m) => { store.focused = !!m.focused },
+  // §38.9: `focus { focused, stack }`. client/ui.lua owns the stack and the natives; the shell only
+  // mirrors it, for `inert` on the layers under a modal and for the Escape order.
+  focus: (m) => Layers.applyFocus(m),
 }
 
 for (const action of Object.keys(actions)) onMessage(action, actions[action])
@@ -503,15 +427,20 @@ function isTextTarget(event) {
   return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true
 }
 
-/** Escape -> topmost modal's cancel result, else close the open page.
+/** Escape -> the §38.9 order: kit escape layers (a capturing listener in kit/use.js already ran and
+ *  stopped the event if a popup was open) -> the built-in menu/input/alert -> the top plugin modal
+ *  -> the open page.
  *  x / Backspace -> cancel a cancellable progress bar. */
 export function handleKeydown(event) {
   if (event.key === 'Escape') {
     const modal = activeModal()
-    if (modal === 'alert') alertResult(false)
-    else if (modal === 'input') inputResult(null)
-    else if (modal === 'menu') menuResult(null)
-    else if (store.openPage) closePage()
+    const target = Layers.escapeTarget(modal, store.openPage)
+    if (target === 'builtin') {
+      if (modal === 'alert') alertResult(false)
+      else if (modal === 'input') inputResult(null)
+      else if (modal === 'menu') menuResult(null)
+    } else if (target === 'modal') closePage(Layers.topModalId())
+    else if (target === 'page') closePage()
     else return
     event.preventDefault()
     return

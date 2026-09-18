@@ -261,9 +261,16 @@
     if (!CoreUI || typeof CoreUI.registerPage !== 'function') {
       check('window.CoreUI.registerPage available', false)
     } else {
+      // DESIGN §38 removed the runtime <script>/<link> injection of §7.4: a plugin's module and
+      // stylesheet come from its OWN resource origin through `plugin:register`, and a page:register
+      // that still carries a `script` must inject nothing at all.
+      window.__pageScriptRan = false
+      const headScriptsBefore = document.head.querySelectorAll('script').length
       send({ action: 'page:register', id: 'test', type: 'page', keepInput: false, style: null,
         script: 'data:text/javascript,window.__pageScriptRan=true' })
-      check('page:register injects and runs the plugin script', await waitFor(() => window.__pageScriptRan === true, 1500))
+      await sleep(250)
+      check('page:register no longer injects a <script> (§38: the loader owns plugin code)',
+        window.__pageScriptRan === false && document.head.querySelectorAll('script').length === headScriptsBefore)
       CoreUI.registerPage('test', { template: '<div class="test-page">hello</div>' })
       const events = []
       const off = typeof CoreUI.on === 'function' ? CoreUI.on('test', 'ping', (d) => events.push(d)) : null

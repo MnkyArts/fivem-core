@@ -1,0 +1,28 @@
+{
+  "//": "Base config for a core UI plugin. A plugin's ui/tsconfig.json is just: { \"extends\": \"@core/ui/tsconfig.plugin.json\", \"include\": [\"src\", \"dev\"] }. Types are never emitted: Vite/esbuild strip them, `npm run typecheck` (vue-tsc) is what checks them (DESIGN §38.13).",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@core/ui/client", "vite/client"],
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": true,
+
+    "allowJs": true,
+    "checkJs": false,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    "jsx": "preserve",
+    "jsxImportSource": "vue"
+  }
+}

@@ -40,6 +40,7 @@ local FIELD_TYPES <const> = { text = true, number = true, select = true, checkbo
 -- hide set, namespaced as 'server:<reason>' so no plugin can clear it.
 local MAX_REASON <const> = 32
 local REASON_PATTERN <const> = '^[%w_%-%.:]+$'
+local MAX_PATCH_PATH <const> = 160          -- the client's own bound for UI.patch (§38.10)
 
 --- Sub-namespace tables: the flat dotted key is the one exports.core:call resolves.
 UI.textUI = {}
@@ -118,6 +119,35 @@ function UI.send(src, id, event, data)
         return false
     end
     return push(src, 'send', { id, event, data })
+end
+
+--- UI.update(src, id, partial) — shallow merge of top-level keys into that page's
+--- props on one client (§38.10). The client re-validates every key and value; this
+--- end only keeps a malformed call off the wire.
+function UI.update(src, id, partial)
+    if not Validate.value('id', id) then
+        Log.error('UI.update: invalid page id (%s)', tostring(id))
+        return false
+    end
+    if type(partial) ~= 'table' then
+        Log.error("UI.update('%s'): partial must be a table", id)
+        return false
+    end
+    return push(src, 'update', { id, partial })
+end
+
+--- UI.patch(src, id, path, value) — one deep op; a nil value deletes the key, so
+--- the argument list really is two long in that case (the client unpacks by hand).
+function UI.patch(src, id, path, value)
+    if not Validate.value('id', id) then
+        Log.error('UI.patch: invalid page id (%s)', tostring(id))
+        return false
+    end
+    if type(path) ~= 'string' or path == '' or #path > MAX_PATCH_PATH then
+        Log.error("UI.patch('%s'): invalid path (%s)", id, tostring(path))
+        return false
+    end
+    return push(src, 'patch', { id, path, value })
 end
 
 --- UI.notify(src, message, type?, duration?) — alias of Core.Notify.send (§4.7).

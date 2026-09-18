@@ -5,6 +5,8 @@
 // never a faked component prop. If a story renders, the wire shape is right.
 import { h, onMounted, watch } from 'vue'
 import { store, dismissNotification, resetExtras } from '../store.js'
+import { resetPages } from '../runtime/pages.ts'
+import { resetLayers } from '../runtime/layers.ts'
 import '../bridge.js' // installs window.__core (store.js pulls it in too, this is explicit)
 
 export { store }
@@ -32,9 +34,10 @@ export function resetStore () {
   send({ action: 'alert:close' })
   send({ action: 'textui:hide' })
   send({ action: 'hud:set', visible: false, cash: 0, bank: 0, name: '', serverId: 0, faction: false })
-  store.openPage = null
-  for (const id of Object.keys(store.overlays)) delete store.overlays[id]
-  for (const id of Object.keys(store.pages)) delete store.pages[id]
+  // §38: the page/plugin/focus state lives in runtime/*.ts (it writes into these same store
+  // slices), so a story starts from a shell with no page, no modal and no focus stack at all.
+  resetPages()
+  resetLayers()
   store.focused = false
   // §21 widgets (shard / spinner / key hints / stat bars / replicated state / locale) own
   // their own timers and keys, so the store clears them itself.

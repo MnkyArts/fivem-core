@@ -2,11 +2,14 @@ import { Meta } from '@storybook/addon-docs/blocks'
 
 <Meta title="Docs/Plugin Pages" />
 
-# Plugin pages (DESIGN §7.4)
+# Plugin pages (DESIGN §38)
 
-A plugin page is a normal Vue component that core's bundle renders inside `PageHost.vue`.
-The plugin ships **no** UI files (`files {}` stays empty in its `fxmanifest.lua`) — its page
-source is compiled into core's single dist at build time.
+A plugin page is a normal Vue component that core's shell renders inside `PageHost.vue`. The
+plugin **builds and ships its own frontend** (`<plugin>/ui/dist`, opted in with
+`core_ui 'ui/dist'` + `files { 'ui/dist/**' }`) and core imports it at runtime from
+`https://cfx-nui-<resource>/ui/dist/`. There is still exactly one CEF page, one Vue, one kit
+and one focus owner — all core's. **Docs → UI Platform** has the whole architecture; this page
+is the page-level view.
 
 Try it in **Built-ins → Page Host**: the shop panel there is a real plugin page, registered
 through `window.CoreUI.registerPage` and opened with a `page:open` message.
@@ -14,59 +17,60 @@ through `window.CoreUI.registerPage` and opened with a `page:open` message.
 ## The three moving parts
 
 ```
-<plugin>/client.lua        Core.UI.registerPage / open / send / on      (Lua side)
-<plugin>/ui/src/index.js   export const id + default component          (compiled into core)
-core/ui/src/plugins.js     globs */ui/src/index.js, registers each one  (before mount)
+<plugin>/client.lua        Core.UI.registerPage / open / send / on      (Lua owns id, type, owner)
+<plugin>/ui/src/index.ts   export default defineUIPlugin({ pages, setup })
+core/ui/src/runtime/       plugins.ts imports the module, pages.ts resolves the component
 ```
 
-### 1. The page component
+### 1. The entry
 
-```js
-// <plugin>/ui/src/index.js
+```ts
+// <plugin>/ui/src/index.ts
+import { defineUIPlugin, definePage } from '@core/ui'
 import Page from './Page.vue'
 
-export const id = 'bank'
-export default Page
-```
+export interface BankProps { title: string; balance: number }
 
-`src/plugins.js` imports every match of `../../../*/ui/src/index.js` and calls
-`CoreUI.registerPage(id, component)` **before** the app mounts, so the component is already
-there when Lua says `page:open`. A page that is not compiled in (a prebuilt third-party
-bundle) can still be loaded by URL: give `Core.UI.registerPage` a `script` (and optional
-`style`) path inside the owning resource and `PageHost.vue` injects the tags once per id.
-
-### 2. Inside the component: `window.CoreUI.usePage(id)`
-
-```js
-import { h } from 'vue'
-
-export default {
-  name: 'BankPage',
-  props: { props: { type: Object, default: () => ({}) } },   // <- page:open props land here
-  setup (vm) {
-    const CoreUI = window.CoreUI
-    const page = CoreUI.usePage('bank')
-
-    // Lua -> page. Auto-unsubscribes with the component (onUnmounted).
-    page.on('balance', (data) => { balance.value = data.balance })
-
-    // page -> Lua: post('ui_event') -> TriggerEvent('core:ui:bank:withdraw', data)
-    const withdraw = (amount) => page.emit('withdraw', { amount })
-
-    return () => h('div', { class: 'core-backdrop' }, [
-      h('h2', { class: 'core-title' }, vm.props.title),
-      h('span', {}, 'Cash ' + CoreUI.hud.cash),              // readonly reactive HUD
-      h('button', { class: 'core-btn', onClick: () => withdraw(500) }, 'Withdraw $500'),
-      h('button', { class: 'core-btn', onClick: () => page.close() }, 'Close'),  // -> ui_close
-    ])
+export default defineUIPlugin({
+  pages: { bank: definePage<BankProps>({ component: Page }) },
+  setup (ctx) {
+    ctx.nui.on('rates', applyRates)          // dies with the plugin
+    ctx.scope.interval(refresh, 5000)        // cleared on dispose
   },
-}
+})
 ```
 
-| `window.CoreUI` | what it does |
+**Module scope is for definitions only.** The browser pins an ES module by URL for the life of
+core's page, so this file evaluates once, while `setup(ctx)` runs once per *activation* — every
+start of the resource. A listener created next to the imports survives a `restart` and fires
+twice; one created through `ctx.scope` or `ctx.nui` is disposed with the plugin. `setup` must
+be synchronous.
+
+### 2. Inside the component: `usePage()`
+
+```vue
+<script setup lang="ts">
+import { useHud, useNui, usePage } from '@core/ui'
+import type { BankProps } from './index.ts'
+
+// No id inside a page component: usePage() resolves the page being rendered.
+const { props, emit, on, close } = usePage<BankProps>()
+const hud = useHud()
+const nui = useNui()
+
+on('balance', (d) => { balance.value = d.balance })   // Lua -> page, scoped to the page
+const withdraw = (amount: number) => emit('withdraw', { amount })   // page -> Lua, fire and forget
+const quote = await nui.invoke('quote', { amount: 500 })            // request/response
+</script>
+```
+
+`<CoreButton>`, `<CorePanel>` and every other kit tag resolve against core's app at render
+time, so the page imports no component and ships no kit CSS.
+
+| `window.CoreUI` (legacy, still present) | what it does |
 | --- | --- |
 | `Vue` | the one Vue instance the shell mounted with — never import a second one |
-| `registerPage(id, component)` | what a compiled-in page (or a loaded bundle) calls once |
+| `registerPage(id, component)` | the legacy component map, used when the owner has no UI plugin |
 | `usePage(id)` | `{ id, props, emit(event, data), on(event, fn), close() }` for the component itself |
 | `emit(pageId, event, data)` | `post('ui_event', { page, event, data })` |
 | `on(pageId, event, fn) -> off` | receives `page:event` from Lua |
@@ -83,7 +87,9 @@ export default {
 
 `props` is **reactive and stable**: a second `page:open` (or `Core.UI.open` with new props)
 mutates the same object instead of remounting the component, so scroll position and local
-state survive.
+state survive — and so does a module-level store that captured it, across a plugin restart.
+`Core.UI.update(id, partial)` and `Core.UI.patch(id, path, value)` mutate the same object with
+far less on the wire (§38.10); `Core.UI.feed` drives `useFeed<T>()` at the frame rate.
 
 ### 3. The Lua side
 
@@ -97,8 +103,13 @@ Core.UI.on('bank', 'withdraw', function(data)
     Core.Net.emit('bank:withdraw', { amount = data.amount })
 end)
 
+-- page -> Lua, request/response (answers nui.invoke('quote', …))
+Core.UI.onRequest('quote', function(data) return { fee = data.amount * 0.02 } end)
+
 -- Lua -> page
 Core.UI.send('bank', 'balance', { balance = 182450 })   -- -> page:event
+Core.UI.update('bank', { balance = 182450 })            -- -> page:patch, shallow merge
+Core.UI.patch('bank', 'history.1', entry)               -- -> page:patch, one value (1-based, Lua's view)
 
 -- open / close
 Core.UI.open('bank', { title = 'Fleeca' })   -- SetNuiFocus(true, true) while it is open
@@ -112,13 +123,18 @@ prompt. Use `Core.UI.menu.open` / `input.open` / `alert` when you want an answer
 
 * **`type = 'page'` is exclusive.** Opening a second page closes the first; `Core.UI.getOpenPage()`
   tells you which one is up. `type = 'overlay'` is additive, never takes focus, and is ignored
-  by Escape — an overlay must be closed by Lua.
+  by Escape — an overlay must be closed by Lua. `type = 'modal'` (§38.9) stacks above the open
+  page, any number of them, and Escape pops the top one first.
 * **Escape is free.** The player can always close a page (`ui_close`), so never leave game state
   half-committed while a page is open.
 * **`keepInput = true`** keeps the game's keyboard alive next to the page (`SetNuiFocusKeepInput`)
   — right for an overlay with a text field, wrong for anything that uses WASD.
-* **A `page:open` for an unregistered id waits 5 s**, then posts `ui_event { event = '__error' }`
-  and shows an error toast. In practice that means a typo in the id — see the
-  *Opened before the bundle registered* story.
+* **A `page:open` waits for the owning plugin**, on that plugin's own load promise, and gives up
+  after `Config.UI.PluginLoadTimeoutMs` (8000) or immediately when the plugin failed — then it
+  posts `ui_event { event = '__error' }`, toasts, and **closes** the page so a page that cannot
+  render never holds the cursor. In practice that means a typo in the id, or `/uiplugins` telling
+  you the plugin never loaded — see the *Opened before the bundle registered* story.
+* **Open state is Lua's.** The shell never closes a page because a plugin went away or came back;
+  it only unmounts the component and re-mounts it when a newer activation is ready.
 * **Everything crossing `ui_event` is untrusted input.** Validate it with `Core.Validate` on the
   client and again on the server; the page is running in the player's own browser.

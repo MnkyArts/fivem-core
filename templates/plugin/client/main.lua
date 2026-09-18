@@ -27,8 +27,12 @@ Core.onReady(function()
     --     end,
     -- })
 
-    -- The Vue page in ui/src, compiled into core's shell (§7.4) — no script/style paths,
-    -- core already has the component. Open it with Core.UI.open('my_plugin', { ... }) and
-    -- receive its events with Core.UI.on('my_plugin', 'greet', function(data) end).
+    -- The Vue page in ui/, built into ui/dist and loaded by core at runtime (§38) — no script or
+    -- style path is ever passed: `core_ui 'ui/dist'` in the fxmanifest is the whole opt-in, and
+    -- registering only declares the id, its layer type and its owner.
+    -- Open it with Core.UI.open('my_plugin', { ... }), push into it with
+    -- Core.UI.send('my_plugin', 'greeting', { text = '...' }), receive its events with
+    -- Core.UI.on('my_plugin', 'hello', function(data) end), and answer its `nui.invoke(name, data)`
+    -- with Core.UI.onRequest(name, function(data) return result end) (§38.8).
     -- Core.UI.registerPage('my_plugin', { type = 'page' })
 end)

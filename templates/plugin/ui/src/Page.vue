@@ -1,20 +1,24 @@
-<script setup>
-// my_plugin page — DESIGN.md §7.4 (the page protocol) and §37 (the UI kit).
+<script setup lang="ts">
+// my_plugin page — core DESIGN §38 (the UI platform) and §37 (the UI kit).
 //
-// usePage(id) -> the reactive props Lua sent to Core.UI.open, plus emit(event, data) /
-// on(event, fn) / close() scoped to this page. CoreUI.hud is the read-only HUD snapshot
-// (cash, bank, name, serverId, faction). Imports from 'vue' resolve to the shell's one Vue.
+// usePage() with no id resolves the page being rendered: `props` is the ONE reactive object Lua's
+// open/update/patch write into, plus emit(event, data) / on(event, fn) / close() scoped to this
+// page. useHud() is the read-only reactive HUD (cash, bank, name, serverId, faction). A listener
+// made here dies with the page — the SDK binds it to the page scope, so there is nothing to undo
+// in onUnmounted. `vue` resolves to the shell's one Vue, never to a second copy.
 import { ref } from 'vue'
+import { useHud, usePage } from '@core/ui'
+import type { MyPluginEvents, MyPluginIncoming, MyPluginProps } from './index.ts'
 
-// PageHost renders <YourPage :props="…">, so the attribute must not fall through to the root.
+// The shell renders <YourPage :props="…">, so the attribute must not fall through to the root.
 defineOptions({ name: 'MyPluginPage', inheritAttrs: false })
 
-const { props, emit, on, close } = window.CoreUI.usePage('my_plugin')
-const hud = window.CoreUI.hud || {}
+const { props, emit, on, close } = usePage<MyPluginProps, MyPluginEvents, MyPluginIncoming>()
+const hud = useHud()
 
 const note = ref('')
 
-on('hello', (data) => { note.value = (data && data.text) || '' })   // Core.UI.send(…)
+on('greeting', (data) => { note.value = data?.text || '' })   // Core.UI.send('my_plugin', 'greeting', …)
 </script>
 
 <template>
@@ -43,6 +47,10 @@ on('hello', (data) => { note.value = (data && data.text) || '' })   // Core.UI.s
                 ]" />
 
                 <CoreAlert v-if="note" class="mt-4" tone="success" title="Core.UI.send" :text="note" />
+
+                <!-- The other half of the kit rule: never a literal colour, font or radius here —
+                     `class="mt-4 flex gap-2"` is fine, `class="bg-[#131722]"` is not. -->
+
 
                 <!-- The footer sits under a hairline on a slightly darker fill. -->
                 <template #footer>

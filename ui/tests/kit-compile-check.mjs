@@ -12,6 +12,9 @@
 //   .css   the §37.4 Chromium 103 list, brace balance and well-formed comments.
 //   .js    syntax-only parse (the @babel/parser inside @vue/compiler-sfc, else acorn 8+,
 //          else `node --check`) — modern ESM and `import.meta.glob` included.
+//   .ts    the same parse with the `typescript` plugin (DESIGN §38: the plugin entries and the
+//          shell runtime are TypeScript now); falls back to `ts.transpileModule` for the syntax
+//          check when @babel/parser is not reachable.
 //
 // Output is one `ERROR|WARN file:line message` line per problem plus a summary; exit code 1
 // when anything was reported as ERROR.
@@ -24,7 +27,7 @@ import path from 'node:path'
 const require = createRequire(import.meta.url)          // resolves resources/node_modules (hoisted workspace)
 const uiDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_ROOTS = [path.join(uiDir, 'src/kit'), path.join(uiDir, 'src/stories/kit')]
-const EXTS = new Set(['.vue', '.css', '.js', '.mjs'])
+const EXTS = new Set(['.vue', '.css', '.js', '.mjs', '.ts', '.mts'])
 
 const problems = []
 const rel = (file) => {
@@ -124,12 +127,32 @@ try {
   if (Number(String(a.version || '0').split('.')[0]) >= 8) acorn = a
 } catch { /* fall back below */ }
 
-function lintJs (file, src) {
+let ts = null
+try { ts = require('typescript') } catch { /* only needed when @babel/parser is missing */ }
+
+function lintJs (file, src, isTs) {
   if (sfc && typeof sfc.babelParse === 'function') {
     try {
-      sfc.babelParse(src, { sourceType: 'module', plugins: [] })
+      sfc.babelParse(src, { sourceType: 'module', plugins: isTs ? ['typescript'] : [] })
     } catch (err) {
       report('ERROR', file, (err.loc && err.loc.line) || 1, err.message)
+    }
+    return
+  }
+  // TypeScript cannot go through acorn or `node --check`; tsc's own transpile is the syntax check.
+  if (isTs) {
+    if (!ts) {
+      report('WARN', file, 1, 'neither @vue/compiler-sfc nor typescript is resolvable — the .ts file was not parsed')
+      return
+    }
+    const out = ts.transpileModule(src, {
+      reportDiagnostics: true,
+      fileName: file,
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, isolatedModules: true },
+    })
+    for (const d of out.diagnostics || []) {
+      const at = d.file && d.start != null ? d.file.getLineAndCharacterOfPosition(d.start).line + 1 : 1
+      report('ERROR', file, at, ts.flattenDiagnosticMessageText(d.messageText, ' '))
     }
     return
   }
@@ -241,7 +264,7 @@ for (const file of files) {
   try { src = readFileSync(file, 'utf8') } catch (err) { report('ERROR', file, 1, 'unreadable: ' + err.message); continue }
   if (ext === '.vue') lintVue(file, src)
   else if (ext === '.css') lintCss(file, src)
-  else lintJs(file, src)
+  else lintJs(file, src, ext === '.ts' || ext === '.mts')
 }
 
 problems.sort((a, b) => (a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1))

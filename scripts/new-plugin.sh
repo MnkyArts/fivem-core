@@ -5,8 +5,8 @@
 # Copies core/templates/plugin to ../<name> (next to core, NOT inside it) and rewrites
 # every placeholder in the copy:
 #
-#   my_plugin      -> <name>                (resource name, event prefixes, page id)
-#   MyPluginPage   -> <CamelName>Page       (Vue component name, if the template uses one)
+#   my_plugin      -> <name>                (resource name, event prefixes, page id, npm package)
+#   MyPlugin       -> <CamelName>           (MyPluginPage, MyPluginProps, … in ui/src)
 #   MY_PLUGIN      -> <UPPER_NAME>          (constants, if the template uses any)
 #
 # It never touches core itself and refuses to overwrite an existing resource.
@@ -62,12 +62,12 @@ replaced=0
 while IFS= read -r file; do
     [ -n "$file" ] || continue
     sed -i \
-        -e "s/MyPluginPage/${CAMEL_NAME}Page/g" \
+        -e "s/MyPlugin/${CAMEL_NAME}/g" \
         -e "s/MY_PLUGIN/${UPPER_NAME}/g" \
         -e "s/my_plugin/${NAME}/g" \
         -- "$file"
     replaced=$((replaced + 1))
-done < <(grep -rlI -e 'my_plugin' -e 'MyPluginPage' -e 'MY_PLUGIN' -- "$TARGET_DIR" || true)
+done < <(grep -rlI -e 'my_plugin' -e 'MyPlugin' -e 'MY_PLUGIN' -- "$TARGET_DIR" || true)
 
 # --- next steps -------------------------------------------------------------
 
@@ -90,13 +90,17 @@ Next steps:
        $NAME/locales/en.json     Core.Locale.t strings ({{var}} placeholders)
 
   4. Only if the plugin shows a page -- uncomment Core.UI.registerPage('$NAME', ...) in
-     client/main.lua, then rebuild core's shell (it compiles every plugin page into it):
+     client/main.lua, then build THIS plugin's own frontend (core is not rebuilt, ever):
 
-       cd $RESOURCES_DIR && npm install     # once, or after adding a ui dependency
-       cd $CORE_DIR/ui && npm run build
-       # then in the server console: refresh; restart $CORE_NAME
+       cd $RESOURCES_DIR && npm install     # once, and after adding a ui dependency
+       cd $RESOURCES_DIR/$NAME/ui && npm run build     # -> $NAME/ui/dist (committed)
+       # then in the server console: refresh; restart $NAME
 
-     Otherwise delete $NAME/ui -- a plugin without a page ships no UI files at all.
+     $NAME/ui/dist is what players download; commit it like core/html. Re-run the build and
+     'restart $NAME' after every UI change -- no core rebuild, no core restart, no CEF reload.
+
+     Otherwise delete $NAME/ui and the 'core_ui' + 'ui/dist/**' lines from fxmanifest.lua --
+     a plugin without a page ships no UI files at all.
 
   5. refresh; ensure $NAME
 
