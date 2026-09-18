@@ -7,6 +7,12 @@ import { Meta } from '@storybook/addon-docs/blocks'
 Two tables define everything the shell understands and everything it can say back. The
 **Lua** panel on every story shows both halves live for that story.
 
+> The runtime UI platform (DESIGN §38) **adds** to both tables: `plugin:register` /
+> `plugin:unregister`, `page:patch`, `page:request`, `feed`, `dev:set`, `inspector:toggle` going
+> down, and `ui_request`, `ui_response`, `ui_plugin`, `ui_error`, `ui_feed` coming back. It also
+> changes two rows below — `page:register` carries `owner` and no longer carries `script`/`style`,
+> and `focus` carries the whole layer `stack`. See **Docs → UI Platform**.
+
 ## Lua → NUI: `SendNUIMessage({ action = ..., ... })`
 
 Dispatched by `src/bridge.js` on the `window 'message'` event and handled by the `actions`
@@ -27,12 +33,13 @@ dropped before it reaches any handler.
 | `alert:open` | `id, title, message, confirm, cancel` | `message` may be a string or an array of lines; `cancel = false` drops the button |
 | `alert:close` | — | closes without a callback |
 | `hud:set` | partial of `visible, cash, bank, name, serverId, faction` | copies only the keys present; `faction` is `{ name, tag, color }` or `false` |
-| `page:register` | `id, type, script, style, keepInput` | `type` is `page` or `overlay`; `script`/`style` are absolute `https://cfx-nui-<owner>/<path>` URLs, and are `null` for the normal compiled-in case |
+| `page:register` | `id, type, keepInput, owner` | `type` is `page`, `overlay` or `modal`; `owner` is the resource whose UI plugin provides the component (§38.5 — `script`/`style` are gone) |
 | `page:unregister` | `id` | drops the record, the overlay and the open page |
 | `page:open` | `id, props` | `type = 'page'` becomes the one `openPage`; `type = 'overlay'` joins `store.overlays` |
 | `page:close` | `id` | `id` omitted closes the open page |
-| `page:event` | `id, event, data` | calls every `CoreUI.on(id, event, fn)` handler |
-| `focus` | `focused` | mirrors `SetNuiFocus` into `store.focused` (informational) |
+| `page:event` | `id, event, data` | calls every `CoreUI.on(id, event, fn)` handler; `id` may be a page id **or** a plugin channel |
+| `page:patch` | `id, ops` | applies `{ p = 'slots.12', v = value }` ops in order to that page's props; an op without `v` deletes the key (§38.10) |
+| `focus` | `focused, stack` | mirrors `SetNuiFocus` into `store.focused` and the layer stack into `store.focusStack` (§38.9) |
 
 ## NUI → Lua: `RegisterNuiCallback`
 
@@ -49,9 +56,15 @@ answers `cb({})` or `cb({ ok = true })`; the shell ignores the answer — it nev
 | `progress_done` | `id` | resolves `Core.UI.progress` with `true` |
 | `ui_close` | `page` | `Core.UI.close(page)` — Escape or a close button in the page |
 | `ui_event` | `page, event, data` | `TriggerEvent(('core:ui:%s:%s'):format(page, event), data)`; `page`/`event` are validated as id strings and `data` is capped at 16 KB of JSON |
+| `ui_request` | `c, n, d, t` | channel, name, payload, timeout — `Core.UI.onRequest(n, fn)`. The `cb` is **held** until the handler returns, the timeout fires or the owner stops (§38.8) |
+| `ui_response` | `rid, ok, data \| error` | resolves a pending `Core.UI.request` |
+| `ui_plugin` | `id, generation, state, error?, ms?, pages` | updates core's plugin record, prints one `[core:ui]` line, fires `uiPluginReady` / `uiPluginFailed` |
+| `ui_error` | `plugin?, page?, component?, message, stack?, info?` | one client print, at most 5/s |
+| `ui_feed` | `channel, active` | first subscriber / last unsubscribe — what `Core.UI.isFeedActive` reports |
 
 Results whose `id` no longer has a pending promise are ignored, so a late click after a
-timeout cannot resolve the next request.
+timeout cannot resolve the next request. `ui_request` is the one callback whose `cb` is not
+answered immediately: FiveM simply holds the POST, with no timeout of its own.
 
 ### The `menu_result` detail worth knowing
 

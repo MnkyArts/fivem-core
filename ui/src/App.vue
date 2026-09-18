@@ -14,7 +14,13 @@ import PageHost from './shell/PageHost.vue'
 import Menu from './shell/Menu.vue'
 import InputDialog from './shell/InputDialog.vue'
 import AlertDialog from './shell/AlertDialog.vue'
+import { defineAsyncComponent } from 'vue'
 import { store } from './store.js'
+
+// §38.14: the inspector is a lazy chunk. The `import()` is only issued the first time
+// `store.dev.inspector` becomes true (`/uiinspect` -> `inspector:toggle`), so a production shell
+// never fetches `assets/inspector.js` and pays nothing for a panel nobody opened.
+const Inspector = defineAsyncComponent(() => import('./shell/Inspector.vue'))
 </script>
 
 <template>
@@ -55,5 +61,8 @@ import { store } from './store.js'
     <!-- §37.3: Teleport target of every kit popup (select, popover, context menu, dialog, drawer,
          tooltip) — inside .core-root, so §31 hides it with the shell. -->
     <div id="core-overlays" class="core-overlays"></div>
+
+    <!-- §38.14: dev only, above everything, never focusable -->
+    <Inspector v-if="store.dev.inspector" />
   </div>
 </template>

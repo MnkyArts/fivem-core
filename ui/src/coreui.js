@@ -1,6 +1,13 @@
-// core UI — the `window.CoreUI` surface plugin bundles talk to (DESIGN §7.4)
-import { post } from './bridge.js'
+// core UI — the `window.CoreUI` surface plugin bundles talk to (DESIGN §7.4, kept by §38.12)
+//
+// §38 gave plugins a typed SDK (`@core/ui`, backed by `globalThis.__CORE_UI_HOST__`), but this
+// object stays: the shell regression suite, the kit regression suite, Storybook and every page
+// written before §38 reach for `window.CoreUI`. Every member below is load-bearing.
+import { post } from './runtime/transport.ts'
 import { store, ensurePage, setPageComponent, whenRegistered, onPageEvent, closePage, notify } from './store.js'
+import { bindToScope, pageHandle } from './runtime/pages.ts'
+import { currentHost, PAGE_KEY } from './runtime/host.ts'
+import { list as pluginList } from './runtime/plugins.ts'
 
 /** Installs `window.CoreUI`. `window.Vue` must already be set (main.js does it first). */
 export function installCoreUI() {
@@ -21,9 +28,10 @@ export function installCoreUI() {
       return post('ui_event', { page: pageId, event, data: data === undefined ? {} : data })
     },
 
-    /** Lua -> page (`page:event`). Returns an unsubscribe function. */
+    /** Lua -> page (`page:event`). `pageId` may also be a plugin channel (§38.5). Returns an
+     *  unsubscribe function; inside a plugin `setup` or a component it is scoped like the SDK's. */
     on(pageId, event, fn) {
-      return onPageEvent(pageId, event, fn)
+      return bindToScope(onPageEvent(pageId, event, fn))
     },
 
     close(pageId) {
@@ -80,22 +88,30 @@ export function installCoreUI() {
       return notify(typeof message === 'object' && message !== null ? message : { message, type })
     },
 
-    /** Composable for the page component itself. */
+    /** Composable for the page component itself. With no id — inside a page rendered by
+     *  PageHost — it resolves the page being rendered, exactly like the SDK's `usePage()`. */
     usePage(id) {
-      const V = window.Vue
-      const props = ensurePage(id).props
-      const api = {
-        id,
-        props,
-        emit: (event, data) => CoreUI.emit(id, event, data),
-        on: (event, fn) => {
-          const off = onPageEvent(id, event, fn)
-          if (V.getCurrentInstance && V.getCurrentInstance()) V.onUnmounted(off)
-          return off
-        },
-        close: () => closePage(id),
+      let pageId = id
+      if (!pageId) {
+        const V = window.Vue
+        const ctx = V && V.getCurrentInstance && V.getCurrentInstance() ? V.inject(PAGE_KEY, null) : null
+        if (!ctx) throw new Error('[core:ui] CoreUI.usePage() without an id works inside a page component only')
+        pageId = ctx.id
       }
-      return api
+      ensurePage(pageId)
+      return pageHandle(pageId)
+    },
+
+    /** §38.2: what the shell knows about every registered plugin (the inspector's source). */
+    plugins() {
+      return pluginList().map((p) => ({
+        id: p.id, state: p.state, generation: p.generation, build: p.build, ms: p.ms, error: p.error, pages: p.pages.slice(),
+      }))
+    },
+
+    /** §38.6: `globalThis.__CORE_UI_HOST__`, for a console poke or a test. */
+    get host() {
+      return currentHost()
     },
   }
 

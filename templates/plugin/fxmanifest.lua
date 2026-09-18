@@ -24,12 +24,18 @@ server_scripts {
     'server/*.lua',
 }
 
--- No `files {}` for the UI. If this plugin has a page, `ui/src` is compiled into core's own
--- shell bundle when core/ui is built (DESIGN.md §7.4) — players download core/html only.
--- List files here only for assets the CEF must fetch from THIS resource (images, sounds).
+-- The UI opt-in (DESIGN.md §38.4): core reads ui/dist/manifest.json from THIS resource and the CEF
+-- imports the module from https://cfx-nui-my_plugin/ui/dist/. Build it with `npm run build` in ui/.
+-- Delete this line (and the ui/ folder) if the plugin shows no page.
+core_ui 'ui/dist'
 
+-- Only files listed here are packed for the client, and the CEF can fetch nothing else: without the
+-- ui/dist glob the build succeeds and the game serves a 404. Never let a `client_scripts` glob
+-- reach into ui/dist — FiveM serves those files as garbage.
 -- `Core.Locale.t` reads `locales/<lang>.json` with LoadResourceFile (DESIGN.md §26), so every
--- locale file of this plugin has to be listed here.
+-- locale file of this plugin has to be listed here. Add assets the CEF must fetch from this
+-- resource (images, sounds) the same way.
 files {
     'locales/*.json',
+    'ui/dist/**',
 }

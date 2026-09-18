@@ -1,0 +1,44 @@
+{
+  "//": "Type-check config for core's shell and the SDK (DESIGN §38). `npm run typecheck` (vue-tsc) is the only thing that reads it: Vite/esbuild strip types and never check them. `types` carries `node` for tests/unit (node:test) and `vite/client` for import.meta.env and asset imports. A plugin does NOT extend this file — it extends @core/ui/tsconfig.plugin.json.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node", "vite/client"],
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": true,
+
+    "allowJs": true,
+    "checkJs": false,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    "jsx": "preserve",
+    "jsxImportSource": "vue",
+
+    "baseUrl": ".",
+    "paths": {
+      "@core/ui": ["./sdk/src/index.ts"],
+      "@core/ui/*": ["./sdk/src/*"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.vue",
+    "sdk/src/**/*.ts",
+    "sdk/src/**/*.d.ts",
+    "sdk/src/**/*.vue",
+    "sdk/tests/types/**/*.ts",
+    "tests/unit/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", "storybook-static", "sdk/tests/fixtures"]
+}

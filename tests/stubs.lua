@@ -293,6 +293,22 @@ stubs.playerNames = {}       -- server id -> name
 stubs.resourceStates = { core = 'started' }
 stubs.nuiFocused = false
 stubs.pauseMenu = false
+-- Client NUI harness (used by tests/client_ui_tests.lua and any suite that loads
+-- client/ui.lua): every SendNUIMessage in order, every RegisterNuiCallback by name,
+-- and the last focus triple plus the raw call log.
+stubs.nuiMessages = {}
+stubs.nuiCallbacks = {}
+stubs.nuiFocus = { focus = false, cursor = false, keepInput = false, calls = {} }
+-- resource -> { ['ui/dist/manifest.json'] = '{…}' } for LoadResourceFile. A `false`
+-- value means "the file exists in the manifest but cannot be read" (what an unpacked
+-- file looks like on the client); 'core' always falls through to the real disk.
+stubs.resourceFiles = {}
+-- resource -> { core_ui = { 'ui/dist' }, file = { 'ui/dist/**' } } for the metadata natives
+stubs.resourceMeta = {}
+-- what the §31 auto-hide watchers read (client/ui.lua); `pause` stays stubs.pauseMenu
+stubs.gameState = { fadedOut = false, fadingOut = false, switch = false,
+    warning = false, hudHidden = false, cinematic = false }
+stubs.sounds = {}            -- every PlaySoundFrontend(id, name, set)
 stubs.net = { drop = false, latency = 0 }   -- drop = packets vanish, latency = ms before delivery
 stubs.clientSrc = 1
 
@@ -448,6 +464,51 @@ function stubs.resetServer()
     stubs.invokingResource, stubs.spawnFails, stubs.spawnDelayMs, stubs.osTime = nil, false, 0, nil
     nextEntity, nextNetId = 1000, 100
     findHandles, nextFindHandle = {}, 0
+end
+
+--- Clears the client NUI harness between suites (messages, callbacks, focus).
+function stubs.resetNui()
+    stubs.nuiMessages, stubs.nuiCallbacks = {}, {}
+    stubs.nuiFocus = { focus = false, cursor = false, keepInput = false, calls = {} }
+    stubs.resourceFiles, stubs.resourceMeta = {}, {}
+end
+
+--- Would `value` survive the JSON encode a NUI `cb` does? Functions, coroutines and
+--- userdata do not, which is what makes a handler result unsendable.
+local function encodable(value, depth)
+    local kind = rawtype(value)
+    if kind == 'function' or kind == 'thread' or kind == 'userdata' then return false end
+    if kind ~= 'table' then return true end
+    if depth > 8 then return false end
+    for k, v in pairs(value) do
+        if not encodable(k, depth + 1) or not encodable(v, depth + 1) then return false end
+    end
+    return true
+end
+
+--- Drives one NUI callback the way the engine does: in its own coroutine, so a
+--- handler may yield, and with a `cb` that may be called LATE (after stubs.tick).
+--- Returns the first answer and the live array of every answer.
+---@return any first, table answers
+function stubs.nui(name, data)
+    local fn = stubs.nuiCallbacks[name]
+    if not fn then error('stubs: no NUI callback ' .. tostring(name), 2) end
+    local answers = {}
+    local function cb(value)
+        if not encodable(value, 0) then error('nui: result cannot be encoded', 0) end
+        answers[#answers + 1] = value
+    end
+    createThread(function() fn(data, cb) end)
+    return answers[1], answers
+end
+
+--- Every message of one action, in order (`stubs.nuiOf('page:patch')`).
+function stubs.nuiOf(action)
+    local out = {}
+    for i = 1, #stubs.nuiMessages do
+        if stubs.nuiMessages[i].action == action then out[#out + 1] = stubs.nuiMessages[i] end
+    end
+    return out
 end
 
 --- The `.state` table of one entity bag (`entity:<netId>` in game).
@@ -653,6 +714,14 @@ local STD <const> = { 'assert', 'error', 'ipairs', 'next', 'pairs', 'pcall', 'xp
     'setmetatable', 'getmetatable', 'rawget', 'rawset', 'rawequal', 'rawlen', 'tonumber',
     'tostring', 'load', 'string', 'table', 'math', 'coroutine', 'utf8' }
 
+--- Sorted keys of a map, so the resource-iteration natives have a stable order.
+local function sortedKeys(map)
+    local keys = {}
+    for key in pairs(map) do keys[#keys + 1] = key end
+    table.sort(keys)
+    return keys
+end
+
 local function hashKey(value)
     local s = tostring(value)
     local h = 0
@@ -695,11 +764,33 @@ function stubs.newEnv(side, resourceName)
     -- natives (all verified with `fxref show`; apiset matches the side they are used on)
     env.GetCurrentResourceName = function() return resourceName end
     env.IsDuplicityVersion = function() return isServer end
+    --- stubs.resourceFiles wins; 'core' falls through to the real files on disk, so
+    --- import.lua's lib loading keeps working while a suite fakes another resource.
     env.LoadResourceFile = function(res, file)
-        if res ~= 'core' or rawtype(file) ~= 'string' then return nil end
+        if rawtype(file) ~= 'string' then return nil end
+        local files = stubs.resourceFiles[res]
+        if files ~= nil then
+            local value = files[file]
+            if value ~= nil then return value end
+        end
+        if res ~= 'core' then return nil end
         return readFile(stubs.root .. '/' .. file)
     end
     env.GetResourceState = function(res) return stubs.resourceStates[res] or 'missing' end
+    env.GetNumResources = function() return #sortedKeys(stubs.resourceStates) end
+    env.GetResourceByFindIndex = function(index)     -- 0-based, like the engine
+        return sortedKeys(stubs.resourceStates)[(tonumber(index) or 0) + 1]
+    end
+    env.GetNumResourceMetadata = function(res, key)
+        local meta = stubs.resourceMeta[res]
+        local list = meta and meta[key]
+        return list and #list or 0
+    end
+    env.GetResourceMetadata = function(res, key, index)   -- 0-based, like the engine
+        local meta = stubs.resourceMeta[res]
+        local list = meta and meta[key]
+        return list and list[(tonumber(index) or 0) + 1] or nil
+    end
     env.GetGameTimer = function() return math.floor(clock) end
     env.GetHashKey = hashKey
     env.GetPlayerPed = function(src) return stubs.peds[tonumber(src)] or 0 end
@@ -722,6 +813,34 @@ function stubs.newEnv(side, resourceName)
         end
         env.IsNuiFocused = function() return stubs.nuiFocused end
         env.IsPauseMenuActive = function() return stubs.pauseMenu end
+        -- the rest of the §31 auto-hide watchers, all apiset client
+        env.IsScreenFadedOut = function() return stubs.gameState.fadedOut end
+        env.IsScreenFadingOut = function() return stubs.gameState.fadingOut end
+        env.IsPlayerSwitchInProgress = function() return stubs.gameState.switch end
+        env.IsWarningMessageActive = function() return stubs.gameState.warning end
+        env.IsHudHidden = function() return stubs.gameState.hudHidden end
+        env.IsCinematicCamRendering = function() return stubs.gameState.cinematic end
+        env.PlaySoundFrontend = function(id, name, set)
+            stubs.sounds[#stubs.sounds + 1] = { id = id, name = name, set = set }
+        end
+        -- NUI: the message log, the callback table stubs.nui() drives, and the two
+        -- focus natives (client apiset) with their full call log
+        env.SendNUIMessage = function(message)
+            stubs.nuiMessages[#stubs.nuiMessages + 1] = message
+            return true
+        end
+        env.RegisterNuiCallback = function(name, fn) stubs.nuiCallbacks[name] = fn end
+        env.RegisterNUICallback = env.RegisterNuiCallback
+        env.SetNuiFocus = function(hasFocus, hasCursor)
+            local focus = stubs.nuiFocus
+            focus.focus, focus.cursor = hasFocus, hasCursor
+            focus.calls[#focus.calls + 1] = { 'SetNuiFocus', hasFocus, hasCursor }
+        end
+        env.SetNuiFocusKeepInput = function(keepInput)
+            local focus = stubs.nuiFocus
+            focus.keepInput = keepInput
+            focus.calls[#focus.calls + 1] = { 'SetNuiFocusKeepInput', keepInput }
+        end
         env.PlayerPedId = function() return stubs.peds[stubs.clientSrc] or 101 end
         env.PlayerId = function() return 0 end
         env.GetPlayerServerId = function() return stubs.clientSrc end

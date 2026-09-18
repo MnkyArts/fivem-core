@@ -1,0 +1,29 @@
+/* @core/ui/reference.css — what an SFC `<style>` block points `@apply` at.
+
+   A scoped style block is compiled on its own, so Tailwind has to be told which theme and which
+   utilities exist before `@apply` can mean anything. In a plugin write exactly one line at the top
+   of the block:
+
+     <style scoped>
+     @reference "@core/ui/reference.css";
+     .my-thing { @apply bg-panel rounded-ui text-fg-dim; }
+     </style>
+
+   `@reference` compiles this file and throws the OUTPUT away, so nothing here reaches the bundle:
+   no preflight, no `:root` token block, no utility class — only the knowledge needed to expand
+   `@apply` (DESIGN §38.3: a plugin sheet carries its own utilities and its scoped rules, nothing
+   else). It replaces the old `@reference "../../../core/ui/src/styles.css"` of the build-time era,
+   which reached across resources into core's source tree.
+
+   Prefer utilities on the tag (`class="bg-panel rounded-ui"`) — they land in the utilities layer and
+   beat the kit's component classes. `@apply` is for what a class attribute cannot express
+   (pseudo-elements, keyframed state, a selector a parent controls).
+
+   Resolution: `@core/ui` has to be findable from the SFC. Inside the npm workspace it is (the
+   workspace links it); a plugin that lives outside the workspace installs `@core/ui` as a
+   devDependency. The two `tailwindcss/*` imports below resolve from THIS file's folder, i.e. from
+   core's own install — a plugin never needs Tailwind next to itself for them. */
+
+@import "tailwindcss/theme.css" theme(reference);
+@import "./theme.css" theme(reference);
+@import "tailwindcss/utilities.css";

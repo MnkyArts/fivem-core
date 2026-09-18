@@ -1,0 +1,59 @@
+/* core UI — the RECIPES: plain custom properties the kit CSS reads directly (DESIGN §37.2).
+
+   Split out of styles.css by §38: `ui/sdk/theme.css` holds the `@theme` tokens and must contain
+   nothing else (Tailwind refuses `@import "…" theme(reference)` on a file that mixes in a `:root`
+   block), so a plugin build can compile its utilities against core's token values by reference.
+   These recipes are HOST-ONLY: a plugin never needs them at build time — it reads them at runtime
+   as `var(--core-grad-accent)` from this, the one stylesheet the page always carries.
+
+   A server re-themes the whole shell by overriding --color-accent*, --core-accent-rgb and the three
+   gradients. The `r g b` triplets exist because Chromium 103 has no color-mix(): kit CSS writes an
+   alpha as `rgb(var(--core-accent-rgb) / 0.16)`. */
+
+:root {
+  --core-accent-rgb: 246 80 63;
+  --core-ink-rgb: 6 11 15;
+  --core-panel-rgb: 11 17 22;
+  --core-error-rgb: 255 69 96;
+  --core-success-rgb: 63 214 127;
+  --core-warning-rgb: 245 166 35;
+  --core-info-rgb: 85 182 247;
+
+  --core-grad-accent: linear-gradient(90deg, #ff5a49 0%, #f6503f 45%, #ee4339 100%);
+  --core-grad-accent-fade: linear-gradient(90deg, #fd5443 0%, #f6503f 18%, rgb(246 80 63 / 0.18) 100%);
+  --core-grad-accent-fade-out: linear-gradient(90deg, #fd5443 0%, #f6503f 16%, rgb(246 80 63 / 0.04) 100%);
+  --core-grad-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0, rgba(255, 255, 255, 0) 120px);
+
+  --core-h-sm: 30px;
+  --core-h-md: 40px;
+  --core-h-lg: 52px;
+  --core-focus: 0 0 0 3px rgb(var(--core-accent-rgb) / 0.18);
+
+  /* Legacy names used by the first-wave components — aliases of the theme tokens above. */
+  --core-panel: var(--color-panel);
+  --core-panel-solid: var(--color-panel-solid);
+  --core-panel-raise: var(--color-panel-raise);
+  --core-border: var(--color-border);
+  --core-border-strong: var(--color-border-strong);
+  --core-backdrop: var(--color-backdrop);
+  --core-accent: var(--color-accent);
+  --core-accent-soft: var(--color-accent-soft);
+  --core-success: var(--color-success);
+  --core-error: var(--color-error);
+  --core-warning: var(--color-warning);
+  --core-info: var(--color-info);
+  --core-text: var(--color-fg);
+  --core-text-dim: var(--color-fg-dim);
+  --core-text-faint: var(--color-fg-faint);
+  --core-radius: var(--radius-ui);
+  --core-radius-sm: var(--radius-ui-sm);
+  --core-gap: 10px;
+  --core-pad: 20px;
+  --core-shadow: var(--shadow-ui);
+  --core-font: var(--font-sans);
+  --core-mono: var(--font-mono);
+  --core-fs: var(--text-ui);
+  --core-fs-sm: var(--text-ui-sm);
+  --core-fs-xs: var(--text-ui-xs);
+  --core-ease: var(--ease-ui);
+}

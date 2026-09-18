@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>my_plugin — core ui dev host</title>
+    <!--
+      The page `npm run dev` serves (core DESIGN §38.11 path 1). It is OPTIONAL: with no
+      index.html, `coreUI()` serves exactly this markup from memory and points it at dev/host.ts.
+      Keep a copy only when you want to add something of your own (a second mount point, a
+      viewport size, a debug script).
+
+      Never shipped: `npm run build` builds src/index.ts into ui/dist and nothing else.
+    -->
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/dev/host.ts"></script>
+  </body>
+</html>

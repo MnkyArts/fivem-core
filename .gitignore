@@ -5,6 +5,12 @@ node_modules/
 ui/node_modules/
 ui/storybook-static/
 ui/.storybook/cache/
+# Built by `node ui/tests/build-fixtures.mjs` (DESIGN §38.15): the fixture plugins' ui/dist trees,
+# the imported benchmark baseline and the patched shells bench.mjs serves. All generated, never
+# committed — `ui/tests/fixtures/**` holds the sources.
+ui/tests/.fixtures-dist/
+# `coreUI()` generates the Tailwind entry and a per-plugin Vite cache next to a plugin's sources.
+ui/tests/fixtures/*/ui/.core-ui/
 # runtime artefacts
 data/*
 *.log

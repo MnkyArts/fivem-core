@@ -857,6 +857,12 @@ Uses `GetGameplayCamCoord`, `GetGameplayCamRot(2)`, `Core.Math.rotationToDirecti
 
 ### 6.10 `Core.UI` (`client/ui.lua`) — the NUI bridge
 
+> **Amended by §38 (2026-09-18).** `script`/`style` are removed from `registerPage` (passing either fails the
+> registration with an error pointing at §38); `type` gains `'modal'`; `page:register` carries `owner`; the
+> focus paragraph below is replaced by the focus STACK of §38.9; and §38.5 adds `plugin:*`, `page:patch`,
+> `page:request`, `feed`, `dev:set`, `inspector:toggle` and the `ui_request` / `ui_response` / `ui_plugin` /
+> `ui_error` / `ui_feed` callbacks. Everything else in this section is unchanged.
+
 State: `pages[id] = { owner, type, script, style, keepInput, registered = bool }`, `openPage = id|nil`
 (exclusive, `type = 'page'`), `overlays[id] = true`, `pending = { [requestId] = promise }`, `nuiReady = bool`,
 `notifyQueue`.
@@ -865,6 +871,7 @@ State: `pages[id] = { owner, type, script, style, keepInput, registered = bool }
 UI.registerPage(id, { type = 'page' | 'overlay', keepInput = false, script = nil, style = nil })
 --   default: the page component is COMPILED INTO core's bundle (§7.4) and looked up by id; script/style are an
 --   optional fallback (relative paths inside the CALLER's resource → 'https://cfx-nui-<owner>/<path>')
+--   §38: script/style REMOVED, type gains 'modal' — UI.registerPage(id, { type, keepInput }) only
 UI.unregisterPage(id)
 UI.open(id, props?) -> bool          -- page: closes the current page first, SetNuiFocus(true, true) (+ SetNuiFocusKeepInput(keepInput)); overlay: just shows it
 UI.close(id?)                        -- id nil → close the open page; no page open → SetNuiFocus(false, false)
@@ -893,9 +900,9 @@ Wire to NUI (`SendNUIMessage({ action = ..., ... })`, table form of the runtime 
 | `input:open` / `input:close` | `id, title, fields, submit, cancel` / — |
 | `alert:open` / `alert:close` | `id, title, message, confirm, cancel` / — |
 | `hud:set` | partial of `{ visible, cash, bank, name, serverId, faction = { name, tag, color } | false }` |
-| `page:register` / `page:unregister` | `id, type, script (URL), style (URL|null), keepInput` / `id` |
+| `page:register` / `page:unregister` | `id, type, script (URL), style (URL|null), keepInput` / `id` — §38.5: `id, type ('page'\|'overlay'\|'modal'), keepInput, owner`; `script`/`style` gone |
 | `page:open` / `page:close` / `page:event` | `id, props` / `id` / `id, event, data` |
-| `focus` | `focused` |
+| `focus` | `focused` — §38.5 adds `stack = { { key, layer, id?, owner } … }` (top last) |
 
 NUI → Lua (`RegisterNuiCallback`, every one calls `cb({})` or `cb({ ok = true })`):
 `ui_ready {}` (NUI reloaded/loaded → set `nuiReady`, re-send every registered page + hud snapshot),
@@ -903,9 +910,10 @@ NUI → Lua (`RegisterNuiCallback`, every one calls `cb({})` or `cb({ ok = true 
 `TriggerEvent(('core:ui:%s:%s'):format(page, event), data)` (page/event validated as `'id'` strings, `data` ≤
 16 KB json), `menu_result { id, value }`, `input_result { id, values }`, `alert_result { id, confirmed }`,
 `progress_cancel { id }`, `progress_done { id }`. Results resolve the matching pending promise (unknown ids
-ignored). Focus: exactly `SetNuiFocus(true, true)` when a `page` or a built-in modal (menu/input/alert) is
-open, `SetNuiFocus(false, false)` the moment none is; `onResourceStop` releases focus and hides everything.
-Notify throughput: queue, flushed at most `Config.UI.MaxNotifyPerSecond` per second (a 100 ms timer), extra
+ignored). Focus **(superseded by §38.9 — the three booleans are a focus STACK now; the observable behaviour is
+the same, plus plugin modals)**: exactly `SetNuiFocus(true, true)` when a `page` or a built-in modal
+(menu/input/alert) is open, `SetNuiFocus(false, false)` the moment none is; `onResourceStop` releases focus and
+hides everything. Notify throughput: queue, flushed at most `Config.UI.MaxNotifyPerSecond` per second (a 100 ms timer), extra
 messages coalesced (`count` field). ESC is handled in the page (keydown → `ui_close`); a 500 ms watchdog also
 releases focus if `IsNuiFocused()` while nothing is open.
 
@@ -927,6 +935,12 @@ equivalent focus release (synchronous).
 ## 7. UI shell (`core/ui` → `core/html`)
 
 ### 7.1 Stack and build
+
+> **Superseded in part by §38 (2026-09-18).** The infrastructure is TypeScript now (`ui/src/runtime/*.ts`,
+> `ui/src/shell.ts`, `ui/sdk/**`), the tokens moved to `ui/sdk/theme.css`, the entry is `@import "tailwindcss"
+> source(none)` with explicit `@source` lines, the `@source "../../../*/ui/src/…"` line is gone, and a plugin
+> page `@reference`s `@core/ui/reference.css` instead of a relative path into core. Everything below about
+> Tailwind v4 CSS-first, the tokens-are-utilities rule and the Chromium 103 bans still holds.
 
 Vue 3 + Vite, plain JavaScript (no TypeScript), `<script setup>` SFCs, Tailwind utilities with scoped CSS where
 a component needs it, no UI component library, no external fonts (the CEF cannot fetch the web).
@@ -955,6 +969,12 @@ game frame through FiveM's NUI render hook and blurs that copy).
 
 ### 7.2 Files
 
+> **Superseded in part by §38.6/§38.7 (2026-09-18).** `ui/src/main.js` and `ui/src/plugins.js` are DELETED:
+> the entry is `ui/src/main.ts` over `ui/src/shell.ts` (`createShell`), the transport moved into
+> `ui/src/runtime/transport.ts` (`bridge.js` is the thin legacy shim), the host object lives in
+> `ui/src/runtime/host.ts`, and `ui/sdk/**` is the plugin-facing package. The `ui/src/store.js` and
+> `ui/src/App.vue` rows still describe what those files do.
+
 ```
 ui/index.html, ui/vite.config.js, ui/package.json
 ui/src/main.js            creates the app, exposes window.Vue and window.CoreUI, mounts #app
@@ -982,6 +1002,13 @@ is `pointer-events: none` except open modals/pages.
 open → `ui_close { page }`. Progress cancel keys: `x`, `Backspace`.
 
 ### 7.4 Plugin pages (`window.CoreUI`) — one UI dist
+
+> **SUPERSEDED BY §38 (2026-09-18).** Build-time compilation of plugin pages, `ui/src/plugins.js`, the
+> `export const id` / `export const pages` entry convention and the `script`/`style` URL loader are all GONE —
+> a resource now builds its own frontend and core imports it at runtime (§38.3, §38.6).
+> What still holds, unchanged: the `window.CoreUI` surface listed below (§38.12 keeps it for tests, stories and
+> old pages) and the **props-identity rule** at the end of this section — `usePage(id).props` is the same
+> reactive object for the life of the shell, across `page:unregister` + `page:register`.
 
 Players download exactly one UI: core's `html/`. Plugin pages live in the plugin's source tree
 (`<plugin>/ui/src/index.js` exporting `id` and the default Vue component, plus its SFCs) and are compiled INTO the
@@ -1099,7 +1126,8 @@ Hooks (local events `core:hook:<name>`, cross-resource, same side):
 | DB flush | server | 5000 ms (only when dirty) | |
 | invite sweep | server | 30 s | |
 
-Targets: client idle **0.00–0.02 ms**; ≤ 10 visible markers/labels **< 0.06 ms**; NUI messages ≤ 10/s. Never:
+Targets: client idle **0.00–0.02 ms**; ≤ 10 visible markers/labels **< 0.06 ms**; NUI messages ≤ 10/s
+(**replaced by §38.10**: idle = 0 messages/s, with feeds ≤ 20 messages/s total). Never:
 `TriggerClientEvent(-1)` from a loop, per-frame `.state` reads, `GetGamePool` per frame, funcref calls per frame.
 
 ---
@@ -2988,3 +3016,461 @@ plugin pages that predate the kit (inventory, charcreator, trucking) and are del
 - **Docs**: README "Design system" (tokens, the tag list, a page example, re-theming, adding icons),
   `stories/docs/DesignSystem.mdx`, AGENTS §2/§3/§4/§5, the plugin template page and `core_example`'s page
   rebuilt on the kit. No Lua API changes, so `types/core.lua` is untouched.
+
+---
+
+## 38. Runtime UI platform — resource-owned frontends in the one CEF (2026-09-18, Liam: "a real FiveM frontend platform")
+
+Until now core compiled every plugin page INTO its own bundle (`ui/src/plugins.js`, §7.4): changing the
+inventory page meant rebuilding core, and a resource core had never seen could not bring a UI. §38 replaces
+that coupling and nothing else: there is still exactly ONE `ui_page` (core's), ONE Vue, ONE kit, ONE focus
+manager — but every resource owns, builds, ships and restarts its own frontend module, and core loads it at
+runtime. **§38 supersedes** §7.1 ("plain JavaScript (no TypeScript)" — the infrastructure is TypeScript now),
+§7.4 (build-time pages, the `script`/`style` URL loader — both removed; the `window.CoreUI` surface and the
+props-identity rule stay), the focus paragraph of §6.10 (→ §38.9) and the "NUI messages ≤ 10/s" line of §9
+(→ §38.10). Everything else in §6.10, §21, §31, §32 and §37 stays in force.
+
+### 38.1 What FiveM guarantees (verified in the CitizenFX source, master `0d8a2a6f7`, 2026-09-07)
+
+| fact | source |
+|---|---|
+| `https://cfx-nui-<resource>/<path>` is served for EVERY resource, with or without a `ui_page` (factories are registered before the `ui_page` check, once per start) | `nui-resources/src/ResourceUI.cpp:38-55`, `ResourceScriptingComponent.cpp:149-154` |
+| the factory is registered on every existing AND future request context — a resource first started while core runs is served inside core's live frame | `nui-core/src/NUIInitialize.cpp:1389-1401` |
+| responses carry `access-control-allow-origin: *`, `cache-control: no-cache, must-revalidate`, no validators; `?query` and `#hash` are erased before the file is opened; `js`/`mjs` → `application/javascript`; the CEF also runs with `disable-web-security` | `nui-core/src/NUISchemeHandler.cpp:92-199,341+`, `NUIApp.cpp:169-232` |
+| only files packed for the client are reachable (`files {}`), a `client_script` that is not also a `file` is served as garbage, and the WHOLE vfs path `resources:/<res>/<path>` is cut at 255 chars | `ResourceUI.cpp:289-338`, `NUISchemeHandler.cpp:124-127` |
+| `restart <res>` re-globs `files {}` against the disk on every start (a NEW file name under an existing glob ships without `refresh`); manifest ENTRIES and new resource folders need `refresh` | `citizen-server-impl/src/ResourceFilesComponent.cpp:506,643-685`, `ServerResourceList.cpp:184` |
+| a restart destroys the client's `fx::Resource`, re-downloads the content-addressed `resource.rpf`, mounts it, starts it and queues `onClientResourceStart` for the next tick; a plain `stop` keeps serving the last files | `citizen-legacy-net-resources/src/ResourceNetBindings.cpp:143-182,598-620`, `ResourceEventComponent.cpp:77` |
+| `LoadResourceFile(other, path)` and `GetResourceMetadata(other, key, i)` work on the client for any started resource | `citizen-scripting-core/src/MetadataScriptFunctions.cpp:169-175` |
+| a NUI callback's `cb` may be called any time later — the POST is simply held, there is no timeout; a body that is not JSON is dropped without a response; a POST to a stopped resource hangs forever | `nui-resources/src/RPCSchemeHandler.cpp:233-236`, `ResourceUICallbacks.cpp:74-101` |
+| `SendNUIMessage` = 2 JSON encodes + 2 parses + UTF-16 conversion + IPC + structured clone per message; all `ui_page`s are iframes of one root browser; NUI focus is ONE global flag | `scheduler.lua:807`, `ResourceUIScripting.cpp:55-88,351-394`, `CefOverlay.cpp:298-323`, `root.html` |
+| CEF is Chromium 103.0.5060.141 (dynamic `import()`, cascade layers, `inert`: yes; import attributes, `:has()`, container queries: no) | `vendor/cef/cef_build_name.txt` |
+
+Consequences baked into the design: an ES module is pinned in the document's module map by URL for the life
+of core's page, so **content-hashed file names are load-bearing** (never re-import one URL and expect new
+code); the manifest is read by Lua (`LoadResourceFile`), never fetched by the page, so no HTTP cache is
+involved; every `fetch` of the shell has a timeout; payload size is the cost driver of the wire, so state is
+patched, not re-sent (§38.10).
+
+### 38.2 Terms and the four states
+
+```
+FiveM resource ──owns──► UI plugin (id == resource name, at most one)
+                              └──owns──► pages · listeners · request handlers · pending requests
+                                         focus entries · feed subscriptions · timers/rAF/observers made through the SDK
+```
+
+Four things that must never be confused (each has its own record):
+
+| state | lives in | values | ends when |
+|---|---|---|---|
+| **module** (code in browser memory, keyed by URL) | shell `runtime/plugins.ts` | `loading` · `loaded` · `failed` | never (a page reload) |
+| **plugin** (one activation of a module for a resource, keyed by resource + `generation`) | shell + `client/ui_plugins.lua` | `registered` · `loading` · `ready` · `failed` · `incompatible` | `plugin:unregister` |
+| **resource active** | Lua only (`onClientResourceStart/Stop`) | started / stopped | resource stop |
+| **page** (declared by Lua, resolved by the plugin, shown by Lua) | shell `runtime/pages.ts` + `client/ui.lua` | `declared` → `resolvable` → `open` → `mounted` | close / unregister |
+
+A cached module is inert: stopping a resource disposes the plugin (scope, pages, CSS, requests) even though
+its JS stays in the module map; starting it again re-activates the cached module when the entry URL is
+unchanged, or imports the new URL when the build changed. **Module scope is for definitions only** — every side
+effect belongs in `setup(ctx)` (runs per activation) or in a component (runs per mount).
+
+### 38.3 What a plugin resource ships
+
+```
+inventory/
+  fxmanifest.lua        dependency 'core'   files { 'ui/dist/**' }   core_ui 'ui/dist'
+  ui/package.json       scripts: dev / build / typecheck; dependencies: the plugin's OWN runtime libs only
+  ui/vite.config.ts     export default defineConfig({ plugins: [coreUI()] })        -- '@core/ui/vite'
+  ui/tsconfig.json      { "extends": "@core/ui/tsconfig.plugin.json", "include": ["src", "dev"] }
+  ui/.gitignore         .core-ui/ and node_modules/ (ui/dist is NOT ignored — it ships)
+  ui/dev/host.ts        browser dev host entry: createDevHost({ id, plugin, mock, pages, props, open }) (never shipped)
+  ui/dev/mock.ts        typed mock data + fake Lua for the dev host (never shipped)
+  ui/index.html         OPTIONAL — `coreUI()` serves one from memory that loads /dev/host.ts
+  ui/src/index.ts       export default defineUIPlugin({ pages: { … }, setup(ctx) { … } })
+  ui/dist/              BUILD OUTPUT, committed like core/html (players download exactly this):
+      manifest.json  plugin.<hash>.js  plugin.<hash>.css  chunks/<name>.<hash>.js  assets/<name>.<hash>.<ext>
+```
+
+`ui/dist/manifest.json` (generated, §38.13 validates it three times — build, server start, client register):
+
+```json
+{ "id": "inventory", "apiVersion": 1, "entry": "plugin.a81f3c.js", "css": ["plugin.982ca1.css"],
+  "build": "a81f3c982c", "load": "eager", "preload": [], "pages": ["inventory", "inventory_hotbar"],
+  "sdk": "1.0.0", "vue": "3.5.42" }
+```
+
+`id` MUST equal the resource name (one plugin per resource — ownership stays trivial and ids cannot collide).
+`apiVersion` is the integer `API_VERSION` of the SDK the plugin was built with; the shell rejects any other
+value with both numbers in the message (§38.12). `load: 'lazy'` defers the import to the first `page:open` of
+one of the resource's pages. `pages` is what the build found statically in `defineUIPlugin({ pages })` —
+tooling and diagnostics only; the authority for page ids, types and ownership remains Lua's
+`Core.UI.registerPage` (§6.10). `preload` lists only the chunks the entry imports STATICALLY (transitively) —
+a lazy page's chunk is never preloaded.
+
+**Shared dependencies.** Vue exists once, inside core's bundle. The shell publishes
+`globalThis.__CORE_UI_HOST__ = { apiVersion, vue, … }` (§38.6) before any plugin is imported; the SDK's Vite
+plugin resolves the bare specifier `vue` — from plugin source AND from third-party packages bundled into the
+plugin (`@lucide/vue`, `@dnd-kit/vue`), plus `@vue/runtime-dom`, `@vue/runtime-core`, `@vue/reactivity` — to a
+virtual module that re-exports the host's namespace. No import map (one static map per document, nothing to
+gain over a host object we need anyway), no Module Federation (its version negotiation solves a problem a
+single-host platform does not have). `@core/ui` itself is a < 2 KB typed facade bundled into every plugin: it
+holds no state and calls the host object at call time, so there is nothing to share and nothing to duplicate.
+The kit needs no import at all — `<CoreButton>` resolves against core's app at render time (§37.3); the SDK
+ships the `GlobalComponents` typings.
+
+**CSS.** A plugin's stylesheet contains ONLY the Tailwind utilities its own sources use (generated against
+core's tokens by reference, inside `@layer utilities`) plus its SFC `<style scoped>` blocks — no preflight, no
+`:root` tokens, no kit classes (those stay global in core's `app.css`, and `@theme static` keeps every token
+alive for them). Cascade layers are document-wide, core's sheet declares the layer order first, so a plugin
+utility still beats a kit class. The sheet is a `<link>` owned by the plugin and removed with it. Unscoped
+global selectors in plugin CSS are a bug (nothing can take them back cleanly) — prefix or scope them.
+Three things the prototype proved are load-bearing: the tokens live in `ui/sdk/theme.css`, a file with NOTHING
+but `@theme` blocks (Tailwind refuses `theme(reference)` on anything else; the `:root` recipes are host-only in
+`ui/src/recipes.css`); core's own sheet starts with `@import "tailwindcss" source(none)` plus explicit
+`@source` lines (automatic detection walks up to the workspace root and would quietly compile plugin utilities
+back into core); token utilities come out as `var(--color-panel, <fallback>)`, so a server re-theme still wins.
+
+### 38.4 Lua: discovery, registration, lifecycle (`client/ui_plugins.lua`, `shared/ui_manifest.lua`, `server/ui_plugins.lua`)
+
+`core_ui '<dir>'` in a resource's fxmanifest is the opt-in (plain manifest metadata; `<dir>` is a relative folder,
+charset `[%w%._%-/]`, no `..`, no leading `/`, no `://`). A resource without the key is never probed, so a
+missing or unreadable manifest in a resource WITH the key is always a loud, one-line error naming the resource,
+the file and the fix — never silence.
+
+Client (`client/ui_plugins.lua`, inside core, loaded after `client/ui.lua`):
+
+- State: `plugins[res] = { id, dir, base, manifest, generation, state, error?, ms? }`; `generations[res]`
+  survives unregistration, so a restart is generation n+1.
+- `discover(res)`: metadata key → `LoadResourceFile(res, dir .. '/manifest.json')` → `json.decode` (pcall) →
+  `UIManifest.validate(res, table)` → `plugins[res]` → `plugin:register`. Triggers: `onClientResourceStart`
+  (any resource but core), core's own start (loop over `GetNumResources()` / `GetResourceByFindIndex(i)`,
+  `GetResourceState(name) == 'started'`), and `ui_ready` (every `plugin:register` is replayed BEFORE the
+  `page:register`s).
+- `onResourceStop(res)`: answer the resource's pending requests with `resource_stopped`, drop its request
+  handlers and feed channels, `plugins[res] = nil`, `plugin:unregister`. Its pages, modals and focus entries
+  leave through the existing Registry sweep (`Registry.onOwnerStop('page', …)`), which runs on the same event.
+- `base = 'https://cfx-nui-<res>/<dir>/'`. Dev override: §38.11.
+- `ui_plugin { id, generation, state, error?, ms?, pages }` from the shell updates `plugins[res]` (stale
+  generations are ignored), prints one `[core:ui]` line (`inventory ready in 38 ms (2 pages)` / the failure
+  with its reason) and fires the hook `uiPluginReady(id)` or `uiPluginFailed(id, error)`.
+
+`shared/ui_manifest.lua` — `UIManifest.API_VERSION = 1`, the pure `UIManifest.dirOk(dir)` (the `core_ui`
+charset rule above, shared by both callers) and the pure `UIManifest.validate(resource, m, dir?) ->
+ok, normalized|error, state?`, where `state` is `incompatible` or `failed` on a rejection and `dir` is only
+needed for the 255-char budget below: `id == resource` (exact), integer `apiVersion` (mismatch → state `incompatible`, message
+names both), `entry` `^[%w%._%-/]+%.m?js$`, `css` ≤ 8 × `^[%w%._%-/]+%.css$`, `build` string ≤ 64, `load` ∈
+{`eager`, `lazy`} (default `eager`), `preload` ≤ 16 js paths, `pages` optional plain ids, no `..` anywhere, and
+`#('resources:/' .. res .. '/' .. dir .. '/' .. file) < 255` for every file.
+
+Server (`server/ui_plugins.lua`): on `onResourceStart` runs the same validator against the disk and
+additionally checks that entry and css files exist, that a `file` glob covers `<dir>`, and that no
+`client_script` glob can match inside `<dir>` (FiveM would serve those files as garbage). Errors go to the
+server console, where a developer looks first. Nothing is sent to clients from here.
+
+### 38.5 Wire protocol (additions; everything in §6.10 not listed here is unchanged)
+
+Lua → NUI (`SendNUIMessage { action = … }`):
+
+| action | fields | notes |
+|---|---|---|
+| `plugin:register` | `id, generation, base, manifest, dev?` | idempotent per (id, generation) |
+| `plugin:unregister` | `id` | disposes the activation; the module stays cached |
+| `page:register` | `id, type ('page'\|'overlay'\|'modal'), keepInput, owner` | `owner` (resource) is NEW; `script`/`style` are GONE |
+| `page:patch` | `id, ops = { { p = 'slots.12', v = value }, … }` | NEW; an op without `v` deletes the key; applied in order |
+| `page:event` | `id, event, data` | `id` is a page id OR a plugin channel (the resource name) |
+| `page:request` | `id, rid, name, data` | NEW; the shell answers with `ui_response` |
+| `feed` | `c = { [channel] = { key = value } }` | NEW; ≤ 1 per `Config.UI.FeedIntervalMs` |
+| `focus` | `focused, stack = { { key, layer, id?, owner } … }` | `stack` is NEW (top last) |
+| `dev:set` | `enabled, log, inspector, loadTimeoutMs` | NEW; on `ui_ready` and on change |
+| `inspector:toggle` | — | NEW |
+
+NUI → Lua (`RegisterNuiCallback`; every one answers `cb`):
+
+| callback | fields | behaviour |
+|---|---|---|
+| `ui_request` | `c, n, d, t` | channel, name, payload, timeout ms. `cb` is HELD until the handler returns, the timeout fires or the owner stops. `{ ok = true, data }` or `{ ok = false, error = { code, message } }` |
+| `ui_response` | `rid, ok, data \| error` | resolves a pending `Core.UI.request` |
+| `ui_plugin` | `id, generation, state, error?, ms?, pages` | §38.4 |
+| `ui_error` | `plugin?, page?, component?, message, stack?, info?` | client print, ≤ 5/s; a crashed focus-holding page has already been closed by the shell through `ui_close` |
+| `ui_feed` | `channel, active` | first subscriber / last unsubscribe of a feed |
+
+### 38.6 The shell runtime (`ui/src/runtime/*.ts`) and the host object
+
+```
+runtime/protocol.ts    every wire message as a discriminated union (action → payload), both directions
+runtime/transport.ts   post() with timeout, onMessage(), request(), counters, swappable for a mock (setTransport)
+runtime/scope.ts       createScope(): the disposable bag behind Scope (listen/timeout/interval/raf/onDispose)
+runtime/plugins.ts     plugin registry + loader: states, module cache by URL, <link> management, apiVersion gate,
+                       load timing, generation tokens (a restart during a load discards the stale result)
+runtime/pages.ts       page records (Lua metadata + owner), component resolution (owner plugin → legacy map),
+                       stable props (§7.4), applyPatch (deep in place | shallow copy-on-write), hooks, waiters
+runtime/layers.ts      the mirrored focus stack, z-order, Escape routing, inert lower layers
+runtime/feeds.ts       latest-value buffers → ONE requestAnimationFrame flush → shallowReactive targets; no idle loop
+runtime/errors.ts      PluginBoundary (onErrorCaptured), attribution, ui_error reporting, recovery
+runtime/host.ts        builds CoreUIHost, publishes globalThis.__CORE_UI_HOST__, keeps window.CoreUI (legacy) alive
+runtime/inspector.ts   stats snapshot for shell/Inspector.vue (lazy chunk, dev only)
+```
+
+`CoreUIHost` (the ONLY contract between a plugin bundle and the shell; verbatim types in
+`ui/sdk/src/contract.ts`, imported by both sides so the compiler proves the shell implements what the SDK
+calls): `apiVersion`, `vue`, `dev`, `usePage(id?)`, `useNui(channel?)`, `useScope()`, `useFeed(channel?)`,
+`hud`, `state`, `stats`, `lang`, `t()`, `notify()`, `playSound()`, `registerIcons()`.
+
+**Loading a plugin** (`plugins.ts`): `plugin:register` → record `registered` → (eager: now; lazy: first
+`page:open` of an owned page) → append `<link rel=stylesheet data-core-plugin=id>` per css + `modulepreload`
+per preload entry → `import(base + entry)` → check `default.__coreUIPlugin === true` and `default.apiVersion
+=== API_VERSION` → create the plugin scope → `setup(ctx)` inside try/catch → state `ready` → resolve page
+components + waiters → `ui_plugin`. Any failure: state `failed`/`incompatible`, links removed, scope disposed,
+one `console.error` with resource, URL, phase (`fetch`/`evaluate`/`validate`/`setup`) and the error, `ui_plugin`
+with the message. Stylesheets and the entry module are requested in parallel; `setup` is synchronous (a returned
+Promise is warned about and its rejection reported). A `page:open` that waits on a loading plugin waits on THAT promise (no fixed 5 s guess);
+it gives up after `loadTimeoutMs` (8000) or immediately when the plugin failed, then posts the legacy
+`ui_event { page, event = '__error', data = { error } }`, shows the toast and CLOSES the page (`ui_close`) so a
+page that cannot render never holds the cursor. **Unregister**: run page `onClose` for open pages, unmount them,
+dispose page scopes then the plugin scope (LIFO: `setup`'s disposer first), reject pending requests
+(`plugin_disposed`), drop feed subscriptions, remove `<link>`s, forget the instance — the module record stays.
+**Open-state is Lua's**: the shell never closes a page on its own because a plugin went away or came back — it
+only unmounts the component. A newer activation that becomes `ready` re-mounts every page Lua still has open
+(same props, fresh page scope, the new definition's `onOpen`); one that fails sends those pages through the
+failure path above, which is the only place the shell asks Lua to close (`ui_close`). `onOpen` runs once per
+open cycle even when `page:open` arrived before the plugin was ready.
+
+**Vue performance rules of the runtime**: components and plugin definitions are `markRaw`; closed pages are
+unmounted (zero work) unless the page asks for `keepAlive` — honoured on the exclusive page layer only (an
+overlay is cheap, a modal is meant to be fresh): such a page is DEACTIVATED through Vue's `<KeepAlive :max="3">`
+and re-activated with its state on the next open, its hooks still fire per open/close, and the cache dies with
+the plugin activation that filled it; page props are deep-reactive by default (precise
+triggers for patches) or `shallowReactive` with copy-on-write patches when the page says `reactivity:
+'shallow'`; feeds are `shallowReactive`; nothing in the runtime runs a timer, observer or rAF while idle.
+
+### 38.7 The SDK (`ui/sdk`, npm workspace package `@core/ui`)
+
+```
+ui/sdk/package.json            name '@core/ui'; exports: '.', './contract', './vite', './dev', './theme.css', './reference.css',
+                               './tsconfig.plugin.json', './client', './package.json'
+ui/sdk/src/contract.ts         types + API_VERSION + HOST_GLOBAL (no runtime code, no enums — Node type-stripping safe)
+ui/sdk/src/index.ts            the facade: defineUIPlugin, definePage, usePage, useNui, useScope, useFeed, useHud, usePlayerState,
+                               useStats, t, notify, playSound, registerIcons, NuiError + every type
+ui/sdk/src/client.d.ts         '*.vue' shim + GlobalComponents for the 62 kit tags (generated by ui/scripts/gen-kit-types.mjs)
+ui/sdk/vite/index.mjs          coreUI(options?) — §38.13
+ui/sdk/src/dev/*.ts            createDevHost(), createMockTransport() — §38.11
+ui/sdk/theme.css               THE token file (`@theme static` only) — core's styles.css imports it, plugin builds reference it
+ui/sdk/reference.css           what an SFC `<style>` block names to use `@apply`: `@reference "@core/ui/reference.css";` (emits nothing)
+ui/sdk/templates/              reference copies of index.html / dev/host.ts / dev/mock.ts for authors; no code reads them —
+                               the scaffold that `scripts/new-plugin.sh` copies is `templates/plugin/`
+```
+
+```ts
+import { defineUIPlugin, definePage, usePage, useNui } from '@core/ui'
+
+interface InventoryProps { items: InventoryItem[]; maxWeight: number }
+interface InventoryEvents { moveItem: { from: number; to: number; amount: number } }
+interface InventoryRpc { split: { req: { slot: number; amount: number }; res: { ok: boolean } } }
+
+export default defineUIPlugin({
+  pages: {
+    inventory: definePage<InventoryProps>({ component: () => import('./Page.vue'), onOpen(page) { … } }),
+    inventory_hotbar: HotbarOverlay,
+  },
+  setup(ctx) { ctx.nui.on('sync', applySync); ctx.scope.listen(window, 'blur', cancelDrag) },
+})
+
+// inside Page.vue
+const page = usePage<InventoryProps, InventoryEvents>()     // no id: the page being rendered
+const nui = useNui<InventoryRpc>()
+page.emit('moveItem', { from: 1, to: 2, amount: 5 })        // fire and forget
+const res = await nui.invoke('split', { slot: 3, amount: 2 })   // request/response, rejects with NuiError
+```
+
+`defineUIPlugin`/`definePage` are pure (they run at module evaluation); every other export resolves the host
+lazily and throws a clear error outside the shell. Generics stay one level deep: a props interface, an event
+map, an rpc map — nothing is inferred across the Lua boundary.
+
+**Lifecycle, formally** (hooks exist only where a plugin can act on them):
+
+| moment | who | hook |
+|---|---|---|
+| module evaluated (once per URL) | browser | — (definitions only) |
+| plugin activated (per resource start) | `plugins.ts` | `setup(ctx)`; its return value is the disposer |
+| page opened / re-opened | `pages.ts` | `onOpen(page)` then the component mounts (or is re-activated) |
+| props changed by `open`/`update`/`patch` while open | `pages.ts` | `onUpdate(page, changedTopLevelKeys)` |
+| page closed | `pages.ts` | component unmounts (or deactivates), then `onClose(page)` |
+| plugin deactivated (resource stop / restart / re-register) | `plugins.ts` | page `onClose`s, scopes disposed, `setup`'s disposer |
+
+### 38.8 Transport: four kinds of traffic
+
+| kind | NUI → Lua | Lua → NUI | guarantees |
+|---|---|---|---|
+| **event** (fire and forget) | `page.emit` / `nui.emit` → `ui_event` → `TriggerEvent('core:ui:<channel>:<event>')` → `Core.UI.on` | `Core.UI.send(channel, event, data)` → `page:event` → `page.on` / `nui.on` | none; listeners die with their scope |
+| **request** | `nui.invoke(name, data, { timeoutMs, signal })` → `ui_request` (held `cb`) → `Core.UI.onRequest(name, fn)` | `Core.UI.request(channel, name, data?, timeoutMs?)` → `page:request` → `nui.handle(name, fn)` → `ui_response` | an id, a timeout on BOTH sides, a typed error (`NuiErrorCode`), rejected when the owner stops (`resource_stopped` / `plugin_disposed`) |
+| **state** | — | `Core.UI.open` (snapshot) · `Core.UI.update` / `Core.UI.patch` (increments) · `Core.UI.feed` (telemetry) | §38.10 |
+| **lifecycle** | `ui_ready`, `ui_plugin`, `ui_error`, `ui_feed`, `ui_close` | `plugin:*`, `page:register/unregister/open/close`, `focus`, `shell:visible`, `dev:set` | framework only |
+
+`Core.UI.onRequest(name, fn)` is a proxy call: the handler crosses as a callable table (§3 of AGENTS.md),
+is stored under the CALLER's channel and tracked by `Core.Registry` (kind `uirpc`). Dispatch: types → payload
+bound → handler lookup (`no_handler`) → `pcall(fn, data)` in the callback's own coroutine (a handler may
+`Core.Callback.await` the server) → `cb`. A result that cannot be encoded answers `bad_result`; an error
+answers `handler_error` with the message. `post()` in the shell never hangs: every fetch has an
+`AbortController` timeout (default 10 s, requests `t + 500 ms`), a non-JSON or failed response rejects with
+`transport`. Simple notifications stay events — nothing is turned into a request that does not need an answer.
+
+### 38.9 Focus and layers (one owner: core)
+
+FiveM's NUI focus is one global flag and only a resource with a frame can set it, so plugins never touch
+`SetNuiFocus`, the cursor, `keepInput` or z-index. `client/ui.lua` replaces its three booleans with a **focus
+stack** — same observable behaviour as §6.10, plus plugin modals:
+
+| layer (rank) | entry key | who | cursor | input |
+|---|---|---|---|---|
+| `hud` (0) | — | overlays (`type = 'overlay'`) and core's HUD widgets | never | never (not in the stack) |
+| `chat` (1) | `chat` | CEF chat input (§23) | no | keyboard only; removed the moment any higher entry appears (as today) |
+| `page` (2) | `page:<id>` | THE exclusive page (`type = 'page'`); opening another replaces it | yes | `keepInput` of the page |
+| `modal` (3) | `modal:<id>` | plugin pages of `type = 'modal'` — NEW; any number, stacked in open order | yes | `keepInput` of the modal |
+| `system` (4) | `system:<kind>` | built-in menu / input / alert (one at a time, as today) | yes | never keepInput |
+
+Top entry = highest rank, then most recent; it alone decides `SetNuiFocus(true, top.cursor)` +
+`SetNuiFocusKeepInput(top.keepInput)`; an empty stack releases both. Natives are called only when the derived
+triple changes. Closing the top entry hands focus to the one below — inventory → confirm modal → closed →
+inventory again, with the inventory's `keepInput` restored. Every removal path pops entries: `UI.close`,
+`UI.unregisterPage`, the Registry owner sweep (resource stop), the §31 hidden transition (closes system, modals
+and the page), the `ui_ready` reset, core's own stop. The 500 ms watchdog keeps its rule: it releases focus
+core holds while the stack is empty and never touches focus core did not take. New protection: a focus-holding
+page whose plugin failed or whose component crashed is closed by the shell (`ui_close`), so a broken page
+cannot trap the cursor.
+
+The shell mirrors the stack (`focus { stack }`) in `runtime/layers.ts`: z-order `hud` 10 < `page` 20 <
+`modal` 30 (+ index) < `system` 50 < `#core-overlays` (kit popups) < inspector; while a modal is open every
+lower focusable layer gets the `inert` attribute (Chromium 102+), the top one does not. Escape goes to: kit
+escape layers (§37, unchanged capturing listener) → system modal → top plugin modal → page.
+
+### 38.10 State: snapshot, patches, feeds
+
+Per message FiveM pays two JSON encodes, two parses, a UTF-16 conversion, an IPC hop and a structured clone —
+cost is proportional to payload size, so the framework makes the small message the easy one:
+
+```lua
+Core.UI.open('inventory', { slots = all, maxWeight = 120 })        -- snapshot, once
+Core.UI.patch('inventory', 'slots.12', slot)                        -- one slot; nil deletes the key
+Core.UI.update('inventory', { weight = 84.5, maxWeight = 130 })     -- shallow merge of top-level keys
+Core.UI.feed({ speed = 132, rpm = 0.71, gear = 4 })                 -- telemetry, channel = calling resource
+```
+
+- `update`/`patch` queue per page and flush once on the next tick (`SetTimeout(0)`) as ONE `page:patch`; any
+  other message for the same page (`open`, `close`, `send`, `request`, `unregisterPage`) flushes that queue
+  first, so a page never sees an event before the state change that preceded it in Lua. Core applies the same
+  ops to its replay copy (`pages[id].props`), so a shell reload (`ui_ready`) restores CURRENT state.
+- **A path addresses the Lua table that was passed to `open` — Lua's view, 1-based** (review 2026-09-18: the
+  first draft used the page's 0-based view; `Core.UI.patch('inv', 'slots.' .. slot, v)` with a Lua slot number
+  would then silently hit the neighbour). Both sides apply the same two rules, so the live page and core's
+  replay copy can never drift apart:
+  **R1 list element** — the container is a list (Lua: a sequence `#t > 0` or an empty table; JS: an `Array`)
+  and the segment is an integer `n` with `1 ≤ n ≤ length + 1`: Lua writes `t[n]`, the shell writes `arr[n - 1]`
+  (`length + 1` appends; deleting the last element shrinks the list).
+  **R2 map key** — everything else: Lua writes the existing integer key `t[n]` when there is one, otherwise the
+  string key; the shell writes the property. An EMPTY JS array that receives a map key is first replaced by `{}`
+  in its parent (an empty Lua table is both, JSON had to pick one). A non-empty list that receives an
+  out-of-range index, or a delete in its middle, is a hole: both sides still apply it as a map key / `nil`, and
+  log a dev warning — send such a list whole with `update`. Collections addressed by id are therefore best
+  keyed by STRINGS (`slots = { ['12'] = … }`), lists stay lists.
+  Max depth 8, segment charset `[%w_%-]`, ≤ 64 ops per flush (more → one `page:open` snapshot instead).
+- `update`/`patch` on a page that is not open (no page, overlay or modal of that id is showing) do nothing and
+  return `false` without a log line: a producer may push blindly, the wire stays silent, and the next `open`
+  carries fresh props anyway. Values are whatever `open` accepts (boolean, number, string, table) — they come
+  from trusted Lua, so they are type-checked but not size-bounded; only `feed` values stay bounded.
+- In the shell a patch mutates the deep-reactive props in place (only the dependants of that leaf re-render) or,
+  for `reactivity: 'shallow'` pages, copies along the path and re-assigns the top-level key. The props object
+  itself is never replaced (§7.4).
+- `feed`: latest value per key wins in Lua, one `feed` message per `Config.UI.FeedIntervalMs` (default 50) for ALL
+  channels and only while something changed; in the shell the message lands in a buffer, ONE
+  `requestAnimationFrame` per frame copies the buffers into `shallowReactive` objects (`useFeed<T>()`), and a
+  250 ms timer covers a throttled rAF. `Core.UI.isFeedActive(channel?)` is true while a mounted component reads
+  that feed (`ui_feed`), so a producer loop can sleep when nobody looks. Interaction-critical traffic (`open`,
+  `close`, `focus`, events, requests, results) is never delayed.
+- Budget (replaces the §9 line): idle = 0 messages/s; with feeds ≤ 20 messages/s total; `hud:set` (100 ms),
+  `stats:set`/`state:set` (250 ms) and the notify queue keep their own coalescing.
+
+### 38.11 Development workflow
+
+1. **Browser, no game (the default loop).** `cd inventory/ui && npm run dev` — the plugin's `index.html` calls
+   `createDevHost({ id, plugin, mock })` from `@core/ui/dev`: the REAL shell (core's `ui/src`, resolved
+   through the workspace) mounted in the plugin's own Vite server with a mock transport. One Vite graph → one
+   Vue (no host shim in this mode) → native HMR for the plugin AND the shell. `mock` is typed: initial pages/props, `onRequest(name, fn)`
+   fakes for `nui.invoke`, `emitToPage`, `patch`, `feed`, and `restart()` which replays
+   `plugin:unregister` → `plugin:register` (generation + 1) to prove the plugin's cleanup. The same mock
+   transport backs Storybook stories and the unit tests.
+2. **In game, plugin-only rebuild.** `npm run build` (or `build -- --watch`) in the plugin, then
+   `restart inventory`: new hash → new URL → new code, no core rebuild, no core restart, no NUI reload.
+3. **In game, dev server (opt-in).** `npm run dev:game` (`vite --mode game`: the attached mode — `vue` is the
+   host shim here, also inside the dep optimizer) plus `Config.UI.Dev.Enabled = true` and
+   `/uidev inventory http://localhost:5173` make core register the plugin with `dev = { origin }`: the shell
+   imports `<origin>/@vite/client` and `<origin>/src/index.ts` instead of the manifest entry. `coreUI()`
+   configures the dev server for it (CORS, `server.origin`, `hmr`, `strictPort`, `fs.allow`). With a production shell a hot
+   update re-activates the plugin (props survive — they belong to the shell); a shell built with
+   `npm run build:dev` keeps Vue's HMR runtime, so SFC edits patch in place. Only `localhost` is supported
+   (secure-context rules; a second machine forwards the port). Production never reads `Config.UI.Dev`.
+
+### 38.12 Errors, isolation, compatibility
+
+- Every page/overlay/modal instance renders inside `PluginBoundary` (`onErrorCaptured` → `false`): the instance is
+  replaced by nothing (production) or a kit-styled report (dev), the error is logged ONCE with
+  `{ resource, page, component, info, message, stack }`, posted as `ui_error`, toasted, and a focus-holding
+  page is closed. The next `page:open` remounts it. `setup`, hooks, event listeners and request handlers run in
+  try/catch with the same attribution; `window.onerror`/`unhandledrejection` attribute by stack URL
+  (`cfx-nui-<resource>`). Nothing is swallowed silently. One realm means a plugin that blocks the thread still
+  blocks the shell — that is the price of one Vue/one CEF, and the inspector's long-task list names the culprit.
+- `apiVersion` gate twice (manifest in Lua, definition in the shell). Version text: `inventory was built for
+  core UI API 2, this core provides 1 — rebuild the plugin with this core's @core/ui or update core`.
+- `window.CoreUI` stays (tests, stories, old pages): `Vue`, `registerPage(id, component)` (legacy component map,
+  used when the owner has no plugin), `usePage`, `emit`, `on`, `close`, `post`, `hud`, `state`, `stats`,
+  `minimap`, `lang`, `t`, `playSound`, `notify`, `whenRegistered`, `kit`, `gameBlur`. A `CoreUI.on` made inside
+  `setup` or a component is scoped like the SDK's; one made at module scope is never cleaned up and logs a dev
+  warning.
+
+### 38.13 Build tooling and validation (`@core/ui/vite`: `coreUI(options?)`)
+
+One plugin, no other config: Vue SFC + Tailwind plugins, `build.target 'chrome103'`, ES module entry
+`src/index.{ts,js}` → `dist/plugin.[hash].js`, `cssCodeSplit: false` → `dist/plugin.[hash].css`,
+`chunks/[name].[hash].js`, `assets/[name].[hash][extname]`, `base: './'` (assets resolve against the plugin's
+own origin), `emptyOutDir` (stale hashes never ship), `preserveEntrySignatures: 'strict'` (Vite's app build
+otherwise drops the entry's `export default`), the virtual `vue` module, the injected utilities-only CSS entry
+(a REAL generated file, `<plugin>/ui/.core-ui/entry.css` — Tailwind resolves `@import`/`@source` against its
+folder), a per-plugin `cacheDir`, the dev-server setup of §38.11 and a deterministic `manifest.json` (emitted
+by an `enforce: 'post'` plugin — the stylesheet does not exist earlier). It FAILS the build, naming the resource, when:
+the folder is not `<resource>/ui`, `defineUIPlugin` is missing from the entry, a page id is not a plain id or
+appears twice, an output path would exceed the 255-char vfs limit, the emitted CSS uses a Chromium-103-banned
+feature (the §37 lint list) or the SDK's `API_VERSION` differs from the one in `contract.ts`; it WARNS when
+a banned CSS feature only shows up inside a JS string literal (bundled third-party code passes through that
+heuristic, so it must not make a plugin unbuildable), when
+`fxmanifest.lua` lacks `core_ui` / a `files` glob covering `ui/dist` or has a `client_script` glob that could
+match it. `ui/scripts/check-plugins.mjs` (workspace level, run by `scripts/check.sh` and CI): duplicate plugin
+ids, duplicate page ids across resources, a `dist` older than its `src`, manifests that do not validate.
+Workspace root: `npm run build:ui` builds core and every plugin; a single plugin builds alone in ~1 s.
+
+### 38.14 Inspector (dev only)
+
+`/uiinspect` (or `Config.UI.Dev.Inspector`) → `inspector:toggle` → the shell lazy-loads `assets/inspector.js`
+(not fetched otherwise): resources and plugin states with generation/build/load ms, module cache, pages
+(declared/open/mounted, owner), the focus stack, per-scope listener/timer/rAF counts, pending requests,
+messages/s and bytes/s per action (byte counting runs only while the panel is open), feed rates, long tasks
+(`PerformanceObserver`), the last 50 errors. With `dev.log` the console shows the lifecycle in one grep-able
+format: `[UI] inventory registered (gen 3, build a81f3c)` · `[UI] inventory loading plugin.a81f3c.js` ·
+`[UI] inventory ready in 38 ms (2 pages)` · `[UI] focus → page:inventory` · `[UI] inventory stopped — cleaned
+2 pages, 5 listeners, 1 pending request`. Production cost: integer counters.
+
+### 38.15 Tests and benchmarks
+
+| suite | runs | covers |
+|---|---|---|
+| `ui/tests/unit/**/*.test.ts` + `ui/sdk/tests/*.test.mjs` (`node --test` with GLOBS — a directory argument finds nothing on Node 22; type stripping, so relative imports carry `.ts`) | offline | manifest validation, plugin state machine with a fake importer (load, fail, incompatible, stale generation, re-activation of a cached module), scopes, request timeouts/abort/owner stop, patch ops (deep + shallow), feed coalescing with a fake rAF, layer stack |
+| `tests/client_ui_tests.lua` (new client stubs for `SendNUIMessage`, `RegisterNuiCallback`, focus natives) | offline | focus stack (nesting, owner sweep, hidden transition, `ui_ready`), discovery + manifest errors, `ui_request` dispatch/timeout/owner stop, patch queue ordering + replay copy, feed coalescing |
+| `ui/tests/runtime-regression.js` on `ui/tests/nui-serve.mjs` (one ORIGIN per resource, FiveM's exact headers, query stripping, `files {}` allow-list) with fixture plugins built by `ui/tests/build-fixtures.mjs` | agent-browser | cross-origin load, hot deploy of an unknown plugin, restart with a new build (new code runs, old listeners gone, shell boot id unchanged), same-build restart (cached module re-activated), lazy load, CSS link add/remove + utility-beats-kit-class, page waiting on a loading plugin, failure modes (404 entry, throwing entry, throwing `setup`, wrong `apiVersion`, crashing page → siblings alive, focus released), request cleanup on unregister, modal layering + Escape order, feeds |
+| `shell-regression.js`, `kit-regression.js`, Storybook play functions | agent-browser | unchanged behaviour (the `script:` URL check becomes a plugin-load check) |
+| `ui/tests/bench.mjs` → `ui/tests/BENCH.md` | agent-browser | shell startup + JS bytes before/after (baseline = the last monolithic `html/`), plugin load latency cold/warm, page open latency, snapshot vs patch for a 200-slot inventory (bytes + apply time, deep vs shallow), feed at 1 kHz in → renders/s out, idle CPU with 10 registered plugins |
+
+### 38.16 Migration
+
+`ui/src/plugins.js` and the `@source "../../../*/ui/src/…"` line are deleted; `core/html` shrinks to the shell
+and the kit. inventory, charcreator, trucking, core_example and `templates/plugin` get `vite.config.ts`,
+`package.json` scripts, the `defineUIPlugin` entry, `core_ui` + `files` in the manifest and a built `ui/dist`;
+side effects at module scope (inventory's store subscriptions and window listeners) move into `setup(ctx)`.
+`Core.UI.registerPage(id, { script, style })` logs an error pointing here. Their Lua is otherwise untouched —
+`registerPage`/`open`/`send`/`on` keep their signatures.

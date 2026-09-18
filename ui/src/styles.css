@@ -1,8 +1,9 @@
 /* core UI — Tailwind CSS v4 (CSS-first) + the design-system tokens (DESIGN §37).
 
    The kit has three layers, each usable on its own:
-     1. TOKENS      the `@theme` block below — every colour, font, radius, shadow, easing and size.
-                    Each one is also a Tailwind utility (§7.1): bg-panel, text-fg-dim, rounded-ui,
+     1. TOKENS      `../sdk/theme.css` — every colour, font, radius, shadow, easing and size. That
+                    file is imported here AND by every plugin build (§38.3), so there is one copy.
+                    Each token is also a Tailwind utility (§7.1): bg-panel, text-fg-dim, rounded-ui,
                     shadow-ui, ease-ui, font-display, text-ui-sm, animate-core-pop-in, ...
      2. CLASSES     src/kit/css/*.css, imported below INTO the components layer so a utility on a tag
                     always wins over the kit class it sits next to (`<CoreButton class="w-full">`).
@@ -17,8 +18,8 @@
      text     --color-fg|fg-dim|fg-faint  keys --color-key|key-fg
      shape    --radius-ui|ui-sm|ui-xs  --shadow-ui|ui-sm|ui-lg|glow|glow-sm  --ease-ui
      size     --text-ui-xs|sm|(base)|lg  --text-display-sm|(base)|lg|xl  --tracking-display|label|eyebrow
-   The `:root` block under it holds the recipes that are NOT utilities (gradients, the rgb triplets kit
-   CSS writes alpha with, control heights, the focus halo) plus the legacy --core-* aliases of §7.1.
+   `./recipes.css` holds what is NOT a utility (gradients, the rgb triplets kit CSS writes alpha
+   with, control heights, the focus halo) plus the legacy --core-* aliases of §7.1 — host only.
 
    Rule: in the shell and in plugin pages, never use backdrop filters; a panel that should show the
    blurred game behind it carries `data-core-blur` instead (DESIGN §32, src/gameblur.js paints the
@@ -27,10 +28,21 @@
    canvas for real. FiveM's CEF is Chromium 103: no color-mix(), no :has(), no CSS nesting, no
    individual translate/rotate/scale properties — write `transform:` (DESIGN §7.1, §37.4). */
 
-@import "tailwindcss";
+/* `source(none)` + explicit @source lines (DESIGN §38.3): without it Tailwind's automatic detection
+   walks up to the npm workspace root and keeps compiling every sibling plugin's utilities into
+   core's bundle — which hides every cascade-layer bug until a plugin is built on its own. Each
+   pattern must end in a FILE glob: a @source path containing a wildcard is matched against files,
+   so a bare directory matches nothing at all. */
+@import "tailwindcss" source(none);
+@source "./**/*.{vue,ts,js}";
+@source "../.storybook/**/*.js";
+@source "../sdk/src/**/*.{vue,ts}";
 
 /* The kit's class vocabulary (DESIGN §37.3). `layer(components)` is load-bearing: kit classes must
-   lose against Tailwind utilities, exactly like the structural classes at the bottom of this file. */
+   lose against Tailwind utilities, exactly like the structural classes at the bottom of this file.
+   The layer ORDER this sheet establishes is document-wide, so a plugin's own stylesheet — which
+   declares the same names and then opens `@layer utilities` — inherits it and a plugin utility
+   still beats a kit class across two files and two origins (§38.3, proven in the prototype). */
 @import "./kit/css/base.css" layer(components);
 @import "./kit/css/actions.css" layer(components);
 @import "./kit/css/surfaces.css" layer(components);
@@ -42,153 +54,12 @@
 @import "./kit/css/game.css" layer(components);
 @import "./kit/css/feedback.css" layer(components);
 
-/* Plugin pages live in sibling resources (<resource>/ui/src, see src/plugins.js) and are compiled
-   into this one bundle, so Tailwind must scan their sources too. The trailing file pattern is
-   required: a @source path containing a wildcard is matched against files, so a bare directory
-   pattern matches nothing at all and plugin utilities silently never reach the bundle. */
-@source "../../../*/ui/src/**/*.{vue,js}";
-
-/* `static`: emit EVERY token as a CSS variable even when no utility references it yet — plugin CSS,
-   inline styles and a server's re-theme read them at runtime (Tailwind would otherwise drop the
-   unused ones, e.g. --color-accent-lo). */
-@theme static {
-  /* Both families are bundled as woff2 in src/kit/fonts (src/kit/fonts.css) — the CEF cannot
-     fetch the web, so the fallbacks only ever show in a browser before the file lands. */
-  --font-sans: 'Barlow', 'Segoe UI', system-ui, -apple-system, Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --font-display: 'Barlow Condensed', 'Barlow', 'Arial Narrow', 'Segoe UI', sans-serif;
-  --font-mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
-
-  --color-ink: #060b0f;
-  --color-panel: rgba(11, 17, 22, 0.90);
-  /* §32: the tint a `.core-glass` panel wears over its blurred copy of the game — thinner than
-     --color-panel, because there is a real picture underneath it now. */
-  --color-panel-glass: rgba(11, 17, 22, 0.64);
-  --color-panel-solid: #0d1419;
-  --color-panel-raise: rgba(255, 255, 255, 0.035);
-  --color-panel-sunken: rgba(0, 0, 0, 0.30);
-  /* Popups (select list, context menu, tooltip) sit over other panels, so they are nearly opaque. */
-  --color-panel-popup: rgba(11, 17, 22, 0.98);
-  /* HUD plates (player chip, tracker, clock chip, stat plate) float over the live game with no
-     glass behind them (§32.1 budget), so they are thinner than a panel — the mockups measure ~0.6. */
-  --color-hud: rgba(8, 12, 16, 0.68);
-  --color-border: rgba(255, 255, 255, 0.12);
-  --color-border-strong: rgba(255, 255, 255, 0.22);
-  --color-backdrop: rgba(4, 8, 11, 0.62);
-
-  --color-accent: #f6503f;
-  --color-accent-hi: #ff6351;
-  --color-accent-lo: #d53e2f;
-  --color-accent-soft: rgba(246, 80, 63, 0.16);
-  --color-on-accent: #ffffff;
-
-  --color-success: #3fd67f;
-  --color-warning: #f5a623;
-  --color-error: #ff4560;
-  --color-info: #55b6f7;
-
-  --color-health: #fa5246;
-  --color-armour: #5dbbf7;
-  --color-stamina: #5de395;
-  --color-hunger: #f5a623;
-  --color-thirst: #4fd1e8;
-  --color-oxygen: #9fd8ff;
-  --color-stress: #b68cff;
-
-  --color-rarity-common: #aeb6bf;
-  --color-rarity-uncommon: #5de395;
-  --color-rarity-rare: #5dbbf7;
-  --color-rarity-epic: #b68cff;
-  --color-rarity-legendary: #f5a623;
-
-  --color-fg: #f3f5f7;
-  --color-fg-dim: rgba(231, 237, 243, 0.66);
-  --color-fg-faint: rgba(231, 237, 243, 0.40);
-  --color-key: #fbfbfb;
-  --color-key-fg: #11161b;
-
-  --radius-ui: 6px;
-  --radius-ui-sm: 4px;
-  --radius-ui-xs: 3px;
-  --shadow-ui: 0 14px 40px rgba(0, 0, 0, 0.50);
-  --shadow-ui-sm: 0 4px 14px rgba(0, 0, 0, 0.40);
-  --shadow-ui-lg: 0 30px 80px rgba(0, 0, 0, 0.60);
-  --shadow-glow: 0 0 0 1px #ff6351, 0 0 22px rgba(246, 80, 63, 0.42), inset 0 0 26px rgba(246, 80, 63, 0.12);
-  --shadow-glow-sm: 0 0 0 1px #ff6351, 0 0 16px rgba(246, 80, 63, 0.32);
-  --ease-ui: cubic-bezier(0.22, 0.61, 0.36, 1);
-
-  --text-ui-xs: 11px;
-  --text-ui-sm: 13px;
-  --text-ui: 15px;
-  --text-ui-lg: 17px;
-  --text-display-sm: 18px;
-  --text-display: 24px;
-  --text-display-lg: 34px;
-  --text-display-xl: 48px;
-  --tracking-display: 0.04em;
-  --tracking-label: 0.14em;
-  --tracking-eyebrow: 0.32em;
-
-  /* Keyframes live in src/kit/css/base.css. */
-  --animate-core-slide-in: core-slide-in 0.18s var(--ease-ui);
-  --animate-core-fade-in: core-fade-in 0.15s var(--ease-ui);
-  --animate-core-pop-in: core-pop-in 0.16s var(--ease-ui);
-  --animate-core-slide-up: core-slide-up 0.2s var(--ease-ui);
-  --animate-core-spin: core-spin 0.8s linear infinite;
-  --animate-core-shimmer: core-shimmer 1.4s linear infinite;
-  --animate-core-pulse: core-pulse 1.6s var(--ease-ui) infinite;
-}
-
-/* Recipes, not utilities — plain custom properties the kit CSS reads directly (DESIGN §37.2).
-   A server re-themes the whole shell by overriding --color-accent*, --core-accent-rgb and the three
-   gradients. The `r g b` triplets exist because Chromium 103 has no color-mix(): kit CSS writes an
-   alpha as `rgb(var(--core-accent-rgb) / 0.16)`. */
-:root {
-  --core-accent-rgb: 246 80 63;
-  --core-ink-rgb: 6 11 15;
-  --core-panel-rgb: 11 17 22;
-  --core-error-rgb: 255 69 96;
-  --core-success-rgb: 63 214 127;
-  --core-warning-rgb: 245 166 35;
-  --core-info-rgb: 85 182 247;
-
-  --core-grad-accent: linear-gradient(90deg, #ff5a49 0%, #f6503f 45%, #ee4339 100%);
-  --core-grad-accent-fade: linear-gradient(90deg, #fd5443 0%, #f6503f 18%, rgb(246 80 63 / 0.18) 100%);
-  --core-grad-accent-fade-out: linear-gradient(90deg, #fd5443 0%, #f6503f 16%, rgb(246 80 63 / 0.04) 100%);
-  --core-grad-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0, rgba(255, 255, 255, 0) 120px);
-
-  --core-h-sm: 30px;
-  --core-h-md: 40px;
-  --core-h-lg: 52px;
-  --core-focus: 0 0 0 3px rgb(var(--core-accent-rgb) / 0.18);
-
-  /* Legacy names used by the first-wave components — aliases of the theme tokens above. */
-  --core-panel: var(--color-panel);
-  --core-panel-solid: var(--color-panel-solid);
-  --core-panel-raise: var(--color-panel-raise);
-  --core-border: var(--color-border);
-  --core-border-strong: var(--color-border-strong);
-  --core-backdrop: var(--color-backdrop);
-  --core-accent: var(--color-accent);
-  --core-accent-soft: var(--color-accent-soft);
-  --core-success: var(--color-success);
-  --core-error: var(--color-error);
-  --core-warning: var(--color-warning);
-  --core-info: var(--color-info);
-  --core-text: var(--color-fg);
-  --core-text-dim: var(--color-fg-dim);
-  --core-text-faint: var(--color-fg-faint);
-  --core-radius: var(--radius-ui);
-  --core-radius-sm: var(--radius-ui-sm);
-  --core-gap: 10px;
-  --core-pad: 20px;
-  --core-shadow: var(--shadow-ui);
-  --core-font: var(--font-sans);
-  --core-mono: var(--font-mono);
-  --core-fs: var(--text-ui);
-  --core-fs-sm: var(--text-ui-sm);
-  --core-fs-xs: var(--text-ui-xs);
-  --core-ease: var(--ease-ui);
-}
+/* §38.3: the tokens are the PUBLIC part of the theme — this exact file is what a plugin build
+   imports as `theme(reference)` to compile its utilities against core's values without re-emitting
+   a single variable. It may contain nothing but `@theme` blocks, which is why the `:root` recipes
+   under it live in their own host-only file. */
+@import "../sdk/theme.css";
+@import "./recipes.css";
 
 @layer base {
   html, body {

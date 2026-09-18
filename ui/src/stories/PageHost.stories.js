@@ -1,5 +1,7 @@
-// Plugin page host (DESIGN §7.4) — a page bundle registers a component through
-// window.CoreUI.registerPage(id, component) and Lua opens it with `page:open`.
+// Plugin page host (DESIGN §7.4, §38.6) — these stories use the LEGACY registration path
+// (`window.CoreUI.registerPage(id, component)`), which §38 keeps for core-owned pages and for
+// anything written before the platform: a real plugin now ships its own `ui/dist`, Lua sends
+// `plugin:register`, and the component comes from the owner's module. Lua opens it the same way.
 //
 // Lua side: `Core.UI.registerPage(id, { type })` declares the page, `Core.UI.open(id, props)`
 // shows it and grabs focus, `Core.UI.send(id, event, data)` pushes into it, and
@@ -111,11 +113,13 @@ export default {
     layout: 'fullscreen',
     docs: {
       description: {
-        component: 'One dist for everybody: plugin pages are compiled INTO core\'s bundle '
-          + '(`src/plugins.js` globs `*/ui/src/index.js`) and register themselves before mount, so '
-          + '`page:register` usually carries `script: null`. The host still supports the URL form '
-          + '(`script` / `style`) for prebuilt third-party bundles, and waits up to 5 s for a '
-          + 'component that has not registered yet.',
+        component: 'Three layers, one error boundary per instance: overlays (z 10, click-through), '
+          + 'THE page (z 20) and plugin modals (z 30 + index, everything under the top one `inert`). '
+          + 'Lua declares a page with an `owner` and the owner\'s plugin — its own `ui/dist`, loaded '
+          + 'at runtime from that resource\'s origin (DESIGN §38.6) — provides the component; the '
+          + '`script`/`style` URL loader of §7.4 is gone. A `page:open` that arrives while the plugin '
+          + 'is still loading waits on THAT plugin\'s promise, then gives up after the load deadline. '
+          + 'These stories use the legacy `CoreUI.registerPage` path, which core-owned pages keep.',
       },
     },
   },
@@ -245,13 +249,14 @@ export const NotRegistered = {
         + "Core.UI.open('sb_missing_page')   -- nothing in the bundle ever calls registerPage for this id\n\n"
         + "Core.UI.on('sb_missing_page', '__error', function()\n"
         + '    Core.Log.error(\'UI page never registered\')\nend)',
-      note: 'Give it five seconds — whenRegistered() times out at 5000 ms.',
+      note: 'Give it eight seconds — the load deadline is Config.UI.Dev.LoadTimeoutMs (8000).',
     },
     docs: {
       description: {
-        story: 'A `page:open` for an id no bundle ever registered: `whenRegistered` waits 5 s, then '
-          + 'PageHost posts `ui_event { event = "__error" }` and drops an error toast. Nothing renders '
-          + 'until then — this is what a typo in the page id looks like.',
+        story: 'A `page:open` for an id no plugin owns and no bundle ever registered: the runtime '
+          + 'waits out the load deadline (8 s), then posts `ui_event { event = "__error" }`, drops an '
+          + 'error toast and CLOSES the page (DESIGN §38.6) so a page that cannot render never holds '
+          + 'the cursor. Nothing renders until then — this is what a typo in a page id looks like.',
       },
     },
   },

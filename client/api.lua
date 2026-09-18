@@ -24,9 +24,11 @@ local removers = {}
 
 -- Namespaces that exist inside core's VM but are not part of the plugin API:
 -- the world scheduler (DESIGN §6.3 -- its draw callbacks must stay local Lua
--- functions, never cross-VM funcrefs) and the registry itself (a plugin must
--- not be able to set a caller name or replace a kind's remover).
-local INTERNAL_NS <const> = { World = true, Registry = true }
+-- functions, never cross-VM funcrefs), the registry itself (a plugin must not
+-- be able to set a caller name or replace a kind's remover) and the seam
+-- client/ui.lua and client/ui_plugins.lua share (DESIGN §38.4: it can send raw
+-- NUI messages and answer held page requests).
+local INTERNAL_NS <const> = { World = true, Registry = true, UIInternal = true }
 
 local Registry = {}
 

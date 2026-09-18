@@ -1,0 +1,4 @@
+# Build scratch and per-package installs. `dist/` is NOT here on purpose: the built bundle is
+# committed exactly like core's html/, because that is what players download (core DESIGN §38.3).
+.core-ui/
+node_modules/

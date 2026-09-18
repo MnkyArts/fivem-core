@@ -122,6 +122,18 @@ Config = {
         -- copies the game frame into a small canvas at `Fps` and CSS-blurs it: Strength
         -- is the blur radius in CSS px, Scale the copy resolution (0.1-1, lower = cheaper).
         Blur = { Enabled = true, Strength = 4, Fps = 30, Scale = 0.5 },
+        -- Runtime UI platform (DESIGN §38). FeedIntervalMs is how often coalesced
+        -- telemetry (Core.UI.feed) leaves Lua, clamped to 16-1000 ms; the request
+        -- timeouts bound both directions of Core.UI.request / Core.UI.onRequest;
+        -- PluginLoadTimeoutMs is how long the shell waits for a plugin's module.
+        FeedIntervalMs = 50, RequestTimeoutMs = 10000, RequestMaxMs = 30000,
+        PluginLoadTimeoutMs = 8000,
+        -- Development only (§38.11, §38.14) — production leaves Enabled = false, and
+        -- nothing below it is read then. `Servers` seeds /uidev for this session:
+        -- Servers = { inventory = 'http://localhost:5173' } makes the shell import the
+        -- plugin from its Vite dev server instead of its build. Log adds the shell's
+        -- lifecycle lines, Inspector opens the panel /uiinspect toggles.
+        Dev = { Enabled = false, Inspector = false, Log = false, Servers = {} },
     },
     -- Adapter: 'kvp' (no setup) | 'mysql' (oxmysql, untested) | 'postgres' (needs the core_pg_url convar)
     DB = { KeyPrefix = 'doc:', FlushIntervalMs = 5000, Adapter = 'postgres' },

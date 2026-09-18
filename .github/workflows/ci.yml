@@ -1,4 +1,8 @@
 # CI for the `core` resource on its own (the resources-level workflow at ../.github covers the npm workspace).
+#
+# It mirrors the offline half of scripts/check.sh. Not here: fxlint (local tooling, it needs the native
+# database) and the three agent-browser suites (they need a Chromium and the agent-browser CLI) — those
+# run locally with `scripts/check.sh --full`.
 name: core
 on: [push, pull_request]
 jobs:
@@ -13,7 +17,25 @@ jobs:
       - name: Syntax
         run: find . -name '*.lua' -not -path './ui/*' -print0 | xargs -0 -n1 luac5.4 -p
       - name: Offline tests
-        run: lua5.4 tests/run_tests.lua && lua5.4 tests/server_tests.lua
+        run: |
+          lua5.4 tests/run_tests.lua
+          lua5.4 tests/server_tests.lua
+          lua5.4 tests/client_chat_tests.lua
+          lua5.4 tests/client_interiors_tests.lua
+          lua5.4 tests/client_ui_tests.lua
       - name: UI build (no workspace lockfile inside this repo, so npm install)
         working-directory: ui
         run: npm install --no-audit --no-fund && npm run build
+      # Everything below needs the dependencies the step above installed.
+      - name: Unit tests (runtime + SDK, DESIGN §38.15)
+        working-directory: ui
+        run: |
+          node --test ../ui/tests/chat-model.test.js
+          node --test 'tests/unit/**/*.test.ts' 'sdk/tests/*.test.mjs'
+      - name: Types
+        working-directory: ui
+        run: npx vue-tsc --noEmit -p tsconfig.json
+      - name: Generated artefacts and plugin manifests
+        run: |
+          node ui/scripts/gen-kit-types.mjs --check
+          node ui/scripts/check-plugins.mjs

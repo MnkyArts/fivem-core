@@ -287,3 +287,52 @@ kit regression 195/195, Storybook builds (265 stories). Open: in-game pass (the 
 pointer behaviour); the existing plugin pages (inventory, charcreator, trucking) still use their own elements
 — migrating them to the kit is the next run; a global UI scale decision (the kit is calibrated to the mockups'
 1672 px frame, ~13 % small at 1080p).
+
+## Runtime UI platform (DESIGN §38) — 2026-09-18
+
+Liam: *"a real FiveM frontend platform"*. Until this run core compiled every plugin page INTO its own bundle
+(`ui/src/plugins.js`, §7.4): changing the inventory meant rebuilding core, and a resource core had never seen
+could not bring a UI. §38 replaces that coupling and nothing else — still ONE `ui_page`, ONE Vue, ONE kit, ONE
+focus owner, but every resource now owns, builds, ships and restarts its own frontend and core imports it at
+runtime from `https://cfx-nui-<res>/ui/dist/`. Contract written first (DESIGN §38, revised after every review
+round), then the TypeScript half of it (`ui/sdk/src/contract.ts`) imported by both sides so the compiler proves
+the shell implements what the SDK calls. Orchestrator (main) owned `DESIGN.md` §38 and routed every
+cross-agent finding; implementers were opus subagents with disjoint files.
+
+| Run | Owner | Files | Status |
+|---|---|---|---|
+| R1 | opus | research only — the CitizenFX source (master `0d8a2a6f7`): `cfx-nui-<res>` is served for every resource with or without a `ui_page`, the response headers, the 255-char vfs path cut, `files {}` as the allow-list, what `restart` vs `refresh` re-globs, the held NUI callback `cb`, CEF 103's feature set → `…/scratchpad/uiplat/R1-fivem-source.md`, condensed into DESIGN §38.1 | complete — every row carries its file:line |
+| R2 | opus | inventory of the old world: every plugin entry, `window.CoreUI` use, third-party deps, CSS, module-level side effects, Lua calls and tests, plus every doc line stating the build-time rule (§C7) → `…/scratchpad/uiplat/R2-repo-inventory.md` | complete — became the docs worklist |
+| P1 | opus | mechanism prototype outside the repo: cross-origin `import()`, the one-Vue shim, utilities-only Tailwind, `preserveEntrySignatures`, the module-map URL pinning, Vite HMR against an attached shell → `P1-prototype-report.md` | complete — six of its findings are now `coreUI()` behaviour |
+| I3 | opus | `shared/ui_manifest.lua` (new), `client/ui_plugins.lua` (new), `server/ui_plugins.lua` (new), `client/ui.lua` (focus stack + `modal`, `owner`, `update`/`patch`/`feed`/`onRequest`/`request`, `ui_ready` replay order, `script`/`style` removed), `client/api.lua`, `server/ui.lua`, `client/ui_remote.lua`, `shared/config.lua`, `fxmanifest.lua`, `types/core.lua`, `tests/stubs.lua` (client NUI stubs), `tests/client_ui_tests.lua` (new) | complete — run_tests 385, server_tests 776, client_ui_tests 277 (275 + the `/uiplugins` dev-origin follow-up), client_chat_tests 40, fxlint 0/0 |
+| I1 | opus | the SDK + tooling: `ui/sdk/**` (`package.json` `@core/ui`, `src/contract.ts`, `src/index.ts` facade, generated `src/client.d.ts`, `theme.css`, `reference.css`, `tsconfig.plugin.json`, `vite/index.mjs` = `coreUI()`, `src/dev/**` dev host + mock, `templates/`, `tests/*.test.mjs`), `ui/scripts/{gen-kit-types,check-plugins}.mjs`, `ui/tsconfig.json`, `ui/package.json`, workspace root `package.json` | complete — facade ~1.1 kB min / 0.57 kB gz, `vue-tsc` clean, TypeScript pinned `^5.9.3` |
+| I2a | opus | the shell runtime: `ui/src/runtime/{protocol,transport,scope,plugins,pages,layers,feeds,errors,host,inspector}.ts`, `ui/src/shell.ts`, `ui/src/main.ts`, `ui/src/shell/{PageHost,PluginBoundary,Inspector}.vue`, `ui/src/recipes.css`, `styles.css` (`source(none)` + explicit `@source`), `coreui.js`/`store.js`/`bridge.js`/`App.vue`, `ui/tests/unit/**`; **deleted** `ui/src/plugins.js` and `ui/src/main.js` | complete — units green, shell 101/101, kit 195/195, `window.CoreUI` surface intact |
+| I4 | opus | migrated `inventory`, `charcreator`, `trucking`, `core_example` and `core/templates/plugin` + `scripts/new-plugin.sh`: per-plugin `ui/package.json`, `vite.config.ts`, `tsconfig.json`, `.gitignore`, `defineUIPlugin` entry, `core_ui 'ui/dist'` + `files { 'ui/dist/**' }`, committed `ui/dist/`; inventory's module-level subscriptions and window listeners moved into `attach(ctx)` called from `setup(ctx)`; `core_example` + the template became the TypeScript showcase | complete — `check-plugins` 4 plugins, 0 errors |
+| I5 | opus | integration: `ui/tests/nui-serve.mjs` (one ORIGIN per resource, FiveM's exact headers and query stripping), `ui/tests/fixtures/**` + `build-fixtures.mjs` (8 fixture resources incl. the failure cases), `runtime-regression.js`, `run-browser-suites.mjs`, `bench.mjs` + `bench-page.js` → `BENCH.md`, `scripts/check.sh` (9 steps), `.github/workflows/*.yml`, `.gitignore` | complete — runtime regression 135/135 |
+| D1 | opus | `README.md` (build + "UI plugins" + the three dev loops + state/requests/plugins API + `Config.UI` keys + commands + troubleshooting + checklist steps 26–35), `AGENTS.md` (§1–§6, §8), `PLAN.md` (this table), superseded-markers in `DESIGN.md` outside §38, `ui/src/stories/docs/*.mdx` + new `UIPlatform.mdx` | complete |
+
+Review rounds (all folded back into DESIGN §38 before the code was written, which is why §38 reads like a
+post-mortem in places): **patch paths** — the first draft addressed the page's 0-based JS view, so
+`Core.UI.patch('inv', 'slots.' .. slot, v)` with a Lua slot number would silently hit the neighbour; §38.10 now
+specifies Lua's 1-based view with the R1/R2 rules applied identically on both sides, and advises keying
+collections by strings. **Page-open ownership** — the shell must never close a page because a plugin came or
+went; open state is Lua's, the shell only unmounts, and the single exception (a failed plugin holding focus)
+posts `ui_close`. **Waiting for a plugin** — the old fixed 5 s guess became a wait on the load promise itself
+with `Config.UI.PluginLoadTimeoutMs`. **`setup` must be synchronous**, or a restart races the next activation.
+**Third-party CSS** — a banned Chromium-103 feature inside a bundled dependency's JS string literal warns
+instead of failing the build, or `@lucide/vue` would make a plugin unbuildable. **Token opacity modifiers**
+(`bg-error/15`) compiled to unguarded `color-mix()` in plugin builds and were invisible in game; `coreUI()` now
+guards them behind `@supports`, which is why charcreator's soft tints appear for the first time.
+
+Measured (`ui/tests/BENCH.md`, medians of 11 runs): a player downloads **378.5 kB** of JS instead of 649.5 kB
+(-42 %; gzip 211.6 → 128.2 kB) and 137.3 kB of CSS instead of 176.0 kB (-22 %); shell startup did not regress
+(43.9 ms vs 54.4 ms, spread wider than the difference); plugin load 8.6 ms cold / 2.2 ms warm; `page:open` to
+mounted 5.2 ms; a one-slot patch is 81 B against a 7 947 B snapshot for a 200-slot inventory (98×), with one
+slot component re-rendered instead of 200; feeds flush at the frame rate no matter the input rate; ten
+registered plugins with no page open run zero timers, zero rAF and zero observers.
+
+Open: **nobody could test in game** (FXServer down, no client) — `…/scratchpad/uiplat/INGAME-CHECKLIST.md` is
+merged into README steps 26–35, and step 27 (cross-resource `import()` inside the real CEF 103) is the one that
+decides the architecture. Also open: `@lucide/vue` and `@dnd-kit/*` are now bundled per plugin rather than once,
+so two plugins using the same library ship it twice (deliberate: a shared vendor chunk would re-introduce the
+coupling §38 removes).

@@ -67,33 +67,39 @@ moment none is, with a 500 ms watchdog for the case where the page died with foc
 
 | file | job |
 | --- | --- |
-| `src/bridge.js` | transport only: `post()`, `onMessage()`, the dev shim, and the `window.__core.onPost` / `onMessage` taps this Storybook listens on |
+| `src/main.ts` → `src/shell.ts` | the page entry and `createShell(target, opts?)` — the boot order the dev host and the tests reuse |
+| `src/runtime/*.ts` | the platform (§38.6): `protocol`, `transport`, `scope`, `plugins`, `pages`, `layers`, `feeds`, `errors`, `host`, `inspector` |
+| `src/bridge.js` | the legacy transport shim: `post()`, `onMessage()`, and the `window.__core.onPost` / `onMessage` taps this Storybook listens on |
 | `src/store.js` | one `reactive()` state object + every `action` handler + the global keyboard rules |
-| `src/coreui.js` | `window.CoreUI`, the surface plugin pages talk to |
-| `src/App.vue` | mounts all eight built-ins; no logic |
-| `src/components/*.vue` | render store state, own their local keyboard (Tab / Enter / arrows) |
+| `src/coreui.js` | `window.CoreUI`, the legacy surface (§38.12) |
+| `src/App.vue` | mounts the built-ins; no logic |
+| `src/shell/*.vue` | render store state as kit compositions, own their local keyboard (Tab / Enter / arrows) |
+| `sdk/` | the `@core/ui` package a plugin builds against (contract, facade, `coreUI()`, tokens, dev host) |
 
 Keyboard ownership is split on purpose: **Escape** and the progress cancel keys
 (`x` / `Backspace`) live in `store.handleKeydown` because they mean "cancel whatever is
 topmost", while `↑ ↓ Enter Tab` live in the component that is on screen.
 
-## One dist, many plugins (DESIGN §7.4)
+## One CEF page, many plugin frontends (DESIGN §38)
 
-A plugin does **not** ship its own UI files. Its page lives in `<plugin>/ui/src/index.js`,
-`core/ui/src/plugins.js` globs `../../../*/ui/src/index.js` at build time, and the page is
-compiled straight into core's bundle — one download, one Vue instance, no duplicated runtime.
+A plugin **owns** its frontend: it builds `<plugin>/ui/dist`, opts in with `core_ui 'ui/dist'`
+plus `files { 'ui/dist/**' }`, and core imports the module at runtime from that resource's own
+origin (`https://cfx-nui-<resource>/ui/dist/plugin.<hash>.js`). One CEF page, one Vue (core's,
+handed over through a host object), one kit, one focus owner — but changing a page means
+`npm run build` in that plugin and `restart <plugin>`, never a core rebuild. See
+**Docs → UI Platform**.
 
 ```lua
--- the plugin's client script only declares metadata
+-- the plugin's client script stays the authority on id, type and owner
 Core.UI.registerPage('bank', { type = 'page', keepInput = false })
 Core.UI.open('bank', { balance = 182450 })
 ```
 
-```js
-// <plugin>/ui/src/index.js — compiled into core's bundle by src/plugins.js
+```ts
+// <plugin>/ui/src/index.ts — built by coreUI(), imported by core at runtime
+import { defineUIPlugin, definePage } from '@core/ui'
 import Page from './Page.vue'
-export const id = 'bank'
-export default Page
+export default defineUIPlugin({ pages: { bank: definePage({ component: Page }) } })
 ```
 
 Besides the page plumbing, `window.CoreUI` hands a page the shell's own live data —
@@ -101,11 +107,13 @@ Besides the page plumbing, `window.CoreUI` hands a page the shell's own live dat
 `lang` / `t(key, vars)` for core's strings and `playSound(name, set)` — all readonly and
 reactive, so a page never has to ask Lua for something the HUD already knows.
 
-Dev dependencies are hoisted by the npm workspace at `resources/package.json`
-(`core/ui`, `*/ui`), so a plugin that needs an extra runtime library adds a minimal
-`ui/package.json`, `npm install` at `resources/` hoists it and Rollup bundles it into the one
-dist. The `script` / `style` URL loader in `PageHost.vue` still exists as a fallback for
-prebuilt third-party bundles — see **Docs → Plugin Pages**.
+The SDK a plugin builds against is the npm workspace package `@core/ui` (`core/ui/sdk`): the
+typed host contract, a facade under 2 KB, the `coreUI()` Vite plugin and core's tokens. Dev
+dependencies are still hoisted by the workspace at `resources/package.json` (`core/ui`,
+`core/ui/sdk`, `*/ui`), so a plugin that needs an extra runtime library adds it to its own
+`ui/package.json` and `npm install` at `resources/` hoists it — but it is bundled into **that
+plugin's** dist, not into core's. The `script` / `style` URL loader is gone; see
+**Docs → Plugin Pages**.
 
 ## Styling (Tailwind v4)
 
@@ -138,11 +146,13 @@ The component classes are what the built-ins are made of, and any page can reuse
 </div>
 ```
 
-A plugin page gets this for free — `styles.css` scans the sibling resources
-(`@source "../../../*/ui/src/**/*.{vue,js}"`), so its utilities are emitted into the same bundle.
-A scoped `<style>` that uses `@apply` has to point Tailwind at the theme first, with the path
-relative to the file: `@reference "../../../core/ui/src/styles.css";` from `<plugin>/ui/src`. It
-reads the tokens and emits nothing.
+The tokens live in `ui/sdk/theme.css` (nothing but `@theme static` blocks — Tailwind refuses
+`theme(reference)` on anything else); core's `styles.css` imports it, and a plugin build
+references the same file, so a plugin's sheet carries only the utilities *it* uses. Core's entry
+is `@import "tailwindcss" source(none)` plus explicit `@source` lines, because Tailwind's
+automatic detection walks up to the workspace root and would compile plugin utilities back into
+core. A scoped `<style>` that uses `@apply` points Tailwind at the theme by package specifier:
+`@reference "@core/ui/reference.css";`. It reads the tokens and emits nothing.
 
 **Never filter the backdrop** — neither the CSS property nor Tailwind's `backdrop-` utilities. The
 game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
