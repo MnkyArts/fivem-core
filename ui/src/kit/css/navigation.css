@@ -1,0 +1,643 @@
+/* core UI kit — Navigation (DESIGN §37.5).
+   CoreTabs, CoreMenu, CoreChips, CoreStepper.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
+
+   The signature of the whole design lives here: the ACTIVE MENU ROW is solid coral for its first
+   third and then dissolves into the panel at the right edge. Its stops (--core-menu-fade, below)
+   were read off the mockups pixel by pixel — see the comment there for why they are not the
+   shared --core-grad-accent-fade-out token.
+
+   Tracking note: `letter-spacing` puts its space AFTER the last glyph too, which pushes every
+   centred label (tab, chip, stepper) half a space to the left. Every label span therefore cancels
+   it with a negative right margin of the same size. */
+
+/* ---- CoreTabs ------------------------------------------------------------------------------
+   Top navigation: dim condensed caps, the active one white over a glowing coral underline that
+   sits ON the hairline. The underline is a per-tab ::after that only fades (§37.5 "if that is
+   cheap") — no shared slider element, so nothing measures the DOM on every change. */
+
+.core-tabs {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+  pointer-events: auto;
+}
+
+.core-tabs__list {
+  --core-tabs-gap: 36px;
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  gap: var(--core-tabs-gap);
+  min-width: 0;
+}
+
+/* The hairline the active underline rides on. */
+.core-tabs--line .core-tabs__list { border-bottom: 1px solid var(--color-border); }
+
+.core-tabs--stretch { display: flex; }
+.core-tabs--stretch .core-tabs__list { flex: 1 1 auto; }
+.core-tabs--stretch .core-tab { flex: 1 1 0; }
+
+.core-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  flex: none;
+  height: 44px;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--color-fg-dim);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.12s var(--ease-ui);
+}
+
+.core-tab__label {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-right: -0.1em;
+}
+
+.core-tab:hover { color: var(--color-fg); }
+/* --color-fg, not --color-on-accent: an active tab label sits on the PANEL (only its underline is
+   coral), so it follows the foreground colour, not the accent's contrast colour. */
+.core-tab.is-active { color: var(--color-fg); }
+
+/* 3 px coral bar, centred on the hairline, with the soft glow of the mockups. */
+.core-tab::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--color-accent);
+  box-shadow: 0 0 10px rgb(var(--core-accent-rgb) / 0.55), 0 0 3px rgb(var(--core-accent-rgb) / 0.75);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s var(--ease-ui);
+}
+.core-tab.is-active::after { opacity: 1; }
+
+.core-tab:disabled,
+.core-tab.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  color: var(--color-fg-dim);
+}
+
+.core-tab:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+  border-radius: var(--radius-ui-xs);
+}
+
+/* A count next to the label ("QUESTS 3"). */
+.core-tab__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-ui-xs);
+  background: rgba(255, 255, 255, 0.10);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--color-fg-dim);
+}
+/* A 22 % coral tint over the panel is not an accent FILL either — foreground colour again. */
+.core-tab.is-active .core-tab__badge {
+  background: rgb(var(--core-accent-rgb) / 0.22);
+  color: var(--color-fg);
+}
+
+/* Vertical hairlines in the gaps (m4 map header). */
+.core-tabs--separators .core-tab + .core-tab::before {
+  content: '';
+  position: absolute;
+  left: calc(var(--core-tabs-gap) / -2);
+  top: 50%;
+  width: 1px;
+  height: 18px;
+  margin-top: -9px;
+  background: var(--color-border-strong);
+}
+
+/* The optional key caps at the ends: a bare button so the cap itself stays the visual. */
+.core-tabs__key {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+  opacity: 0.85;
+  transition: opacity 0.12s var(--ease-ui);
+}
+.core-tabs__key:hover { opacity: 1; }
+.core-tabs__key:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+  border-radius: var(--radius-ui-xs);
+}
+
+.core-tabs--sm .core-tabs__list { --core-tabs-gap: 26px; }
+.core-tabs--sm .core-tab { height: 34px; font-size: 14px; padding: 0 8px; }
+.core-tabs--lg .core-tabs__list { --core-tabs-gap: 44px; }
+.core-tabs--lg .core-tab { height: 54px; font-size: 20px; padding: 0 12px; }
+.core-tabs--lg .core-tab::after { height: 4px; }
+
+/* ---- CoreMenu ------------------------------------------------------------------------------
+   The vertical menu of the main menu, the inventory sidebar and the shell's keyboard menu.
+   One geometry, three sizes, driven by four custom properties so the legacy .core-item below can
+   reuse the small one without repeating a single declaration. Rows are square-cornered and
+   full-bleed inside their container — the inset in the mockups is the PANEL's padding. */
+
+.core-menu,
+.core-list {
+  /* The dissolve, measured off m1_menu.png and m3_sidebar.png. The shared
+     --core-grad-accent-fade-out token matches the inventory sidebar but gives up its colour by
+     halfway, which is not how the main-menu row reads: that one stays solid for its first third
+     and only then lets go. These stops sit between the two and are written over the same three
+     re-theming tokens (§37.2), so a server that moves --color-accent* still moves this. */
+  --core-menu-fade: linear-gradient(
+    90deg,
+    var(--color-accent-hi) 0%,
+    var(--color-accent) 11%,
+    var(--color-accent) 34%,
+    rgb(var(--core-accent-rgb) / 0.52) 68%,
+    rgb(var(--core-accent-rgb) / 0.03) 100%
+  );
+  --core-menu-h: 56px;
+  --core-menu-fs: 18px;
+  /* §37.5 calls the md icon 26 px; that is the MARK in the mockups, and an MDI path fills about
+     three quarters of its 24-grid, so the BOX has to be a size up to draw a mark that big. */
+  --core-menu-icon: 30px;
+  --core-menu-pad: 18px;
+  --core-menu-gap: 22px;
+}
+
+.core-menu {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  pointer-events: auto;
+}
+
+.core-menu--sm {
+  --core-menu-h: 38px;
+  --core-menu-fs: 15px;
+  --core-menu-icon: 22px;
+  --core-menu-pad: 12px;
+  --core-menu-gap: 14px;
+}
+
+.core-menu--lg {
+  --core-menu-h: 70px;
+  --core-menu-fs: 25px;
+  --core-menu-icon: 34px;
+  --core-menu-pad: 26px;
+  --core-menu-gap: 28px;
+}
+
+.core-menu__item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--core-menu-gap);
+  width: 100%;
+  min-height: var(--core-menu-h);
+  margin: 0;
+  padding: 0 var(--core-menu-pad);
+  border: 0;
+  background-color: transparent;
+  background-image: none;
+  -webkit-appearance: none;
+  appearance: none;
+  text-align: left;
+  color: var(--color-fg-dim);
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+
+.core-menu__item:hover {
+  background-color: rgba(255, 255, 255, 0.04);
+  color: var(--color-fg);
+}
+
+/* `fade` (the default) is the mockups' dissolve; without it the row wears the solid gradient. */
+.core-menu__item.is-active {
+  background-image: var(--core-grad-accent);
+  color: var(--color-on-accent);
+}
+.core-menu.is-fade .core-menu__item.is-active { background-image: var(--core-menu-fade); }
+.core-menu__item.is-active:hover { filter: brightness(1.06); }
+
+.core-menu__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--core-menu-icon);
+  height: var(--core-menu-icon);
+}
+
+.core-menu__body {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 0;
+}
+
+.core-menu__label {
+  display: block;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--core-menu-fs);
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.core-menu__desc {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: 13px;
+  line-height: 1.35;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--color-fg-faint);
+}
+.core-menu__item.is-active .core-menu__desc { color: rgba(255, 255, 255, 0.78); }
+
+.core-menu__trailing {
+  flex: none;
+  margin-left: auto;
+  padding-left: 14px;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 14px;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+.core-menu__item.is-active .core-menu__trailing { color: rgba(255, 255, 255, 0.86); }
+
+.core-menu__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 20px;
+  height: 20px;
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: var(--radius-ui-xs);
+  background: rgb(var(--core-accent-rgb) / 0.20);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: var(--color-accent-hi);
+}
+.core-menu__badge + .core-menu__trailing { margin-left: 0; }
+.core-menu__item.is-active .core-menu__badge {
+  background: rgba(255, 255, 255, 0.22);
+  color: var(--color-on-accent);
+}
+
+.core-menu__item.is-danger { color: var(--color-error); }
+.core-menu__item.is-danger:hover { background-color: rgb(var(--core-error-rgb) / 0.12); }
+.core-menu__item.is-danger.is-active,
+.core-menu.is-fade .core-menu__item.is-danger.is-active {
+  background-image: linear-gradient(
+    90deg,
+    rgb(var(--core-error-rgb) / 1) 0%,
+    rgb(var(--core-error-rgb) / 1) 34%,
+    rgb(var(--core-error-rgb) / 0.52) 68%,
+    rgb(var(--core-error-rgb) / 0.03) 100%
+  );
+  color: var(--color-on-accent);
+}
+
+.core-menu__item.is-disabled,
+.core-menu__item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-menu__item.is-disabled:hover,
+.core-menu__item:disabled:hover {
+  background-color: transparent;
+  color: var(--color-fg-dim);
+  filter: none;
+}
+
+.core-menu__item:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: -2px;
+}
+
+/* ---- legacy .core-list / .core-item (DESIGN §37.5, K3 brief) --------------------------------
+   The shell's keyboard menu (components/Menu.vue) still renders a plain <ul class="core-list">
+   of <li class="core-item">, so those bare classes have to draw the small menu row themselves. */
+
+ul.core-list,
+.core-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.core-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  min-height: 38px;
+  padding: 0 12px;
+  color: var(--color-fg-dim);
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-item:hover {
+  background-color: rgba(255, 255, 255, 0.04);
+  color: var(--color-fg);
+}
+.core-item.is-active {
+  background-image: var(--core-menu-fade);
+  color: var(--color-on-accent);
+}
+.core-item.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-item.is-disabled:hover {
+  background-color: transparent;
+  color: var(--color-fg-dim);
+}
+
+/* Menu.vue's inner spans, so a legacy row reads like a core-menu--sm row. `text-accent` on the
+   icon is a Tailwind utility (utilities layer, always over components), and coral on the coral
+   gradient is invisible — an important declaration is the only way back for the active row. */
+.core-item .label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.core-item .desc {
+  font-family: var(--font-sans);
+  letter-spacing: 0;
+  text-transform: none;
+}
+.core-item.is-active .desc { color: rgba(255, 255, 255, 0.78); }
+.core-item.is-active .icon { color: var(--color-on-accent) !important; }
+
+/* ---- CoreChips -----------------------------------------------------------------------------
+   Filter chips / segmented control (m4 quest filters): the selected one is solid coral with no
+   border, the rest are outlined wells. */
+
+.core-chips {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  pointer-events: auto;
+}
+.core-chips--wrap { flex-wrap: wrap; }
+
+/* `stretch`: equal-width cells filling the row (the map filter bar of m4). `minWidth` is the other
+   half of the same problem — a floor under every chip so a four-letter label does not make a cell
+   half the width of its neighbour. One custom property on the group, not a style per chip. */
+.core-chips--stretch { display: flex; }
+.core-chips--stretch .core-chip { flex: 1 1 0; }
+
+.core-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex: none;
+  height: 36px;
+  min-width: var(--core-chip-min, 0);
+  margin: 0;
+  padding: 0 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui-sm);
+  background-color: rgba(255, 255, 255, 0.03);
+  background-image: none;
+  -webkit-appearance: none;
+  appearance: none;
+  font-family: var(--font-display);
+  /* §37.5 says display 500 / 14 px; the quest filter in m4 carries visibly more weight than that
+     next to its neighbours, and 600 / 15 px is what lines the chip row up with the mockup. */
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--color-fg-dim);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.12s var(--ease-ui), border-color 0.12s var(--ease-ui),
+    background-color 0.12s var(--ease-ui);
+}
+
+.core-chip__label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-right: -0.08em;
+}
+
+.core-chip:hover {
+  border-color: var(--color-border-strong);
+  background-color: rgba(255, 255, 255, 0.06);
+  color: var(--color-fg);
+}
+
+.core-chip.is-active {
+  border-color: transparent;
+  background-image: var(--core-grad-accent);
+  color: var(--color-on-accent);
+}
+.core-chip.is-active:hover {
+  border-color: transparent;
+  filter: brightness(1.08);
+}
+
+.core-chip__count {
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--color-fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+.core-chip.is-active .core-chip__count { color: rgba(255, 255, 255, 0.82); }
+
+.core-chip:disabled,
+.core-chip.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-chip:disabled:hover,
+.core-chip.is-disabled:hover {
+  border-color: var(--color-border);
+  background-color: rgba(255, 255, 255, 0.03);
+  color: var(--color-fg-dim);
+  filter: none;
+}
+
+.core-chip:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+.core-chips--sm { gap: 8px; }
+.core-chips--sm .core-chip { height: 28px; padding: 0 12px; font-size: 13px; }
+.core-chips--lg { gap: 14px; }
+.core-chips--lg .core-chip { height: 44px; padding: 0 22px; font-size: 17px; }
+
+/* ---- CoreStepper ---------------------------------------------------------------------------
+   `< value >` cycler in the shared box look of §37.5 (well fill, 16 % border -> 28 % on hover,
+   accent + halo while something inside has focus). */
+
+.core-stepper {
+  --core-stepper-h: var(--core-h-md);
+  display: inline-flex;
+  align-items: stretch;
+  height: var(--core-stepper-h);
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: var(--radius-ui-sm);
+  background: var(--color-panel-sunken);
+  pointer-events: auto;
+  transition: border-color 0.12s var(--ease-ui), box-shadow 0.12s var(--ease-ui);
+}
+.core-stepper:hover { border-color: rgba(255, 255, 255, 0.28); }
+.core-stepper:focus-within,
+.core-stepper.is-focused {
+  border-color: var(--color-accent);
+  box-shadow: var(--core-focus);
+}
+
+.core-stepper--block {
+  display: flex;
+  width: 100%;
+}
+
+.core-stepper__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--core-stepper-h);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  color: var(--color-fg-dim);
+  cursor: pointer;
+  transition: color 0.12s var(--ease-ui), background-color 0.12s var(--ease-ui);
+}
+.core-stepper__btn:hover {
+  background-color: rgba(255, 255, 255, 0.06);
+  color: var(--color-fg);
+}
+.core-stepper__btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  background-color: transparent;
+  color: var(--color-fg-dim);
+}
+.core-stepper__btn:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: -2px;
+}
+
+.core-stepper__value {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 6px;
+}
+.core-stepper__value:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: -2px;
+}
+
+.core-stepper__label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-right: -0.06em;
+  color: var(--color-fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.core-stepper__count {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 13px;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: var(--color-fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.core-stepper.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-stepper.is-disabled:hover { border-color: rgba(255, 255, 255, 0.16); }
+
+.core-stepper--sm { --core-stepper-h: var(--core-h-sm); }
+.core-stepper--sm .core-stepper__label { font-size: 13px; }
+.core-stepper--sm .core-stepper__count { font-size: 11px; }
+.core-stepper--lg { --core-stepper-h: var(--core-h-lg); }
+.core-stepper--lg .core-stepper__label { font-size: 18px; }
+.core-stepper--lg .core-stepper__count { font-size: 14px; }

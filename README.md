@@ -43,8 +43,8 @@ and stops a client forging `cash`, `faction` or a vehicle's `locked`.
 
 **Operating it**: FXServer caches manifests — after adding or removing script files run `refresh` before
 `ensure core`, otherwise the restart silently runs the old file list. `ensure core` also restarts every
-resource that declares `dependency 'core'`. Status (2026-09-15): fxlint clean, 385 lib + 718 server + 999 interiors offline
-checks green, UI regression 49/49, Storybook 37 play functions green, both resources start clean on the dev
+resource that declares `dependency 'core'`. Status (2026-09-15): fxlint clean, 385 lib + 720 server + 999 interiors offline
+checks green, shell regression 99/99 (2026-09-18), Storybook play functions green, both resources start clean on the dev
 server; **the in-game checklist below has not been run yet**.
 
 The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
@@ -300,7 +300,7 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 | | `deposit(src, amount)` `withdraw` `getBank(id)` `setMeta(id, k, v)` `getMeta(id, k)` |
 | `Core.Vehicles` §4.6 | `spawn(opts)` `delete(netId)` `exists` `getEntity` `getInfo` `setLocked` `isLocked` `list()` |
 | | `giveKeys(netId, charId)` `removeKeys` `hasKeys(src, netId)` `setOwner` `getOwner` `getPlayerVehicles(src)` — `keyMode = 'virtual'` is default; `'item'` leaves virtual keys empty for a domain plugin's physical-key check |
-| | `persist(netId)` `getRecords(charId)` `getRecord(vehId)` `spawnRecord` `store(netId)` `saveProps` `deleteRecord` |
+| | `persist(netId)` `getRecords(charId)` `getRecord(vehId)` `spawnRecord` `restoreRecord` `adopt(netId, opts)` `store(netId)` `saveProps` `deleteRecord` |
 | `Core.Notify` §4.7 | `send(src, message, type?, duration?)` `broadcast(message, type?)` — types `info` `success` `error` `warning` |
 
 Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `Core.Player(src).money:add('cash', 10)`.
@@ -416,6 +416,10 @@ on('greeting', d => { reply.value = d.text })
 emit('greet', { name: name.value })
 ```
 
+What the page *draws* is the UI kit (next section): `<CoreScreen>`, `<CorePanel>`, `<CoreButton>`,
+`<CoreSlotGrid>` … are registered globally on the shell's Vue app, so a page imports no component,
+ships no stylesheet and looks like the rest of the server by default.
+
 A page store that lives outside the component (a module singleton, like the inventory's) may keep
 `usePage(id).props`: the object survives close/re-open and even a plugin restart (`page:unregister` +
 `page:register`). Create its watchers in a detached `effectScope(true)`, though — a `watch` made during a
@@ -433,61 +437,177 @@ self-hosted bundle, but nothing ships that way any more.)
 `window.CoreUI` also exposes `Vue`, `hud` (live HUD snapshot) and `post`. The exact NUI protocol
 (`page:register`, `page:open`, `ui_event`, `menu_result`, …) is DESIGN §6.10. No CDNs, no web fonts: no network.
 
-### Styling with Tailwind
+### Design system (UI kit)
 
-The shell's CSS is **Tailwind CSS v4**, CSS-first: `@tailwindcss/vite` in `ui/vite.config.js` and one
-entry stylesheet, `ui/src/styles.css`, which holds the `@theme` tokens, the shared `.core-*` classes
-and the base layer. There is no `tailwind.config.js` and no PostCSS step.
+Every screen — the shell's own built-ins and every plugin page — is built from **one** kit (DESIGN §37),
+so nothing drifts apart. The look is Liam's four mockups: blue-black translucent slate, one coral accent
+(`#f6503f`) with two gradient recipes, Barlow Condensed for anything that shouts and Barlow for prose,
+6 px panels / 4 px controls, hairline borders, near-white key caps. Three layers, each usable on its own:
 
-A plugin page gets all of it for free: `styles.css` also scans the sibling resources
-(`@source "../../../*/ui/src/**/*.{vue,js}"`), so utilities used in `<plugin>/ui/src` are emitted into
-core's one bundle. Plugins install nothing — `cd core/ui && npm run build` rebuilds the shell *and*
-every plugin page's CSS at once (`core/html/assets/app.css`).
-
-The design tokens are ordinary utilities, opacity modifiers included (`bg-accent/10`):
-
-| group | utilities | value |
+| layer | where | what it is |
 |---|---|---|
-| surfaces | `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-backdrop` | `rgba(14,16,20,.86)` · `#0e1014` · `rgba(255,255,255,.04)` · `rgba(0,0,0,.28)` |
-| hairlines | `border-border` `border-border-strong` | `rgba(255,255,255,.08)` · `rgba(255,255,255,.16)` |
-| text | `text-fg` `text-fg-dim` `text-fg-faint` | `#f2f4f8` · 62 % · 38 % |
-| accent | `text-accent` `bg-accent-soft` | `#5b8cff` · `rgba(91,140,255,.18)` |
-| states | `text-success` `text-error` `text-warning` `text-info` | `#3ddc84` · `#ff5d5d` · `#ffb347` · `#5b8cff` |
-| shape | `rounded-ui` `rounded-ui-sm` `shadow-ui` `ease-ui` | 8 px · 5 px · `0 8px 28px rgba(0,0,0,.45)` · `cubic-bezier(.22,.61,.36,1)` |
-| type | `font-sans` `font-mono` · `text-ui` `text-ui-sm` `text-ui-xs` | system stack · Cascadia Mono · 14 / 12 / 10 px |
-| motion | `animate-core-slide-in` `animate-core-fade-in` `animate-core-pop-in` | the shell's three entrances |
+| tokens | the `@theme` block of `ui/src/styles.css` | every colour, font, radius, shadow, size — each one also a Tailwind utility (`bg-panel`, `text-fg-dim`, `rounded-ui`, `font-display`, `text-display-lg`) |
+| classes | `ui/src/kit/css/*.css` | the `.core-*` vocabulary (`core-btn`, `core-panel`, `core-slot`, …); plain HTML may wear them |
+| components | `ui/src/kit/components/Core*.vue` | ~60 tags registered **globally** on the shell's one Vue app — `<CoreButton>` works in any page with no import |
 
-Prefer the shared component classes over rebuilding a panel by hand — they are what the built-in
-menus and dialogs are made of, so a page written with them cannot drift from the shell:
+#### The tags
 
-| class | what it is |
+Grouped as in DESIGN §37.5, which is the full API (props · slots · emits · classes · exact look):
+
+| group | components |
 |---|---|
-| `core-panel` `core-modal` `core-backdrop` | the dark panel, its 320–460 px modal padding, the dimmed full-screen layer |
-| `core-title` `core-text` `core-label` | 15 px heading, dimmed body copy, uppercase micro-label |
-| `core-btn` + `core-btn--primary` / `--ghost` / `--danger` | the button, its three variants, `[disabled]` handled |
-| `core-field` `core-input` `core-select` `core-check` `core-key` | form row, text field, select, checkbox row, keycap |
-| `core-list` `core-item` (+ `.is-active` / `.is-disabled`) | scrollable list and its rows |
-| `core-interactive` | `pointer-events: auto` — the shell is click-through, so anything clickable needs it |
+| foundation | **CoreIcon** a registry glyph (`kit/icons.js`, 185 names, 24 × 24, `currentColor`) |
+| actions | **CoreButton** every button (`primary` `secondary` `ghost` `danger` `success`, `fade`, `kbd`, `loading`, `block`) · **CoreIconButton** square icon-only · **CoreKey** a key cap or mouse glyph · **CoreKeyHint** cap + caption · **CoreKeyHints** the hint bar of a footer · **CorePrompt** `[F] ENTER VEHICLE` · **CorePromptGroup** stacked prompts |
+| surfaces | **CorePanel** the bordered panel (title/subtitle/eyebrow, `actions` + `footer` slots, `blur`) · **CoreScreen** full-page scaffold (header · body · footer) · **CoreBackground** the scrim over the game · **CoreCard** media + text card · **CoreHeading** title block with the `//` marker · **CoreDivider** hairline · **CoreDash** the short accent bar · **CoreTagline** stacked wide-tracked lines · **CoreBrand** logo lockup |
+| navigation | **CoreTabs** top row with the glowing underline · **CoreMenu** vertical rows (main menu, sidebar) · **CoreChips** filter chips / segmented control · **CoreStepper** `‹ value ›` cycler |
+| forms — text | **CoreField** label + control + hint/error (`inline` = settings row) · **CoreInput** text field · **CoreTextarea** with counter · **CoreNumberInput** `[−] 12 [+]` · **CoreSelect** dropdown (`box` or the inline `SORT: RECENT ⌄`) |
+| forms — choice | **CoreCheckbox** · **CoreRadioGroup** / **CoreRadio** (`radio` or `card`) · **CoreSwitch** · **CoreSlider** · **CoreSwatches** colour picker |
+| data — meters | **CoreProgress** linear bar (`inline`, `segments`, threshold tones) · **CoreRing** radial · **CoreStatBar** HUD vital · **CoreStatRow** detail stat between hairlines · **CoreSpinner** · **CoreSkeleton** |
+| data — display | **CoreBadge** count pip · **CoreTag** small chip (tones + rarities) · **CoreAvatar** · **CorePlayerChip** avatar · name · level · XP · **CoreTable** · **CoreKeyValue** ruled label/value rows · **CoreEmpty** empty state |
+| game | **CoreSlot** item slot · **CoreSlotGrid** the inventory grid · **CoreHotbar** · **CoreList** / **CoreListItem** rich rows · **CoreObjective** · **CoreTracker** HUD quest card · **CoreCompass** heading strip |
+| feedback | **CoreAlert** inline banner · **CoreToast** notification card · **CoreDialog** modal (focus trap, escape layers) · **CoreDrawer** side sheet · **CorePopover** anchored panel · **CoreContextMenu** right-click menu · **CoreTooltip** |
+
+Props follow one vocabulary: `size` (`sm|md|lg`), `tone` (`accent|neutral|success|warning|danger|info`,
+plus the meter tones `health|armour|stamina|hunger|thirst|oxygen|stress` where a meter takes one),
+`icon` (a registry name or raw path data), `disabled`, `v-model` for anything carrying a value, and
+`items` for anything listing things (strings or `{ value, label, icon?, description?, disabled? }`).
+
+#### A page, in full
 
 ```vue
-<div class="core-panel core-interactive w-[380px] font-sans text-fg">
-    <h1 class="core-title">my_plugin</h1>
-    <p class="text-ui-sm text-fg-dim">Utilities and tokens, no stylesheet of your own.</p>
-    <button class="core-btn core-btn--primary mt-3" @click="close()">Close</button>
-</div>
+<script setup>
+import { ref } from 'vue'
+const { props, emit, close } = window.CoreUI.usePage('my_plugin')   // props / emit / on / close
+const tab = ref('bag')
+const selected = ref(null)
+</script>
+
+<template>
+    <CoreScreen background="scrim" blur>
+        <template #nav>
+            <CoreTabs v-model="tab" :items="[{ value: 'bag', label: 'Bag' }, { value: 'crate', label: 'Crate' }]" />
+        </template>
+
+        <CorePanel title="Inventory" subtitle="Gear up for what's next." slash scroll>
+            <template #actions><CoreButton icon="sort" size="sm">Sort</CoreButton></template>
+            <CoreSlotGrid v-model:selected="selected" :items="props.items || []" :columns="6" :slots="24" />
+            <template #footer>
+                <CoreButton variant="primary" kbd="F" :disabled="!selected"
+                    @click="emit('use', { id: selected })">Use</CoreButton>
+            </template>
+        </CorePanel>
+
+        <template #footer-end>
+            <CoreKeyHints bare :items="[{ key: 'ESC', label: 'Close' }, { key: 'F', label: 'Use' }]" />
+        </template>
+    </CoreScreen>
+</template>
 ```
+
+`templates/plugin/ui/src/Page.vue` is the same thing in its smallest form, `core_example/ui/src/Page.vue`
+the annotated one; every component has a Storybook story under **Kit/** with a playground and a gallery,
+**Kit → Showcase** rebuilds the four mockups from kit parts only, and **Docs → Design System** is this
+section inside Storybook.
+
+#### Tokens
+
+Utilities and CSS variables are the same names. Opacity modifiers (`bg-accent/10`) only work on the
+**hex** tokens — Tailwind cannot resolve an `rgba()`/`var()` token and Chromium 103 has no `color-mix()`.
+
+| group | utilities / variables | value |
+|---|---|---|
+| surfaces | `bg-ink` `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-panel-sunken` `bg-panel-popup` `bg-hud` `bg-backdrop` | `#060b0f` · `rgba(11,17,22,.90)` · `#0d1419` · white 3.5 % · black 30 % · `rgba(11,17,22,.98)` · `rgba(8,12,16,.68)` · `rgba(4,8,11,.62)` |
+| hairlines | `border-border` `border-border-strong` | white 12 % · white 22 % |
+| text | `text-fg` `text-fg-dim` `text-fg-faint` · `bg-key` `text-key-fg` | `#f3f5f7` · 66 % · 40 % · `#fbfbfb` · `#11161b` |
+| accent | `text-accent` `bg-accent-hi` `bg-accent-lo` `bg-accent-soft` `text-on-accent` | `#f6503f` · `#ff6351` · `#d53e2f` · `rgba(246,80,63,.16)` · `#fff` |
+| states | `text-success` `text-warning` `text-error` `text-info` | `#3fd67f` · `#f5a623` · `#ff4560` · `#55b6f7` |
+| vitals | `text-health` `text-armour` `text-stamina` `text-hunger` `text-thirst` `text-oxygen` `text-stress` (also the meter `tone` names) | `#fa5246` `#5dbbf7` `#5de395` `#f5a623` `#4fd1e8` `#9fd8ff` `#b68cff` |
+| rarity | `text-rarity-common` `text-rarity-uncommon` `text-rarity-rare` `text-rarity-epic` `text-rarity-legendary` | `#aeb6bf` `#5de395` `#5dbbf7` `#b68cff` `#f5a623` |
+| shape | `rounded-ui` `rounded-ui-sm` `rounded-ui-xs` · `shadow-ui` `shadow-ui-sm` `shadow-ui-lg` `shadow-glow` `shadow-glow-sm` · `ease-ui` | 6 / 4 / 3 px · the panel shadows · the coral selection glow · `cubic-bezier(.22,.61,.36,1)` |
+| type | `font-sans` `font-display` `font-mono` · `text-ui-xs` `text-ui-sm` `text-ui` `text-ui-lg` · `text-display-sm` `text-display` `text-display-lg` `text-display-xl` · `tracking-display` `tracking-label` `tracking-eyebrow` | Barlow · Barlow Condensed · Cascadia Mono · 11 / 13 / 15 / 17 px · 18 / 24 / 34 / 48 px · 0.04 / 0.14 / 0.32 em |
+| motion | `animate-core-fade-in` `animate-core-slide-in` `animate-core-pop-in` `animate-core-slide-up` `animate-core-spin` `animate-core-shimmer` `animate-core-pulse` | the kit's entrances and loops |
+| recipes (`:root`, not utilities) | `--core-grad-accent` `--core-grad-accent-fade` `--core-grad-accent-fade-out` `--core-grad-sheen` · `--core-accent-rgb` (and `-ink-` `-panel-` `-error-` `-success-` `-warning-` `-info-`) · `--core-h-sm` `--core-h-md` `--core-h-lg` · `--core-focus` | the two accent gradients + the panel sheen · `r g b` triplets, because alpha is written `rgb(var(--core-accent-rgb) / 0.16)` · control heights 30 / 40 / 52 px · the focus halo |
+
+Three type voices carry the whole look and exist as classes too: `core-display` (700, tight tracking),
+`core-label` (600, 12 px, 0.14 em) and `core-eyebrow` (500, 13 px, 0.32 em — the wide subtitle under a
+heading), next to `core-title`, `core-text`, `core-flavor` and `core-num` (tabular figures).
+
+#### Rules for a page
+
+- **Compose, do not restyle.** Reach for a `<Core…>` tag first; write custom CSS only for what the kit
+  lacks, and then over the tokens — **never a literal colour, font family or radius** in a page.
+- **Utilities win.** The kit's classes are imported into the `components` layer, so `class="w-full mt-4"`
+  on a kit tag always beats the kit's own rule. Layout utilities (`flex`, `gap-*`, `min-w-0`) are fine;
+  colour and type belong to the kit.
+- **Chromium 103.** No `:has()`, no `color-mix()`, no CSS nesting, no container queries, no `dvh`, no
+  Popover API, no `calc(infinity)`, no `oklch()`. Tailwind's `translate-*` / `rotate-*` / `scale-*`
+  utilities emit the individual transform properties (Chrome 104+) and silently do nothing in game —
+  write `[transform:translateX(-50%)]`.
+- **Glass is a prop.** `blur` on CorePanel, CoreScreen / CoreBackground, CoreDialog, CoreDrawer and
+  CorePopover sets `data-core-blur` (`true` = `Config.UI.Blur.Strength`, a number = that radius). Panels
+  only, ≤ 12 on screen, never on rows, slots, chips or list items — every consumer costs a canvas copy
+  per frame (next section).
+- **Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities** — the
+  game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
+  black box. That ban is absolute; `data-core-blur` is the replacement.
+- **The shell is click-through.** Interactive kit roots set `pointer-events: auto` themselves; a plain
+  `<div>` of your own that must take the mouse needs `core-interactive`.
+
+#### Re-theming
+
+A server changes the whole shell's colour by overriding five values — everything else is derived:
+
+```css
+:root {
+    --color-accent: #f6503f;  --color-accent-hi: #ff6351;  --color-accent-lo: #d53e2f;
+    --color-accent-soft: rgba(246, 80, 63, 0.16);
+    --core-accent-rgb: 246 80 63;                                   /* alpha recipes read this */
+    --core-grad-accent: linear-gradient(90deg, #ff5a49 0%, #f6503f 45%, #ee4339 100%);
+    --core-grad-accent-fade: linear-gradient(90deg, #fd5443 0%, #f6503f 18%, rgb(246 80 63 / 0.18) 100%);
+    --core-grad-accent-fade-out: linear-gradient(90deg, #fd5443 0%, #f6503f 16%, rgb(246 80 63 / 0.04) 100%);
+}
+```
+
+#### Icons and fonts
+
+`ui/src/kit/icons.js` ships 185 filled glyphs on a 24 × 24 grid (path data from Material Design Icons,
+Apache-2.0). Every `icon` prop takes a registry name **or** raw path data, and a plugin adds its own:
+
+```js
+window.CoreUI.kit.registerIcons({ 'my-icon': 'M12 2 2 22h20L12 2z' })   // then icon="my-icon"
+```
+
+`Barlow` and `Barlow Condensed` are bundled as woff2 in `ui/src/kit/fonts/` (SIL OFL 1.1, `OFL.txt` next
+to them) because the CEF has no network — never add a web font, a CDN or an `@import url(...)`.
+
+#### Tailwind mechanics
+
+The CSS is **Tailwind CSS v4**, CSS-first: `@tailwindcss/vite` in `ui/vite.config.js` and one entry
+stylesheet, `ui/src/styles.css` (the `@theme` tokens, the ten kit partials, the base layer). No
+`tailwind.config.js`, no PostCSS. A plugin installs nothing: `styles.css` also scans the sibling
+resources (`@source "../../../*/ui/src/**/*.{vue,js}"`), so utilities used in `<plugin>/ui/src` land in
+core's one bundle — `cd core/ui && npm run build` rebuilds the shell *and* every plugin page's CSS
+(`core/html/assets/app.css`).
 
 A scoped `<style>` block is compiled on its own, so `@apply` inside one needs the theme pointed out
 first — relative to the file, which from a plugin is
 `@reference "../../../core/ui/src/styles.css";` (`<plugin>/ui/src` → the resources folder → core).
 It emits nothing; only the tokens are read. Utilities in the template need no `@reference`.
 
-**FiveM's CEF is Chromium 103.** Tailwind's `translate-*` / `rotate-*` / `scale-*` utilities emit the individual transform properties (Chrome 104+) and silently do nothing in game — write `[transform:translateX(-50%)]` instead; no Popover API, `:has()` or `calc(infinity)` either.
+#### Checking a page
 
-**Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities** — the
-game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a solid
-black box. That ban stays; for a glass panel put **`data-core-blur`** on the panel instead (next
-section). `core/ui/src/styles.css` documents the same rule.
+```bash
+cd core/ui
+node tests/kit-compile-check.mjs ../../my_plugin/ui/src/Page.vue   # compiles the SFC + the CEF lint, no build
+npm run dev                                                        # Vite on 5173: index.html is the live shell
+#   http://localhost:5173/kit-preview.html?scene=<SceneName>&bg=game|keyart|menu|ink — one kit scene, no Storybook
+npm run storybook                                                  # Kit/… stories: every component, every state
+```
+
+Two browser suites guard the shell (both need the built `html/` served over HTTP, see "Verification" in
+`AGENTS.md`): `ui/tests/shell-regression.js` for the built-ins and the protocol, `ui/tests/kit-regression.js`
+for the kit — every catalogue name mounts without a Vue warning, the interactive contracts hold, the
+bundled fonts resolve and no rule in the built CSS uses a Chromium-103-unsafe feature.
 
 ### Game blur (glass panels)
 
@@ -499,15 +619,16 @@ holding a blurred crop of it. The wrapper paints the panel colour itself, so a g
 the normal one with the game showing through, border and all.
 
 ```vue
-<section class="core-panel core-interactive" data-core-blur>   <!-- Config.UI.Blur.Strength -->
-<section class="core-panel" data-core-blur="18">               <!-- 18 px, this panel only -->
+<CorePanel blur>                                               <!-- Config.UI.Blur.Strength -->
+<CorePanel :blur="18">                                         <!-- 18 px, this panel only -->
+<section class="core-panel" data-core-blur>                    <!-- the same thing without the kit -->
 <section class="core-panel" data-core-blur="0">                <!-- no glass on this panel -->
 <section class="core-panel" data-core-blur style="--core-glass-tint: rgba(20, 14, 14, 0.66)">
 ```
 
-A page needs **no JavaScript at all** — the attribute is the whole API, and it works on an element
-that appears later. `--core-glass-tint` on the element overrides the panel colour the wrapper paints
-(default `--color-panel-glass`, `rgba(14,16,20,.62)`).
+A page needs **no JavaScript at all** — the attribute is the whole API (the kit's `blur` prop only
+sets it), and it works on an element that appears later. `--core-glass-tint` on the element overrides
+the panel colour the wrapper paints (default `--color-panel-glass`, `rgba(11,17,22,.64)`).
 
 Each consumer costs one small canvas copy per frame, so put it on **panels, never on list rows** or
 per-item elements, and keep **12 or fewer on screen** — core's own ten built-ins (the three modals,
@@ -555,7 +676,7 @@ State bags are server-written, client-read. Read them with `Core.Player.get(key)
 | bag | keys |
 |---|---|
 | `player:<src>` | `loaded` `name` `charId` `group` `cash` `bank` `faction` (summary or `false`) `dead` |
-| `entity:<netId>` (core vehicles) | `coreVeh` `locked` `owner` `keys` `keyMode` `plate` `vehId` |
+| `entity:<netId>` (core vehicles) | `coreVeh` `locked` `owner` `keys` `keyMode` `plate` `vehId` `coreProps` (optional persisted props) |
 | `GlobalState` | `core:ready`, `faction:<id>` = `{ name, tag, color, memberCount }` or `false` |
 
 ## Commands
@@ -719,7 +840,7 @@ an inventory plugin fills it — write against `Core.Services.get('items')` and 
 
 ### Vehicle records and key modes
 
-`Core.Vehicles` owns the live entity and its generic record, including the complete property payload (custom colors, extras, liveries, wheel/mod/toggle maps, dirt, tyre health/bursts, doors, window intactness and lights). On a core restart it marks every persisted live record stored and captures its final server position before deleting the old entities, so records are retrievable rather than stranded out of garage. Property maps use GTA's zero-based native ids and safely survive JSON round trips. Plates are trimmed/uppercased and unique across both stored records and live entities; the default `LS-` prefix produces values such as `LS-48291`. GTA cannot distinguish a lowered window from a broken one through `IsVehicleWindowIntact`, so both persist as non-intact. `spawn` defaults to `keyMode = 'virtual'`, which inserts the owner into the replicated `keys` map and keeps existing `U` lock behaviour. A domain plugin that issues a physical inventory key must spawn with `keyMode = 'item'`: core still records the owner, but grants no virtual key, so that plugin validates the actual item before it calls `Core.Vehicles.setLocked`.
+`Core.Vehicles` owns the live entity and its generic record, including the complete property payload (custom colors, extras, liveries, wheel/mod/toggle maps, dirt, tyre health/bursts, doors, window intactness and lights). `stored = true` means deliberately garaged; `stored = false` means the vehicle belongs in the world. A clean core stop preserves that world state and captures the final server position before deleting only the obsolete runtime entity. A domain plugin restores out records with `restoreRecord`, which refuses stored records and duplicate vehIds. `adopt` promotes an existing network vehicle (for example, a server-validated hotwired ambient car) into the same server-owned persistent contract. Restored props are projected through `coreProps` and refreshed only when a validated saved-property payload changes, so any client that streams the vehicle can apply them even if its owner is offline. Property maps use GTA's zero-based native ids and safely survive JSON round trips. Plates are trimmed/uppercased and unique across both stored records and live entities; the default `LS-` prefix produces values such as `LS-48291`. GTA cannot distinguish a lowered window from a broken one through `IsVehicleWindowIntact`, so both persist as non-intact. `spawn` defaults to `keyMode = 'virtual'`, which inserts the owner into the replicated `keys` map and keeps existing `U` lock behaviour. A domain plugin that issues a physical inventory key must spawn with `keyMode = 'item'`: core still records the owner, but grants no virtual key. Core's `U` route then no-ops without a misleading error, allowing that plugin to bind `U` and validate the actual item before calling `Core.Vehicles.setLocked`.
 `Core.Api` hands a live table across resources, so **every call costs two msgpack hops**: fine for wiring,
 never for per-frame work. A table leaves `Api.get` the moment its owning resource stops.
 

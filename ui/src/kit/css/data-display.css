@@ -1,0 +1,555 @@
+/* core UI kit — Data — display (DESIGN §37.5).
+   CoreBadge, CoreTag, CoreAvatar, CorePlayerChip, CoreTable, CoreKeyValue,
+   CoreEmpty.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
+
+   One local decision this group had to make: a `solid` chip paints `--color-ink` text on every tone
+   but `accent` and `danger`, the only two dark enough for white (§37.5 names warning / legendary /
+   uncommon / common; the rule generalises it).
+
+   The two plates that sit on the live game — the player chip and a `dark` tag — use `--color-hud`,
+   the kit-wide HUD fill, not `--color-panel`: a HUD element has no panel around it and the mockups
+   read through it. */
+
+/* ---- CoreBadge — count / status pip ---------------------------------------------------------
+   Sits on top of an icon or after a label, so it is inline-flex with `vertical-align: middle` and
+   never grows: a three-character count widens it, nothing else does. */
+
+.core-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-ui-xs);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+/* `dot` drops the value and becomes a pip — the only round thing in the kit besides an avatar. */
+.core-badge.is-dot {
+  min-width: 0;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+/* `pulse`: a ring in the tone expanding out of the pip on the shared `core-ping` keyframe. It
+   starts exactly on the pip's own edge, so the first frame is hidden behind it and only the growing
+   part is ever seen — no z-index needed. The pip itself stays solid: a count has to stay readable. */
+.core-badge.is-pulse::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 1px solid var(--tone);
+  animation: core-ping 1.6s var(--ease-ui) infinite;
+  pointer-events: none;
+}
+
+/* ---- CoreTag — small label chip --------------------------------------------------------------
+   The HUD clock chip of mockup 2 is `variant="dark" size="lg"`; a rarity wins over `tone` because
+   rarityClass() lands after toneClass() on the root and both only set --tone / --tone-rgb. */
+
+.core-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-ui-xs);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 1;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.core-tag--sm { height: 20px; padding: 0 7px; gap: 5px; font-size: 11px; }
+.core-tag--lg { height: 30px; padding: 0 12px; gap: 8px; font-size: 15px; }
+
+/* Tracking adds a trailing gap after the last glyph; pulling the label back re-centres the chip. */
+.core-tag__label { margin-right: -0.1em; }
+.core-tag__icon { margin-left: -1px; }
+
+.core-tag__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-right: -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  background: none;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: opacity 0.12s var(--ease-ui);
+}
+.core-tag__remove:hover { opacity: 1; }
+.core-tag__remove:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+  opacity: 1;
+}
+
+/* ---- the four chip fills, shared by CoreBadge and CoreTag ----------------------------------- */
+
+.core-badge--soft,
+.core-tag--soft {
+  background: rgb(var(--tone-rgb) / 0.14);
+  border-color: rgb(var(--tone-rgb) / 0.30);
+  color: var(--tone);
+}
+
+.core-badge--outline,
+.core-tag--outline {
+  background: transparent;
+  border-color: rgb(var(--tone-rgb) / 0.55);
+  color: var(--tone);
+}
+
+.core-badge--solid,
+.core-tag--solid {
+  background: var(--tone);
+  border-color: transparent;
+  color: var(--color-ink);
+}
+
+/* The two tones dark enough to carry white; accent also earns the brand gradient (§37.1). */
+.core-tone-accent.core-badge--solid,
+.core-tone-accent.core-tag--solid {
+  background: var(--core-grad-accent);
+  color: var(--color-on-accent);
+}
+.core-tone-danger.core-badge--solid,
+.core-tone-danger.core-tag--solid { color: var(--color-on-accent); }
+
+/* `dark` is the HUD chip: no border, just a plate of ink under white text. The glyph keeps the
+   tone, which is what makes mockup 2's clock a warm sun in front of a plain white 18:24. The chip
+   is small and often sits on bright sky, so it stays at the 78 % of §37.5 rather than dropping to
+   --color-hud: a 24 px plate at 62 % lets the art bleed straight through four digits. */
+.core-tag--dark {
+  background: rgb(var(--core-ink-rgb) / 0.78);
+  border-color: transparent;
+  color: var(--color-fg);
+}
+.core-tag--dark .core-tag__icon { color: var(--tone); }
+
+/* ---- CoreAvatar ------------------------------------------------------------------------------
+   The box is sized inline (px come from the `size` prop), so only the look lives here. `ring` is an
+   outline with an offset rather than a border: it costs no layout and leaves the 2 px ink gap. */
+
+.core-avatar {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  flex: none;
+  border-radius: var(--radius-ui-sm);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--color-fg-dim);
+  font-family: var(--font-display);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+  user-select: none;
+}
+.core-avatar--circle { border-radius: 50%; }
+
+.core-avatar__img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+
+.core-avatar.is-ring {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+/* ---- status dots (CoreAvatar + CorePlayerChip) ---------------------------------------------- */
+
+.core-avatar__status {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  box-sizing: border-box;
+  border: 2px solid var(--color-ink);
+  border-radius: 50%;
+  background: var(--color-fg-faint);
+}
+/* On a circle the corner of the bounding box is outside the disc — pull the dot onto the edge. */
+.core-avatar--circle .core-avatar__status { right: 3%; bottom: 3%; }
+
+.core-avatar__status.is-online,
+.core-playerchip__status.is-online { background: var(--color-success); }
+.core-avatar__status.is-away,
+.core-playerchip__status.is-away { background: var(--color-warning); }
+.core-avatar__status.is-busy,
+.core-playerchip__status.is-busy { background: var(--color-error); }
+.core-avatar__status.is-offline,
+.core-playerchip__status.is-offline { background: var(--color-fg-faint); }
+
+/* ---- CorePlayerChip — mockup 1, top right ----------------------------------------------------
+   Portrait flush against the left edge (the root clips it to the panel radius), name and status on
+   the first line, `Lv. 32` plus its own 4 px XP rail on the second. A HUD element: click-through,
+   so a plugin that puts a button in the `meta` slot has to re-enable pointer events on it. */
+
+.core-playerchip {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  box-sizing: border-box;
+  width: 296px;
+  min-height: 74px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui);
+  background-color: var(--color-hud);
+  background-image: var(--core-grad-sheen);
+  box-shadow: var(--shadow-ui-sm);
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.core-playerchip__avatar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  width: 72px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 24px;
+  line-height: 1;
+  text-transform: uppercase;
+  color: var(--color-fg-dim);
+}
+.core-playerchip__avatar img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.core-playerchip__body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  justify-content: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px 14px 10px 16px;
+}
+
+.core-playerchip__top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.core-playerchip__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.core-playerchip__status {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-fg-faint);
+}
+
+.core-playerchip__meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.core-playerchip__level {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg);
+}
+.core-playerchip__xp {
+  flex: 1 1 auto;
+  height: 4px;
+  min-width: 40px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.16);
+  overflow: hidden;
+}
+/* `display: block` is load-bearing: both rails are <span>s, and an inline box ignores width. */
+.core-playerchip__xpfill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--core-grad-accent);
+  transition: width 0.25s var(--ease-ui);
+}
+
+.core-playerchip__subtitle {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.25;
+  color: var(--color-fg-dim);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ---- CoreTable -------------------------------------------------------------------------------
+   A real <table>, so a column keeps its width across rows without a grid. The root is the scroll
+   wrapper (`core-table__wrap`) because `stickyHeader` needs a scroll container and the caller's
+   max-height has to land on it; the <table> itself wears `core-table`. */
+
+/* Rows are clickable and the body is focusable, so the wrapper takes the mouse back (§37.4) — a
+   table dropped straight into a click-through page would otherwise never see a click. */
+.core-table__wrap {
+  position: relative;
+  width: 100%;
+  overflow: auto;
+  pointer-events: auto;
+}
+
+.core-table {
+  width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  color: var(--color-fg);
+}
+
+.core-table__th {
+  height: 34px;
+  padding: 0 14px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--color-border);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-faint);
+}
+.core-table__th--center { text-align: center; }
+.core-table__th--right { text-align: right; }
+
+/* The header has to be opaque or the rows scroll through it: the panel token is 90 % alpha. */
+.core-table__wrap.is-sticky .core-table__th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--color-panel-solid);
+}
+
+.core-table__body:focus { outline: none; }
+.core-table__body:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: -2px;
+}
+
+.core-table__row { transition: background-color 0.12s var(--ease-ui); }
+
+.core-table__cell {
+  height: 44px;
+  padding: 0 14px;
+  vertical-align: middle;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.core-table__cell--center { text-align: center; }
+.core-table__cell--right { text-align: right; }
+.core-table--dense .core-table__th { height: 30px; }
+.core-table--dense .core-table__cell { height: 36px; }
+
+.core-table.is-selectable .core-table__row { cursor: pointer; }
+.core-table.is-selectable .core-table__row:hover { background: rgba(255, 255, 255, 0.03); }
+
+.core-table__row.is-selected { background: var(--color-accent-soft); }
+/* The 2 px bar lives on the first cell: a collapsed table drops an inset shadow on the <tr>. */
+.core-table__row.is-selected .core-table__cell:first-child { box-shadow: inset 2px 0 0 var(--color-accent); }
+
+.core-table__empty > .core-table__cell {
+  height: auto;
+  padding: 0;
+  border-bottom: 0;
+  text-align: center;
+  color: var(--color-fg-dim);
+}
+/* Only the DEFAULT one-line placeholder: the `empty` slot usually holds a CoreEmpty, whose own
+   paragraphs must keep their own voices, so the child combinator stops the rule at the top level. */
+.core-table__empty > .core-table__cell > p {
+  margin: 0;
+  padding: 34px 16px;
+  font-size: var(--text-ui-sm);
+  color: var(--color-fg-faint);
+}
+
+/* A cell that pairs a thumbnail with a name — the faction roster of the gallery. */
+.core-table__media {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* ---- CoreKeyValue ----------------------------------------------------------------------------
+   The read-out voice of mockup 3 ("3 / 10 — IN INVENTORY"): label voice left, display voice right,
+   one hairline per row. `columns` splits the same rows into a grid for a wide detail panel. */
+
+/* A <dl> of <div><dt><dd></div> rows — the UA margins on both have to go first. */
+.core-kv {
+  display: grid;
+  width: 100%;
+  margin: 0;
+  column-gap: 32px;
+}
+
+.core-kv__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 32px;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.core-kv__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+}
+.core-kv__icon {
+  flex: none;
+  color: var(--color-fg-faint);
+}
+
+.core-kv__value {
+  flex: none;
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  color: var(--color-fg);
+  text-align: right;
+}
+
+/* `tone` on an item paints the value and its glyph — a red WANTED level, a green payout. */
+.core-kv__item.is-toned .core-kv__value,
+.core-kv__item.is-toned .core-kv__icon { color: var(--tone); }
+
+/* ---- CoreEmpty -------------------------------------------------------------------------------
+   What a list says when it has nothing: a framed glyph, a display-voice line, one sentence of
+   explanation and whatever the caller puts in the default slot (the actions). */
+
+.core-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 44px 24px;
+  text-align: center;
+}
+
+.core-empty__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 60px;
+  height: 60px;
+  margin-bottom: 18px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-fg-faint);
+}
+
+.core-empty__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--text-display-sm);
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+}
+
+.core-empty__text {
+  margin: 10px 0 0;
+  max-width: 46ch;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--color-fg-dim);
+}
+
+/* The slot holds buttons, so it takes the mouse back even inside a click-through overlay. */
+.core-empty__actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 20px;
+  pointer-events: auto;
+}

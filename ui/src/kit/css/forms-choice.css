@@ -1,0 +1,546 @@
+/* core UI kit — Forms — choice (DESIGN §37.5).
+   CoreCheckbox, CoreRadioGroup, CoreRadio, CoreSwitch, CoreSlider,
+   CoreSwatches.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
+
+   Every control here is a REAL native input under the paint: `appearance: none` on the
+   checkbox and the radio (they need no pseudo-element, so the input itself can be the box),
+   a sibling track for the switch (Chromium renders no ::before/::after on a void <input>) and
+   the ::-webkit-slider-* pseudo-elements for the range. Keyboard, labels, :checked, :disabled
+   and :indeterminate therefore come for free instead of being re-implemented in JS.
+   The tick and the indeterminate bar are inline SVG data URIs — one background-image, no extra
+   element, and a bold round-joined mark that matches the mockup's map filters. */
+
+/* ---- checkbox (.core-check) ----------------------------------------------------------------
+   The look hangs off `.core-check input`, so the legacy markup
+   `<label class="core-check"><input type="checkbox"><span>…</span></label>` wears it too. */
+
+.core-check {
+  --core-check-size: 22px;
+  --core-check-gap: 14px;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--core-check-gap);
+  pointer-events: auto;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.core-check--sm { --core-check-size: 18px; --core-check-gap: 11px; }
+.core-check--lg { --core-check-size: 26px; --core-check-gap: 16px; }
+
+.core-check input[type='checkbox'] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: none;
+  width: var(--core-check-size);
+  height: var(--core-check-size);
+  margin: 0;
+  padding: 0;
+  border: 1.5px solid rgba(255, 255, 255, 0.38);
+  border-radius: var(--radius-ui-xs);
+  background-color: rgb(var(--core-ink-rgb) / 0.28);
+  background-repeat: no-repeat;
+  background-position: 50% 50%;
+  background-size: 82% 82%;
+  cursor: inherit;
+  transition: border-color 0.12s var(--ease-ui), background-color 0.12s var(--ease-ui),
+    box-shadow 0.12s var(--ease-ui);
+}
+
+.core-check:hover input[type='checkbox']:not(:disabled) { border-color: rgba(255, 255, 255, 0.70); }
+
+.core-check input[type='checkbox']:checked,
+.core-check input[type='checkbox']:indeterminate {
+  border-color: transparent;
+  background-color: var(--color-accent);
+  background-image: var(--core-grad-accent);
+}
+
+/* The bold, round-joined tick of the mockup's MAP FILTERS, drawn once as a data URI. */
+.core-check input[type='checkbox']:checked {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='3.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5.4 12.7l4.7 4.7L18.8 7.4'/%3E%3C/svg%3E"), var(--core-grad-accent);
+}
+
+.core-check input[type='checkbox']:indeterminate {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='5' y='10.5' width='14' height='3' rx='1.5' fill='%23ffffff'/%3E%3C/svg%3E"), var(--core-grad-accent);
+}
+
+.core-check:hover input[type='checkbox']:checked:not(:disabled),
+.core-check:hover input[type='checkbox']:indeterminate:not(:disabled) {
+  box-shadow: 0 0 0 1px rgb(var(--core-accent-rgb) / 0.45), 0 0 12px rgb(var(--core-accent-rgb) / 0.30);
+}
+
+.core-check input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+/* Between box and label: the map-filter glyph, at full `fg` whether the row is on or off — the
+   mockup keeps every glyph bright and lets the coral box carry the state. It also leaves more air
+   between the box and the glyph than between the glyph and the label, hence the extra margin. */
+.core-check__icon {
+  flex: none;
+  margin-top: 1px;
+  margin-left: 8px;
+  color: var(--color-fg);
+}
+
+/* `> span` and not a part class: the legacy label is a bare <span>. */
+.core-check > span {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  line-height: calc(var(--core-check-size) - 2px);
+  color: var(--color-fg);
+}
+
+.core-check__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.core-check__label {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  line-height: calc(var(--core-check-size) - 2px);
+  color: var(--color-fg);
+}
+
+.core-check__desc {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui-sm);
+  line-height: 1.45;
+  color: var(--color-fg-dim);
+}
+
+.core-check.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-check input[type='checkbox']:disabled { cursor: not-allowed; }
+
+/* ---- radio (.core-radiogroup, .core-radio) --------------------------------------------------
+   Same trick as the checkbox: the <input type="radio"> IS the ring. The dot is a hard-stopped
+   radial-gradient rather than a pseudo-element, which a void input cannot have. */
+
+.core-radiogroup {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  pointer-events: auto;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.core-radiogroup--horizontal {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 18px;
+}
+.core-radiogroup--card { gap: 10px; }
+.core-radiogroup.is-disabled { opacity: 0.45; }
+
+.core-radio {
+  --core-radio-size: 20px;
+  --core-radio-gap: 12px;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--core-radio-gap);
+  pointer-events: auto;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.core-radio--sm { --core-radio-size: 16px; --core-radio-gap: 10px; }
+.core-radio--lg { --core-radio-size: 24px; --core-radio-gap: 14px; }
+
+.core-radio input[type='radio'] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: none;
+  width: var(--core-radio-size);
+  height: var(--core-radio-size);
+  margin: 0;
+  padding: 0;
+  border: 1.5px solid rgba(255, 255, 255, 0.38);
+  border-radius: 50%;
+  background-color: rgb(var(--core-ink-rgb) / 0.28);
+  cursor: inherit;
+  transition: border-color 0.12s var(--ease-ui), box-shadow 0.12s var(--ease-ui);
+}
+
+.core-radio:hover input[type='radio']:not(:disabled) { border-color: rgba(255, 255, 255, 0.70); }
+
+.core-radio input[type='radio']:checked {
+  border-width: 2px;
+  border-color: var(--color-accent-hi);
+  background-image: radial-gradient(circle at 50% 50%,
+    var(--color-accent) 0,
+    var(--color-accent) calc(var(--core-radio-size) * 0.25),
+    rgba(0, 0, 0, 0) calc(var(--core-radio-size) * 0.25 + 0.5px));
+  box-shadow: 0 0 10px rgb(var(--core-accent-rgb) / 0.35);
+}
+
+.core-radio input[type='radio']:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+.core-radio > span {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  line-height: calc(var(--core-radio-size) - 1px);
+  color: var(--color-fg);
+}
+
+.core-radio__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.core-radio__label {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  line-height: calc(var(--core-radio-size) - 1px);
+  color: var(--color-fg);
+}
+
+.core-radio__desc {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui-sm);
+  line-height: 1.45;
+  color: var(--color-fg-dim);
+}
+
+.core-radio.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-radio input[type='radio']:disabled { cursor: not-allowed; }
+
+/* *card*: the big selectable tile — spawn point, difficulty, payment method. */
+.core-radio--card {
+  align-items: center;
+  padding: 13px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui-sm);
+  background: var(--color-panel-raise);
+  transition: border-color 0.14s var(--ease-ui), background-color 0.14s var(--ease-ui),
+    box-shadow 0.14s var(--ease-ui);
+}
+.core-radio--card:hover { border-color: var(--color-border-strong); }
+.core-radio--card.is-checked {
+  border-color: var(--color-accent-hi);
+  background: var(--color-accent-soft);
+  box-shadow: var(--shadow-glow-sm);
+}
+.core-radio--card .core-radio__body { flex: 1 1 auto; }
+.core-radio--card.is-disabled:hover { border-color: var(--color-border); }
+
+/* ---- switch (.core-switch) ------------------------------------------------------------------
+   The one control whose input cannot be the paint: Chromium renders no pseudo-element on a void
+   <input>, and the thumb has to move inside the track. So the input is visually hidden (never
+   display:none — that would take it out of the tab order) and the sibling track reads :checked. */
+
+.core-switch {
+  position: relative;
+  --core-switch-w: 42px;
+  --core-switch-h: 22px;
+  --core-switch-thumb: 16px;
+  --core-switch-pad: 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  pointer-events: auto;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.core-switch--sm { --core-switch-w: 34px; --core-switch-h: 18px; --core-switch-thumb: 12px; }
+.core-switch--lg { --core-switch-w: 52px; --core-switch-h: 26px; --core-switch-thumb: 20px; }
+.core-switch--left { flex-direction: row-reverse; justify-content: space-between; }
+
+.core-switch__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.core-switch__track {
+  position: relative;
+  flex: none;
+  width: var(--core-switch-w);
+  height: var(--core-switch-h);
+  border: 1px solid rgba(255, 255, 255, 0.20);
+  border-radius: var(--radius-ui-xs);
+  background: var(--color-panel-sunken);
+  transition: background-color 0.14s var(--ease-ui), border-color 0.14s var(--ease-ui),
+    box-shadow 0.14s var(--ease-ui);
+}
+
+.core-switch__thumb {
+  position: absolute;
+  top: 50%;
+  left: var(--core-switch-pad);
+  width: var(--core-switch-thumb);
+  height: var(--core-switch-thumb);
+  margin-top: calc(var(--core-switch-thumb) / -2);
+  border-radius: 2px;
+  background: var(--color-key);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transition: transform 0.16s var(--ease-ui), background-color 0.14s var(--ease-ui);
+}
+
+.core-switch:hover .core-switch__track { border-color: rgba(255, 255, 255, 0.34); }
+
+.core-switch__input:checked + .core-switch__track {
+  border-color: transparent;
+  background-image: var(--core-grad-accent);
+}
+.core-switch__input:checked + .core-switch__track .core-switch__thumb {
+  transform: translateX(calc(var(--core-switch-w) - var(--core-switch-thumb) - var(--core-switch-pad) * 2));
+}
+.core-switch:hover .core-switch__input:checked + .core-switch__track {
+  box-shadow: 0 0 12px rgb(var(--core-accent-rgb) / 0.32);
+}
+
+.core-switch__input:focus-visible + .core-switch__track {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+.core-switch__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.core-switch__label {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  line-height: 1.3;
+  color: var(--color-fg);
+}
+
+.core-switch__desc {
+  font-family: var(--font-sans);
+  font-size: var(--text-ui-sm);
+  line-height: 1.45;
+  color: var(--color-fg-dim);
+}
+
+.core-switch.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-switch.is-disabled:hover .core-switch__track { border-color: rgba(255, 255, 255, 0.20); }
+
+/* ---- slider (.core-slider) -------------------------------------------------------------------
+   A real <input type="range"> painted through the ::-webkit-slider-* pseudo-elements — the CEF is
+   Chromium, so the -moz- set would be dead weight. The fill is not a second element: the track is
+   a two-stop gradient cut at --core-slider-pct, which the component sets inline from toPercent().
+   The bare class `input[type='range'].core-slider` gets the same track and thumb. */
+
+.core-slider {
+  --core-slider-pct: 0%;
+  --core-slider-track: 4px;
+  --core-slider-thumb-w: 10px;
+  --core-slider-thumb-h: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+  min-width: 0;
+}
+
+.core-slider__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.core-slider__label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+}
+
+.core-slider__value {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--text-ui);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  line-height: 1;
+  color: var(--color-fg);
+}
+
+.core-slider__rail {
+  position: relative;
+  display: block;
+  padding: 2px 0;
+}
+
+.core-slider__input,
+input[type='range'].core-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: var(--core-slider-thumb-h);
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.core-slider__input::-webkit-slider-runnable-track,
+input[type='range'].core-slider::-webkit-slider-runnable-track {
+  height: var(--core-slider-track);
+  border-radius: 2px;
+  background-image: linear-gradient(90deg,
+    var(--tone, var(--color-accent)) 0,
+    var(--tone, var(--color-accent)) var(--core-slider-pct),
+    rgba(255, 255, 255, 0.14) var(--core-slider-pct),
+    rgba(255, 255, 255, 0.14) 100%);
+}
+
+.core-slider__input::-webkit-slider-thumb,
+input[type='range'].core-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: var(--core-slider-thumb-w);
+  height: var(--core-slider-thumb-h);
+  margin-top: calc((var(--core-slider-track) - var(--core-slider-thumb-h)) / 2);
+  border: 0;
+  border-radius: 2px;
+  background: var(--color-key);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  transition: box-shadow 0.12s var(--ease-ui);
+}
+
+.core-slider__input:hover::-webkit-slider-thumb,
+.core-slider__input:active::-webkit-slider-thumb,
+input[type='range'].core-slider:hover::-webkit-slider-thumb {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55), 0 0 0 5px rgb(var(--tone-rgb, var(--core-accent-rgb)) / 0.25);
+}
+
+/* The whole track is the ring, not the thumb: a 10 px tile with a 2 px outline around it reads as
+   a smudge at 1080p, and the control the key is steering is the track. */
+.core-slider__input:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Marks under the track: one 1 px hairline per step, the ends flush with the track ends. */
+.core-slider__ticks {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  height: 5px;
+  margin: -1px calc(var(--core-slider-thumb-w) / 2) 0;
+}
+.core-slider__tick {
+  width: 1px;
+  height: 5px;
+  background: rgba(255, 255, 255, 0.18);
+}
+.core-slider__tick.is-passed { background: rgb(var(--tone-rgb, var(--core-accent-rgb)) / 0.55); }
+
+.core-slider__ends {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  font-family: var(--font-sans);
+  font-size: var(--text-ui-sm);
+  line-height: 1.3;
+  color: var(--color-fg-faint);
+}
+
+.core-slider.is-disabled { opacity: 0.45; }
+.core-slider.is-disabled .core-slider__input { cursor: not-allowed; }
+.core-slider.is-disabled .core-slider__input::-webkit-slider-thumb { box-shadow: none; }
+
+/* ---- swatches (.core-swatches, .core-swatch) --------------------------------------------------
+   Real buttons with aria-pressed, so a swatch row is a toolbar and not a grid of divs. Every
+   swatch keeps a 1 px light inset line: a near-black paint would otherwise have no edge at all
+   against the panel, and the selection ring alone cannot say where the tile is. */
+
+.core-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  pointer-events: auto;
+  min-width: 0;
+}
+.core-swatches--grid {
+  display: grid;
+  justify-content: start;
+}
+
+.core-swatch {
+  --core-swatch-size: 30px;
+  flex: none;
+  width: var(--core-swatch-size);
+  height: var(--core-swatch-size);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-ui-xs);
+  background-color: var(--color-panel-raise);
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+  transition: box-shadow 0.12s var(--ease-ui), transform 0.12s var(--ease-ui);
+}
+
+.core-swatches--sm .core-swatch { --core-swatch-size: 22px; }
+.core-swatches--md .core-swatch { --core-swatch-size: 30px; }
+.core-swatches--lg .core-swatch { --core-swatch-size: 38px; }
+.core-swatches--circle .core-swatch { border-radius: 50%; }
+
+.core-swatch:hover {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.40),
+    0 0 0 2px var(--color-ink), 0 0 0 3px rgba(255, 255, 255, 0.28);
+}
+
+.core-swatch.is-selected,
+.core-swatch.is-selected:hover {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.30),
+    0 0 0 2px var(--color-ink), 0 0 0 4px var(--color-accent-hi),
+    0 0 14px rgb(var(--core-accent-rgb) / 0.35);
+}
+
+.core-swatch:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+.core-swatch:disabled,
+.core-swatches.is-disabled .core-swatch {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

@@ -1,23 +1,22 @@
 <script setup>
 // Notification stack, top-right under the HUD (DESIGN §7.2).
 // Entries are pushed/removed by the store; this component only renders them.
+//
+// Skin: CoreToast cards (DESIGN §37.6) — tone bar, tone glyph, display-voice kicker and the
+// `count` pill. `is-<type>` stays on the card as the hook class the stories read.
 import { store } from '../store.js'
+import CoreIcon from '../kit/components/CoreIcon.vue'
 
 const TYPES = ['info', 'success', 'error', 'warning']
 
-// Per-type accents as theme utilities; `is-<type>` stays on the card as a hook class.
-const BAR = {
-  info: 'bg-accent',
-  success: 'bg-success',
-  error: 'bg-error',
-  warning: 'bg-warning',
+// notify's four types -> the kit's six tones (§37.4) and the tone glyph of CoreToast.
+const TONE = {
+  info: 'core-tone-info',
+  success: 'core-tone-success',
+  error: 'core-tone-danger',
+  warning: 'core-tone-warning',
 }
-const TITLE = {
-  info: 'text-accent',
-  success: 'text-success',
-  error: 'text-error',
-  warning: 'text-warning',
-}
+const ICON = { info: 'info', success: 'success', error: 'error', warning: 'warning' }
 
 function typeOf (t) {
   return TYPES.indexOf(t) === -1 ? 'info' : t
@@ -28,30 +27,26 @@ function typeOf (t) {
   <TransitionGroup
     name="notif"
     tag="div"
-    class="notifs relative w-[300px] flex flex-col items-stretch gap-[8px] pointer-events-none"
+    class="notifs relative w-[340px] flex flex-col items-stretch gap-[8px] pointer-events-none"
   >
     <div
       v-for="n in store.notifications"
       :key="n.id"
-      class="notif flex items-stretch gap-[9px] py-[8px] pr-[10px] pl-0
-             bg-panel border border-border rounded-ui overflow-hidden text-[13px] leading-[1.35]"
-      :class="'is-' + typeOf(n.type)"
+      class="notif core-toast"
+      :class="['is-' + typeOf(n.type), TONE[typeOf(n.type)]]"
+      role="status"
+      aria-live="polite"
       data-core-blur
     >
-      <span class="bar flex-[0_0_3px] w-[3px] rounded-l-[3px]" :class="BAR[typeOf(n.type)]"></span>
-      <div class="body flex-auto min-w-0">
-        <div
-          v-if="n.title"
-          class="title text-[11px] font-bold tracking-[0.05em] uppercase mb-[2px]"
-          :class="TITLE[typeOf(n.type)]"
-        >{{ n.title }}</div>
-        <div class="msg text-fg [overflow-wrap:anywhere]">{{ n.message }}</div>
+      <span class="bar core-toast__bar" aria-hidden="true"></span>
+      <div class="core-toast__main">
+        <CoreIcon class="core-toast__icon" :name="ICON[typeOf(n.type)]" size="md" />
+        <div class="body core-toast__body">
+          <div v-if="n.title" class="title core-toast__title">{{ n.title }}</div>
+          <div class="msg core-toast__message">{{ n.message }}</div>
+        </div>
+        <span v-if="n.count > 1" class="count core-toast__count">&times;{{ n.count }}</span>
       </div>
-      <span
-        v-if="n.count > 1"
-        class="count flex-none self-center px-[6px] py-px border border-border rounded-full
-               text-[11px] tabular-nums text-fg-dim"
-      >&times;{{ n.count }}</span>
     </div>
   </TransitionGroup>
 </template>

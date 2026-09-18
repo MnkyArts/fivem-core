@@ -607,6 +607,8 @@ Vehicles.persist(netId) -> vehId | nil             -- creates the record for a s
 Vehicles.getRecords(charId) -> array of records
 Vehicles.getRecord(vehId) -> record | nil
 Vehicles.spawnRecord(vehId, coords, heading, ownerSrc?) -> netId | nil, err   -- spawns from a record (props sent to ownerSrc's client), stored = false
+Vehicles.restoreRecord(vehId, coords?, heading?, ownerSrc?) -> netId | nil, err -- only an out record; saved position is the default
+Vehicles.adopt(netId, opts) -> vehId | nil, err -- trusted server resource promotes an existing network vehicle
 Vehicles.store(netId) -> bool                      -- saves position/props (last known), deletes the entity, stored = true
 Vehicles.saveProps(netId, props) -> bool           -- from the owner's client (§5), validated
 Vehicles.deleteRecord(vehId) -> bool
@@ -621,12 +623,20 @@ such as `LS-48291`. `SetVehicleNumberPlateText`; state: `coreVeh = true`, `locke
 `vehId`; `keyMode = 'virtual'` (the compatibility default) inserts the owner into `keys`, while
 `'item'` intentionally does not so a domain plugin can make a physical inventory key authoritative; `SetEntityRoutingBucket` if `bucket`; `SetEntityOrphanMode(veh, 2)` when `persistent` or an owner is
 set (otherwise leave default); track `spawned[netId]`; props → `TriggerClientEvent('core:client:applyVehicleProps',
-ownerSrc, netId, props)` if `ownerSrc`; `persist` saves `vehType` and `keyMode` in `meta`, and
-`spawnRecord` restores both; hook `vehicleSpawned (netId, info)`. `delete`: `DeleteEntity` + untrack +
-hook `vehicleDeleted (netId)`. On core's own `onResourceStop`, every persisted live record is first
-updated with `stored = true`, its cached props and final server position, then its entity is deleted
-synchronously; it is therefore retrievable after core restarts. `entityRemoved` (AddEventHandler):
-untrack if it was ours.
+ownerSrc, netId, props)` if `ownerSrc`; `persist` saves `vehType` and `keyMode` in `meta`, and both record spawn
+paths restore them; hook `vehicleSpawned (netId, info)`. `delete`: `DeleteEntity` + untrack + hook
+`vehicleDeleted (netId)`. `adopt` accepts only an existing network vehicle, canonicalises or replaces its plate,
+sets orphan mode, creates the same record/state contract and refuses an already tracked net id. It is a trusted
+server-resource API, never a client event.
+
+`stored = true` means deliberately garaged; `stored = false` means the record belongs in the world. On core's own
+`onResourceStop`, every persisted live record keeps `stored = false` while its cached props and exact final server
+position are synchronously saved before the obsolete entity is deleted. A domain plugin calls `restoreRecord` in
+bounded boot batches; that function refuses stored records and duplicate vehIds, so it cannot materialise something
+parked in a garage twice. A restored record also projects `coreProps` in its entity state (and refreshes it only
+when a validated saved-property payload changes), allowing whichever client streams it to replay colours/mods/
+damage even when the owner is offline. `entityRemoved`
+(`AddEventHandler`) only drops live bookkeeping: it never silently changes the persistent garage/world decision.
 
 ### 4.7 `Core.Notify` server (`server/notify.lua`)
 
@@ -812,7 +822,7 @@ Vehicles.getProps(veh) -> props, Vehicles.setProps(veh, props) -> bool   -- requ
 Vehicles.getPlate(veh) -> string (trimmed), Vehicles.getDisplayName(vehOrModel) -> string
 Vehicles.hasKeys(veh) -> bool           -- Entity(veh).state: explicit keys[charId] (not item-key vehicles); false if not a coreVeh
 Vehicles.isLocked(veh) -> bool          -- state 'locked'
-Vehicles.toggleLock(veh?) -> nil        -- veh or current/closest (≤ 8 m) with keys → Net.emit('core:server:vehicleLock', netId)
+Vehicles.toggleLock(veh?) -> nil        -- virtual-key veh or current/closest (≤ 8 m) → Net.emit('core:server:vehicleLock', netId); item-key vehicle no-ops for its plugin
 Vehicles.setEngine(veh, on), Vehicles.repair(veh), Vehicles.saveProps(veh)   -- saveProps → Net.emit('core:server:vehicleProps', netId, getProps(veh))
 ```
 
@@ -830,7 +840,9 @@ applies only keys present.
 Built-in behaviour: `AddStateBagChangeHandler('locked', nil, ...)` → only for entities with state `coreVeh` →
 `SetVehicleDoorsLocked(veh, value and 2 or 1)` (+ on stream-in via `Core.Vehicles` checking `Entity(veh).state.locked`
 when the player tries to enter: a 500 ms guard that only runs while `GetVehiclePedIsTryingToEnter(ped) ~= 0`).
-Key `Config.Vehicles.LockKey` (`U`) via `Core.Keys.register` → `toggleLock()`.
+Key `Config.Vehicles.LockKey` (`U`) via `Core.Keys.register` → `toggleLock()`. For `keyMode = 'item'`, this
+intentionally no-ops (without a false "no keys" message) so the owning domain plugin can bind the same UX key and
+validate its physical inventory item server-side.
 
 ### 6.9 `Core.Raycast` (`client/raycast.lua`)
 
@@ -1037,7 +1049,9 @@ Server writes, clients read (strict-mode safe). All keys flat.
 | | `locked` | boolean |
 | | `owner` | charId or `false` |
 | | `keys` | `{ [charId] = true }` |
+| | `keyMode` | `'virtual'` or `'item'` |
 | | `plate`, `vehId` | strings (`vehId` only when persisted) |
+| | `coreProps` | optional persisted `CoreVehicleProps` projection, refreshed only when saved props change |
 | `global` | `core:ready` | boolean |
 | | `faction:<id>` | `{ name, tag, color, memberCount }` or `false` |
 
@@ -1465,6 +1479,8 @@ Player.isNear(src, coords, range) -> bool; Player.getStreet(src) -> street, zone
 Vehicles.getInRange(coords, range) -> array of netId (core vehicles only), Vehicles.getDriver(netId) -> src|nil, Vehicles.getPassengers(netId) -> array
 Vehicles.getClosestToPlayer(src, maxDist = 20.0) -> netId|nil; Vehicles.setData(netId|vehId, key, value) / getData — record meta
 Globals.get(key, default?) / Globals.set(key, value) / Globals.increment(key, delta = 1) -> number / Globals.unset(key)   -- document 'globals'/'server', persisted; Globals.set(key, value, true) also mirrors to GlobalState['g:' .. key]
+--   the document is read on first access; that read yields on an asynchronous backend (postgres, mysql), and every caller arriving during it
+--   waits on the same promise (the db.lua barrier) — a plugin's onReady and its first cron tick may hit Globals at once (2026-09-16)
 Services.register(name, impl) -> bool / Services.get(name) -> impl|nil / Services.has(name) / Services.unregister(name)
 --   documented interfaces (README): notification { send(src, msg, type), broadcast(msg, type) }, currency { add(src, account, n, reason), sub, has, get },
 --   death { respawn(src, coords, heading), revive(src) }, items { add(src, id, qty, data), sub, has, remove(src, uid), get(src) }, time { set(h, m), get() },
@@ -2179,3 +2195,765 @@ IsInteriorEntitySetActive, RefreshInterior (INTERIOR), GetGameBuildNumber (CFX s
 README: cheat-sheet row + config rows + checklist step ("carrier off the coast, casino doors closed,
 tuner shop exteriors present; `/interiors` prints counts"). Diagnostics: client command `/interiors`
 lists groups with loaded counts (console + chat).
+
+## 37. Design system — the UI kit (`ui/src/kit`) — 2026-09-18, Liam: "our UIs all look kind of different"
+
+Every plugin page used to build its own buttons, sliders and panels, so no two UIs looked alike. §37 gives the
+shell and every plugin **one visual language and one component library**. The look comes from Liam's four
+mockups (`FiveM/DesignMockups/`: main menu, HUD, inventory, map) and **replaces** the §7.2 "visual direction"
+(blue accent, system font, 8 px radius) — nothing in the kit is derived from the old look. Three layers, each
+usable on its own:
+
+1. **tokens** — the `@theme` block of `ui/src/styles.css` (§37.2): every colour, font, radius, shadow.
+2. **classes** — `ui/src/kit/css/*.css`, the `.core-*` vocabulary (§37.5 names them per component); plain HTML
+   in a page may wear them directly.
+3. **components** — `ui/src/kit/components/Core*.vue`, registered globally (§37.3): `<CoreButton>` works in every
+   plugin page without an import.
+
+Rule for pages (AGENTS §3 UI): compose kit components; write custom CSS only for what the kit lacks, and then
+with tokens only — never a literal colour, font family or radius.
+
+### 37.1 Visual language (what makes a screen look like the mockups)
+
+- **Surfaces**: blue-black slate. Translucent panels (`--color-panel`, 90 %) over the game, 1 px hairline
+  border (white 12 %, 22 % for the strong one), 6 px panel radius, 4 px control radius, 3 px for key caps /
+  checkboxes / badges / tags. A faint
+  top sheen on panels, a deep soft shadow under them. Wells (inputs, tracks) are darker than the panel
+  (`--color-panel-sunken`), raised cells (slots, chips) a touch lighter (`--color-panel-raise`).
+- **Accent**: one coral red (`#f6503f`). Two gradient recipes carry the brand: the **solid** accent gradient
+  (primary buttons, active chips, checked boxes, progress fills) and the **fading** accent gradient — full
+  coral on the left dissolving into the panel on the right (active menu rows, the fading primary button).
+  Selection is a 1–2 px `accent-hi` border plus a soft coral glow, never a filled block.
+- **Type**: `Barlow Condensed` (display: headings, buttons, tabs, menu rows, labels, numbers — uppercase,
+  tracked) and `Barlow` (body copy, descriptions, form text). Both are bundled (`kit/fonts/`, OFL 1.1) because
+  the CEF cannot fetch the web. Three label voices: *display* (700, tight tracking), *label* (600, 12 px,
+  0.14 em), *eyebrow* (500, 13 px, 0.32 em — the widely spaced subtitle under a heading).
+- **Keys**: a key cap is a solid near-white tile with dark condensed text; mouse buttons are line glyphs.
+- **Motifs**: the short accent dash, the `//` double-slash heading marker with an italic title, stacked
+  wide-tracked taglines next to a vertical hairline, hairline-framed stat rows.
+- **Motion**: 120 ms hovers, 160–220 ms enters and 120 ms leaves (`--ease-ui`), fades, a 0.97 pop and 12–18 px
+  slides; nothing bounces. `prefers-reduced-motion` cuts every `core-*` transition to nothing, but leaves the
+  functional animations running — a frozen spinner reads as a hang, not as calm.
+- **Icons**: filled glyphs on a 24 × 24 grid (`kit/icons.js`, path data from Material Design Icons, Apache-2.0),
+  drawn with `currentColor`.
+
+### 37.2 Tokens (`ui/src/styles.css`, exact values)
+
+The token *names* of §7.1 stay (every page already uses `bg-panel`, `text-fg-dim`, `rounded-ui`, …); their
+values change and new ones join. `@theme` (→ Tailwind utilities) :
+
+```css
+--font-sans: 'Barlow', 'Segoe UI', system-ui, -apple-system, Roboto, 'Helvetica Neue', Arial, sans-serif;
+--font-display: 'Barlow Condensed', 'Barlow', 'Arial Narrow', 'Segoe UI', sans-serif;
+--font-mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+
+--color-ink: #060b0f;                          /* page floor, scrims, ring gaps */
+--color-panel: rgba(11, 17, 22, 0.90);
+--color-panel-glass: rgba(11, 17, 22, 0.64);   /* tint over a data-core-blur copy (§32) */
+--color-panel-solid: #0d1419;
+--color-panel-raise: rgba(255, 255, 255, 0.035);
+--color-panel-sunken: rgba(0, 0, 0, 0.30);
+--color-panel-popup: rgba(11, 17, 22, 0.98);  /* select list, context menu, tooltip, popover */
+--color-hud: rgba(8, 12, 16, 0.68);          /* HUD plates over the live game: chip, tracker, clock, stat plate */
+--color-border: rgba(255, 255, 255, 0.12);
+--color-border-strong: rgba(255, 255, 255, 0.22);
+--color-backdrop: rgba(4, 8, 11, 0.62);
+
+--color-accent: #f6503f;   --color-accent-hi: #ff6351;   --color-accent-lo: #d53e2f;
+--color-accent-soft: rgba(246, 80, 63, 0.16);  --color-on-accent: #ffffff;
+
+--color-success: #3fd67f;  --color-warning: #f5a623;  --color-error: #ff4560;  --color-info: #55b6f7;
+--color-health: #fa5246;   --color-armour: #5dbbf7;   --color-stamina: #5de395;
+--color-hunger: #f5a623;   --color-thirst: #4fd1e8;   --color-oxygen: #9fd8ff;  --color-stress: #b68cff;
+--color-rarity-common: #aeb6bf;  --color-rarity-uncommon: #5de395;  --color-rarity-rare: #5dbbf7;
+--color-rarity-epic: #b68cff;    --color-rarity-legendary: #f5a623;
+
+--color-fg: #f3f5f7;  --color-fg-dim: rgba(231, 237, 243, 0.66);  --color-fg-faint: rgba(231, 237, 243, 0.40);
+--color-key: #fbfbfb; --color-key-fg: #11161b;
+
+--radius-ui: 6px;  --radius-ui-sm: 4px;  --radius-ui-xs: 3px;
+--shadow-ui: 0 14px 40px rgba(0, 0, 0, 0.50);  --shadow-ui-sm: 0 4px 14px rgba(0, 0, 0, 0.40);
+--shadow-ui-lg: 0 30px 80px rgba(0, 0, 0, 0.60);
+--shadow-glow: 0 0 0 1px #ff6351, 0 0 22px rgba(246, 80, 63, 0.42), inset 0 0 26px rgba(246, 80, 63, 0.12);
+--shadow-glow-sm: 0 0 0 1px #ff6351, 0 0 16px rgba(246, 80, 63, 0.32);
+--ease-ui: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+--text-ui-xs: 11px;  --text-ui-sm: 13px;  --text-ui: 15px;  --text-ui-lg: 17px;
+--text-display-sm: 18px;  --text-display: 24px;  --text-display-lg: 34px;  --text-display-xl: 48px;
+--tracking-display: 0.04em;  --tracking-label: 0.14em;  --tracking-eyebrow: 0.32em;
+```
+
+plus the `--animate-core-*` entries (§7.1's three and `core-slide-up`, `core-spin`, `core-shimmer`,
+`core-pulse`). Plain custom properties in `:root` (not theme keys — recipes, not utilities):
+
+```css
+--core-accent-rgb: 246 80 63;     /* kit CSS writes alpha as rgb(var(--core-accent-rgb) / 0.16) — Chrome 65+ */
+--core-ink-rgb: 6 11 15;  --core-panel-rgb: 11 17 22;
+--core-error-rgb: 255 69 96;  --core-success-rgb: 63 214 127;  --core-warning-rgb: 245 166 35;  --core-info-rgb: 85 182 247;
+--core-grad-accent: linear-gradient(90deg, #ff5a49 0%, #f6503f 45%, #ee4339 100%);
+--core-grad-accent-fade: linear-gradient(90deg, #fd5443 0%, #f6503f 18%, rgb(246 80 63 / 0.18) 100%);
+--core-grad-accent-fade-out: linear-gradient(90deg, #fd5443 0%, #f6503f 16%, rgb(246 80 63 / 0.04) 100%);
+--core-grad-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0, rgba(255, 255, 255, 0) 120px);
+--core-h-sm: 30px;  --core-h-md: 40px;  --core-h-lg: 52px;      /* control heights */
+--core-focus: 0 0 0 3px rgb(var(--core-accent-rgb) / 0.18);     /* focus halo for boxes */
+```
+
+A server re-themes by overriding `--color-accent*`, `--core-accent-rgb` and the three gradients. The legacy
+`--core-*` aliases of §7.1 stay (they point at the theme tokens). Body text is `--text-ui` (15 px Barlow reads
+like 14 px Segoe); the root stays 16 px (§7.1). Alpha modifiers (`bg-accent/10`) are only safe on **hex**
+tokens — Tailwind's static fallback cannot resolve an `rgba()`/`var()` token and Chromium 103 has no
+`color-mix()`.
+
+### 37.3 Files, registration, use from a plugin page
+
+```
+ui/src/kit/index.js          components map (import.meta.glob of ./components/Core*.vue), installKit(app), re-exports
+ui/src/kit/icons.js          ICONS name → 24×24 path (185 glyphs vendored from @mdi/js 7.4, Apache-2.0 — no
+                             dependency), registerIcons(map), iconPath(nameOrPath)
+ui/src/kit/use.js            SIZES/TONES/METER_TONES/RARITIES, oneOf, toneClass/rarityClass, useId, normalizeItems,
+                             clamp, toPercent, nextEnabledIndex, blurAttr, escape layers, onClickOutside,
+                             overlayTarget, placeFloating/useFloating, focusables, useFocusTrap
+ui/src/kit/fonts.css         @font-face for the vendored woff2 files in ui/src/kit/fonts/ (+ OFL.txt)
+ui/src/kit/css/base.css      type voices, scroll, focus ring, transitions, keyframes        (foundation)
+ui/src/kit/css/{actions,surfaces,navigation,forms-text,forms-choice,data-meters,data-display,game,feedback}.css
+ui/src/kit/components/Core*.vue
+ui/src/stories/kit/*.stories.js, ui/src/stories/kit/scenes/*.vue, ui/src/stories/kit/assets/*
+```
+
+`styles.css` imports every partial **into the components layer** (`@import "./kit/css/actions.css"
+layer(components);`), so utilities still win over kit classes (`<CoreButton class="w-full">`). `main.js`
+imports `kit/fonts.css`, calls `installKit(app)` before mount and publishes `CoreUI.kit = { components,
+registerIcons, icons }`; `App.vue` ends with `<div id="core-overlays" class="core-overlays">` (fixed, inset 0,
+z 60, click-through) — the Teleport target of every kit popup, inside `.core-root` so §31 hides it with the
+shell. `.storybook/preview.js` does the same through `setup(app)`.
+
+A plugin page simply writes the tags — they resolve at runtime against the one Vue app (§7.4):
+
+```vue
+<CoreScreen background="scrim" blur>
+  <template #nav><CoreTabs v-model="tab" :items="tabs" /></template>
+  <CorePanel title="Inventory" subtitle="Gear up for what's next." blur>
+    <CoreSlotGrid v-model:selected="sel" :items="items" :columns="4" />
+  </CorePanel>
+  <template #footer-end><CoreKeyHints :items="[{ key: 'ESC', label: 'Back' }]" bare /></template>
+</CoreScreen>
+```
+
+A plugin adds icons with `window.CoreUI.kit.registerIcons({ 'my-icon': 'M…' })` (24 × 24 path data) or passes a
+raw path wherever an `icon` prop is accepted.
+
+### 37.4 Conventions (every component)
+
+- **Names**: component `Core<Name>`, file `kit/components/Core<Name>.vue`, root class `core-<name>`, parts
+  `core-<name>__<part>`, variants `core-<name>--<variant>`, states `is-active | is-selected | is-open |
+  is-disabled | is-invalid | is-loading | is-focused`, plus whatever the component itself needs (`is-checked`,
+  `is-on`, `is-empty`, `is-bare`, …), and `has-<thing>` for an optional part that changes the box (`has-accent`
+  on a panel, `has-slash` on a heading, `has-label` on a divider). No scoped styles: all kit CSS lives in the
+  group's
+  partial, written as plain CSS over the tokens (no `@apply`, no Tailwind gradient/transform utilities).
+  Templates may use layout utilities (`flex`, `gap-*`, `min-w-0`).
+- **Props vocabulary**: `size: 'sm'|'md'|'lg'` (default `md`); `tone: 'accent'|'neutral'|'success'|'warning'|
+  'danger'|'info'`; `icon: string` (registry name or raw path; a same-named slot overrides it); `disabled`;
+  value carriers use `v-model` (`modelValue`); lists take `items` — strings or `{ value, label, icon?,
+  description?, disabled?, … }`, normalised by `normalizeItems`. Runtime validators on enum props. `<script
+  setup>`, plain JS, `defineModel` allowed (Vue 3.5). A few components widen the scale on purpose: CoreProgress
+  adds `xs`, CoreHeading / CoreDialog / CoreAvatar add `xl`, and CoreIcon / CoreAvatar / CoreSpinner / CoreRing
+  take a number of px instead.
+- **Tones**: a component that takes `tone` puts `core-tone-<tone>` on its root (`toneClass()` in `use.js`).
+  `css/base.css` maps every tone — the six semantic ones, the meter tones `health | armour | stamina | hunger |
+  thirst | oxygen | stress`, and `core-rarity-<rarity>` — to two custom properties, `--tone` (the colour) and
+  `--tone-rgb` (its `r g b` triplet); the group partial only ever writes `var(--tone)` and
+  `rgb(var(--tone-rgb) / 0.16)`. A `color` prop sets `--tone` inline.
+- **Pointer events**: the shell is click-through, overlays too. Every interactive root sets `pointer-events:
+  auto` in its class (HUD-type components — prompt, prompt group, tracker, compass, stat bar, player chip,
+  toast — stay `none`, and a slot inside one of them turns the mouse back on for itself).
+- **Keyboard**: everything clickable is a `<button>` or carries `tabindex="0"` + Enter/Space; roving arrows in
+  tabs, menu, chips, stepper, select, list, slot grid (2D), swatches, table and the context menu — a radio
+  group has none, because native radios sharing a `name` already arrow themselves;
+  `:focus-visible` shows the 2 px `accent-hi` outline (offset 2 px).
+- **Escape layers**: the store closes the open page on Escape (§7.3, a bubbling `window` listener). A kit popup
+  (select list, popover, context menu, dialog, drawer) registers an *escape layer*
+  (`useEscapeLayer(openRef, close)`): one capturing `window` listener pops the top layer and stops the event,
+  so Escape closes the innermost popup first and only then reaches the store. CoreTooltip is the exception —
+  it listens without stopping the key, because a hint lying over a dialog must not eat that dialog's Escape.
+  A dialog that cannot be closed still registers its layer: swallowing the key is the point.
+- **Popups** teleport to `overlayTarget()` (`#core-overlays`, created on `body` when missing) and are placed
+  with `useFloating(anchorRef, floatingRef, openRef, { placement, offset, matchWidth })` — fixed coordinates
+  from `getBoundingClientRect()`, flipped and clamped into the viewport, refreshed on resize and on capturing
+  scroll. Every one of them resolves the target in `onMounted`, never during render: `#core-overlays` is the
+  last child of `.core-root`, so a render-time call would find nothing and build a second one on `body` —
+  an orphan outside `.core-root`, which §31 could no longer hide with the shell.
+- **Overlay z-scale** (everything teleported into `#core-overlays` shares one stacking context): backdrop /
+  dialog / drawer 40, popups (select list, popover, context menu) 50, tooltip 60 — a popup opened from inside a
+  dialog paints above the scrim, matching the escape-layer order.
+- **Chromium 103** (§7.1): no individual `translate`/`rotate`/`scale` properties (write `transform:`), no
+  `:has()`, no `color-mix()`, no CSS nesting, no container queries, no `dvh`, no Popover API, no
+  `scrollbar-width` (use `::-webkit-scrollbar`), no `oklch()`. Never `backdrop-filter`; glass is
+  `data-core-blur` and only on panels (§32) — a kit component exposes it as the `blur` prop
+  (`true` → the attribute, a number → its value).
+- **Glass budget** (§32.1): `blur` exists on CorePanel, CoreScreen/CoreBackground (one per page), CoreDialog
+  and CoreDrawer (both `true` by default), CorePopover, CoreToast and CoreKeyHints; never on rows, slots,
+  chips or list items.
+- **HUD plates** — the things that float over the live game with no glass behind them (player chip, tracker,
+  key-hint bar, the clock chip `CoreTag variant="dark"`, a stat plate) — fill with `--color-hud` or
+  `rgb(var(--core-ink-rgb) / a)` (the prompt band is such a gradient); a **popup** over a panel fills with
+  `--color-panel-popup` (select list, context menu, popover) or ink 96 % (tooltip).
+- **`defineModel` does not reflect a write locally** while a parent `v-model` is bound: the write goes out as
+  `update:modelValue` and comes back on the next tick, so a burst of programmatic updates inside one task
+  collapses to the last one. Real input is unaffected (one event per keystroke or click); a test or a story
+  that drives a control in a loop must `await nextTick()` between the writes.
+- **`.core-panel` is a column** (`display: flex; flex-direction: column`). A legacy page that used the class
+  as a row writes `flex-row` next to it — a utility always wins over the kit class (§37.3).
+- **Inline SVG**: a `fill="var(--x)"` *presentation attribute* does not resolve in Chromium — write
+  `style="fill: var(--x)"` (or let the glyph inherit through `fill="currentColor"`, which is what CoreIcon
+  does).
+- **CSS hover rules win per property, not per rule**: a base `:hover` that sets `background` overrides a
+  variant that only adds a `filter`, whatever the source order. Every variant that brings its own fill is
+  therefore excluded from the base hover by hand (`:not(.core-btn--primary)…`) or re-declares the fill in its
+  own hover — Chromium 103 has no `:has()` to do it the short way.
+
+### 37.5 Catalogue
+
+Format: **Name** — purpose. `props` (default) · slots · emits · classes · look. Sizes are CSS px at 1080p.
+Shared looks: *label voice* = display 600, 12 px, uppercase, 0.14 em, `fg-dim`; *eyebrow voice* = display 500,
+13 px, uppercase, 0.32 em, `fg-dim`; *display voice* = display 700, uppercase, 0.04 em, line-height 1; *box look*
+(inputs, select, number, stepper) = `--core-h-md` high, `panel-sunken` fill, 1 px white 16 % border → 28 % on
+hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 px radius; *disabled* = opacity
+0.45, `cursor: not-allowed`, no hover.
+
+#### Foundation
+
+- **CoreIcon** — a registry glyph. `name` (registry name or raw path), `path` (explicit raw path), `size`
+  (`'xs'` 14 | `'sm'` 16 | `'md'` 20 | `'lg'` 24 | `'xl'` 32 | number; default `md`), `spin`, `title` (else
+  `aria-hidden`; with one the root is `role="img"`) · — · — · `core-icon is-spin` · an inline
+  `<svg viewBox="0 0 24 24" fill="currentColor">`; unknown name renders an empty box and warns once per name.
+
+#### Actions (`css/actions.css`)
+
+- **CoreButton** — every button. `variant: 'primary'|'secondary'|'ghost'|'danger'|'success'` (`secondary`),
+  `fade` (primary: the fading gradient of the mockups' USE button instead of the solid one), `size`, `block`,
+  `icon`, `iconRight`, `kbd` (a key cap inside, left: `[F] USE`), `loading`, `disabled`, `active` (toggle on),
+  `type` (`button`) · default, `icon`, `trailing` · `click` (never while disabled/loading) · `core-btn
+  core-btn--<variant> core-btn--<size> is-fade is-block is-active is-loading is-disabled` + `__kbd __icon
+  __label __spinner` · display 600 uppercase 0.08 em,
+  16 px (sm 13, lg 19 / 0.1 em), heights `--core-h-*`, padding 0 20 (sm 12, lg 28), radius 4, gap 10 (sm 8,
+  lg 14 — a 52 px button needs its glyph clear of the label). The BARE class is the secondary md button, so
+  `<button class="core-btn">` in a legacy page or a built-in is already right.
+  *secondary*: white 3 % fill, white 14 % border, `fg-dim` text → hover 7 % / 30 % / `fg`. *primary*:
+  `--core-grad-accent`, white text, inset top highlight + coral drop glow (`0 8px 22px rgb(accent / .24)`), hover
+  `filter: brightness(1.08)` and a stronger glow, active `transform: translateY(1px)`. *fade*:
+  `--core-grad-accent-fade`, 1 px `rgb(accent / .45)` border, no outer glow. *ghost*: no fill/border, hover white
+  6 %. *danger* / *success*: tone 8 % fill, tone 50 % border, tone text, hover 16 %. `is-active`: `accent-soft`
+  fill, `accent` border, `fg` text — except on the primary, which keeps its gradient and only gets a stronger
+  glow. Loading swaps the icon for a 16 px ring (sm 13, lg 18) and keeps the label, so the width never moves.
+  Icon 18 px (sm 14, lg 22).
+- **CoreIconButton** — square icon-only button. `icon` (required), `label` (aria-label + `title`), `variant:
+  'secondary'|'ghost'|'primary'|'danger'|'success'` (`secondary`), `fade` (primary only, as CoreButton), `size`,
+  `round`, `active`, `disabled` · default (custom glyph) · `click` · `core-iconbtn core-iconbtn--<variant>
+  core-iconbtn--<size> is-fade is-round is-active is-disabled`
+  · width = height = `--core-h-*`, glyph 20 px (sm 16, lg 24), every fill shared with CoreButton in one
+  selector list so the two can never drift; `round` = 50 %.
+- **CoreKey** — a key cap. `label` (`'F'`, `'ESC'`, `'SPACE'`; `'mouse-left'|'mouse-right'|'mouse-middle'|
+  'mouse-scroll'|'mouse'` draw the mouse glyph instead of a cap), `variant: 'solid'|'outline'` (`solid`), `size`
+  (20 / 26 / 32 px), `pressed`, `progress` (0–1, hold-to-confirm) · default (wins over the mouse names) · — ·
+  `core-key core-key--<size> core-key--<variant>` (`core-key--mouse` instead, for a mouse label) plus
+  `is-pressed is-holding` + `__progress` · min-width =
+  height, padding 0 7 (sm 5, lg 9), radius 3, display 700 15 px (sm 12, lg 18); the bare class is the solid md
+  cap. *solid*:
+  `--color-key` tile, `--color-key-fg` text, `0 2px 0 rgba(0,0,0,.45)` lip. *outline*: white 6 % fill, white 28 %
+  border, `fg` text. *mouse*: no tile, no lip, the glyph at the cap's height. Pressed: `accent` tile, white text,
+  lip collapsed, `translateY(1px)`. `progress` scales a 3 px `accent` bar along the bottom edge — no transition
+  on it, because the caller drives it per frame.
+- **CoreKeyHint** — cap(s) + caption. `keys` (string | string[]) (alias `k`, used when `keys` is empty),
+  `label`, `variant`, `size` · default (caption) · — · `core-keyhint core-keyhint--<size>` + `__keys __label` ·
+  gap 10 (sm 8, lg 12); caption display 500 14 px (sm 12, lg 16) uppercase 0.1 em, `fg` at 85 % — not `fg-dim`,
+  which disappears over a bright map; several caps sit 4 px apart.
+- **CoreKeyHints** — the hint bar. `items: [{ key | keys, label }]` (a bare string is a cap with no caption),
+  `align: 'start'|'end'|'between'` (`end`), `bare` (no chrome — inside a CoreScreen footer), `variant`, `size`,
+  `blur` · default, `start`, `end` · — · `core-keyhints core-keyhints--<align> is-bare` · gap 10 / 28; not
+  bare: `--color-hud` fill, hairline border, radius 4, padding 8 14.
+- **CorePrompt** — interaction prompt (`[F] ⛭ ENTER VEHICLE`). `keys` (string | string[]), `label`, `icon`,
+  `description`, `progress` (0–1 hold), `active`, `disabled`, `interactive` (takes the mouse and makes the root
+  a real `<button>`; default click-through `<div>`)
+  · default, `icon` · `click` (interactive only) · `core-prompt is-active is-disabled is-interactive` +
+  `__keys __band __icon __text __label __desc` · `lg` solid CoreKeys (every cap carries `progress`),
+  8 px gap, then a band ≥ 220 × 40 px: `linear-gradient(90deg, rgb(ink / .80) 0 66%, rgb(ink / 0) 100%)`,
+  padding 0 36 0 14, icon 20 px `fg`, label display 600 16 px uppercase 0.08 em; description sans 12 px `fg-dim`
+  on a second line. `is-active`: the cap turns `accent` without CoreKey's pressed offset — lit, not held.
+- **CorePromptGroup** — stacked prompts. `items: [{ keys, label, icon?, description?, progress?, active?,
+  disabled?, interactive? }]` (`interactive` travels per item), `align: 'start'|'end'` (`start`) · default ·
+  `select` (item, index) · `core-prompts core-prompts--<align>` · column, gap 8, click-through.
+
+#### Surfaces (`css/surfaces.css`)
+
+- **CorePanel** — the bordered dark panel. `variant: 'default'|'solid'|'flat'|'ghost'|'hud'` (`hud` = the HUD
+  plate: `--color-hud` fill, radius 4, `--shadow-ui-sm`, no sheen, `border-strong` hairline, never `blur`), `padding:
+  'none'|'sm'|'md'|'lg'` (0 / 12 / 20 / 28; `md`), `title`, `subtitle`, `eyebrow`, `slash`, `headingSize` (`md`),
+  `accent` (2 px fading coral line on the top edge), `scroll` (body scrolls), `blur`, `tag` (`section`) ·
+  default, `header` (replaces the heading), `actions` (header right), `footer` · — · `core-panel
+  core-panel--<variant> core-panel--pad-<p> has-accent` + `__header __heading __actions __body __footer` ·
+  `--color-panel` fill +
+  `--core-grad-sheen`, hairline border, radius 6, `--shadow-ui`; *solid* opaque; *flat* white 2 %, no shadow;
+  *ghost* nothing but padding. The padding lives on the PARTS, so a bare `<div class="core-panel">` is the
+  default variant with none of its own; a body that follows a header keeps only 14 px of top padding. Footer
+  has a hairline top and a black 18 % fill.
+- **CoreCard** — media + text card (the LAST PLAYED card, quest detail). `variant: 'default'|'flat'|'ghost'`
+  (`flat` = white 2 % fill, no shadow; `ghost` = no fill, border or shadow — a brief sitting flush on a panel),
+  `image`, `imagePosition: 'left'|'top'` (`left`), `mediaWidth` (168), `mediaHeight` (180), `eyebrow`, `title`,
+  `uppercase` (true),
+  `subtitle`, `icon` (before the subtitle), `selected`, `interactive`, `disabled` · default (body), `media`,
+  `icon`, `meta` (footer row under a hairline), `trailing` · `click` · `core-card core-card--media-<pos>
+  is-selected is-interactive is-disabled` + `__media __image __fade __main __eyebrow __title __subtitle __body
+  __meta __trailing` · panel fill, hairline, radius 6. *left*: image inset in the card's 14 px padding with
+  radius 4, 20 px gap. *top*: full-bleed
+  image fading into the panel colour, main block pulled 40 px up over the fade. Eyebrow label voice `fg-faint`;
+  title display 700 22 px (`uppercase: false` → `is-plain`: mixed case, no tracking — the quest names of
+  mockup 4); subtitle sans 15 px `fg-dim` with a 16 px icon; meta 14 px `fg-dim`, `<b>`/`<strong>` = `fg`.
+  Interactive hover: border `border-strong` + a `panel-raise` lift; selected: `accent-hi` border +
+  `--shadow-glow-sm`. An interactive card is NOT a `<button>` — its slots hold buttons — it takes
+  `role="button"` + `tabindex="0"` and answers Enter/Space by hand, the one exception to §37.4's keyboard rule.
+- **CoreBackground** — full-bleed scrim over the game. `variant: 'scrim'|'left'|'right'|'top'|'bottom'|
+  'bars'|'vignette'|'solid'|'none'` (`vignette`), `dim` (0–1, overrides the variant's own 0.62–0.94 through
+  `--core-bg-a`), `fade` (0–1, how far across the box a directional gradient reaches, `--core-bg-fade`; unset
+  keeps the variant's own 0.52 / 0.62), `image`, `position` (`background-position` of the image, `'center'`),
+  `pattern: 'none'|'grid'`, `blur` · default (extra layers) · — · `core-bg
+  core-bg--<variant>` + `__image __scrim __pattern` · absolute inset 0,
+  click-through, `aria-hidden`, z 0. *left* = ink 94 % → 0 at 62 % of the width (the main-menu look);
+  *vignette* = radial ink 25 % → 88 %; *bars* = the two cinematic bands; *solid* = `--color-ink`; *grid* = a
+  40 px white 2 % hairline grid.
+- **CoreScreen** — full-page scaffold (the inventory / map frame). `background` (CoreBackground variant,
+  `scrim`), `dim`, `image`, `position` (forwarded to the background), `blur`, `padded` (true), `navAlign:
+  'space'|'center'|'start'` (`space` shares the room between brand and status; `center` pins the nav to the
+  middle of the screen like mockup 3; `start` hangs it next to the brand like mockup 4) · `background`, `brand`,
+  `nav`, `status` (header: left / centre / right), default (body), `footer-start`, `footer-end` · — ·
+  `core-screen core-screen--nav-<align>` + `__header __brand __nav __status __body __footer __footer-start
+  __footer-end` ·
+  absolute inset 0, column, `pointer-events: auto`. Header 76 px, padding 0 32, hairline bottom, ink gradient
+  fill; body flex 1, `is-padded` = 24 28; footer 64 px, hairline top, ink 90 %. Header and footer render only
+  when one of their slots is filled — a bare screen is a scrim and a padded column.
+- **CoreHeading** — title block. `title`, `subtitle` (eyebrow voice, under), `eyebrow` (label voice, above),
+  `size: 'sm'|'md'|'lg'|'xl'` (18 / 24 / 34 / 48 with the subtitle at 12 / 13 / 14 / 16; `md`), `slash` (the `//`
+  marker + italic title), `tag` (`h2`),
+  `align` (`left`) · default (title), `subtitle`, `actions` · — · `core-heading core-heading--<size>
+  core-heading--align-<align> has-slash` + `__main __eyebrow __title __slash __text __subtitle __actions` · the
+  marker is two `accent` bars, 0.34 em × 0.9 em, skewed −20°, 0.2 em apart. At `lg`/`xl` the title is not flat
+  white: it is clipped out of a white → `fg` → `fg-dim` vertical gradient (so is a `lg` CoreBrand name).
+- **CoreDivider** — hairline. `vertical`, `strong`, `label` · default (the caption) · — · `core-divider
+  core-divider--vertical core-divider--strong has-label` + `__label` · a labelled line parts around a label
+  voice `fg-faint` caption (the halves are pseudo-elements) and drops `role="separator"`.
+- **CoreDash** — the short accent bar. `width` (28; a string passes through), `tone` (`accent`) · — · — ·
+  `core-dash core-tone-<tone>` · 3 px high, radius 1.5, `aria-hidden`; the accent tone wears the brand gradient
+  instead of a flat fill.
+- **CoreTagline** — stacked wide-tracked words. `lines: string[]`, `rule` (`true` a vertical hairline left,
+  `'accent'` the 2 px coral rule of mockups 3/4), `dash` (`true` or a width; accent dash under), `align` ·
+  default · — · `core-tagline core-tagline--align-<a> has-rule is-rule-accent has-dash` + `__lines __line
+  __dash` · display 500 12 px uppercase 0.3 em `fg-faint`, line-height 1.75, an ink text-shadow so it survives
+  bright key art (panel text never wears one).
+- **CoreBrand** — logo lockup. `name`, `tagline`, `logo` (url), `size: 'sm'|'md'|'lg'|'xl'` · `logo` (an inline
+  SVG, which inherits the accent colour from the box) · — · `core-brand core-brand--<size>` + `__logo __text
+  __name __tagline` · name display 700 (22 / 30 / 48 / 64) with a 32 / 44 / 70 / 90 px mark box, tagline eyebrow
+  voice with an ink text-shadow (it sits on key art); without a logo the box is not rendered at all.
+
+#### Navigation (`css/navigation.css`)
+
+- **CoreTabs** — top navigation. `v-model`, `items: [{ value, label, icon?, badge?, disabled? }]`, `size`,
+  `separators`, `stretch`, `line` (true: hairline under the row), `prevKey`, `nextKey` (outline key caps at the
+  ends, clickable) · `tab` ({ item, active }) · `update:modelValue`, `change` (value, item) · `core-tabs
+  core-tabs--<size> core-tabs--line core-tabs--separators core-tabs--stretch`, `core-tabs__list`,
+  `core-tabs__key`, `core-tab is-active is-disabled` + `__label __badge` ·
+  row 44 px (sm 34, lg 54), display 600 17 px (sm 14, lg 20) uppercase 0.1 em, `fg-dim` → `fg` on hover → white
+  when active with a 3 px (lg 4) glowing `accent` underline sitting on the hairline; gap 36 (sm 26, lg 44); the
+  underline is a per-tab `::after` that only fades, so nothing measures the DOM. ←/→ (and ↑/↓) move selection
+  and focus together, Home/End jump to the first/last enabled tab, Enter/Space is the button's own click.
+- **CoreMenu** — vertical menu (main menu, category sidebar, the shell's keyboard menu). `v-model` (active
+  value), `items: [{ value, label, icon?, description?, trailing?, badge?, disabled?, danger? }]`, `size`
+  (row 38 / 56 / 70 px; text 15 / 18 / 25), `fade` (true: the active row dissolves), `selectOnHover`,
+  `loop` (true) · `item` ({ item, active }), `trailing` ({ item, active }) · `update:modelValue`, `select`
+  (item: click or Enter) · `core-menu core-menu--<size> is-fade`, `core-menu__item is-active is-disabled
+  is-danger` + `__icon __body __label __desc __badge __trailing` · display
+  600 uppercase 0.07 em `fg-dim`, icon box 30 px (sm 22, lg 34 — a size up from the mark, because an MDI path
+  fills about three quarters of its 24-grid) with a 22 px gap (sm 14, lg 28); hover white 4 % + `fg`; active
+  white text on `--core-menu-fade`, the dissolve measured off the mockups (solid coral to 34 %, 52 % at 68 %,
+  gone at 100 %) — `fade: false` gives the solid `--core-grad-accent` instead; description sans 13 px `fg-faint`
+  under the label; badge an `accent` 20 % pill; trailing right-aligned display 500 `fg-faint`; `is-danger` is
+  the same geometry in `error`. ↑/↓ (and ←/→) move, skipping disabled, Home/End jump, Enter selects.
+- **CoreChips** — filter chips / segmented control. `v-model` (value, or array with `multiple`), `items`
+  (`{ value, label, icon?, count?, disabled? }`), `multiple`, `allowEmpty`, `size`, `wrap`, `stretch` (equal-width
+  cells filling the row, the map's filter bar), `minWidth` (px per chip, 0) · `chip`
+  ({ item, active }) · `update:modelValue` · `core-chips core-chips--<size> core-chips--wrap`, `core-chip
+  is-active is-disabled` + `__label __count`
+  · 36 px high (sm 28, lg 44), padding 0 16 (sm 12, lg 22), radius 4, display 600 15 px uppercase 0.08 em — the
+  mockup's filter row carries visibly more weight than 500 / 14 px would; idle white 3 % + hairline
+  + `fg-dim`; hover `border-strong` + white 6 % + `fg`; active `--core-grad-accent`, white, no border. ←/→ move
+  the FOCUS only — a chip is a toggle, so arrowing onto one must not change the filter; Space/Enter toggles.
+- **CoreStepper** — `‹ value ›` cycler. `v-model`, `items` (cycles their values) or `min`/`max`/`step`,
+  `loop`, `format` (value, item), `showCount` (`3 / 24`), `block`, `size`, `disabled` · default
+  ({ value, item }) · `update:modelValue` · `core-stepper core-stepper--<size> core-stepper--block is-disabled`
+  + `__btn __btn--prev __btn--next __value __label __count` · box look; the chevron buttons are square at the
+  box height (40 px at `md`) and sit OUT of the tab order — the centre is the `role="spinbutton"` tab stop, so
+  a settings column is one Tab per control; centre display 600 15 px (sm 13, lg 18) uppercase, count `fg-faint`.
+  ←/↓ and →/↑ step, Home/End jump to the ends, the chevrons disable themselves at the bounds unless `loop`,
+  and a float step is re-rounded to 6 decimals so `0.1 + 0.2` never prints as `0.30000000000000004`.
+
+#### Forms — text (`css/forms-text.css`)
+
+- **CoreField** — label + control + hint/error. `label`, `hint`, `error` (its presence is what makes the field
+  invalid, and it replaces the hint), `required`, `inline` (settings row:
+  label left, control right, hairline under), `controlWidth` (`50%`), `id` (else one is generated) · default
+  ({ id, invalid }), `label`, `hint` · — · `core-field core-field--inline is-invalid` + `__text __label
+  __required __control __hint __error` · label voice (inline: sans 15 px `fg`), hint 13 px
+  `fg-faint`, error 13 px `error` with an icon.
+- **CoreInput** — `v-model`, `type`, `placeholder`, `icon`, `prefix`, `suffix`, `size`, `clearable`,
+  `maxlength`, `invalid`, `disabled`, `readonly`, `autofocus`, `id`, `name` · `prefix`, `suffix` ·
+  `update:modelValue`, `enter` (value), `clear`, `focus`, `blur` · exposes `focus()` · `core-inputbox
+  core-inputbox--<size> is-focused is-invalid is-disabled` > `__el`, plus `__icon __prefix __suffix __clear` ·
+  box look; sans 15 px; `user-select: text` on the element (the shell turns selection off globally).
+  `inheritAttrs: false` — a caller's `aria-*` or `@keydown` lands on the `<input>`, not on the div; a click
+  anywhere in the well focuses it. The bare legacy elements `input.core-input`, `textarea.core-input` and
+  `select.core-select` wear the same look (the shell's InputDialog still renders them).
+- **CoreTextarea** — `v-model`, `rows` (4), `maxlength`, `counter`, `resize: 'none'|'vertical'`, `invalid`,
+  `disabled`, `readonly`, `autofocus`, `placeholder`, `id`, `name` · — · `update:modelValue`, `focus`, `blur` ·
+  exposes `focus()` · `core-textarea core-textarea--resize is-focused is-invalid is-disabled` + `__el
+  __counter` (`is-over` past `maxlength`) · the box look as a column, so the counter sits inside the well.
+- **CoreNumberInput** — `[−] 12 [+]`. `v-model` (number), `min`/`max` (`null` = unbounded), `step` (1),
+  `precision` (`null` = as many decimals as `step` has), `suffix`, `size`, `invalid`, `disabled`, `id`, `name` ·
+  — · `update:modelValue`, `focus`, `blur` · exposes `focus()` · `core-number core-number--<size> is-focused
+  is-invalid is-disabled` + `__btn __btn--dec __btn--inc __field __el __suffix` · box look; square buttons at
+  the box height (40 px at `md`), out of the tab order, disabled at the bounds and repeating while held
+  (400 ms, then every 60 ms); centre display 600 17 px tabular (sm 13, lg 18). The field keeps its own TEXT
+  while it is being typed — a half-written `-` is not thrown away — and commits (parse, clamp, round) on blur
+  and on Enter; ↑/↓ step.
+- **CoreSelect** — dropdown. `v-model`, `items` (`{ value, label, icon?, description?, disabled? }`),
+  `placeholder` (`Select…`), `label` (inline caption: `SORT:`), `variant:
+  'box'|'inline'` (`box`), `size`, `placement: 'auto'|'bottom'|'top'`, `maxHeight` (260), `invalid`,
+  `disabled`, `id` · `option` ({ item, selected, active }), `value` ({ item }) · `update:modelValue`, `open`,
+  `close` · `core-selectbox core-selectbox--<variant> core-selectbox--<size> is-open is-invalid is-disabled` >
+  `__trigger __caption __value __chevron`, popup `core-selectbox__popup core-selectbox__popup--<variant>` >
+  `__option is-active is-selected is-disabled` + `__option-icon __option-body __option-label __option-desc
+  __check __empty` (the bare legacy `select.core-select` keeps the look of a
+  native `<select>`, which is why the component does not reuse that name) · *box* = box look + chevron (turns
+  180° and `accent` when open); *inline* = no chrome, caption and
+  value both display 600 13 px 0.14 em — only the colour separates them (the mockup's `SORT: RECENT ⌄`).
+  Popup: teleported, `--color-panel-popup`,
+  `border-strong`, radius 4, `--shadow-ui`, 4 px padding, min-width 160 (`matchWidth` on the box variant);
+  options ≥ 36 px, sans 15 px; active = `accent` 16 % +
+  2 px inset left bar (the keyboard cursor); selected = an `accent` check on the right — both can be true at
+  once. Space/Enter/↑/↓ open, ↑/↓ and Home/End move, Enter/Space picks, Tab and an outside pointerdown close,
+  Escape closes through the kit's layer, and typing jumps to a label (700 ms buffer). Focus never leaves the
+  trigger: the list is a `role="listbox"` driven by `aria-activedescendant`.
+
+#### Forms — choice (`css/forms-choice.css`)
+
+- **CoreCheckbox** — `v-model` (boolean, or array with `value`), `value`, `label`, `description`, `icon`
+  (between box and label — the map-filter row), `indeterminate`, `size`, `disabled` · default (label), `icon` ·
+  `update:modelValue` · `core-check core-check--<size> is-checked is-indeterminate is-disabled` + `__icon
+  __body __label __desc` (a `<label>` around a real `<input type="checkbox">`) · box 22 px
+  (sm 18, lg 26), radius 3, ink 28 % fill, 1.5 px white 38 % border → 70 % hover; checked: `--core-grad-accent`
+  + a white tick (a data-URI, `indeterminate` a white bar); label sans 15 px `fg`, description 13 px `fg-dim`.
+  The rule targets `.core-check input`, so legacy markup gets the look too; `inheritAttrs: false` keeps
+  `class`/`style` on the label and sends `name`, `id` and the rest to the input.
+- **CoreRadioGroup** / **CoreRadio** — group: `v-model`, `items`, `name` (generated when absent),
+  `orientation: 'vertical'|'horizontal'` (`vertical`), `variant: 'radio'|'card'` (`radio`), `size`, `disabled` ·
+  default, `item` ({ item, index, checked }) · `update:modelValue`; the group `provide`s model, name, size,
+  variant and disabled, so a CoreRadio written by hand inside the slot joins it. Radio: `value`, `label`,
+  `description`, `name`, `disabled`, `size`/`variant` (`null` = inherit the group's) · default ·
+  `update:modelValue` · `core-radiogroup core-radiogroup--<orientation> core-radiogroup--<variant> is-disabled`,
+  `core-radio core-radio--<size> core-radio--card is-checked is-disabled` + `__body __label __desc` · circle
+  20 px (sm 16, lg 24), white 38 % border; checked `accent-hi` 2 px ring + a centred `accent` dot half the
+  circle wide, and a soft
+  glow. *card*: padded `panel-raise` tile, hairline → checked `accent-hi` border, `accent-soft` fill,
+  `--shadow-glow-sm`. No roving-arrow code: native radios sharing a `name` already arrow themselves.
+- **CoreSwitch** — `v-model`, `label`, `description`, `labelPosition: 'left'|'right'` (`left` — label, then the
+  switch: the settings row), `size`, `disabled` · default (label) ·
+  `update:modelValue` · `core-switch core-switch--<size> core-switch--left is-on is-disabled` + `__input
+  __track __thumb __body __label __desc` · squared track 42 × 22 (sm 34 × 18, lg 52 × 26), radius 3, sunken
+  fill; thumb 16 × 16, radius 2, `--color-key`; on: `--core-grad-accent` track, thumb moved 20 px. The input is
+  the only one in the group that is not the paint (Chromium draws no pseudo-element on a void `<input>`): it is
+  visually hidden — never `display: none`, which would drop it out of the tab order — and the sibling track
+  reads `:checked` through `+`.
+- **CoreSlider** — `v-model` (number), `min` (0), `max` (100), `step` (1), `label`, `showValue`, `format`,
+  `suffix`, `minLabel`, `maxLabel`, `ticks` (`true` = one mark per step up to 20, or a count), `tone`
+  (semantic tones only), `disabled` · `value` ({ value, percent }) · `update:modelValue` (while
+  dragging), `change` (on release) · `core-slider core-tone-<tone> is-disabled` + `__head __label __value __rail
+  __input __ticks __tick __ends` · the root is a column around a real `<input type="range">` painted through the
+  `::-webkit-slider-*` pseudo-elements; track 4 px, white 14 %; the fill is not a second element — the track
+  itself is a two-stop `var(--tone)` gradient cut at `--core-slider-pct`; thumb 10 × 20,
+  radius 2, `--color-key`, 5 px `rgb(tone / .25)` halo on hover/drag. The bare `input[type=range].core-slider`
+  gets the same track and thumb.
+- **CoreSwatches** — colour picker. `v-model`, `items` (strings — value and paint at once — or
+  `{ value, color, label?, disabled? }`), `size`, `shape: 'square'|'circle'`, `columns` (0 = a wrapping row),
+  `disabled` · — · `update:modelValue` · `core-swatches core-swatches--sm|lg core-swatches--circle
+  core-swatches--grid is-disabled`, `core-swatch is-selected` ·
+  30 px (22 / 30 / 38), radius 3, an inset white 22 % line so a near-black paint still has an edge; selected:
+  2 px ink gap, then a 2 px `accent-hi` ring and a coral glow. One tab stop; ←/→ rove AND pick as they go
+  (a colour picker is judged by what the ped looks like right now), Home/End jump.
+
+#### Data — meters (`css/data-meters.css`)
+
+- **CoreProgress** — linear bar. `value`, `min` (0), `max` (100), `tone` (the six semantic tones or any of the
+  seven vitals; default `accent`), `color` (any CSS colour), `size: 'xs'|'sm'|'md'|'lg'` (2 / 4 / 8 / 12),
+  `label`, `icon`, `showValue`, `valueText`, `format` (value, max), `inline` (icon · label · bar · value on one
+  row — the capacity bar), `segments`, `indeterminate`, `warnBelow`, `dangerBelow` (percent → the tone CLASS
+  switches, so a re-themed server still owns the palette) · `label`,
+  `value` · — · `core-progress core-progress--<size> core-tone-<tone> core-progress--inline is-segmented
+  is-indeterminate` + `__head __caption __icon __label __value __max __track __fill` · track white
+  12 %, radius 2; fill `--core-grad-accent` (accent), `#dfe3e7 → #c9cfd5` (neutral), the tone colour otherwise;
+  width eases 250 ms. Value display 600 15 px; the dimmed `/ 30.0` half is only printed when the caller really
+  passed a `max` — the prop has a default, so only the raw vnode can tell. `segments` masks the track into
+  n cells, `indeterminate` sweeps a 35 % fill across it.
+- **CoreRing** — radial progress. `value`, `max` (100), `size` (48 px), `thickness` (4), `tone` (meter tones
+  too), `color`, `icon` ·
+  default (centre) · — · `core-ring core-tone-<tone>` + `__svg __track __fill __center __value` · one SVG
+  circle with a shrinking `stroke-dashoffset`, white 12 % well, butt caps, 250 ms ease; it starts at 12 o'clock
+  through the SVG `transform` ATTRIBUTE, never a CSS transform (§37.4). The centre prints the value at 32 % of
+  the box, or the glyph at 42 %.
+- **CoreStatBar** — HUD vital (`♥ ▬▬▬ 100`). `icon`, `iconTone: 'tone'|'fg'` (`fg` = a white glyph on a coloured
+  bar, the mockup's shield), `value`, `max` (100), `tone` (`health`), `width` (220), `showValue` (true), `lowBelow`
+  (25 → the GLYPH pulses; the bar never moves) · — · — · `core-statbar
+  core-tone-<tone> is-low` + `__icon __track __fill __value` · click-through; icon 20 px in the tone, bar
+  10 px in a `panel-sunken` well, value display 600 19 px tabular with a 44 px floor width, so 100 → 75 cannot
+  resize the plate around it.
+- **CoreStatRow** — detail stat (`♥ HEALTH RESTORE … +75`). `icon`, `label`, `value`, `tone` (no default — an
+  untoned row keeps its value in `fg`, exactly like the mockup), `hairlines:
+  'both'|'top'|'bottom'|'none'` (`both`) · `value` · — · `core-statrow core-statrow--line-<hairlines>
+  core-tone-<tone>` + `__icon __label __value` · 56 px row, icon 22 px in `fg`, label display 500
+  16 px uppercase 0.1 em `fg-dim`, value display 700 24 px in the tone; stacked rows share one hairline.
+- **CoreSpinner** — `size` (14 / 18 / 24 | number), `tone` (meter tones too), `label` · default (the caption) ·
+  — · `core-spinner core-tone-<tone>` + `__ring __label` · `role="status"`; one ring, `border-strong` with the
+  top side in the tone and a stroke of size / 8.
+- **CoreSkeleton** — `width` (`100%`), `height` (14), `lines` (1), `radius` (3 px) · — · — · `core-skeleton
+  core-skeleton--lines` + `__line` · white 6 % + shimmer, `aria-hidden`; the last line of a stack ends at 62 %,
+  the way a real paragraph does.
+
+#### Data — display (`css/data-display.css`)
+
+- **CoreBadge** — count / status pip. `value`, `max` (99 → `99+`; a non-numeric value is printed as it stands),
+  `tone` (`accent`), `variant: 'solid'|'soft'|'outline'` (`solid`), `dot`, `pulse` · default · — ·
+  `core-badge core-badge--<variant> core-tone-<tone> is-dot is-pulse` · 18 px min-width and height, radius 3,
+  display 700 11 px tabular; *solid* = the tone filled with `ink` text (the accent wears the brand gradient),
+  *soft* = tone 14 %, *outline* = border only; `dot` drops the value for an 8 px round pip; `pulse` adds a ring
+  in the tone expanding out of the edge on the `core-ping` keyframe — the pip itself stays solid.
+- **CoreTag** — small label chip. `label`, `icon`, `tone` (`neutral`), `rarity: 'common'|'uncommon'|'rare'|
+  'epic'|'legendary'` (wins over `tone`), `variant: 'soft'|'solid'|'outline'|'dark'` (`soft`), `size`,
+  `removable` ·
+  default · `remove` · `core-tag core-tag--<variant> core-tag--<size>` + `core-rarity-<r>` (else
+  `core-tone-<tone>`) +
+  `__icon __label __remove` · 24 px (sm 20, lg 30), radius 3, display 600 13 px uppercase 0.1 em; *dark* is the
+  HUD clock chip — `rgb(ink / .78)` with `fg` text and the glyph in the tone. Only the ✕ takes the mouse.
+- **CoreAvatar** — `src`, `name` (initials fallback, also on a load error), `size` (`sm` 28 | `md` 40 | `lg` 56 |
+  `xl` 76 | number), `shape: 'square'|'circle'` (`square` = radius 4), `status: 'online'|'away'|'busy'|
+  'offline'`, `ring` · — · — · `core-avatar core-avatar--<shape> is-ring` + `__img __initials __status` ·
+  everything that scales with the box is inline (a number is a legal `size`); the presence dot is 26 % of the
+  box, 8–16 px, ringed in ink; `ring` = a 2 px `accent-hi` outline with a 2 px ink gap.
+- **CorePlayerChip** — avatar · name · level · XP bar · status dot (mockup 1, top right). `name`, `avatar`,
+  `level`, `levelLabel` (`Lv.`), `progress` (0–1, not 0–100), `status`, `subtitle` · `avatar`, `meta` (replaces
+  the level + XP row) · — · `core-playerchip` + `__avatar __body __top __name __status __meta __level __xp
+  __xpfill __subtitle` ·
+  296 × ≥ 74 px, `--color-hud` fill + sheen + hairline + `--shadow-ui-sm`, click-through; 72 px avatar column
+  flush left, name display 700 18 px uppercase. The XP rail is the chip's OWN 4 px bar, not a CoreProgress: it
+  shares a flex row with the level and must not inherit a meter's label/value chrome.
+- **CoreTable** — `columns: [{ key, label, align?, width?, format?(value, row) }]`, `rows`, `rowKey` (`id`),
+  `selectable`, `v-model:selected` (the ROW KEY, never the index — rows get re-sorted), `dense`, `stickyHeader`,
+  `empty` · `cell-<key>` ({ row, value, column }), `empty` · `row-click` ·
+  root `core-table__wrap core-scroll is-sticky` (the scroll box, so a caller's `max-height` lands on it) around
+  `<table class="core-table core-table--dense is-selectable">` + `__th __th--<align> __body __row __cell
+  __cell--<align> __empty` · header label voice `fg-faint` 34 px (dense 30) over a hairline, rows 44 px (dense
+  36) with white 6 % hairlines, hover white 3 % while selectable, selected
+  `accent-soft` + a 2 px inset bar on the first cell (a collapsed table discards an inset shadow put on the
+  `<tr>`). The
+  `<tbody>` is the tab stop: ↑/↓ and Home/End move the selection, Enter/Space re-fires `row-click`.
+- **CoreKeyValue** — `items: [{ label, value, icon?, tone? }]`, `columns` (1) · `value-<i>` ({ item, value }) ·
+  — · `core-kv` (a `<dl>`) + `__item is-toned __label __icon __value` · rows ≥ 32 px under a white 6 %
+  hairline, label voice left, value display 600 15 px tabular right; an item `tone` paints the value and its
+  glyph; `columns` only splits the same rows into a grid (32 px column gap).
+- **CoreEmpty** — `icon`, `title`, `text` · default (actions) · — · `core-empty` + `__icon __title __text
+  __actions` · a 60 px framed glyph box (icon drawn at 28), display 700 18 px title, sans 14 px `fg-dim` text
+  at most 46ch wide; the actions row turns the mouse back on, because an empty state often sits in a
+  click-through panel.
+
+#### Game (`css/game.css`)
+
+- **CoreSlot** — item slot. `image`, `icon` (fallback glyph), `count`, `hotkey` (key chip top-left), `label`
+  (title attr + accessible name), `rarity`, `durability` (0–1, 3 px bar on the bottom edge: green, amber under
+  50 %, red under 20 %), `badge` (top-right text), `selected`,
+  `disabled` (aria only, so the grid's arrows can still walk over it), `empty`, `size` (px; default fills the
+  cell), `ratio` (`'1 / 1'`), `interactive` (true → a `<button>`; false → a plain `<div>` for a legend or a
+  tooltip) · default, `overlay` · `click`,
+  `dblclick`, `contextmenu` · `core-slot core-slot--rarity-<r> core-rarity-<r> is-selected is-empty
+  is-disabled` + `__media __image __glyph __hotkey __badge __count __durability __rarity __overlay` ·
+  `panel-raise`
+  fill, white 12 % border, radius 4, image contained in a 12 % inset; count display 700 19 px bottom-right;
+  hotkey = an 18 px solid key chip (its own markup, not CoreKey — a 96 px cell must not pull in cap sizes and
+  hold states); hover `border-strong` + white 6 %; selected 2 px `accent-hi` border +
+  `--shadow-glow`; rarity = a 2 px line + a faint bloom in the rarity colour along the bottom.
+- **CoreSlotGrid** — `items: [{ id, …slot props }]` (`id` identifies the cell and is stripped before the rest
+  is spread onto CoreSlot, so it can never land as a DOM id), `columns` (4), `gap` (12), `slots` (pad with empty
+  cells up to this count — the bag's capacity), `v-model:selected` (id), `ratio` · `slot` ({ item }) — rendered
+  INSIDE each cell, in CoreSlot's own default slot, so the grid keeps the focus · `select` (item) ·
+  `core-slotgrid` (a `role="grid"`) · one tab stop; ←/→ walk the row and spill into the next, ↑/↓ jump a row,
+  Home/End go to the ends.
+- **CoreHotbar** — `items`, `active` (INDEX, not an id), `keys` (cap labels, default 1…n; an item's own
+  `hotkey` still wins), `slotWidth` (96), `ratio` (`'5 / 4'`) · — · `select` (index, item) · `core-hotbar` ·
+  gap 6; the cells bring their own `panel-glass` fill and the 6 px radius, because over the bare game
+  `panel-raise` has nothing to lighten.
+- **CoreList** / **CoreListItem** — rich rows (the quest list). List: `items: [{ id, …item props }]`,
+  `v-model` (selected id), `dividers` · `item` ({ item, selected, index }) · `select` (item). Item: `image`,
+  `icon`, `iconTone` (`accent`), `title`,
+  `subtitle`, `trailing`, `selected`, `completed`, `disabled`, `interactive` (true) · `media`, `icon`, default,
+  `trailing` · `click` · `core-listview core-listview--dividers` (a `role="listbox"`), `core-listitem
+  is-selected is-completed is-disabled is-interactive` + `__media __image __icon __text __title __subtitle
+  __trailing` (not `core-list`: that legacy name is
+  the old menu `<ul>`, kept by `css/navigation.css` together with `.core-item` as `core-menu--sm` rows) · cards
+  with a 10 px gap by default, `dividers` collapses them into one hairline-separated list; thumb 96 × 84
+  radius 3, icon
+  26 px in the tone, title display 700 19 px and NOT uppercased — the only display-voice title in the kit that
+  is set in Title Case by default; subtitle sans 14 px `fg-dim`, trailing sans 15 px `fg-dim`
+  bottom-right; selected = `accent-hi` border + `--shadow-glow-sm`; `completed` dims the thumb and the title.
+  One tab stop, ↑/↓ and Home/End rove, Enter/Space selects (the rows are buttons).
+- **CoreObjective** — `text`, `state: 'open'|'active'|'done'|'failed'`, `trailing`, `optional` · default (the
+  text), `trailing` · — ·
+  `core-objective is-<state>` + `__ring __text __optional __trailing` · 18 px ring; active = `accent` ring +
+  8 px dot and a glow; done = filled `accent` + check, text
+  `fg-dim`; failed = `error` cross, struck through. Display only — the state is announced by the text.
+- **CoreTracker** — HUD quest tracker. `title`, `text`, `distance`, `icon` (`map-marker`), `tone`
+  (`warning`), `objectives` (rendered as CoreObjectives) · default · — · `core-tracker core-tone-<tone>` +
+  `__rail __pin __body __title __text __distance __objectives` · a `--color-hud` card, radius 4,
+  `--shadow-ui-sm`, a rail column with the tone pin and a hairline running down out of it and fading beside the
+  copy, title display 700 18 px uppercase, text sans 15 px `fg-dim`, distance row with its own
+  pin. Click-through.
+- **CoreCompass** — heading strip. `heading` (0–360, anything else wrapped), `width` (560), `fov` (270 — the
+  field of view of mockup 2, which puts W, N and E on the band at once), `labels: 'all'|'cardinal'` (`cardinal`
+  = only N/E/S/W between bare ticks, as the mockup), `markers: [{ heading, icon?, tone?, label? }]`,
+  `showBearing` (`042` under the band) · — · — · `core-compass` + `__band __strip __marks
+  __tick __label __markers __marker __marker-label __needle __bearing` · a 30 px band fading out at both ends
+  (`-webkit-mask-image` — Chromium 103 has no unprefixed one),
+  ticks every 15°, cardinals display 700 15 px and the intercardinals 10 px, an `accent` triangle overhanging
+  the top edge marks the centre. The strip is built ONCE over −180…540° (every marker repeated a turn either
+  side, so a wrap-around never pops) and two `v-memo` layers freeze it: a heading update is one
+  `transform: translateX()` and no allocation.
+
+#### Feedback (`css/feedback.css`)
+
+- **CoreAlert** — inline banner. `tone` (`info`), `title`, `text`, `icon` (auto by tone; `icon=""` drops it),
+  `variant: 'soft'|'outline'` (`soft`), `dismissible` · default, `actions` · `dismiss` · `core-alert
+  core-tone-<tone> core-alert--<tone> core-alert--<variant>` + `__icon __body __title __text __actions __close`
+  · tone
+  10 % fill (*outline*: a `panel-sunken` well behind the same frame), tone 35 % border, 3 px tone bar on the
+  left, title display 600 14 px uppercase, text 14 px `fg-dim`.
+- **CoreToast** — notification card. `tone` (`info`), `title`, `message`, `icon` (auto by tone), `count`
+  (`x3`; under 2 hides the pill), `progress` (0–1 life bar; omit it and there is no bar),
+  `dismissible`, `blur` · default · `dismiss` · `core-toast core-tone-<tone> core-toast--<tone>` + `__bar
+  __main __icon __body __title __message __count __close __life __lifefill` · 340 px, panel fill, hairline,
+  radius 4, `--shadow-ui-sm`, 3 px tone bar down the left, 20 px tone icon, title display 700 13 px uppercase
+  0.12 em in the tone, message sans
+  14 px `fg`. Click-through — only the ✕ takes the mouse, so a stack of toasts can never swallow a click.
+- **CoreDialog** — modal. `v-model:open`, `title`, `subtitle`, `icon`, `tone` (`accent`), `size:
+  'sm'|'md'|'lg'|'xl'` (360 / 460 / 640 / 860), `closable` (true: ✕, Escape, backdrop click), `persistent`
+  (blocks Escape and the backdrop; the ✕ and the footer still work),
+  `backdrop` (true), `blur` (true), `teleport` (true) · default, `header`, `footer` · `update:open`, `close`
+  (reason: `escape` | `backdrop` | `button`) · backdrop `core-backdrop core-backdrop--clear`, panel
+  `core-dialog core-tone-<tone> core-dialog--<size>` + `__header __icontile __titles __title __subtitle __close
+  __body __footer` ·
+  panel fill + sheen, hairline, radius 6, `--shadow-ui-lg`, 2 px fading tone line on the top edge; optional
+  40 px icon
+  tile (tone 16 %); title display 700 22 px uppercase; body sans 15 px `fg-dim` and scrolling; footer black
+  22 %, hairline top,
+  buttons right, gap 10. Focus moves in on open (first `[autofocus]`, else the first focusable), Tab is
+  trapped, focus returns on close. Enter `core-pop`, leave fade. One wrapper does three jobs: the scrim, a
+  click-through centring layer (`backdrop: false`) and nothing at all (`teleport: false` as well), so the panel
+  markup exists exactly once. `inheritAttrs: false` — the caller's attributes land on the panel.
+- **CoreDrawer** — side sheet. `v-model:open`, `side: 'right'|'left'`, `width` (420), `title`, `subtitle`,
+  `closable`, `backdrop` (true), `blur` (true), `teleport` (true) · default, `header`, `footer` ·
+  `update:open`, `close` (reason) · `core-drawer core-tone-accent core-drawer--<side>` + the same `__header
+  __titles __title __subtitle __close __body __footer` parts as CoreDialog · full height against its edge, no
+  radius, the same fill, top line, focus trap and Escape layer; it has no `tone` prop, so the coral line is
+  pinned to the accent tone class. It enters with the base.css slide that travels towards its own side
+  (`core-slide-left` comes in from the right).
+- **CorePopover** — anchored floating panel. `v-model:open`, `placement` (`bottom-start`), `offset` (8),
+  `trigger: 'click'|'hover'|'manual'`, `matchWidth`, `blur` · `trigger` ({ open, toggle }), default ·
+  `update:open` · exposes `toggle/open/close` · `core-popover__anchor` (an inline-flex span, because
+  useFloating needs a real rect) + `core-popover core-popover--<resolved placement>` · `--color-panel-popup`,
+  `border-strong`, radius 4, `--shadow-ui`, padding 12, max-width 420. Hover keeps a 120 ms grace so the
+  pointer can cross the `offset` gap; an outside click closes anything but `trigger="manual"`.
+- **CoreContextMenu** — right-click menu. `v-model:open`, `position: { x, y }` (viewport px), `items:
+  [{ value, label, icon?, kbd?, danger?, disabled?, separator? }]` · `item` ({ item, active }) · `select`
+  (item), `update:open` · `core-contextmenu` + `__item is-active is-danger is-disabled`, `__icon __label __kbd
+  __sep` ·
+  `--color-panel-popup`, `border-strong`, radius 4, rows 34 px display 600 14 px uppercase 0.06 em, active =
+  `accent-soft` + a 2 px inset bar (hover and the roving cursor are the SAME state — never two highlights),
+  danger rows in `error`; placed against a zero-size rect with the kit's flip-then-clamp, so a menu opened in a
+  corner stays on screen; the panel takes focus on open and ↑/↓ (skipping separators like disabled rows),
+  Home/End, Enter/Space and Escape drive it; a window blur, scroll or resize dismisses it.
+- **CoreTooltip** — `text`, `placement` (`top`), `delay` (350 ms; focus shows it at once), `disabled` ·
+  default (the trigger),
+  `content` (rich: item tooltips) · — · `core-tooltip__anchor` + `core-tooltip core-tooltip--rich
+  core-tooltip--<resolved placement>` · ink 96 %, `border-strong`, radius 4, 13 px, max-width 260; rich content
+  padding 12, max-width 280. Never takes the mouse, and it does NOT register an escape layer (§37.4): Escape
+  and any pointer-down dismiss it without stopping the event for whatever is under it.
+
+### 37.6 The shell's built-ins wear the kit
+
+The Lua-driven built-ins (§6.10, §21) keep their **protocol, store logic, keyboard handling, timers and hook
+classes** (everything `ui/tests/shell-regression.js` and the stories read: `.hud .bar.is-ok`, `.stats .stat`,
+`.core-item[data-index]`, `[data-role]`, `[data-field]`, `[data-error]`, `.notif.is-<type>`, `.pos-<p>`, …) and
+change only their skin: they render kit classes / kit components, so `Core.UI.alert` looks like a CoreDialog and
+a toast like a CoreToast.
+
+| built-in | becomes |
+|---|---|
+| `Notifications` | CoreToast cards (tone = type, `count`), same slide-in |
+| `TextUI` | a CorePrompt (`key` → cap, `text` → label), same four positions |
+| `Progress` | a small glass panel: label (display voice) · cancel CoreKeyHint · CoreProgress `md` accent |
+| `KeyHints` | CoreKeyHints (solid caps) bottom right |
+| `Spinner` | glass pill: text + CoreSpinner |
+| `Menu` | dialog panel: CoreHeading + the `core-menu` rows (`sm`/`md`) + a CoreKeyHints footer |
+| `InputDialog` | dialog panel: CoreField + CoreInput / CoreSelect / CoreCheckbox / CoreSlider, footer buttons |
+| `AlertDialog` | dialog panel with the accent top line; confirm = primary, cancel = secondary |
+| `Hud` | mockup HUD card: money block in display voice, vitals as CoreStatBar rows, place/faction/identity rows |
+| `StatsBars` | CoreProgress rows with threshold tones |
+| `Shard` | display voice title, eyebrow voice subtitle |
+| `Chat` | tokens + box look on the composer; feed text in Barlow |
+
+`gameblur.js`, `bridge.js`, the store and `PageHost` are untouched.
+
+### 37.7 Stories, tests, docs
+
+- **Storybook**: `Kit/Foundations/{Tokens,Icon}` (colours, type, the icon registry), then one
+  `Kit/<Group>/<Name>` file per component — several carry the pair they document, so the titles are:
+  *Actions*: Button, Icon Button, Key & Key Hint, Key Hints, Prompt & Prompt Group · *Surfaces*: Panel, Card,
+  Background, Screen, Heading, Divider & Dash, Brand & Tagline · *Navigation*: Tabs, Menu, Chips, Stepper ·
+  *Forms*: Field, Input & Textarea, Number Input, Select, Checkbox, Radio & Radio Group, Switch, Slider,
+  Swatches · *Data*: Progress, Ring, Stat Bar, Stat Row, Spinner & Skeleton, Badge & Tag,
+  Avatar & Player Chip, Table, Key Value, Empty · *Game*: Slot & Grid, Hotbar, List & List Item,
+  Objective & Tracker, Compass · *Feedback*: Alert, Toast, Dialog, Drawer, Popover, Context Menu, Tooltip.
+  Each has a `Playground` (controls) and a `Gallery` story (a scene SFC in `stories/kit/scenes/` — the shipped
+  bundle has no runtime compiler, so scenes are compiled SFCs or `h()`), and
+  `Kit/Showcase/{MainMenu,Hud,Inventory,Map}`:
+  the four mockups rebuilt from kit components only (the completeness proof; art in `stories/kit/assets/`,
+  Storybook-only, never in `html/`). `storySort` puts `Kit` after `Built-ins`, Foundations and Showcase first.
+  Every gallery scene is built from
+  `scenes/KitStage.vue` (`title`, `description`, `width` (1100), `center`, `padded`; the page frame) and
+  `scenes/KitSection.vue` (`label`, `layout: 'row'|'column'|'grid'`, `columns`, `gap`, `note`; one labelled
+  group). Both turn ligatures off, or Barlow draws the `--` of every token name in the prose as a dash.
+- **Dev harness**: `ui/kit-preview.html?scene=<SceneName>&bg=game|keyart|menu|ink|none` (Vite dev server only —
+  the production build's single input stays `index.html`; Vite binds **localhost**, not 127.0.0.1) mounts one
+  scene with the kit installed, the way implementers and reviewers screenshot a component next to the mockup.
+  No `scene` lists every scene it found,
+  a failed import is drawn on the page in red, and `&scroll=page` swaps the shell's `fixed inset-0` root for a
+  growing one so `agent-browser screenshot --full` catches a tall gallery instead of stopping at the first
+  viewport. `node ui/tests/kit-compile-check.mjs <files…>` (no arguments: `ui/src/kit` and
+  `ui/src/stories/kit`) parses and `compileScript`s every SFC with
+  `@vue/compiler-sfc`, syntax-checks the JS, and lints CSS for the Chromium 103
+  list of §37.4 plus brace balance and well-formed comments — the parallel-safe check, because `npm run build`
+  empties `html/`. Nothing in that file may be spelled the way a Tailwind class is: Tailwind scans `ui/`,
+  so a literal needle would generate the very declarations the rule forbids.
+- **`ui/tests/kit-regression.js`** (agent-browser, like the shell suite, against the built `html/`): every
+  catalogue name is in `CoreUI.kit.components` and mounts without a Vue warning; the interactive contracts
+  (button click/disabled/loading, checkbox/radio/switch/slider/number/stepper/chips/tabs/menu `v-model`,
+  select open → arrows → Enter → Escape-closes-the-popup-not-the-page, dialog focus trap + escape layering,
+  context menu clamping, tooltip show/hide, slot grid selection); the bundled fonts resolve
+  (`document.fonts.check`); no kit CSS rule uses a Chromium-103-unsafe feature (the suite greps the built
+  `app.css` for `color-mix(` outside `@supports`, `:has(`, `translate:`, `rotate:`, `scale:`, the banned filter).
+- **Docs**: README "Design system" (tokens, the tag list, a page example, re-theming, adding icons),
+  `stories/docs/DesignSystem.mdx`, AGENTS §2/§3/§4/§5, the plugin template page and `core_example`'s page
+  rebuilt on the kit. No Lua API changes, so `types/core.lua` is untouched.

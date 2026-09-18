@@ -78,40 +78,65 @@ Inside the page, `window.CoreUI.usePage(id)` gives `{ props, emit, on, close }` 
 `window.CoreUI.hud` is the live HUD snapshot; `import ... from 'vue'` resolves to the one Vue
 instance the shell owns. No external fonts or CDNs: the CEF has no network.
 
+`ui/src/Page.vue` in this template is a working page built from the kit (next section) — read its
+comments, keep the shape, replace the content.
+
 Need an extra runtime library (drag-and-drop, charts, …)? Copy `ui/package.json.example` to
 `ui/package.json`, keep only that one dependency, and re-run `npm install` at the resources
 folder — the import is bundled into the same single dist. Never list `vue` there.
 
-### Styling — Tailwind CSS v4
+### Styling — the UI kit
 
-Nothing to install, nothing to configure, no CSS file of your own. Core's stylesheet is Tailwind v4
-(CSS-first, `@tailwindcss/vite`) and it scans **your** sources too — `@source "../../../*/ui/src/**/*.{vue,js}"`
-in `core/ui/src/styles.css` — so every utility your page uses is emitted into core's single bundle.
+Nothing to install, nothing to configure, **no CSS file of your own**. Core ships a design system
+(`DESIGN.md` §37): ~60 components registered globally on the shell's Vue app, so your page just
+writes the tags and looks like the rest of the server:
 
 ```vue
-<div class="core-panel core-interactive w-[380px] font-sans text-fg">
-    <h1 class="core-title">my_plugin</h1>
-    <p class="text-ui-sm text-fg-dim">Plain utilities, plus core's own tokens.</p>
-    <button class="core-btn core-btn--primary mt-3" @click="close()">Close</button>
-</div>
+<CoreScreen background="scrim">
+    <CorePanel title="my_plugin" subtitle="What this page is for" blur>
+        <template #actions><CoreIconButton icon="close" label="Close" variant="ghost" @click="close()" /></template>
+        <CoreKeyValue :items="[{ label: 'Player', value: hud.name, icon: 'user' }]" />
+        <template #footer>
+            <CoreKeyHints bare :items="[{ key: 'ESC', label: 'Close' }]" />
+        </template>
+    </CorePanel>
+</CoreScreen>
 ```
 
-The shell's design tokens are ordinary utilities (opacity modifiers such as `bg-accent/10` work too):
+| group | components |
+|---|---|
+| actions | `CoreButton` `CoreIconButton` `CoreKey` `CoreKeyHint` `CoreKeyHints` `CorePrompt` `CorePromptGroup` |
+| surfaces | `CorePanel` `CoreScreen` `CoreBackground` `CoreCard` `CoreHeading` `CoreDivider` `CoreDash` `CoreTagline` `CoreBrand` |
+| navigation | `CoreTabs` `CoreMenu` `CoreChips` `CoreStepper` |
+| forms | `CoreField` `CoreInput` `CoreTextarea` `CoreNumberInput` `CoreSelect` `CoreCheckbox` `CoreRadioGroup` `CoreRadio` `CoreSwitch` `CoreSlider` `CoreSwatches` |
+| data | `CoreProgress` `CoreRing` `CoreStatBar` `CoreStatRow` `CoreSpinner` `CoreSkeleton` `CoreBadge` `CoreTag` `CoreAvatar` `CorePlayerChip` `CoreTable` `CoreKeyValue` `CoreEmpty` |
+| game | `CoreSlot` `CoreSlotGrid` `CoreHotbar` `CoreList` `CoreListItem` `CoreObjective` `CoreTracker` `CoreCompass` |
+| feedback | `CoreAlert` `CoreToast` `CoreDialog` `CoreDrawer` `CorePopover` `CoreContextMenu` `CoreTooltip` |
+| foundation | `CoreIcon` (185 glyphs; `window.CoreUI.kit.registerIcons({ 'my-icon': 'M…' })` adds yours) |
+
+Props follow one vocabulary: `size` (`sm|md|lg`), `tone`, `icon`, `disabled`, `v-model`, `items`.
+The full API is `DESIGN.md` §37.5, the live version is core's Storybook (**Kit → …**, plus
+**Docs → Design System**), and core's README has the same list with a page example.
+
+For the bits the kit does not cover, Tailwind v4 is there (CSS-first, no config file): core's
+stylesheet scans **your** sources — `@source "../../../*/ui/src/**/*.{vue,js}"` in
+`core/ui/src/styles.css` — so every utility your page uses lands in core's single bundle. Layout
+utilities (`flex`, `gap-*`, `w-*`, `mt-*`) on a kit tag always win over the kit's own rule.
+**Colours, fonts and radii come from core's tokens, never from a literal value:**
 
 | group | utilities |
 |---|---|
-| surfaces | `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-backdrop` |
+| surfaces | `bg-ink` `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-panel-sunken` `bg-hud` `bg-backdrop` |
 | hairlines | `border-border` `border-border-strong` |
 | text | `text-fg` `text-fg-dim` `text-fg-faint` |
 | accent and states | `text-accent` `bg-accent-soft` `text-success` `text-error` `text-warning` `text-info` |
-| shape | `rounded-ui` (8 px) `rounded-ui-sm` (5 px) `shadow-ui` `ease-ui` |
-| type | `font-sans` `font-mono` · `text-ui` (14 px) `text-ui-sm` (12 px) `text-ui-xs` (10 px) |
+| vitals and rarity | `text-health` `text-armour` `text-stamina` `text-hunger` `text-thirst` · `text-rarity-rare` `…-epic` `…-legendary` |
+| shape | `rounded-ui` (6 px) `rounded-ui-sm` (4 px) `rounded-ui-xs` (3 px) `shadow-ui` `shadow-glow` `ease-ui` |
+| type | `font-sans` (Barlow) `font-display` (Barlow Condensed) `font-mono` · `text-ui` (15 px) `text-ui-sm` (13 px) `text-ui-xs` (11 px) · `text-display` (24 px) `text-display-lg` (34 px) |
 
-The `.core-*` component classes give a page the exact look of the built-in menus and dialogs:
-`core-panel` `core-modal` `core-backdrop` `core-title` `core-text` `core-label`
-`core-btn` (+ `core-btn--primary` / `--ghost` / `--danger`) `core-field` `core-input` `core-select`
-`core-check` `core-key` `core-list` `core-item` (`.is-active` / `.is-disabled`) and `core-interactive`
-(`pointer-events: auto`, which a page needs because the shell is click-through).
+Class names work too — `core-panel` `core-btn` `core-input` `core-key` `core-label` `core-eyebrow`
+`core-display` `core-text` and `core-interactive` (`pointer-events: auto`, which a plain `<div>` of
+your own needs because the shell is click-through).
 
 A scoped `<style>` block is compiled on its own, so `@apply` has to be pointed at the theme first —
 the path is relative to **your** `ui/src/`:
@@ -127,13 +152,18 @@ the path is relative to **your** `ui/src/`:
 `@reference` only reads that file (tokens, `.core-*`, custom utilities) and emits nothing, so the
 bundle keeps one copy of the CSS. Utilities written in the template need no `@reference`.
 
+**FiveM's CEF is Chromium 103**: no `:has()`, no `color-mix()`, no CSS nesting, no container
+queries, no `dvh`, no Popover API, and Tailwind's `translate-*` / `rotate-*` / `scale-*` utilities
+emit properties Chrome only learned in 104 — write `[transform:translateX(-50%)]`.
+
 **Never use `backdrop-filter` / `-webkit-backdrop-filter` or Tailwind's `backdrop-*` utilities** —
 the game frame is not part of the CEF's compositing surface, so FiveM paints the filtered area as a
-solid black box. For a glass panel put **`data-core-blur`** on the panel element instead: core draws
-a live, blurred copy of the game frame behind it, no JavaScript needed (`data-core-blur="18"` for a
-custom radius, `--core-glass-tint` for a custom tint). Panels only — never list rows. See core's
-README, "Game blur (glass panels)".
+solid black box. For a glass panel pass **`blur`** to a kit panel (or put `data-core-blur` on your
+own element): core draws a live, blurred copy of the game frame behind it, no JavaScript needed
+(`:blur="18"` for a custom radius, `--core-glass-tint` for a custom tint). Panels only — never list
+rows, and 12 or fewer on screen. See core's README, "Game blur (glass panels)".
 
+Check the page without a build: `node ../core/ui/tests/kit-compile-check.mjs ui/src/Page.vue`.
 New classes only reach the game after core's UI is rebuilt (`cd core/ui && npm run build`).
 
 ## 4. Where the APIs are documented

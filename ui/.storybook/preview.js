@@ -8,13 +8,22 @@ import * as Vue from 'vue'
 
 window.Vue = Vue // must be set before installCoreUI(), exactly like main.js
 
+import { setup } from '@storybook/vue3-vite'
 import '../src/styles.css'
+import '../src/kit/fonts.css'
 import { installCoreUI } from '../src/coreui.js'
 import { installGameBlur } from '../src/gameblur.js'
+import { installKit } from '../src/kit/index.js'
 import { resetStore } from '../src/stories/storeHelpers.js'
 import { luaChannel, withoutLog } from '../src/stories/luaBridge.js'
 
 installCoreUI()
+
+// §37.3: main.js calls installKit(app) before mounting; here Storybook owns the app, so the kit is
+// registered through its setup hook — every story can write `<CoreButton>` with no import.
+setup((app) => {
+  installKit(app)
+})
 
 // main.js installs this on #app; here it watches the whole preview body, so a story's panels
 // get their glass wherever the story mounts them. There is no FiveM render hook in a browser,
@@ -66,7 +75,16 @@ export const parameters = {
   },
   options: {
     storySort: {
-      order: ['Docs', ['Introduction', 'Protocol', 'Plugin Pages'], 'Shell', 'Built-ins', '*'],
+      order: [
+        'Docs',
+        ['Introduction', 'Design System', 'Protocol', 'Plugin Pages'],
+        'Shell',
+        'Built-ins',
+        // §37.7: the design system sits after the shell it skins.
+        'Kit',
+        ['Foundations', 'Showcase', 'Actions', 'Surfaces', 'Navigation', 'Forms', 'Data', 'Game', 'Feedback'],
+        '*',
+      ],
     },
   },
 }

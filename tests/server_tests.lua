@@ -79,8 +79,8 @@ end
 
 -- manifest order; a file that does not exist yet is skipped so the suite keeps running
 local SERVER_FILES <const> = {
-    'server/api.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/notify.lua', 'server/perms.lua',
-    'server/player.lua', 'server/money.lua', 'server/factions.lua', 'server/vehicles.lua',
+    'server/api.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/globals.lua', 'server/notify.lua',
+    'server/perms.lua', 'server/player.lua', 'server/money.lua', 'server/factions.lua', 'server/vehicles.lua',
 }
 
 --- A fresh core VM with import.lua, shared/config.lua and the server modules loaded.
@@ -210,6 +210,69 @@ local function suiteDB()
     eq(put[1], 'x-2', 'writes go to the new adapter')
     eq(Reloaded.DB.setAdapter({ loadAll = function() end }), false, 'an incomplete adapter is refused')
     eq(Reloaded.DB.setAdapter('nope'), false, 'a non-table adapter is refused')
+end
+
+--- Core.Globals (DESIGN §22): the persisted key/value store, its GlobalState mirror, and the
+--- first-access load barrier — two callers during an asynchronous load both get the document,
+--- and it is loaded once (the postgres race of 2026-09-16: a plugin's onReady and its cron).
+local function suiteGlobals()
+    suite('globals')
+    stubs.resetServer()
+    local env, Core = newServer()
+    local G = Core.Globals
+
+    eq(G.get('unset', 7), 7, 'get of an unset key returns the default')
+    eq(G.get('unset'), nil, 'and nil without one')
+    eq(G.set('bad key!', 1), false, 'set refuses an invalid key')
+    eq(G.get('bad key!', 'd'), 'd', 'get of an invalid key returns the default')
+    eq(G.set('season', 'winter'), true, 'set stores a value')
+    eq(G.get('season'), 'winter', 'get returns it')
+    eq(G.set('flag', true, true), true, 'set with the mirror flag')
+    eq(env.GlobalState['g:flag'], true, 'a mirrored key is published to GlobalState')
+    eq(env.GlobalState['g:season'], nil, 'an unmirrored key is not')
+    eq(G.set('fn', function() end), false, 'set refuses a function')
+    eq(G.increment('count'), 1, 'increment starts an unset key at 0')
+    eq(G.increment('count', 4), 5, 'increment adds the delta')
+    eq(G.increment('season'), nil, 'increment of a non-number is nil')
+    eq(G.unset('count'), true, 'unset removes the key')
+    eq(G.unset('count'), false, 'a second unset is false')
+    eq(G.get('count'), nil, 'the key is gone')
+    G.set('box', { a = { 1, 2 } })
+    G.get('box').a[1] = 99
+    eq(G.get('box').a[1], 1, 'a stored table comes back as a copy')
+
+    -- persisted through Core.DB: a fresh VM reads the document back and republishes the mirror
+    local env2, Reloaded = newServer()
+    eq(Reloaded.Globals.get('season'), 'winter', 'a fresh VM reads the document back from KVP')
+    eq(env2.GlobalState['g:flag'], true, 'mirrored keys are republished on load')
+    eq(env2.GlobalState['g:season'], nil, 'unmirrored keys still are not')
+
+    -- the first-access barrier: an adapter whose loadAll yields, two callers at once
+    local env3, Core3 = newServer()
+    local loads = 0
+    eq(Core3.DB.setAdapter({
+        loadAll = function(name)
+            loads = loads + 1
+            env3.Wait(50)                      -- postgres/mysql: the collection load yields
+            if name == 'globals' then
+                return { server = '{"values":{"season":"summer"},"mirror":{"season":true}}' }
+            end
+            return {}
+        end,
+        put = function() end, remove = function() end, flush = function() end,
+    }), true, 'an asynchronous adapter is accepted')
+    local results = {}
+    env3.Citizen.CreateThread(function() results.first = Core3.Globals.get('season', 'none') end)
+    env3.Citizen.CreateThread(function() results.second = Core3.Globals.get('season', 'none') end)
+    eq(results.first, nil, 'the first caller is parked inside the load')
+    eq(results.second, nil, 'the second caller is parked on the barrier')
+    stubs.tick(100)
+    eq(results.first, 'summer', 'the first caller gets the loaded value')
+    eq(results.second, 'summer', 'the caller that arrived during the load waits for it and gets it too')
+    eq(loads, 1, 'the document was loaded once')
+    eq(env3.GlobalState['g:season'], 'summer', 'the mirror is republished after the load')
+    eq(#stubs.failures, 0, 'no thread errored')
+    eq(Core3.Globals.get('season'), 'summer', 'later callers read the loaded store')
 end
 
 --- Core.Perms (DESIGN §4.4): console, ACE, config group, and the setGroup delegation.
@@ -921,6 +984,7 @@ local function suiteVehicles()
     eq(#deletedHook, 1, 'store emitted vehicleDeleted')
     eq(errOf(V.spawn({ model = 'adder', coords = vector3(9.0, 9.0, 9.0), plate = 'LSTEST1' })), 'plate_taken',
         'a stored record reserves its plate globally')
+    eq(errOf(V.restoreRecord(vehId)), 'record_stored', 'world restore refuses a deliberately garaged record')
 
     local respawned = V.spawnRecord(vehId, vector3(5.0, 5.0, 5.0), 10.0, 1)
     check(math.type(respawned) == 'integer', 'spawnRecord brings the vehicle back')
@@ -935,6 +999,8 @@ local function suiteVehicles()
     eq(V.saveProps(respawned, { modEngine = 3, colour = 'red', extras = { 1, 2 }, on = true }), true,
         'saveProps accepts a well-formed props table')
     eq(V.getRecord(vehId).props.modEngine, 3, 'the props reached the record')
+    eq(stubs.entityState(env, V.getEntity(respawned)).coreProps.colour, 'red',
+        'changed saved props are projected for clients that stream later')
     local nativeMaps = {
         modEngine = 3, mods = { [0] = 3, ['1'] = 2 }, extras = { [0] = true, ['1'] = false },
         modToggles = { [17] = true }, burstTyres = { [0] = true }, tyreHealth = { [0] = 850.0 },
@@ -963,14 +1029,38 @@ local function suiteVehicles()
     eq(V.getRecord(vehId), nil, 'the record is gone')
     eq(V.deleteRecord('nope'), false, 'deleteRecord of an unknown id is false')
 
-    -- Core restart: tracked persisted vehicles are marked stored before synchronous deletion,
-    -- so their records can be retrieved after the new core VM starts.
+    -- Core/server restart: a live persistent vehicle remains logically out and can be restored at its final position.
     local restartNetId = V.spawn({ model = 'adder', coords = vector3(77.0, 88.0, 20.0), ownerSrc = 1 })
     local restartVehId = V.persist(restartNetId)
+    eq(V.saveProps(restartNetId, { colour = 'green' }), true, 'world vehicle props save before restart')
     stubs.triggerOn(env, 'onResourceStop', 0, Core.name)
-    eq(V.getRecord(restartVehId).stored, true, 'core stop marks a persisted vehicle stored')
+    eq(V.getRecord(restartVehId).stored, false, 'core stop keeps a world vehicle out of the garage')
     eq(V.getRecord(restartVehId).position.x, 77.0, 'core stop saves final vehicle position')
     eq(V.exists(restartNetId), false, 'core stop deletes the live entity after storing it')
+    local restoredNetId = V.restoreRecord(restartVehId)
+    check(math.type(restoredNetId) == 'integer', 'an out record restores into the world')
+    eq(stubs.coords[V.getEntity(restoredNetId)].x, 77.0, 'world restore uses the saved record position')
+    eq(V.getInfo(restoredNetId).vehId, restartVehId, 'restored world entity keeps its unique vehicle id')
+    eq(stubs.entityState(env, V.getEntity(restoredNetId)).coreProps.colour, 'green',
+        'world restore projects props for whichever client streams it')
+    eq(V.delete(restoredNetId), true, 'restored world test entity is removed')
+
+    -- A validated server plugin can adopt an existing ambient vehicle without trusting a client-created record.
+    local ambient = stubs.newEntity(2, { model = env.GetHashKey('blista'), vehType = 'automobile', plate = 'NPC123' })
+    stubs.coords[ambient], stubs.headings[ambient] = vector3(31.0, 32.0, 33.0), 123.0
+    local ambientNetId = env.NetworkGetNetworkIdFromEntity(ambient)
+    local adoptedVehId = V.adopt(ambientNetId, {
+        ownerSrc = 1, keyMode = 'item', locked = false, props = { colour = 'blue' },
+    })
+    check(type(adoptedVehId) == 'string', 'an ambient network vehicle can be adopted persistently')
+    eq(V.getInfo(ambientNetId).vehId, adoptedVehId, 'adoption tracks the ambient net id under its new vehId')
+    eq(V.getInfo(ambientNetId).keyMode, 'item', 'adoption keeps physical-key mode')
+    eq(V.getRecord(adoptedVehId).position.x, 31.0, 'adoption persists the ambient world position')
+    eq(stubs.entities[ambient].orphanMode, 2, 'adoption makes the ambient entity server-persistent')
+    eq(stubs.entityState(env, ambient).coreProps.colour, 'blue', 'adoption projects trusted initial props')
+    eq(errOf(V.adopt(ambientNetId, { ownerSrc = 1 })), 'already_tracked', 'the same ambient entity cannot be adopted twice')
+    eq(V.delete(ambientNetId), true, 'adopted ambient test entity is removed')
+    eq(V.deleteRecord(adoptedVehId), true, 'adopted ambient test record is removed')
     eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
 end
 
@@ -1523,6 +1613,7 @@ end
 local suites = {
     { 'db', suiteDB },
     { 'db_pg', suiteDbPg },
+    { 'globals', suiteGlobals },
     { 'chat', suiteChat },
     { 'perms', suitePerms },
     { 'player', suitePlayer },

@@ -46,17 +46,26 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   <Transition name="alert">
     <div v-if="visible" class="core-backdrop alert-back z-50">
       <div
-        ref="panel" class="core-panel core-modal alert w-[380px] max-w-[80vw] animate-[core-pop-in_0.12s_var(--ease-ui)]"
+        ref="panel"
+        class="core-dialog core-tone-accent core-dialog--md alert animate-[core-pop-in_0.12s_var(--ease-ui)]"
         role="alertdialog" :aria-label="store.alert.title || 'Notice'" data-core-blur
       >
-        <h2 class="core-title">{{ store.alert.title || 'Notice' }}</h2>
-        <p class="core-text msg mt-2 max-h-[50vh] overflow-y-auto leading-normal whitespace-pre-line">{{ message }}</p>
-        <div class="actions mt-3.5 flex justify-end gap-2">
-          <button v-if="cancelLabel" type="button" class="core-btn" data-role="cancel" @click="cancel">
-            {{ cancelLabel }}
+        <div class="core-dialog__header">
+          <div class="core-dialog__titles">
+            <h2 class="core-title core-dialog__title">{{ store.alert.title || 'Notice' }}</h2>
+          </div>
+        </div>
+        <div class="core-dialog__body core-scroll">
+          <p class="core-text msg whitespace-pre-line">{{ message }}</p>
+        </div>
+        <!-- No CoreButton here: `confirmEl` is focused as a DOM node and the buttons are what
+             onKeydown() cycles with Tab, so they stay native elements wearing the kit classes. -->
+        <div class="core-dialog__footer actions">
+          <button v-if="cancelLabel" type="button" class="core-btn core-btn--secondary core-btn--md" data-role="cancel" @click="cancel">
+            <span class="core-btn__label">{{ cancelLabel }}</span>
           </button>
-          <button ref="confirmEl" type="button" class="core-btn core-btn--primary" data-role="confirm" @click="confirm">
-            {{ store.alert.confirm || 'OK' }}
+          <button ref="confirmEl" type="button" class="core-btn core-btn--primary core-btn--md" data-role="confirm" @click="confirm">
+            <span class="core-btn__label">{{ store.alert.confirm || 'OK' }}</span>
           </button>
         </div>
       </div>

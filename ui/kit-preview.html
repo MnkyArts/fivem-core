@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <title>core ui kit — scene preview</title>
+    <!--
+      DESIGN §37.7 dev harness. `npm run dev`, then
+
+        http://localhost:5173/kit-preview.html?scene=<SceneName>&bg=game|keyart|menu|ink|none
+
+      mounts ONE scene from src/stories/kit/scenes with the kit installed, so a component can be
+      screenshotted next to its mockup without booting Storybook. `&scroll=page` swaps the shell's
+      fixed self-scrolling root for a growing one, so a full-page screenshot catches a tall gallery
+      in one image. Vite's build input stays index.html (rollupOptions.input is not set), so this
+      page never reaches html/.
+    -->
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/kit/preview.js"></script>
+  </body>
+</html>

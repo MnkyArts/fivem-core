@@ -578,6 +578,14 @@ local function installServerNatives(env, rec)
         local record = stubs.entities[entity]
         return (record and record.exists) and record.type or 0
     end
+    env.GetEntityModel = function(entity)
+        local record = stubs.entities[entity]
+        return (record and record.exists) and record.model or 0
+    end
+    env.GetVehicleType = function(entity)
+        local record = stubs.entities[entity]
+        return (record and record.exists) and (record.vehType or 'automobile') or nil
+    end
     env.GetEntityHeading = function(entity) return stubs.headings[entity] or 0.0 end
     env.GetEntityHealth = function(entity)
         local value = stubs.health[entity]
@@ -587,6 +595,10 @@ local function installServerNatives(env, rec)
     env.SetVehicleNumberPlateText = function(entity, plate)
         local record = stubs.entities[entity]
         if record then record.plate = plate end
+    end
+    env.GetVehicleNumberPlateText = function(entity)
+        local record = stubs.entities[entity]
+        return (record and record.exists and record.plate) or ''
     end
     env.NetworkGetNetworkIdFromEntity = function(entity)
         local record = stubs.entities[entity]

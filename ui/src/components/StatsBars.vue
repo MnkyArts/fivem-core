@@ -3,22 +3,34 @@
 // `Config.Stats` def with `hud = true`. App.vue hangs this in the top-right rail
 // directly under Hud.vue, so the component does no positioning of its own.
 //
-// Colour follows the def's thresholds: amber under 25 %, red under 10 % (§18).
+// Skin: the same --color-hud plate as Hud.vue, rows as inline CoreProgress bars
+// (label voice · 8 px track) — DESIGN §37.6.
+//
+// Colour follows the def's thresholds: amber under 25 %, red under 10 % (§18). Above them a
+// stat named after one of the kit's vitals (§37.2) wears that vital's tone, anything else the
+// neutral ramp.
 import { computed } from 'vue'
 import { store } from '../store.js'
 
 const WARNING_PCT = 25
 const ERROR_PCT = 10
 
-// Threshold colours as theme utilities; `is-ok` / `is-warning` / `is-error` stay on the
-// row as hook classes (the stories read them back off `.stats .stat`).
-const FILL = { ok: 'bg-accent', warning: 'bg-warning', error: 'bg-error' }
+// Threshold tones; `is-ok` / `is-warning` / `is-error` stay on the row as hook classes
+// (the stories read them back off `.stats .stat`).
+const VITALS = ['health', 'armour', 'stamina', 'hunger', 'thirst', 'oxygen', 'stress']
+const LEVEL_TONE = { warning: 'core-tone-warning', error: 'core-tone-danger' }
 const LABEL = { ok: 'text-fg-dim', warning: 'text-fg-dim', error: 'text-error' }
 
 function percent (stat) {
   const span = stat.max - stat.min
   if (!(span > 0)) return 0
   return Math.min(100, Math.max(0, ((stat.value - stat.min) / span) * 100))
+}
+
+/** A healthy bar is the vital's own colour when the name is one of the kit's seven; anything else
+    takes the neutral ramp, which cannot be mistaken for the coral accent or the error red. */
+function okTone (name) {
+  return VITALS.indexOf(String(name).toLowerCase()) === -1 ? 'core-tone-neutral' : 'core-tone-' + name
 }
 
 // Lua tables have no order, so the bars are sorted by name: the stack never reshuffles
@@ -34,7 +46,7 @@ const rows = computed(() => Object.keys(store.stats)
       label: stat.label || name,
       pct,
       level,
-      fillClass: FILL[level],
+      toneClass: LEVEL_TONE[level] || okTone(name),
       labelClass: LABEL[level],
     }
   }))
@@ -44,27 +56,26 @@ const rows = computed(() => Object.keys(store.stats)
   <Transition name="stats">
     <div
       v-if="rows.length"
-      class="stats pointer-events-none min-w-[176px] px-[12px] py-[8px]
-             bg-panel border border-border rounded-ui flex flex-col gap-[6px]"
+      class="stats pointer-events-none w-[268px] px-[14px] py-[11px]
+             bg-hud border border-border rounded-ui-sm shadow-ui-sm
+             [--core-glass-tint:var(--color-hud)] flex flex-col gap-[9px]"
       data-core-blur
     >
+      <!-- The right gutter is the width of the HUD's vitals number column, so the bars of the two
+           plates end on the same line in the rail — the way the 54 px label column used to line up
+           their left edges. -->
       <div
         v-for="row in rows"
         :key="row.name"
-        class="stat flex items-center gap-[9px]"
-        :class="'is-' + row.level"
+        class="stat core-progress core-progress--md core-progress--inline gap-[10px] pr-[45px]"
+        :class="['is-' + row.level, row.toneClass]"
       >
         <span
-          class="lbl flex-[0_0_54px] text-ui-xs font-semibold tracking-[0.08em] uppercase
-                 overflow-hidden text-ellipsis whitespace-nowrap"
+          class="lbl core-progress__label mr-0 flex-[0_0_66px]"
           :class="row.labelClass"
         >{{ row.label }}</span>
-        <span class="track flex-auto h-[4px] rounded-[3px] bg-[rgba(255,255,255,0.08)] overflow-hidden">
-          <span
-            class="fill block h-full rounded-[3px] [transition:width_0.25s_var(--ease-ui),background_0.2s_ease]"
-            :class="row.fillClass"
-            :style="{ width: row.pct + '%' }"
-          ></span>
+        <span class="track core-progress__track flex-auto">
+          <span class="fill core-progress__fill" :style="{ width: row.pct + '%' }"></span>
         </span>
       </div>
     </div>

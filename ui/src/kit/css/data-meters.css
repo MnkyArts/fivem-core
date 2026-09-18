@@ -1,0 +1,359 @@
+/* core UI kit — Data — meters (DESIGN §37.5).
+   CoreProgress, CoreRing, CoreStatBar, CoreStatRow, CoreSpinner,
+   CoreSkeleton.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
+
+   Every fill reads `var(--tone)` / `rgb(var(--tone-rgb) / a)`, which base.css sets from the
+   `core-tone-*` class on the root, so one component covers the accent, the six semantic tones and
+   the seven vitals. A `color` prop overrides both inline (`--tone` plus `--core-progress-fill`,
+   which wins over the two gradient recipes below). */
+
+/* ---- CoreProgress --------------------------------------------------------------------------
+   The linear bar of the mockups: the inventory capacity row (inline, neutral, a near-white fill
+   over a white-12 % well) and the thin coral XP bar of the player chip. */
+
+.core-progress {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  --core-progress-h: 8px;
+}
+
+.core-progress--xs { --core-progress-h: 2px; }
+.core-progress--sm { --core-progress-h: 4px; }
+.core-progress--md { --core-progress-h: 8px; }
+.core-progress--lg { --core-progress-h: 12px; }
+
+/* Stacked layout: caption left, value right, the track under both. */
+.core-progress__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 9px;
+}
+
+.core-progress__caption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.core-progress__icon {
+  color: var(--tone);
+  flex: none;
+}
+
+.core-progress__label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.core-progress__value {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--color-fg);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  white-space: nowrap;
+}
+
+/* The `/ 30.0` half of a capacity readout stays quiet — only the current value is bright. */
+.core-progress__max { color: var(--color-fg-dim); }
+
+.core-progress__track {
+  position: relative;
+  overflow: hidden;
+  height: var(--core-progress-h);
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.core-progress__fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-radius: inherit;
+  background: var(--core-progress-fill, var(--tone));
+  transition: width 0.25s var(--ease-ui);
+}
+
+/* The two gradient recipes of §37.5: the brand gradient for the accent tone, the near-white ramp
+   of the capacity bar for neutral. Both lose against an explicit `color` prop. */
+.core-progress.core-tone-accent .core-progress__fill {
+  background: var(--core-progress-fill, var(--core-grad-accent));
+}
+.core-progress.core-tone-neutral .core-progress__fill {
+  background: var(--core-progress-fill, linear-gradient(90deg, #dfe3e7 0%, #c9cfd5 100%));
+}
+
+/* Inline (the capacity row): glyph · caption · bar · value on one line. The extra margins are the
+   mockup's uneven rhythm — the bar breathes more than the glyph does. */
+.core-progress--inline {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.core-progress--inline .core-progress__label { margin-right: 10px; }
+.core-progress--inline .core-progress__track {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.core-progress--inline .core-progress__value { margin-left: 18px; }
+
+/* Segments (ammo, armour plates): one mask on the TRACK carves both the well and the fill, so the
+   cells line up whatever width the fill has. The mask box is 2 px wider than the track, which puts
+   the trailing gap of the last cell outside the element instead of clipping the bar's right end.
+   Chromium 103 only knows the prefixed longhand. */
+.core-progress.is-segmented .core-progress__track {
+  --core-progress-seg: calc((100% + 2px) / var(--core-progress-cells, 6));
+  -webkit-mask-image: repeating-linear-gradient(
+    90deg,
+    #000 0,
+    #000 calc(var(--core-progress-seg) - 2px),
+    transparent calc(var(--core-progress-seg) - 2px),
+    transparent var(--core-progress-seg)
+  );
+}
+
+/* Indeterminate: a short fill sweeping the track (keyframes in base.css). No width transition —
+   the animation owns the movement. */
+.core-progress.is-indeterminate .core-progress__fill {
+  width: 35%;
+  transition: none;
+  animation: core-indeterminate 1.15s ease-in-out infinite;
+}
+
+/* ---- CoreRing ------------------------------------------------------------------------------
+   Radial progress. The arc starts at 12 o'clock through the SVG `transform` attribute on the
+   circle (an SVG presentation attribute, not a CSS transform), so no utility can flatten it. */
+
+.core-ring {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.core-ring__svg { display: block; }
+
+.core-ring__track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.12);
+}
+
+.core-ring__fill {
+  fill: none;
+  stroke: var(--tone);
+  stroke-linecap: butt;
+  transition: stroke-dashoffset 0.25s var(--ease-ui);
+}
+
+.core-ring__center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-fg);
+  pointer-events: none;
+}
+
+.core-ring__value {
+  font-family: var(--font-display);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: var(--tracking-display);
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* ---- CoreStatBar ---------------------------------------------------------------------------
+   The HUD vital of mockup 2: a glyph in the vital's colour, a chunky flat bar in a dark well and a
+   big condensed number. It is a read-out, never a target — the whole row stays click-through, and
+   the value is left-aligned with a floor width so 100 -> 75 cannot resize the plate around it. */
+
+.core-statbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  pointer-events: none;
+}
+
+.core-statbar__icon {
+  flex: none;
+  color: var(--tone);
+}
+
+/* `iconTone="fg"`: the colour stays in the bar, like the white shield of mockup 2. */
+.core-statbar--icon-fg .core-statbar__icon { color: var(--color-fg); }
+
+.core-statbar.is-low .core-statbar__icon { animation: core-pulse 1.2s var(--ease-ui) infinite; }
+
+.core-statbar__track {
+  position: relative;
+  overflow: hidden;
+  flex: none;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--color-panel-sunken);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+
+.core-statbar__fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-radius: inherit;
+  background: var(--core-statbar-fill, var(--tone));
+  transition: width 0.25s var(--ease-ui);
+}
+
+.core-statbar__value {
+  flex: none;
+  min-width: 44px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 19px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--color-fg);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+}
+
+/* ---- CoreStatRow ---------------------------------------------------------------------------
+   The detail stat of mockup 3 (heart · HEALTH RESTORE · +75) between two hairlines. Stacked rows
+   share one line: the neighbour's top border only turns transparent, so the 56 px rhythm holds. */
+
+.core-statrow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 56px;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.core-statrow--line-both {
+  border-top-color: var(--color-border);
+  border-bottom-color: var(--color-border);
+}
+.core-statrow--line-top { border-bottom-color: transparent; }
+.core-statrow--line-bottom { border-top-color: transparent; }
+.core-statrow--line-none {
+  border-top-color: transparent;
+  border-bottom-color: transparent;
+}
+
+.core-statrow + .core-statrow { border-top-color: transparent; }
+
+.core-statrow__icon {
+  flex: none;
+  color: var(--color-fg);
+}
+
+.core-statrow__label {
+  min-width: 0;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 16px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--color-fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* No tone -> `--tone` is undefined and the value stays white, exactly like the mockup's +75. */
+.core-statrow__value {
+  flex: none;
+  margin-left: auto;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: var(--tracking-display);
+  color: var(--tone, var(--color-fg));
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* ---- CoreSpinner ---------------------------------------------------------------------------
+   Work with no measurable progress. The ring is one border with a single lit side over a white
+   20 % circle — the same recipe the shell's busy pill has always used (§37.6), so the built-in and
+   the kit component are the same object. */
+
+.core-spinner {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--tone);
+}
+
+.core-spinner__ring {
+  flex: none;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: var(--core-spinner-w, 2px) solid var(--color-border-strong);
+  border-top-color: var(--tone);
+  animation: core-spin 0.8s linear infinite;
+}
+
+.core-spinner__label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+  white-space: nowrap;
+}
+
+/* ---- CoreSkeleton --------------------------------------------------------------------------
+   The placeholder block while a page waits for its data: white 6 % with a highlight sweeping
+   across a 200 %-wide background (the `core-shimmer` keyframes of base.css). */
+
+.core-skeleton { display: block; }
+
+.core-skeleton__line {
+  background-color: rgba(255, 255, 255, 0.06);
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.09) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 200% 100%;
+  animation: core-shimmer 1.4s linear infinite;
+}
+
+.core-skeleton__line + .core-skeleton__line { margin-top: 9px; }
+
+/* A paragraph never ends flush: the last line of a multi-line block is short, like real copy. */
+.core-skeleton--lines .core-skeleton__line:last-child { width: 62%; }

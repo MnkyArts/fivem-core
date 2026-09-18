@@ -1,0 +1,206 @@
+/* core UI kit — foundation classes (DESIGN §37.4, §37.5).
+   Type voices, the icon box, the tone/rarity variables every group partial reads, the scroll and
+   focus looks, the Vue transition class sets and every keyframe the kit animates with.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens, no @apply.
+   Chromium 103 (§7.1): write `transform:`, never the individual translate/rotate/scale properties;
+   no :has(), no color-mix(), no CSS nesting — alpha is rgb(var(--x-rgb) / a) or an rgba() literal. */
+
+/* ---- type voices -------------------------------------------------------------------------- */
+
+.core-display {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  line-height: 1;
+}
+.core-display--sm { font-size: var(--text-display-sm); }
+.core-display--md { font-size: var(--text-display); }
+.core-display--lg { font-size: var(--text-display-lg); }
+.core-display--xl { font-size: var(--text-display-xl); }
+
+/* The widely spaced subtitle under a heading ("EXPLORE A LARGER TOMORROW"). */
+.core-eyebrow {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 13px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  color: var(--color-fg-dim);
+}
+
+/* The small caption over a control or a table column. */
+.core-label {
+  display: block;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+}
+
+.core-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 22px;
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+}
+
+.core-text {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--color-fg-dim);
+}
+
+/* Italic aside under a description ("A small kit. A second chance."). */
+.core-flavor {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-style: italic;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-fg-faint);
+}
+
+/* Any number that must not jitter while it counts (money, ammo, vitals). */
+.core-num {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* ---- icons (CoreIcon) --------------------------------------------------------------------- */
+
+.core-icon {
+  display: inline-block;
+  flex: none;
+  vertical-align: middle;
+}
+.core-icon.is-spin { animation: core-spin 0.8s linear infinite; }
+
+/* ---- tones (§37.4) ------------------------------------------------------------------------
+   A component that takes `tone` puts `core-tone-<tone>` on its root (toneClass() in use.js) and its
+   group partial then only ever writes `var(--tone)` and `rgb(var(--tone-rgb) / 0.16)`. `--tone-rgb`
+   is the space-separated triplet of the same colour, because Chromium 103 cannot color-mix(). A
+   `color` prop overrides both inline. The colours point at the theme tokens so a re-themed server
+   (other --color-accent / --core-accent-rgb) re-tones every component at once; the meter and rarity
+   triplets are literals — change them together with their --color-* token. */
+
+.core-tone-accent   { --tone: var(--color-accent); --tone-rgb: var(--core-accent-rgb); }
+.core-tone-neutral  { --tone: #d5dae0; --tone-rgb: 213 218 224; }
+.core-tone-success  { --tone: var(--color-success); --tone-rgb: var(--core-success-rgb); }
+.core-tone-warning  { --tone: var(--color-warning); --tone-rgb: var(--core-warning-rgb); }
+.core-tone-danger   { --tone: var(--color-error); --tone-rgb: var(--core-error-rgb); }
+.core-tone-info     { --tone: var(--color-info); --tone-rgb: var(--core-info-rgb); }
+
+/* Meter tones — the vitals of §37.2. */
+.core-tone-health   { --tone: var(--color-health); --tone-rgb: 250 82 70; }
+.core-tone-armour   { --tone: var(--color-armour); --tone-rgb: 93 187 247; }
+.core-tone-stamina  { --tone: var(--color-stamina); --tone-rgb: 93 227 149; }
+.core-tone-hunger   { --tone: var(--color-hunger); --tone-rgb: 245 166 35; }
+.core-tone-thirst   { --tone: var(--color-thirst); --tone-rgb: 79 209 232; }
+.core-tone-oxygen   { --tone: var(--color-oxygen); --tone-rgb: 159 216 255; }
+.core-tone-stress   { --tone: var(--color-stress); --tone-rgb: 182 140 255; }
+
+/* Item rarities — same two variables, so a slot or a tag can wear either. */
+.core-rarity-common    { --tone: var(--color-rarity-common); --tone-rgb: 174 182 191; }
+.core-rarity-uncommon  { --tone: var(--color-rarity-uncommon); --tone-rgb: 93 227 149; }
+.core-rarity-rare      { --tone: var(--color-rarity-rare); --tone-rgb: 93 187 247; }
+.core-rarity-epic      { --tone: var(--color-rarity-epic); --tone-rgb: 182 140 255; }
+.core-rarity-legendary { --tone: var(--color-rarity-legendary); --tone-rgb: 245 166 35; }
+
+/* ---- scroll and focus --------------------------------------------------------------------- */
+
+/* Chromium 103 has no `scrollbar-width`, so the thin bar is the -webkit- pseudo-element set.
+   `.core-list` keeps the same look for the first-wave built-ins that still wear that class. */
+.core-scroll { overflow-y: auto; }
+.core-scroll::-webkit-scrollbar,
+.core-list::-webkit-scrollbar { width: 6px; height: 6px; }
+.core-scroll::-webkit-scrollbar-thumb,
+.core-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+}
+.core-scroll::-webkit-scrollbar-thumb:hover,
+.core-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.30); }
+.core-scroll::-webkit-scrollbar-track,
+.core-list::-webkit-scrollbar-track { background: transparent; }
+
+/* The one focus ring of the kit (§37.4): keyboard only, never on a mouse click. */
+.core-focusable:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+/* ---- transitions (<Transition name="core-fade"> and friends) -------------------------------
+   Enters take 160-220 ms on --ease-ui, leaves 120 ms: nothing in the kit bounces (§37.1). */
+
+.core-fade-enter-active { transition: opacity 0.16s var(--ease-ui); }
+.core-fade-leave-active { transition: opacity 0.12s var(--ease-ui); }
+.core-fade-enter-from,
+.core-fade-leave-to { opacity: 0; }
+
+.core-pop-enter-active { transition: opacity 0.18s var(--ease-ui), transform 0.18s var(--ease-ui); }
+.core-pop-leave-active { transition: opacity 0.12s var(--ease-ui), transform 0.12s var(--ease-ui); }
+.core-pop-enter-from,
+.core-pop-leave-to { opacity: 0; transform: scale(0.97); }
+
+.core-slide-up-enter-active { transition: opacity 0.2s var(--ease-ui), transform 0.2s var(--ease-ui); }
+.core-slide-up-leave-active { transition: opacity 0.12s var(--ease-ui), transform 0.12s var(--ease-ui); }
+.core-slide-up-enter-from,
+.core-slide-up-leave-to { opacity: 0; transform: translateY(12px); }
+
+.core-slide-down-enter-active { transition: opacity 0.2s var(--ease-ui), transform 0.2s var(--ease-ui); }
+.core-slide-down-leave-active { transition: opacity 0.12s var(--ease-ui), transform 0.12s var(--ease-ui); }
+.core-slide-down-enter-from,
+.core-slide-down-leave-to { opacity: 0; transform: translateY(-12px); }
+
+.core-slide-left-enter-active { transition: opacity 0.22s var(--ease-ui), transform 0.22s var(--ease-ui); }
+.core-slide-left-leave-active { transition: opacity 0.12s var(--ease-ui), transform 0.12s var(--ease-ui); }
+.core-slide-left-enter-from,
+.core-slide-left-leave-to { opacity: 0; transform: translateX(18px); }
+
+.core-slide-right-enter-active { transition: opacity 0.22s var(--ease-ui), transform 0.22s var(--ease-ui); }
+.core-slide-right-leave-active { transition: opacity 0.12s var(--ease-ui), transform 0.12s var(--ease-ui); }
+.core-slide-right-enter-from,
+.core-slide-right-leave-to { opacity: 0; transform: translateX(-18px); }
+
+/* ---- keyframes (the --animate-core-* tokens of styles.css point at these) ------------------- */
+
+@keyframes core-slide-in { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: none; } }
+@keyframes core-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes core-pop-in { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: none; } }
+@keyframes core-slide-up { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes core-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+/* CoreSkeleton sweeps a highlight across a 200%-wide background. */
+@keyframes core-shimmer { from { background-position: -150% 0; } to { background-position: 250% 0; } }
+
+/* A HUD value that wants attention (a vital under `lowBelow`, a pulsing badge). */
+@keyframes core-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+/* An expanding ring that fades out (a pulsing CoreBadge, a map ping). */
+@keyframes core-ping { 0% { transform: scale(1); opacity: 0.7; } 80%, 100% { transform: scale(2.4); opacity: 0; } }
+
+/* CoreProgress `indeterminate`: a short fill sweeping the whole track. */
+@keyframes core-indeterminate { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+
+/* Accessibility: hovers, enters and slides stop easing; functional motion (a spinner that says
+   "busy", an indeterminate bar) keeps running — a frozen ring reads as a hang, not as calm. */
+@media (prefers-reduced-motion: reduce) {
+  [class*='core-'],
+  [class*='core-']::before,
+  [class*='core-']::after {
+    transition-duration: 0.01ms !important;
+  }
+}

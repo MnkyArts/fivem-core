@@ -1,0 +1,644 @@
+/* core UI kit — Forms — text (DESIGN §37.5).
+   CoreField, CoreInput, CoreTextarea, CoreNumberInput, CoreSelect.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
+
+   Two things are shared by every control in this group and therefore written once, as a selector
+   list, rather than copied per component:
+     - the BOX LOOK of §37.5 (a dark well, a crisp hairline, coral focus with a soft halo) — it also
+       lands on the bare legacy elements `input.core-input`, `textarea.core-input` and
+       `select.core-select`, which the shell's InputDialog still renders;
+     - the size scale, carried by the local `--core-box-h` / `--core-box-pad` pair so a size class
+       is one rule instead of five.
+   Hover and focus rules always exclude `.is-disabled` by hand: Chromium 103 has no :has(), and a
+   disabled control must not react at all (§37.5 disabled = opacity 0.45, cursor not-allowed). */
+
+/* ---- the box look (shared) ------------------------------------------------------------------ */
+
+.core-inputbox,
+.core-textarea,
+.core-number,
+.core-selectbox--box .core-selectbox__trigger,
+input.core-input,
+textarea.core-input,
+select.core-select {
+  --core-box-h: var(--core-h-md);
+  --core-box-pad: 12px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  background: var(--color-panel-sunken);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: var(--radius-ui-sm);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  line-height: 1.4;
+  pointer-events: auto;
+  transition:
+    border-color 0.12s var(--ease-ui),
+    box-shadow 0.12s var(--ease-ui),
+    background-color 0.12s var(--ease-ui);
+}
+
+.core-inputbox:not(.is-disabled):hover,
+.core-textarea:not(.is-disabled):hover,
+.core-number:not(.is-disabled):hover,
+.core-selectbox--box:not(.is-disabled) .core-selectbox__trigger:hover,
+input.core-input:hover:not(:disabled),
+textarea.core-input:hover:not(:disabled),
+select.core-select:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+/* Focus is the coral hairline plus the 3 px halo of --core-focus. The wrapper components mirror
+   the inner element's focus onto the root as `is-focused`, so the well lights up as one box. */
+.core-inputbox.is-focused,
+.core-textarea.is-focused,
+.core-number.is-focused,
+.core-selectbox--box.is-open .core-selectbox__trigger,
+.core-selectbox--box .core-selectbox__trigger:focus-visible,
+input.core-input:focus,
+textarea.core-input:focus,
+select.core-select:focus {
+  border-color: var(--color-accent);
+  box-shadow: var(--core-focus);
+  outline: none;
+}
+
+.core-inputbox.is-invalid,
+.core-textarea.is-invalid,
+.core-number.is-invalid,
+.core-selectbox--box.is-invalid .core-selectbox__trigger,
+input.core-input.is-invalid,
+textarea.core-input.is-invalid,
+select.core-select.is-invalid {
+  border-color: var(--color-error);
+  box-shadow: 0 0 0 3px rgb(var(--core-error-rgb) / 0.16);
+}
+
+.core-inputbox.is-disabled,
+.core-textarea.is-disabled,
+.core-number.is-disabled,
+.core-selectbox.is-disabled,
+input.core-input:disabled,
+textarea.core-input:disabled,
+select.core-select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* ---- the size scale (shared) ---------------------------------------------------------------- */
+
+.core-inputbox--sm,
+.core-number--sm,
+.core-selectbox--sm .core-selectbox__trigger {
+  --core-box-h: var(--core-h-sm);
+  --core-box-pad: 10px;
+  font-size: var(--text-ui-sm);
+}
+
+.core-inputbox--lg,
+.core-number--lg,
+.core-selectbox--lg .core-selectbox__trigger {
+  --core-box-h: var(--core-h-lg);
+  --core-box-pad: 16px;
+  font-size: var(--text-ui-lg);
+}
+
+/* ---- CoreField ------------------------------------------------------------------------------
+   Stacked by default (label voice over the control, hint or error under it); `--inline` is the
+   settings row of the mockups: text left, control right-aligned in `controlWidth`, hairline under.
+   The bare legacy `.core-field` (the shell's InputDialog) only needs the block rhythm. */
+
+.core-field {
+  display: block;
+  margin-bottom: 12px;
+}
+.core-field:last-child { margin-bottom: 0; }
+
+.core-field__label {
+  display: block;
+  margin-bottom: 8px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+}
+
+.core-field__required {
+  margin-left: 3px;
+  color: var(--color-accent);
+  font-style: normal;
+}
+
+.core-field__hint,
+.core-field__error {
+  margin: 6px 0 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-ui-sm);
+  line-height: 1.4;
+  color: var(--color-fg-faint);
+}
+
+.core-field__error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--color-error);
+}
+.core-field__error .core-icon { margin-top: 1px; }
+
+/* Inline (settings) row: the label drops the display voice for plain body copy — a row of settings
+   reads as a list of sentences, not as a stack of captions (§37.5). */
+.core-field--inline {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 0;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.core-field--inline .core-field__text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.core-field--inline .core-field__label {
+  margin-bottom: 0;
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: var(--text-ui);
+  line-height: 1.35;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--color-fg);
+}
+
+.core-field--inline .core-field__control {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.core-field--inline .core-field__hint,
+.core-field--inline .core-field__error { margin-top: 3px; }
+
+.core-field.is-invalid .core-field__label { color: var(--color-fg); }
+
+/* ---- CoreInput ------------------------------------------------------------------------------
+   The ROOT wears the box; the `<input>` inside is stripped bare so icon, prefix, suffix and the
+   clear button share one well and one focus ring. `user-select: text` undoes the shell's global
+   `user-select: none` — a form field the player cannot select text in feels broken. */
+
+.core-inputbox {
+  height: var(--core-box-h);
+  padding: 0 var(--core-box-pad);
+  gap: 8px;
+  cursor: text;
+}
+
+.core-inputbox.is-disabled { cursor: not-allowed; }
+
+.core-inputbox__el {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  user-select: text;
+  outline: none;
+}
+.core-inputbox__el::placeholder { color: var(--color-fg-faint); }
+.core-inputbox__el:disabled { cursor: not-allowed; }
+.core-inputbox__el::-webkit-outer-spin-button,
+.core-inputbox__el::-webkit-inner-spin-button { appearance: none; margin: 0; }
+
+.core-inputbox__icon {
+  flex: none;
+  color: var(--color-fg-faint);
+}
+.core-inputbox.is-focused .core-inputbox__icon { color: var(--color-fg-dim); }
+
+/* Prefix and suffix are part of the VALUE, not decoration (a `+49` dial code, a `$`), so they read
+   in the same size as the text, one step dimmer, and never wrap. */
+.core-inputbox__prefix,
+.core-inputbox__suffix {
+  flex: none;
+  color: var(--color-fg-faint);
+  font-size: inherit;
+  white-space: nowrap;
+}
+.core-inputbox__suffix { color: var(--color-fg-dim); }
+
+.core-inputbox__clear {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--color-fg-faint);
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background-color 0.12s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-inputbox__clear:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--color-fg);
+}
+.core-inputbox__clear:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+/* ---- CoreTextarea ---------------------------------------------------------------------------
+   Same well, but a column: the element grows with `rows` and the counter sits under it, inside the
+   box, so a form full of fields keeps one rectangle per control. */
+
+.core-textarea {
+  flex-direction: column;
+  align-items: stretch;
+  height: auto;
+  padding: 10px var(--core-box-pad);
+}
+
+.core-textarea__el {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.5;
+  user-select: text;
+  outline: none;
+  resize: none;
+}
+.core-textarea__el::placeholder { color: var(--color-fg-faint); }
+.core-textarea__el:disabled { cursor: not-allowed; }
+.core-textarea--resize .core-textarea__el { resize: vertical; }
+
+.core-textarea__counter {
+  align-self: flex-end;
+  margin-top: 6px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--text-ui-xs);
+  letter-spacing: 0.08em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg-faint);
+}
+.core-textarea__counter.is-over { color: var(--color-error); }
+
+/* ---- CoreNumberInput ------------------------------------------------------------------------
+   `[-] 12 [+]`: one well split in three by hairlines, the buttons square on the box height so the
+   whole control scales with `size`. The value keeps the display voice and tabular figures — a
+   held `+` must not make the row jitter while the digits change (§37.1 core-num). */
+
+.core-number { padding: 0; }
+
+.core-number__btn {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--core-box-h);
+  align-self: stretch;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-fg-dim);
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background-color 0.12s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-number__btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-fg);
+}
+.core-number__btn:active:not(:disabled) { background: rgba(255, 255, 255, 0.10); }
+.core-number__btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.core-number__btn:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: -2px;
+}
+.core-number__btn--dec { border-right: 1px solid var(--color-border); }
+.core-number__btn--inc { border-left: 1px solid var(--color-border); }
+
+.core-number__field {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 0 6px;
+}
+
+.core-number__el {
+  flex: 0 1 auto;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-fg);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--text-ui-lg);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: 0.02em;
+  text-align: center;
+  user-select: text;
+  outline: none;
+}
+.core-number__el::placeholder { color: var(--color-fg-faint); }
+.core-number__el:disabled { cursor: not-allowed; }
+.core-number__el::-webkit-outer-spin-button,
+.core-number__el::-webkit-inner-spin-button { appearance: none; margin: 0; }
+
+.core-number--sm .core-number__el { font-size: var(--text-ui-sm); }
+.core-number--lg .core-number__el { font-size: var(--text-display-sm); }
+
+.core-number__suffix {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: var(--text-ui-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-fg-faint);
+  white-space: nowrap;
+}
+
+/* ---- CoreSelect -----------------------------------------------------------------------------
+   Two shapes from one component: `box` is the form control (box look + chevron) and `inline` is the
+   mockup's chrome-free `SORT: RECENT v` — a caption in the label voice, the value in the display
+   voice, a chevron that turns when the list is open. The popup is teleported into #core-overlays,
+   so it is styled from the root class name, not from a descendant selector. */
+
+/* The box variant fills its column (a CoreField control slot is a flex box, and without an explicit
+   width a block child would shrink to its longest label there); the inline variant is type in a
+   heading row, so it stays exactly as wide as the words. */
+.core-selectbox {
+  display: block;
+  width: 100%;
+  pointer-events: auto;
+}
+.core-selectbox--inline {
+  display: inline-block;
+  width: auto;
+}
+
+.core-selectbox__trigger {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  margin: 0;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.core-selectbox.is-disabled .core-selectbox__trigger { cursor: not-allowed; }
+
+.core-selectbox--box .core-selectbox__trigger {
+  height: var(--core-box-h);
+  padding: 0 calc(var(--core-box-pad) - 2px) 0 var(--core-box-pad);
+  gap: 10px;
+}
+
+.core-selectbox__caption {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+}
+
+.core-selectbox__value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--color-fg);
+}
+.core-selectbox__value.is-placeholder { color: var(--color-fg-faint); }
+
+.core-selectbox__chevron {
+  flex: none;
+  color: var(--color-fg-dim);
+  transition: transform 0.16s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-selectbox.is-open .core-selectbox__chevron { transform: rotate(180deg); }
+.core-selectbox--box.is-open .core-selectbox__chevron { color: var(--color-accent); }
+
+/* Inline: no chrome at all, the caption and the value share one condensed line (the mockup's
+   `SORT: RECENT`), the chevron sits a generous 14 px away so the pair reads as a heading. */
+.core-selectbox--inline .core-selectbox__trigger {
+  width: auto;
+  height: auto;
+  padding: 2px 0;
+  gap: 7px;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-ui-xs);
+}
+.core-selectbox--inline .core-selectbox__value {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--text-ui-sm);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg);
+}
+/* In the mockup the caption and the value are the same condensed caps at the same size — only the
+   colour separates them, which is what makes `SORT: RECENT` read as one line instead of two. */
+.core-selectbox--inline .core-selectbox__caption { font-size: var(--text-ui-sm); }
+.core-selectbox--inline .core-selectbox__chevron { margin-left: 9px; }
+.core-selectbox--inline:not(.is-disabled) .core-selectbox__trigger:hover .core-selectbox__chevron,
+.core-selectbox--inline.is-open .core-selectbox__chevron { color: var(--color-fg); }
+.core-selectbox--inline:not(.is-disabled) .core-selectbox__trigger:hover .core-selectbox__caption {
+  color: var(--color-fg);
+}
+.core-selectbox--inline .core-selectbox__trigger:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 3px;
+}
+.core-selectbox--inline.is-invalid .core-selectbox__value { color: var(--color-error); }
+
+.core-selectbox--sm .core-selectbox__caption { font-size: 11px; }
+.core-selectbox--lg .core-selectbox__caption { font-size: 13px; }
+.core-selectbox--sm.core-selectbox--inline .core-selectbox__caption,
+.core-selectbox--sm.core-selectbox--inline .core-selectbox__value { font-size: var(--text-ui-xs); }
+.core-selectbox--lg.core-selectbox--inline .core-selectbox__caption,
+.core-selectbox--lg.core-selectbox--inline .core-selectbox__value { font-size: var(--text-ui); }
+
+/* The popup lives in #core-overlays (click-through), so it turns the pointer back on for itself and
+   carries its own stacking — `position: fixed` and the coordinates come from useFloating as an
+   inline style (§37.4). 50 is the popup step of the overlay z-scale (backdrop / dialog / drawer 40,
+   popups 50, tooltip 60): a select inside a CoreDialog has to open ABOVE that dialog's scrim. */
+.core-selectbox__popup {
+  z-index: 50;
+  box-sizing: border-box;
+  min-width: 160px;
+  padding: 4px;
+  background: var(--color-panel-popup);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-ui-sm);
+  box-shadow: var(--shadow-ui);
+  overflow-y: auto;
+  pointer-events: auto;
+}
+
+.core-selectbox__option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 36px;
+  margin: 0;
+  padding: 0 10px 0 12px;
+  border: 0;
+  border-radius: var(--radius-ui-xs);
+  background: none;
+  color: var(--color-fg-dim);
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.1s var(--ease-ui), color 0.1s var(--ease-ui);
+}
+.core-selectbox__option + .core-selectbox__option { margin-top: 1px; }
+.core-selectbox__option:hover { background: rgba(255, 255, 255, 0.04); color: var(--color-fg); }
+
+/* `is-active` is the keyboard cursor, `is-selected` the current value — both can be true at once,
+   which is why the bar is a box-shadow and the check an element. */
+.core-selectbox__option.is-active {
+  background: rgb(var(--core-accent-rgb) / 0.16);
+  box-shadow: inset 2px 0 0 var(--color-accent);
+  color: var(--color-fg);
+}
+.core-selectbox__option.is-selected { color: var(--color-fg); }
+.core-selectbox__option.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: none;
+  box-shadow: none;
+}
+
+.core-selectbox__option-icon { flex: none; color: var(--color-fg-faint); }
+.core-selectbox__option.is-active .core-selectbox__option-icon,
+.core-selectbox__option.is-selected .core-selectbox__option-icon { color: var(--color-accent); }
+
+/* The body is a block column: a `<span>` label and a `<span>` description would otherwise run into
+   each other on one line, and the option has to stay a flex row for the icon and the check. */
+.core-selectbox__option-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 0;
+}
+.core-selectbox__option-label {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.core-selectbox__option-desc {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--text-ui-sm);
+  line-height: 1.35;
+  color: var(--color-fg-faint);
+}
+
+.core-selectbox__check {
+  flex: none;
+  color: var(--color-accent);
+}
+
+.core-selectbox__empty {
+  padding: 10px 12px;
+  font-family: var(--font-sans);
+  font-size: var(--text-ui-sm);
+  font-style: italic;
+  color: var(--color-fg-faint);
+}
+
+/* ---- legacy bare elements -------------------------------------------------------------------
+   The shell's InputDialog (§37.6) still renders `input.core-input`, `textarea.core-input` and a
+   native `select.core-select`, so the box look has to work on the element itself. The native select
+   keeps its own popup (the OS list), which is why the component above uses another class name. */
+
+input.core-input,
+textarea.core-input,
+select.core-select {
+  display: block;
+  height: var(--core-h-md);
+  padding: 0 12px;
+  user-select: text;
+}
+input.core-input::placeholder,
+textarea.core-input::placeholder { color: var(--color-fg-faint); }
+
+textarea.core-input {
+  height: auto;
+  min-height: 84px;
+  padding: 10px 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+select.core-select {
+  padding: 0 34px 0 12px;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23a9b3bd'%3E%3Cpath d='M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  background-size: 16px 16px;
+}
+/* A native option list is painted by the OS, so it needs a real opaque colour, not the panel token
+   (which is translucent) — otherwise the list renders white-on-white on some platforms. */
+select.core-select option {
+  background: var(--color-panel-solid);
+  color: var(--color-fg);
+}

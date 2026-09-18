@@ -1,0 +1,920 @@
+/* core UI kit — Surfaces (DESIGN §37.5).
+   CorePanel, CoreCard, CoreBackground, CoreScreen, CoreHeading, CoreDivider,
+   CoreDash, CoreTagline, CoreBrand.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5. */
+
+/* ---- CorePanel ------------------------------------------------------------------------------
+   The most used element of the kit: a translucent slate box over the game. Padding lives on the
+   PARTS, never on the root, so a bare legacy `<div class="core-panel">` is the default variant with
+   no padding of its own (§37.5) and a page can drop a full-bleed grid straight into it.
+   `--core-panel-pad` is the one knob the `--pad-*` variants turn. */
+
+.core-panel {
+  --core-panel-pad: 20px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui);
+  /* The sheen is the first layer, so it sits OVER the fill: a 120 px highlight down from the top
+     edge, barely there — the mockups' panels are lighter at the top, not glossy. */
+  background-image: var(--core-grad-sheen);
+  background-color: var(--color-panel);
+  box-shadow: var(--shadow-ui);
+  color: var(--color-fg);
+}
+
+.core-panel--solid { background-color: var(--color-panel-solid); }
+
+.core-panel--flat {
+  background-color: rgba(255, 255, 255, 0.02);
+  box-shadow: none;
+}
+
+.core-panel--ghost {
+  background-image: none;
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* The HUD plate: thinner, tighter and flatter than a menu panel, because it sits ON the game the
+   whole time — no sheen (there is no top edge to catch light at this size) and the brighter
+   hairline is what keeps it readable over a bright street. */
+.core-panel--hud {
+  background-image: none;
+  background-color: var(--color-hud);
+  border-color: var(--color-border-strong);
+  border-radius: var(--radius-ui-sm);
+  box-shadow: var(--shadow-ui-sm);
+}
+
+.core-panel--hud .core-panel__footer {
+  border-bottom-left-radius: var(--radius-ui-sm);
+  border-bottom-right-radius: var(--radius-ui-sm);
+}
+
+.core-panel--hud.has-accent::before {
+  border-top-left-radius: var(--radius-ui-sm);
+  border-top-right-radius: var(--radius-ui-sm);
+}
+
+/* `accent`: the 2 px coral line on the top edge that dissolves to the right (§37.1's fading
+   gradient). Inset by the border so it never paints over the rounded corner. */
+.core-panel.has-accent::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--core-grad-accent-fade-out);
+  border-top-left-radius: var(--radius-ui);
+  border-top-right-radius: var(--radius-ui);
+  pointer-events: none;
+}
+
+.core-panel__header {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: var(--core-panel-pad) var(--core-panel-pad) 0;
+}
+
+.core-panel__heading { min-width: 0; }
+
+.core-panel__actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Pulled up so a control next to a heading sits on the title's optical line, not on its box. */
+  margin-top: 2px;
+}
+
+.core-panel__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  padding: var(--core-panel-pad);
+}
+
+/* A heading already carries its own breathing room underneath, so the body loses most of its top
+   padding when it follows one. Sibling selector, not :has() — Chromium 103 (§37.4). */
+.core-panel__header + .core-panel__body { padding-top: 14px; }
+
+/* A scrolling body is its own clip box, so it has to carry the panel's bottom corners or the last
+   row paints square over the radius. */
+.core-panel__body.core-scroll {
+  border-bottom-left-radius: var(--radius-ui);
+  border-bottom-right-radius: var(--radius-ui);
+}
+
+.core-panel--hud .core-panel__body.core-scroll {
+  border-bottom-left-radius: var(--radius-ui-sm);
+  border-bottom-right-radius: var(--radius-ui-sm);
+}
+
+.core-panel__footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px var(--core-panel-pad);
+  border-top: 1px solid var(--color-border);
+  background: rgba(0, 0, 0, 0.18);
+  border-bottom-left-radius: var(--radius-ui);
+  border-bottom-right-radius: var(--radius-ui);
+}
+
+.core-panel--pad-none { --core-panel-pad: 0px; }
+.core-panel--pad-sm { --core-panel-pad: 12px; }
+.core-panel--pad-md { --core-panel-pad: 20px; }
+.core-panel--pad-lg { --core-panel-pad: 28px; }
+
+.core-panel--pad-none .core-panel__header + .core-panel__body { padding-top: 0; }
+.core-panel--pad-none .core-panel__footer { padding: 0; }
+.core-panel--pad-sm .core-panel__footer { padding: 9px 12px; }
+.core-panel--pad-lg .core-panel__footer { padding: 14px 28px; }
+
+/* ---- CoreCard -------------------------------------------------------------------------------
+   Media + text (the LAST PLAYED card of mockup 1, the quest detail of mockup 4). Two shapes:
+   `left` insets the picture inside the card padding, `top` lets it bleed to the top edge and
+   dissolve into the card so the title can be pulled up over the fade.
+   The fade needs the card colour with an alpha, and Chromium 103 has no color-mix(), so it is mixed
+   from the --core-panel-rgb triplet of §37.2 rather than from the --color-panel token. */
+
+.core-card {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui);
+  background-image: var(--core-grad-sheen);
+  background-color: var(--color-panel);
+  box-shadow: var(--shadow-ui);
+  color: var(--color-fg);
+  transition: border-color 0.12s var(--ease-ui), box-shadow 0.12s var(--ease-ui),
+    background-color 0.12s var(--ease-ui);
+}
+
+/* The same three fills CorePanel has, for the same reason: a card INSIDE a panel must not stack a
+   second shadowed surface on the first. `ghost` is the quest brief of mockup 4, sitting flush on
+   the panel. The state rules at the bottom of this block win over all three (two classes beat one),
+   so selection and hover still read on a ghost card. */
+.core-card--flat {
+  background-image: none;
+  background-color: rgba(255, 255, 255, 0.02);
+  box-shadow: none;
+}
+
+.core-card--ghost {
+  background-image: none;
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.core-card__media {
+  flex: none;
+  position: relative;
+  overflow: hidden;
+  background: var(--color-panel-sunken);
+}
+
+.core-card__image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.core-card__main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.core-card__eyebrow {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-faint);
+}
+
+.core-card__title {
+  margin: 8px 0 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 22px;
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+}
+
+/* `uppercase: false` — the quest titles of mockup 4 are set in mixed case and lose the tracking. */
+.core-card__title.is-plain {
+  text-transform: none;
+  letter-spacing: 0.005em;
+}
+
+.core-card__eyebrow + .core-card__title { margin-top: 10px; }
+
+.core-card__subtitle {
+  margin: 11px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.3;
+  color: var(--color-fg-dim);
+}
+
+.core-card__body {
+  margin: 12px 0 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--color-fg-dim);
+}
+
+.core-card__meta {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.3;
+  color: var(--color-fg-dim);
+}
+
+.core-card__meta b,
+.core-card__meta strong {
+  font-weight: 600;
+  color: var(--color-fg);
+}
+
+.core-card__trailing {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-fg-dim);
+}
+
+/* -- media left: the picture sits inside the card's own 14 px padding, radius 4 (§37.5). */
+.core-card--media-left {
+  flex-direction: row;
+  align-items: stretch;
+  padding: 14px;
+  gap: 20px;
+}
+
+.core-card--media-left .core-card__media { border-radius: var(--radius-ui-sm); }
+
+/* Centred against the picture: the mockup's text block is shorter than the image and sits on
+   its middle, but it still governs the card height once the copy grows past it. */
+.core-card--media-left .core-card__main {
+  justify-content: center;
+  padding: 2px 2px 2px 0;
+}
+
+.core-card--media-left .core-card__trailing { padding-left: 4px; }
+
+/* -- media top: full-bleed picture dissolving into the card, title pulled up over the fade. */
+.core-card--media-top { flex-direction: column; }
+
+.core-card--media-top .core-card__media {
+  width: 100%;
+  border-top-left-radius: var(--radius-ui);
+  border-top-right-radius: var(--radius-ui);
+}
+
+.core-card--media-top .core-card__fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 80%;
+  background: linear-gradient(
+    180deg,
+    rgb(var(--core-panel-rgb) / 0) 0%,
+    rgb(var(--core-panel-rgb) / 0.42) 34%,
+    rgb(var(--core-panel-rgb) / 0.88) 64%,
+    rgb(var(--core-panel-rgb) / 1) 88%
+  );
+  pointer-events: none;
+}
+
+.core-card--media-top .core-card__main {
+  position: relative;
+  z-index: 1;
+  margin-top: -40px;
+  padding: 0 20px 18px;
+}
+
+.core-card--media-top .core-card__trailing {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+}
+
+/* -- states (§37.5): hover lifts the hairline, selection is a coral edge + glow, never a fill. */
+.core-card.is-interactive {
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.core-card.is-interactive:hover {
+  border-color: var(--color-border-strong);
+  background-image: linear-gradient(0deg, var(--color-panel-raise), var(--color-panel-raise)),
+    var(--core-grad-sheen);
+}
+
+.core-card.is-interactive:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+.core-card.is-selected {
+  border-color: var(--color-accent-hi);
+  box-shadow: var(--shadow-glow-sm);
+}
+
+.core-card.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.core-card.is-disabled.is-interactive:hover {
+  border-color: var(--color-border);
+  background-image: var(--core-grad-sheen);
+}
+
+/* ---- CoreBackground -------------------------------------------------------------------------
+   The scrim layer between the game and a full screen: absolute, click-through, z 0 (§37.5).
+   `--core-bg-a` is the `dim` prop; every variant reads it so one number darkens the whole page.
+   `--core-bg-fade` is the `fade` prop: how far across the box the directional gradients reach
+   transparent, so a short header strip can dissolve over its whole height. Both are unset by the
+   component unless the caller passes them, which is how left/right keep their documented 62 %.
+   The ink comes from the --core-ink-rgb triplet of §37.2, not from --color-ink: Chromium 103
+   cannot take an alpha of a hex custom property. */
+
+.core-bg {
+  --core-bg-a: 0.62;
+  --core-bg-fade: 0.52;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.core-bg__image,
+.core-bg__scrim,
+.core-bg__pattern {
+  position: absolute;
+  inset: 0;
+}
+
+.core-bg__image {
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+
+/* A 40 px hairline grid — structure under a map or a stat wall, never a texture you notice. */
+.core-bg__pattern {
+  background-image:
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.022) 0 1px, rgba(255, 255, 255, 0) 1px 40px),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.022) 0 1px, rgba(255, 255, 255, 0) 1px 40px);
+}
+
+.core-bg--scrim .core-bg__scrim { background: rgb(var(--core-ink-rgb) / var(--core-bg-a)); }
+
+/* The main menu (mockup 1): all but opaque on the left third, gone by 62 % of the width. */
+.core-bg--left { --core-bg-a: 0.94; --core-bg-fade: 0.62; }
+.core-bg--left .core-bg__scrim {
+  background: linear-gradient(
+    90deg,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) 0%,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) calc(var(--core-bg-fade) * 35%),
+    rgb(var(--core-ink-rgb) / 0) calc(var(--core-bg-fade) * 100%)
+  );
+}
+
+.core-bg--right { --core-bg-a: 0.94; --core-bg-fade: 0.62; }
+.core-bg--right .core-bg__scrim {
+  background: linear-gradient(
+    270deg,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) 0%,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) calc(var(--core-bg-fade) * 35%),
+    rgb(var(--core-ink-rgb) / 0) calc(var(--core-bg-fade) * 100%)
+  );
+}
+
+.core-bg--top { --core-bg-a: 0.88; }
+.core-bg--top .core-bg__scrim {
+  background: linear-gradient(
+    180deg,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) 0%,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) calc(var(--core-bg-fade) * 15%),
+    rgb(var(--core-ink-rgb) / 0) calc(var(--core-bg-fade) * 100%)
+  );
+}
+
+.core-bg--bottom { --core-bg-a: 0.88; }
+.core-bg--bottom .core-bg__scrim {
+  background: linear-gradient(
+    0deg,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) 0%,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) calc(var(--core-bg-fade) * 15%),
+    rgb(var(--core-ink-rgb) / 0) calc(var(--core-bg-fade) * 100%)
+  );
+}
+
+/* Cinematic bands top and bottom — the header/footer bars of the inventory and map screens. */
+.core-bg--bars { --core-bg-a: 0.92; }
+.core-bg--bars .core-bg__scrim {
+  background:
+    linear-gradient(180deg, rgb(var(--core-ink-rgb) / var(--core-bg-a)) 0%,
+      rgb(var(--core-ink-rgb) / var(--core-bg-a)) 7%, rgb(var(--core-ink-rgb) / 0) 30%),
+    linear-gradient(0deg, rgb(var(--core-ink-rgb) / var(--core-bg-a)) 0%,
+      rgb(var(--core-ink-rgb) / var(--core-bg-a)) 7%, rgb(var(--core-ink-rgb) / 0) 30%);
+}
+
+.core-bg--vignette { --core-bg-a: 0.88; }
+.core-bg--vignette .core-bg__scrim {
+  background: radial-gradient(
+    ellipse at 50% 50%,
+    rgb(var(--core-ink-rgb) / 0.25) 0%,
+    rgb(var(--core-ink-rgb) / 0.55) 58%,
+    rgb(var(--core-ink-rgb) / var(--core-bg-a)) 100%
+  );
+}
+
+.core-bg--solid .core-bg__scrim { background: var(--color-ink); }
+
+/* ---- CoreScreen -----------------------------------------------------------------------------
+   The page frame of mockups 3 and 4: a background layer at z 0 and header / body / footer above
+   it. Header and footer only exist when one of their slots is filled, so a bare screen is nothing
+   but a scrim and a body. */
+
+.core-screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  pointer-events: auto;
+  color: var(--color-fg);
+}
+
+.core-screen__header,
+.core-screen__body,
+.core-screen__footer {
+  position: relative;
+  z-index: 1;
+}
+
+.core-screen__header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  height: 76px;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--color-border);
+  background: linear-gradient(
+    180deg,
+    rgb(var(--core-ink-rgb) / 0.92) 0%,
+    rgb(var(--core-ink-rgb) / 0.66) 58%,
+    rgb(var(--core-ink-rgb) / 0.22) 100%
+  );
+}
+
+.core-screen__brand {
+  flex: none;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.core-screen__nav {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+
+.core-screen__status {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+/* navAlign (§37.5). `space` shares the leftover room, so the nav is centred BETWEEN brand and
+   status. `center` lifts the nav out of the flow and pins it to the middle of the screen, which is
+   the only way mockup 3's tabs sit on the page centre while the brand is much wider than the
+   status. `start` hangs it off the brand (mockup 4). transform, never the translate property —
+   Chromium 103 (§37.4). */
+.core-screen--nav-start .core-screen__nav { justify-content: flex-start; }
+
+.core-screen--nav-center .core-screen__header { justify-content: space-between; }
+
+.core-screen--nav-center .core-screen__nav {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  flex: none;
+  transform: translateX(-50%);
+}
+
+.core-screen__body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.core-screen__body.is-padded { padding: 24px 28px; }
+
+.core-screen__footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  height: 64px;
+  padding: 0 32px;
+  border-top: 1px solid var(--color-border);
+  background: rgb(var(--core-ink-rgb) / 0.90);
+}
+
+.core-screen__footer-start,
+.core-screen__footer-end {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.core-screen__footer-end { margin-left: auto; }
+
+/* ---- CoreHeading ----------------------------------------------------------------------------
+   Title block: an optional label-voice eyebrow above, the display title, an eyebrow-voice subtitle
+   under it and an actions group on the right. `--core-heading-size` is the one number the size
+   variants turn, so the slash marker can be expressed in em and scale with the title. */
+
+.core-heading {
+  --core-heading-size: var(--text-display);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+}
+
+.core-heading--sm { --core-heading-size: var(--text-display-sm); }
+.core-heading--md { --core-heading-size: var(--text-display); }
+.core-heading--lg { --core-heading-size: var(--text-display-lg); }
+.core-heading--xl { --core-heading-size: var(--text-display-xl); }
+
+.core-heading__main { min-width: 0; }
+
+.core-heading__eyebrow {
+  margin: 0 0 10px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+}
+
+.core-heading__title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.46em;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--core-heading-size);
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+}
+
+/* The big display type of the mockups is not flat white: it runs from white at the cap line into
+   the dimmed foreground at the baseline. Only the two large sizes — below 34 px it is invisible. */
+.core-heading--lg .core-heading__text,
+.core-heading--xl .core-heading__text,
+.core-brand--lg .core-brand__name,
+.core-brand--xl .core-brand__name {
+  background-image: linear-gradient(180deg, #ffffff 0%, var(--color-fg) 46%, var(--color-fg-dim) 132%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+/* The `//` marker: two accent bars leaning right, sized in em so they follow the title (§37.5). */
+.core-heading__slash {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2em;
+  /* The skew leans the bars out of their boxes; the pad keeps the first one off the left edge. */
+  padding-left: 0.14em;
+}
+
+.core-heading__slash span {
+  display: block;
+  width: 0.34em;
+  height: 0.9em;
+  background: var(--color-accent);
+  transform: skewX(-20deg);
+}
+
+.core-heading.has-slash .core-heading__text { font-style: italic; }
+
+.core-heading__subtitle {
+  margin: 14px 0 0;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 13px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  color: var(--color-fg-dim);
+}
+
+/* The eyebrow voice grows with the title it sits under — 13 px under a 48 px display line reads as
+   a caption that lost its heading. The 0.32 em track never changes: that is the voice. */
+.core-heading--sm .core-heading__subtitle { margin-top: 10px; font-size: 12px; }
+.core-heading--lg .core-heading__subtitle { font-size: 14px; }
+.core-heading--xl .core-heading__subtitle { margin-top: 18px; font-size: 16px; }
+
+.core-heading__actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.core-heading--align-center { justify-content: center; }
+.core-heading--align-center .core-heading__main { text-align: center; }
+.core-heading--align-center .core-heading__title { justify-content: center; }
+.core-heading--align-right { justify-content: flex-end; }
+.core-heading--align-right .core-heading__main { text-align: right; }
+.core-heading--align-right .core-heading__title { justify-content: flex-end; }
+
+/* ---- CoreDivider ----------------------------------------------------------------------------
+   A hairline, and — with a label — a hairline that parts around a caption. */
+
+.core-divider {
+  flex: none;
+  display: block;
+  width: 100%;
+  height: 1px;
+  border: 0;
+  margin: 0;
+  background: var(--color-border);
+}
+
+.core-divider--strong { background: var(--color-border-strong); }
+
+.core-divider--vertical {
+  width: 1px;
+  height: auto;
+  min-height: 16px;
+  align-self: stretch;
+}
+
+.core-divider.has-label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: auto;
+  background: none;
+}
+
+.core-divider.has-label::before,
+.core-divider.has-label::after {
+  content: '';
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--color-border);
+}
+
+.core-divider--strong.has-label::before,
+.core-divider--strong.has-label::after { background: var(--color-border-strong); }
+
+.core-divider__label {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-faint);
+  white-space: nowrap;
+}
+
+.core-divider--vertical.has-label {
+  flex-direction: column;
+  width: auto;
+  gap: 10px;
+}
+
+.core-divider--vertical.has-label::before,
+.core-divider--vertical.has-label::after {
+  width: 1px;
+  height: auto;
+  min-height: 12px;
+}
+
+/* ---- CoreDash -------------------------------------------------------------------------------
+   The short accent bar of §37.1 — under a heading, after a footer line, below a tagline. */
+
+.core-dash {
+  display: block;
+  flex: none;
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--tone);
+}
+
+/* The brand dash is the accent gradient, not a flat fill: a hair brighter on the left. */
+.core-dash.core-tone-accent { background: var(--core-grad-accent); }
+
+/* ---- CoreTagline ----------------------------------------------------------------------------
+   Stacked, widely tracked words beside a vertical rule (mockups 1, 3, 4). The tracking puts a
+   trailing gap after the last letter of every line, so a right-aligned block is pulled back by
+   exactly that much or it reads as misaligned. */
+
+/* The one place the kit shadows text: a tagline sits directly on the key art (the sunset of mockup
+   1), where fg-faint at 12 px disappears. Inherited from the root, so slot content gets it too.
+   Panel text never wears this — there is a panel fill under it. */
+.core-tagline {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  text-shadow: 0 1px 2px rgb(var(--core-ink-rgb) / 0.55);
+}
+
+.core-tagline__lines {
+  display: flex;
+  flex-direction: column;
+}
+
+.core-tagline__line {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 12px;
+  line-height: 1.75;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  color: var(--color-fg-faint);
+  white-space: nowrap;
+}
+
+.core-tagline.has-rule {
+  border-left: 1px solid var(--color-border);
+  padding-left: 18px;
+}
+
+/* Mockups 3 and 4 use a coral rule instead of the hairline — `rule="accent"`. */
+.core-tagline.is-rule-accent {
+  border-left: 2px solid var(--color-accent);
+  padding-left: 16px;
+}
+
+.core-tagline__dash { margin-top: 12px; }
+
+.core-tagline--align-center { align-items: center; }
+.core-tagline--align-center .core-tagline__lines { text-align: center; }
+.core-tagline--align-center .core-tagline__line { margin-right: -0.3em; }
+.core-tagline--align-right { align-items: flex-end; }
+.core-tagline--align-right .core-tagline__lines { text-align: right; }
+.core-tagline--align-right .core-tagline__line { margin-right: -0.3em; }
+
+/* ---- CoreBrand ------------------------------------------------------------------------------
+   The logo lockup of the main menu and of every screen header: mark, name, tagline under it.
+   Without a logo the mark box is not rendered at all, so the name sits flush with its column. */
+
+.core-brand {
+  --core-brand-name: 30px;
+  --core-brand-logo: 44px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.core-brand--sm {
+  --core-brand-name: 22px;
+  --core-brand-logo: 32px;
+  gap: 10px;
+}
+
+.core-brand--md {
+  --core-brand-name: 30px;
+  --core-brand-logo: 44px;
+}
+
+.core-brand--lg {
+  --core-brand-name: 48px;
+  --core-brand-logo: 70px;
+  gap: 20px;
+}
+
+/* The main-menu wordmark of mockup 1 measures ~68 px at 1080p — `lg` is the biggest a header ever
+   needs, `xl` is the splash screen. */
+.core-brand--xl {
+  --core-brand-name: 64px;
+  --core-brand-logo: 90px;
+  gap: 26px;
+}
+
+.core-brand__logo {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--core-brand-logo);
+  height: var(--core-brand-logo);
+  color: var(--color-accent);
+}
+
+.core-brand__logo img,
+.core-brand__logo svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.core-brand__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.core-brand__name {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--core-brand-name);
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+  white-space: nowrap;
+}
+
+.core-brand__tagline {
+  margin-top: 7px;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 13px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  color: var(--color-fg-dim);
+  white-space: nowrap;
+  /* Same reason as .core-tagline: the lockup lives on the key art, not on a panel. */
+  text-shadow: 0 1px 2px rgb(var(--core-ink-rgb) / 0.55);
+}
+
+.core-brand--sm .core-brand__tagline {
+  margin-top: 5px;
+  font-size: 11px;
+}
+
+.core-brand--lg .core-brand__tagline { margin-top: 10px; }
+.core-brand--xl .core-brand__tagline { margin-top: 13px; font-size: 14px; }

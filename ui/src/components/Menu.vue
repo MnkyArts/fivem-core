@@ -3,6 +3,16 @@
 // store.js owns Escape (-> menuResult(null)); this component owns Up/Down/Enter and the mouse.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { store, menuResult, activeModal } from '../store.js'
+// Imported by path, not by the kit's global registration: the shell must not depend on install
+// order (DESIGN §37.6). CoreKeyHints draws the footer row of caps.
+import CoreKeyHints from '../kit/components/CoreKeyHints.vue'
+
+// The three keys this component and store.js answer to, in the footer's reading order.
+const HINTS = [
+  { keys: ['↑', '↓'], label: 'Move' },
+  { key: 'Enter', label: 'Select' },
+  { key: 'Esc', label: 'Close' },
+]
 
 const listEl = ref(null)
 const selected = ref(0)
@@ -67,13 +77,22 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 <template>
   <Transition name="menu">
     <div v-if="visible" class="core-backdrop menu-back z-50">
-      <div class="core-panel core-modal menu w-[380px] max-w-[80vw] pb-1.5 animate-[core-pop-in_0.12s_var(--ease-ui)]" data-core-blur>
-        <h2 class="core-title">{{ store.menu.title || 'Menu' }}</h2>
-        <ul ref="listEl" class="core-list mt-2" role="menu">
+      <div
+        class="core-dialog core-tone-accent core-dialog--md menu animate-[core-pop-in_0.12s_var(--ease-ui)]"
+        data-core-blur
+      >
+        <div class="core-dialog__header">
+          <div class="core-dialog__titles">
+            <h2 class="core-title core-dialog__title">{{ store.menu.title || 'Menu' }}</h2>
+          </div>
+        </div>
+        <!-- The rows are full-bleed inside the panel, so the body drops the dialog's side padding
+             and the row's own `px-5` re-aligns the labels with the title above. -->
+        <ul ref="listEl" class="core-list core-menu--sm core-dialog__body core-scroll px-0 pt-0 pb-1.5" role="menu">
           <li
             v-for="(item, i) in items"
             :key="i"
-            class="core-item"
+            class="core-item core-menu__item min-h-11 gap-4 px-5"
             :class="{ 'is-active': i === selected, 'is-disabled': !!item.disabled }"
             role="menuitem"
             :data-index="i"
@@ -82,16 +101,19 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             @mouseenter="hover(i)"
             @click="choose(i)"
           >
-            <span v-if="item.icon" class="icon min-w-5 flex-none text-center text-[13px] text-accent">{{ item.icon }}</span>
-            <span class="body flex min-w-0 flex-col">
-              <span class="label text-ui-sm leading-[1.3]">{{ item.label }}</span>
-              <span v-if="item.description" class="desc text-ui-xs text-fg-dim">{{ item.description }}</span>
+            <span v-if="item.icon" class="icon core-menu__icon text-[15px] text-accent">{{ item.icon }}</span>
+            <span class="body core-menu__body">
+              <span class="label core-menu__label">{{ item.label }}</span>
+              <span v-if="item.description" class="desc core-menu__desc">{{ item.description }}</span>
             </span>
           </li>
-          <li v-if="!items.length" class="core-item is-disabled">No entries</li>
+          <li v-if="!items.length" class="core-item core-menu__item is-disabled min-h-11 px-5">
+            <span class="label core-menu__label">No entries</span>
+          </li>
         </ul>
-        <!-- one line on purpose: Vue's whitespace: 'condense' would eat the spaces around the <b>s -->
-        <p class="hint mt-2 border-t border-t-border pt-2 text-ui-xs text-fg-faint [&_b]:font-semibold [&_b]:text-fg-dim">&#8593;&#8595; move &middot; <b>Enter</b> select &middot; <b>Esc</b> close</p>
+        <div class="core-dialog__footer">
+          <CoreKeyHints class="hint" :items="HINTS" align="end" size="sm" bare />
+        </div>
       </div>
     </div>
   </Transition>

@@ -28,6 +28,7 @@ local KEY_PATTERN <const> = '^[%w_%.%-:]+$'
 local values                -- [key] = value, loaded from the document on first access
 local mirror = {}           -- [key] = true for keys published to GlobalState
 local loaded = false
+local loading               -- the promise the first loader parks while Core.DB.get is out (DESIGN §22)
 
 --- A usable global key: short, printable, safe as a GlobalState key.
 local function isKey(key)
@@ -36,12 +37,33 @@ local function isKey(key)
 end
 
 --- Loads the document once. Missing document = empty store; nothing is written until the first set.
+--- `Core.DB.get` yields on a backend that loads its collection asynchronously (postgres, mysql),
+--- so the first caller parks a promise and every caller that arrives during the load waits for it
+--- (the same barrier `db.lua` uses) — `loaded` only flips once `values` exists. Before this guard
+--- a second caller in that window read `values` while it was still nil (a plugin's onReady and
+--- its first cron tick, on the postgres adapter).
 local function ensureLoaded()
     if loaded then return values end
-    loaded = true
-    local doc = Core.DB.get(COLLECTION, DOCUMENT)
+    if loading then
+        local ok, err = pcall(Citizen.Await, loading)
+        if not ok then
+            Log.error('globals: waiting for the %s/%s load failed: %s', COLLECTION, DOCUMENT, tostring(err))
+        end
+        if loaded then return values end
+        return {}                     -- the load failed: an empty, unpersisted view for this caller
+    end
+    local barrier = promise.new()
+    loading = barrier
+    local ok, doc = pcall(Core.DB.get, COLLECTION, DOCUMENT)
+    if not ok then
+        Log.error('globals: could not read %s/%s: %s', COLLECTION, DOCUMENT, tostring(doc))
+        doc = nil
+    end
     values = (doc and type(doc.values) == 'table') and doc.values or {}
     mirror = (doc and type(doc.mirror) == 'table') and doc.mirror or {}
+    loaded = true
+    loading = nil
+    barrier:resolve(true)
     for key in pairs(mirror) do
         if isKey(key) and values[key] ~= nil then
             GlobalState[MIRROR_PREFIX .. key] = values[key]

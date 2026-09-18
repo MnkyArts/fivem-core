@@ -1,38 +1,60 @@
 <script setup>
-// DESIGN.md §7.4: usePage(id) -> the reactive props Lua sent to Core.UI.open, plus
-// emit(event, data) / on(event, fn) / close() scoped to this page. CoreUI.hud is the
-// read-only HUD snapshot (cash, bank, name, serverId, faction). Imports from 'vue' work.
+// my_plugin page — DESIGN.md §7.4 (the page protocol) and §37 (the UI kit).
+//
+// usePage(id) -> the reactive props Lua sent to Core.UI.open, plus emit(event, data) /
+// on(event, fn) / close() scoped to this page. CoreUI.hud is the read-only HUD snapshot
+// (cash, bank, name, serverId, faction). Imports from 'vue' resolve to the shell's one Vue.
+import { ref } from 'vue'
+
+// PageHost renders <YourPage :props="…">, so the attribute must not fall through to the root.
+defineOptions({ name: 'MyPluginPage', inheritAttrs: false })
+
 const { props, emit, on, close } = window.CoreUI.usePage('my_plugin')
 const hud = window.CoreUI.hud || {}
 
-on('hello', (data) => console.log('my_plugin: from Lua ->', data))   // Core.UI.send(...)
+const note = ref('')
+
+on('hello', (data) => { note.value = (data && data.text) || '' })   // Core.UI.send(…)
 </script>
 
 <template>
-    <!-- Styling is Tailwind CSS v4 — nothing to install or configure: core's build scans
-         <plugin>/ui/src and emits the utilities this file uses into its one bundle (README §3).
-         Core's theme tokens (core/ui/src/styles.css), usable as normal utilities:
-           colours  bg-panel bg-panel-solid bg-panel-raise border-border border-border-strong
-                    bg-backdrop text-accent bg-accent-soft text-success text-error text-warning
-                    text-info text-fg text-fg-dim text-fg-faint
-           radius   rounded-ui rounded-ui-sm   shadow shadow-ui   easing ease-ui
-           fonts    font-sans font-mono        sizes  text-ui text-ui-sm text-ui-xs
-         Shared component classes: core-panel core-modal core-backdrop core-title core-text
-         core-label core-btn (--primary/--ghost/--danger) core-field core-input core-select
-         core-check core-key core-list core-item core-interactive.
-         CSS backdrop filters stay banned (FiveM's CEF paints the filtered area as a solid black
-         box). For a glass panel put `data-core-blur` on it instead — core draws a live, blurred
-         copy of the game frame behind every element carrying it (README "Game blur (glass
-         panels)"). Panels only, never list rows. -->
-    <div class="pointer-events-none fixed inset-0 flex items-center justify-center font-sans text-fg">
-        <section class="core-panel core-modal core-interactive w-[380px]" data-core-blur>
-            <h1 class="core-title">my_plugin</h1>
-            <p class="core-text mb-3">{{ hud.name || 'nobody' }} — {{ props.title || 'props from Lua show up here' }}</p>
-            <div class="flex gap-2">
-                <button class="core-btn core-btn--primary" @click="emit('hello', { at: Date.now() })">Send an
-                    event</button>
-                <button class="core-btn" @click="close()">Close</button>
-            </div>
-        </section>
-    </div>
+    <!-- Every `<Core…>` tag is a UI kit component (DESIGN §37.5, README "Design system"):
+         registered globally on the shell's Vue app, so a page imports nothing. Compose the
+         page from them instead of styling your own boxes — that is what makes every plugin
+         look like one product. Custom CSS only for what the kit lacks, and then with the
+         theme tokens (`bg-panel`, `text-fg-dim`, `rounded-ui`, `text-ui-sm`, `font-display`),
+         never a literal colour, font or radius.
+         Layout utilities (flex, gap-*, w-*) are fine on a kit tag: the kit classes live in the
+         components layer, so a utility next to them always wins.
+         Glass is the `blur` prop (-> `data-core-blur`, DESIGN §32): panels only, never rows. -->
+    <CoreScreen background="scrim">
+        <div class="flex h-full items-center justify-center">
+            <CorePanel class="w-[440px] max-w-[86vw]" eyebrow="Plugin page" title="my_plugin"
+                subtitle="Your page starts here" accent blur>
+                <!-- `actions` is the header's right-hand side. -->
+                <template #actions>
+                    <CoreIconButton icon="close" label="Close (ESC)" variant="ghost" @click="close()" />
+                </template>
+
+                <!-- Label/value rows, hairline-framed: `items` is data, not markup. -->
+                <CoreKeyValue :items="[
+                    { label: 'Player', value: hud.name || '—', icon: 'user' },
+                    { label: 'From Lua', value: props.title || 'props of Core.UI.open show up here' },
+                ]" />
+
+                <CoreAlert v-if="note" class="mt-4" tone="success" title="Core.UI.send" :text="note" />
+
+                <!-- The footer sits under a hairline on a slightly darker fill. -->
+                <template #footer>
+                    <div class="flex items-center justify-between gap-4">
+                        <CoreKeyHints bare align="start" :items="[{ key: 'ESC', label: 'Close' }]" />
+                        <div class="flex gap-2">
+                            <CoreButton icon="bolt" @click="emit('hello', { at: Date.now() })">Send an event</CoreButton>
+                            <CoreButton variant="primary" @click="close()">Done</CoreButton>
+                        </div>
+                    </div>
+                </template>
+            </CorePanel>
+        </div>
+    </CoreScreen>
 </template>

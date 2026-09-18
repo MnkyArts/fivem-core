@@ -187,11 +187,11 @@ function submit() {
     </div>
 
     <div v-if="open" class="composer">
-      <div class="row rounded-ui" data-core-blur>
-        <button class="chan-btn core-interactive text-fg-dim" tabindex="-1"
+      <div class="row core-inputbox" data-core-blur>
+        <button class="chan-btn core-interactive" tabindex="-1"
                 :title="`${activeChannel.description || activeChannel.label || activeChannel.id} · Ctrl+Tab to switch`"
                 @mousedown.prevent @click="cycleChannel()">{{ activeChannel.label || activeChannel.id }}</button>
-        <input ref="input" :value="draft" class="chat-input core-interactive" placeholder="Message or /command"
+        <input ref="input" :value="draft" class="chat-input core-inputbox__el core-interactive" placeholder="Message or /command"
                aria-label="Chat message" role="combobox" aria-autocomplete="list" :aria-expanded="matches.length > 0"
                :aria-controls="matches.length ? 'chat-commands' : undefined"
                :aria-activedescendant="matches.length ? `chat-command-${selected}` : undefined"
@@ -200,7 +200,7 @@ function submit() {
                @input="onInput" @keydown="onKeydown" @keyup="updateCaret" @click="updateCaret" @select="updateCaret" />
       </div>
 
-      <div v-if="matches.length" class="command-help rounded-ui">
+      <div v-if="matches.length" class="command-help">
         <ul id="chat-commands" ref="suggestionsEl" class="command-list" role="listbox" aria-label="Available commands">
           <li v-for="(command, index) in matches" :id="`chat-command-${index}`" :key="command.command"
               class="command-option" :class="{ selected: selected === index }" role="option"
@@ -212,7 +212,7 @@ function submit() {
         </ul>
         <div class="command-keys text-fg-faint">↑ ↓ select <span>Tab complete</span><span>{{ selected + 1 }} / {{ matches.length }}</span></div>
       </div>
-      <div v-else-if="context.command" class="argument-help command-help rounded-ui">
+      <div v-else-if="context.command" class="argument-help command-help">
         <div class="signature"><span class="text-fg-dim">{{ context.command.command }}</span><span
           v-for="(param, index) in context.command.params" :key="index" class="param"
           :class="index === context.argument ? 'param-active text-accent' : 'text-fg-dim'"
@@ -227,8 +227,13 @@ function submit() {
 </template>
 
 <style scoped>
-.chat { width: min(440px, calc(100vw - 36px)); color-scheme: dark; scrollbar-color: var(--color-border-strong) transparent; }
-.feed { max-height: min(250px, 35vh); overflow: hidden; opacity: 0; visibility: hidden; transition: opacity 250ms ease, visibility 250ms; scrollbar-width: thin; padding: 0 2px; }
+/* §37.6: the chat wears the kit's tokens and its box look. The composer row IS a `core-inputbox`
+   (fill, hairline, 4 px radius) and only the chat-specific knobs live here; the suggestion panel is
+   a popup, so it takes `--color-panel-popup`. The feed itself stays chrome-less — it is text lying
+   on the world, kept readable by its shadow, not by a plate behind it.
+   Chromium 103 has no `scrollbar-width` / `scrollbar-color`: the scrollbars are ::-webkit- rules. */
+.chat { width: min(440px, calc(100vw - 36px)); color-scheme: dark; }
+.feed { max-height: min(250px, 35vh); overflow: hidden; opacity: 0; visibility: hidden; transition: opacity 250ms ease, visibility 250ms; padding: 0 2px; }
 .feed-visible { opacity: 1; visibility: inherit; transition: opacity 250ms ease; }
 .chat-hidden .feed { visibility: hidden; transition: none; }
 .feed-reading { overflow-y: auto; pointer-events: auto; }
@@ -236,20 +241,53 @@ function submit() {
 .line { line-height: 1.45; margin-bottom: 2px; overflow-wrap: anywhere; white-space: pre-wrap; text-shadow: 0 1px 3px #000, 0 0 2px #000; }
 .name, .tag { font-weight: 600; }
 .composer { margin-top: 7px; }
-.row { display: flex; align-items: center; min-height: 34px; padding: 0 10px; gap: 10px; background: var(--color-panel); border: 1px solid var(--color-border); }
-.chan-btn { flex: none; border: 0; background: none; padding: 0; font-size: 11px; cursor: pointer; }
-.chat-input { min-width: 0; flex: 1; height: 32px; padding: 0; background: none; border: 0; outline: none; color: inherit; font: inherit; }
-.chat-input::placeholder { color: var(--color-fg-faint); }
-.command-help { margin-top: 4px; background: var(--color-panel); overflow: hidden; border: 1px solid var(--color-border); }
-.command-list { max-height: min(230px, 30vh); overflow-y: auto; scrollbar-width: thin; padding: 3px; margin: 0; list-style: none; }
-.command-option { padding: 6px 8px; border-radius: 3px; pointer-events: auto; cursor: pointer; }
-.command-option.selected { background: var(--color-panel-raise); }
-.signature { display: flex; flex-wrap: wrap; gap: 5px; font-size: 12px; }
+
+/* The row: kit box look, chat rhythm. `--core-box-h` / `--core-box-pad` are the kit's own knobs. */
+.row { --core-box-h: 34px; --core-box-pad: 10px; gap: 10px; font-size: var(--text-ui-sm); }
+.row:focus-within { border-color: var(--color-accent); box-shadow: var(--core-focus); }
+
+/* Channel button in the label voice — it names the room, it is not a sentence. */
+.chan-btn {
+  flex: none; border: 0; background: none; padding: 0; cursor: pointer;
+  font-family: var(--font-display); font-size: 12px; font-weight: 600; line-height: 1;
+  letter-spacing: var(--tracking-label); text-transform: uppercase; color: var(--color-fg-dim);
+  transition: color 0.12s var(--ease-ui);
+}
+.chan-btn:hover { color: var(--color-fg); }
+.chat-input { cursor: text; }
+
+.command-help {
+  margin-top: 4px; overflow: hidden;
+  background: var(--color-panel-popup);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui-sm);
+  box-shadow: var(--shadow-ui-sm);
+}
+.command-list { max-height: min(230px, 30vh); overflow-y: auto; padding: 3px; margin: 0; list-style: none; }
+.command-option { padding: 7px 9px; border-radius: var(--radius-ui-xs); pointer-events: auto; cursor: pointer; }
+/* The selected row is the kit's fading accent gradient (§37.1), the same recipe an active menu row
+   wears — full coral under the command, dissolved by the right edge. */
+.command-option.selected { background-image: var(--core-grad-accent-fade); }
+.command-option.selected .param,
+.command-option.selected .command-description { color: rgba(255, 255, 255, 0.82); }
+.signature { display: flex; flex-wrap: wrap; gap: 6px; font-family: var(--font-mono); font-size: 12px; }
 .command-description, .argument-description { margin: 3px 0 0; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
-.command-keys { display: flex; gap: 14px; padding: 4px 11px 6px; font-size: 10px; }
+.command-keys {
+  display: flex; gap: 14px; padding: 5px 11px 7px;
+  font-family: var(--font-display); font-size: 10px; font-weight: 600; line-height: 1.4;
+  letter-spacing: var(--tracking-label); text-transform: uppercase;
+}
 .command-keys span:last-child { margin-left: auto; }
 .argument-help { padding: 8px 11px; }
 .param-active { text-decoration: underline; text-underline-offset: 3px; }
 .param-type { margin-left: 8px; }
+
+.feed::-webkit-scrollbar,
+.command-list::-webkit-scrollbar { width: 6px; }
+.feed::-webkit-scrollbar-track,
+.command-list::-webkit-scrollbar-track { background: transparent; }
+.feed::-webkit-scrollbar-thumb,
+.command-list::-webkit-scrollbar-thumb { background: var(--color-border-strong); border-radius: 3px; }
+
 @media (prefers-reduced-motion: reduce) { .feed { transition: none; } }
 </style>

@@ -24,6 +24,7 @@ local GUARD_ACTIVE_MS <const> = 500     -- entry guard cadence while the ped is 
 local GUARD_IDLE_MS <const> = 1500      -- ... and while it is not
 
 local stopping = false
+local appliedBagProps = {} -- [local entity] = vehId/plate + network-id token
 
 local function notify(message, kind)
     local ui = Core.UI
@@ -437,6 +438,9 @@ function Vehicles.toggleLock(veh)
     end
     if not isVehicle(veh) then return end
     if not Entity(veh).state.coreVeh then return end
+    -- Physical-key domain plugins validate their inventory item server-side and may bind the same UX key.
+    -- Do not emit core's virtual-key route (or its misleading "no keys" notification) for item-key vehicles.
+    if Entity(veh).state.keyMode == 'item' then return end
     if not Vehicles.hasKeys(veh) then
         notify(Config.Texts.no_keys, 'error')
         return
@@ -473,6 +477,36 @@ local function entityFromBag(bagName)
     return 0
 end
 
+local function applyProjectedProps(veh, props, force)
+    if veh == 0 or type(props) ~= 'table' or not DoesEntityExist(veh) then return false end
+    local state = Entity(veh).state
+    if state.coreVeh ~= true then return false end
+    -- Entity handles are recyclable. Include the current network id so storing and later restoring the same
+    -- vehId onto a reused local handle cannot suppress the new entity's property replay.
+    local identity = state.vehId or state.plate
+    local token = identity and (tostring(identity) .. ':' .. tostring(Vehicles.getNetId(veh))) or nil
+    if token == nil or (not force and appliedBagProps[veh] == token) then return true end
+    if not Vehicles.setProps(veh, props) then return false end
+    appliedBagProps[veh] = token
+    return true
+end
+
+-- Restored world vehicles may spawn before their owner is online. A property projection lets whichever client
+-- streams the entity apply its persisted colours/mods/damage; the entry guard below is the fallback
+-- when the bag arrived while that entity was still out of scope.
+AddStateBagChangeHandler('coreProps', nil, function(bagName, _, value)
+    local veh = entityFromBag(bagName)
+    if veh ~= 0 then applyProjectedProps(veh, value, true) end
+end)
+
+-- State keys may arrive in either order on first stream. If coreProps arrived before coreVeh, this second
+-- edge applies the already-present projection without adding a vehicle-pool scan or a permanent poll.
+AddStateBagChangeHandler('coreVeh', nil, function(bagName, _, value)
+    if value ~= true then return end
+    local veh = entityFromBag(bagName)
+    if veh ~= 0 then applyProjectedProps(veh, Entity(veh).state.coreProps) end
+end)
+
 -- Server writes `locked`, every client mirrors it onto the doors. Core vehicles only.
 AddStateBagChangeHandler('locked', nil, function(bagName, _, value)
     if type(value) ~= 'boolean' then return end
@@ -492,6 +526,11 @@ CreateThread(function()
             sleep = GUARD_ACTIVE_MS
             if DoesEntityExist(veh) then
                 local state = Entity(veh).state
+                local identity = state.vehId or state.plate
+                local token = identity and (tostring(identity) .. ':' .. tostring(Vehicles.getNetId(veh))) or nil
+                if token ~= nil and appliedBagProps[veh] ~= token then
+                    applyProjectedProps(veh, state.coreProps)
+                end
                 if state.coreVeh and state.locked == true and GetVehicleDoorLockStatus(veh) ~= 2 then
                     SetVehicleDoorsLocked(veh, 2)
                 end

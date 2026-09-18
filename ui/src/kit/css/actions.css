@@ -1,0 +1,479 @@
+/* core UI kit — Actions (DESIGN §37.5).
+   CoreButton, CoreIconButton, CoreKey, CoreKeyHint, CoreKeyHints, CorePrompt,
+   CorePromptGroup.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5. */
+
+/* ---- CoreButton ----------------------------------------------------------------------------
+   The BARE class is the secondary md button, so legacy markup keeps its look without a rewrite
+   (`<button class="core-btn">` in AlertDialog / InputDialog / plugin pages). The component only
+   adds `core-btn--secondary` on top, which changes nothing. Order carries meaning here: the box
+   comes first, the variants after it, and the disabled block last of all, because nothing below
+   that one may hand a dead control a hover back. */
+
+.core-btn {
+  position: relative;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: var(--core-h-md);
+  padding: 0 20px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-ui-sm);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-fg-dim);
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color 0.12s var(--ease-ui), border-color 0.12s var(--ease-ui),
+    color 0.12s var(--ease-ui), box-shadow 0.12s var(--ease-ui), filter 0.12s var(--ease-ui),
+    transform 0.12s var(--ease-ui);
+}
+
+/* The hover of the bare class and of `secondary`, and the reason it names every other variant:
+   a variant hover that only adds `filter` cannot undo a fill written here (both selectors are
+   hover rules, so the later one wins per property, not per rule). Excluding them keeps a primary
+   coral while the pointer is on it. `is-active` is excluded for the same reason. */
+.core-btn:not([disabled]):not(.is-disabled):not(.is-loading):not(.is-active):not(.core-btn--primary):not(.core-btn--ghost):not(.core-btn--danger):not(.core-btn--success):hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.30);
+  color: var(--color-fg);
+}
+.core-btn:not([disabled]):not(.is-disabled):not(.is-loading):active { transform: translateY(1px); }
+.core-btn:focus-visible { outline: 2px solid var(--color-accent-hi); outline-offset: 2px; }
+
+.core-btn--sm { height: var(--core-h-sm); padding: 0 12px; gap: 8px; font-size: 13px; }
+.core-btn--md { height: var(--core-h-md); padding: 0 20px; gap: 10px; font-size: 16px; }
+/* The gap grows with the size: at 52 px the mockups' TRACK QUEST holds its glyph well clear of the
+   label, and 10 px would read as one crowded lockup. */
+.core-btn--lg {
+  height: var(--core-h-lg);
+  padding: 0 28px;
+  gap: 14px;
+  font-size: 19px;
+  letter-spacing: 0.1em;
+}
+
+.core-btn.is-block { display: flex; width: 100%; }
+
+.core-btn__icon,
+.core-btn__kbd,
+.core-btn__spinner { flex: none; }
+/* The cap inside a button is decoration: a click on it must reach the button, and the lip would
+   fight the button's own edge. */
+.core-btn__kbd { pointer-events: none; box-shadow: none; }
+.core-btn__label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* `loading` keeps the label (and therefore the width): the spinner takes the icon's place, or
+   sits where the icon would have been. A 2 px ring in the button's own text colour — the kit has
+   CoreSpinner, but a button must not depend on another group's component to stay usable. */
+.core-btn__spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.24);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: core-spin 0.7s linear infinite;
+}
+.core-btn--sm .core-btn__spinner { width: 13px; height: 13px; }
+.core-btn--lg .core-btn__spinner { width: 18px; height: 18px; }
+.core-btn.is-loading { cursor: default; }
+
+/* ---- CoreIconButton -------------------------------------------------------------------------
+   A square CoreButton: only the box differs, every fill comes from the shared variant rules
+   below — which is also why this block sits ABOVE them (same specificity, later wins). */
+
+.core-iconbtn {
+  position: relative;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--core-h-md);
+  height: var(--core-h-md);
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-ui-sm);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-fg-dim);
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color 0.12s var(--ease-ui), border-color 0.12s var(--ease-ui),
+    color 0.12s var(--ease-ui), box-shadow 0.12s var(--ease-ui), filter 0.12s var(--ease-ui),
+    transform 0.12s var(--ease-ui);
+}
+
+.core-iconbtn:not([disabled]):not(.is-disabled):not(.is-active):not(.core-iconbtn--primary):not(.core-iconbtn--ghost):not(.core-iconbtn--danger):hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.30);
+  color: var(--color-fg);
+}
+.core-iconbtn:not([disabled]):not(.is-disabled):active { transform: translateY(1px); }
+.core-iconbtn:focus-visible { outline: 2px solid var(--color-accent-hi); outline-offset: 2px; }
+
+.core-iconbtn--sm { width: var(--core-h-sm); height: var(--core-h-sm); }
+.core-iconbtn--md { width: var(--core-h-md); height: var(--core-h-md); }
+.core-iconbtn--lg { width: var(--core-h-lg); height: var(--core-h-lg); }
+.core-iconbtn.is-round { border-radius: 50%; }
+
+/* ---- button variants (shared with CoreIconButton) -------------------------------------------
+   Every fill lives once, in a selector list that names both roots, so the square icon button can
+   never drift away from the button it sits next to. */
+
+.core-btn--primary,
+.core-iconbtn--primary {
+  border-color: transparent;
+  background: var(--core-grad-accent);
+  color: var(--color-on-accent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), 0 8px 22px rgb(var(--core-accent-rgb) / 0.24);
+}
+.core-btn--primary:not([disabled]):not(.is-disabled):not(.is-loading):not(.is-active):hover,
+.core-iconbtn--primary:not([disabled]):not(.is-disabled):not(.is-active):hover {
+  border-color: transparent;
+  background: var(--core-grad-accent);
+  filter: brightness(1.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.30), 0 10px 28px rgb(var(--core-accent-rgb) / 0.38);
+}
+
+/* The mockups' USE button: coral holds through the first fifth and dissolves into the panel,
+   with a thin coral line holding the shape — no outer glow, or the fade would be framed by it. */
+.core-btn--primary.is-fade,
+.core-iconbtn--primary.is-fade {
+  border-color: rgb(var(--core-accent-rgb) / 0.45);
+  background: var(--core-grad-accent-fade);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+.core-btn--primary.is-fade:not([disabled]):not(.is-disabled):not(.is-loading):not(.is-active):hover,
+.core-iconbtn--primary.is-fade:not([disabled]):not(.is-disabled):not(.is-active):hover {
+  border-color: rgb(var(--core-accent-rgb) / 0.70);
+  background: var(--core-grad-accent-fade);
+  filter: brightness(1.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.20);
+}
+
+.core-btn--ghost,
+.core-iconbtn--ghost {
+  border-color: transparent;
+  background: none;
+  color: var(--color-fg-dim);
+  box-shadow: none;
+}
+.core-btn--ghost:not([disabled]):not(.is-disabled):not(.is-loading):not(.is-active):hover,
+.core-iconbtn--ghost:not([disabled]):not(.is-disabled):not(.is-active):hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: transparent;
+  color: var(--color-fg);
+}
+
+.core-btn--danger,
+.core-iconbtn--danger { --core-btn-rgb: var(--core-error-rgb); --core-btn-fg: var(--color-error); }
+.core-btn--success,
+.core-iconbtn--success { --core-btn-rgb: var(--core-success-rgb); --core-btn-fg: var(--color-success); }
+
+.core-btn--danger,
+.core-btn--success,
+.core-iconbtn--danger,
+.core-iconbtn--success {
+  border-color: rgb(var(--core-btn-rgb) / 0.50);
+  background: rgb(var(--core-btn-rgb) / 0.08);
+  color: var(--core-btn-fg);
+  box-shadow: none;
+}
+.core-btn--danger:not([disabled]):not(.is-disabled):not(.is-loading):not(.is-active):hover,
+.core-btn--success:not([disabled]):not(.is-disabled):not(.is-loading):not(.is-active):hover,
+.core-iconbtn--danger:not([disabled]):not(.is-disabled):not(.is-active):hover,
+.core-iconbtn--success:not([disabled]):not(.is-disabled):not(.is-active):hover {
+  border-color: rgb(var(--core-btn-rgb) / 0.70);
+  background: rgb(var(--core-btn-rgb) / 0.16);
+  color: var(--core-btn-fg);
+}
+
+/* `active` is the toggle-on state (a pressed filter, a sticky tool), not :active. Two classes, so
+   it wins over every variant above — except the primary, which keeps its gradient and only gets
+   its glow pushed up. */
+.core-btn.is-active,
+.core-iconbtn.is-active {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-fg);
+}
+.core-btn--primary.is-active,
+.core-iconbtn--primary.is-active {
+  border-color: transparent;
+  background: var(--core-grad-accent);
+  color: var(--color-on-accent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), 0 8px 26px rgb(var(--core-accent-rgb) / 0.38);
+}
+
+/* Two classes plus the guards, so an active control keeps its coral under the pointer. */
+.core-btn.is-active:not([disabled]):not(.is-disabled):not(.is-loading):hover,
+.core-iconbtn.is-active:not([disabled]):not(.is-disabled):hover {
+  border-color: var(--color-accent-hi);
+  background: rgb(var(--core-accent-rgb) / 0.24);
+  color: var(--color-fg);
+}
+.core-btn--primary.is-active:not([disabled]):not(.is-disabled):not(.is-loading):hover,
+.core-iconbtn--primary.is-active:not([disabled]):not(.is-disabled):hover {
+  border-color: transparent;
+  background: var(--core-grad-accent);
+  color: var(--color-on-accent);
+  filter: brightness(1.08);
+}
+
+/* Last block of the button cascade: nothing below may re-enable a hover on a dead control. */
+.core-btn[disabled],
+.core-btn.is-disabled,
+.core-iconbtn[disabled],
+.core-iconbtn.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: none;
+  transform: none;
+}
+
+/* ---- CoreKey -------------------------------------------------------------------------------
+   The bare class is the solid md cap, so `<span class="core-key">F</span>` in a plugin page or in
+   a built-in is already right. A wide label (ESC, SPACE) grows the cap sideways: the height is
+   fixed and `min-width` only guarantees the square. */
+
+.core-key {
+  position: relative;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 7px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: var(--radius-ui-xs);
+  background: var(--color-key);
+  color: var(--color-key-fg);
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.45);
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.core-key--sm { height: 20px; min-width: 20px; padding: 0 5px; font-size: 12px; }
+.core-key--md { height: 26px; min-width: 26px; padding: 0 7px; font-size: 15px; }
+.core-key--lg { height: 32px; min-width: 32px; padding: 0 9px; font-size: 18px; }
+
+.core-key--outline {
+  border-color: rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-fg);
+  box-shadow: none;
+}
+
+/* A mouse button is a line glyph (§37.1), not a cap: the tile, the lip and the padding go, and
+   CoreIcon draws at the cap's height. Must sit after the size rules to undo them. */
+.core-key--mouse {
+  height: auto;
+  min-width: 0;
+  padding: 0;
+  overflow: visible;
+  border-color: transparent;
+  background: none;
+  color: var(--color-fg);
+  box-shadow: none;
+}
+
+.core-key.is-pressed {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  box-shadow: none;
+  transform: translateY(1px);
+}
+.core-key--mouse.is-pressed {
+  background: none;
+  color: var(--color-accent);
+  transform: none;
+}
+
+/* Hold-to-confirm. The bar is scaled, not resized, and carries no transition of its own: the
+   caller drives `progress` per frame and a transition would lag a frame behind every update. */
+.core-key__progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  transform-origin: left center;
+  background: var(--color-accent);
+}
+.core-key.is-pressed .core-key__progress { background: var(--color-on-accent); }
+
+/* ---- CoreKeyHint / CoreKeyHints -------------------------------------------------------------
+   Cap(s) plus a caption, and the bar they line up in (the mockups' map footer). `is-bare` is the
+   footer form: no chrome at all, because CoreScreen's footer already brings the hairline. */
+
+.core-keyhint {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+.core-keyhint__keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+/* The mockup's footer captions sit at ~85 % white, not at `fg-dim`: a hint is read at a glance,
+   over the map, and 66 % disappears into a bright frame. */
+.core-keyhint__label {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-fg);
+  opacity: 0.85;
+}
+.core-keyhint--sm { gap: 8px; }
+.core-keyhint--sm .core-keyhint__label { font-size: 12px; }
+.core-keyhint--lg { gap: 12px; }
+.core-keyhint--lg .core-keyhint__label { font-size: 16px; }
+
+.core-keyhints {
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 28px;
+  padding: 8px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui-sm);
+  background: var(--color-hud);
+}
+.core-keyhints--start { justify-content: flex-start; }
+.core-keyhints--end { justify-content: flex-end; }
+.core-keyhints--between { justify-content: space-between; }
+.core-keyhints.is-bare {
+  padding: 0;
+  border-color: transparent;
+  background: none;
+}
+
+/* ---- CorePrompt / CorePromptGroup ------------------------------------------------------------
+   HUD elements: click-through unless `interactive` turns the mouse back on (§37.4). The band is
+   the mockup's dissolving plate — opaque under the label, gone by the right edge, so the prompt
+   sits on the world instead of in a box. */
+
+.core-prompt {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-fg);
+  text-align: left;
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.core-prompt.is-interactive { cursor: pointer; pointer-events: auto; }
+.core-prompt:focus-visible { outline: 2px solid var(--color-accent-hi); outline-offset: 2px; }
+
+.core-prompt__keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+/* The band is a strip lying on the world, not a chip around the words: it runs well past the
+   label (the mockup gives "ENTER VEHICLE" ~260 px) and only dissolves over the last third, so a
+   short label still reads as a plate rather than as a box that ends with the text. */
+.core-prompt__band {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 220px;
+  min-height: 40px;
+  padding: 0 36px 0 14px;
+  background: linear-gradient(90deg,
+    rgb(var(--core-ink-rgb) / 0.80) 0%,
+    rgb(var(--core-ink-rgb) / 0.80) 66%,
+    rgb(var(--core-ink-rgb) / 0) 100%);
+}
+.core-prompt__icon { flex: none; }
+.core-prompt__text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.core-prompt__label {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-fg);
+}
+.core-prompt__desc {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--color-fg-dim);
+}
+
+/* `is-active` turns the cap coral without CoreKey's pressed offset — the prompt is lit, not held. */
+.core-prompt.is-active .core-key {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+}
+.core-prompt.is-active .core-key--mouse {
+  background: none;
+  color: var(--color-accent);
+}
+.core-prompt.is-interactive:not(.is-disabled):hover .core-prompt__band {
+  background: linear-gradient(90deg,
+    rgb(var(--core-ink-rgb) / 0.92) 0%,
+    rgb(var(--core-ink-rgb) / 0.92) 66%,
+    rgb(var(--core-ink-rgb) / 0) 100%);
+}
+.core-prompt.is-disabled { opacity: 0.45; }
+.core-prompt.is-disabled.is-interactive { cursor: not-allowed; }
+
+.core-prompts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.core-prompts--start { align-items: flex-start; }
+.core-prompts--end { align-items: flex-end; }
+

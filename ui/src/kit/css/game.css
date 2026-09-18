@@ -1,0 +1,818 @@
+/* core UI kit — Game (DESIGN §37.5).
+   CoreSlot, CoreSlotGrid, CoreHotbar, CoreList, CoreListItem, CoreObjective,
+   CoreTracker, CoreCompass.
+   Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
+   following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5. */
+
+/* ---- CoreSlot — the item cell of mockup 3 --------------------------------------------------
+   A barely-lighter tile with a bright hairline; the selected one carries the coral frame and the
+   glow that --shadow-glow draws inside AND outside in one declaration. The root is a <button>
+   when the slot is interactive, so the reset below has to undo the UA button look as well.
+   --core-slot-edge lifts the durability bar over the rarity line when a slot wears both. */
+
+.core-slot {
+  --core-slot-edge: 0px;
+  position: relative;
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  aspect-ratio: var(--core-slot-ratio, 1 / 1);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-ui-sm);
+  background-color: var(--color-panel-raise);
+  background-image: none;
+  color: var(--color-fg);
+  font: inherit;
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: none;
+  cursor: default;
+  transition:
+    border-color 0.12s var(--ease-ui),
+    background-color 0.12s var(--ease-ui),
+    box-shadow 0.16s var(--ease-ui);
+}
+
+/* A slot only takes the mouse when it is interactive: a legend or a tooltip slot sits inside a
+   click-through HUD and must not eat the click or show a hand (§37.4 pointer events). */
+.core-slot.is-interactive {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.core-slot.is-interactive:hover {
+  border-color: var(--color-border-strong);
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.core-slot:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+.core-slot.is-empty,
+.core-slot.is-disabled {
+  cursor: default;
+}
+
+.core-slot.is-empty:hover {
+  border-color: rgba(255, 255, 255, 0.12);
+  background-color: var(--color-panel-raise);
+}
+
+.core-slot.is-disabled { cursor: not-allowed; }
+
+.core-slot.is-disabled:hover {
+  border-color: rgba(255, 255, 255, 0.12);
+  background-color: var(--color-panel-raise);
+}
+
+.core-slot.is-disabled .core-slot__media,
+.core-slot.is-disabled .core-slot__count,
+.core-slot.is-disabled .core-slot__badge,
+.core-slot.is-disabled .core-slot__hotkey {
+  opacity: 0.38;
+}
+
+/* Selection is never a filled block (§37.1): 1 px border + the 1 px ring of --shadow-glow read
+   as the mockup's 2 px coral frame, and the same shadow supplies the inner and the outer bloom. */
+.core-slot.is-selected {
+  border-color: var(--color-accent-hi);
+  background-color: rgb(var(--core-accent-rgb) / 0.07);
+  box-shadow: var(--shadow-glow);
+}
+
+.core-slot.is-selected:hover {
+  border-color: var(--color-accent-hi);
+  background-color: rgb(var(--core-accent-rgb) / 0.10);
+  box-shadow: var(--shadow-glow);
+}
+
+/* ---- CoreSlot parts ------------------------------------------------------------------------ */
+
+.core-slot__media {
+  position: absolute;
+  left: 12%;
+  top: 12%;
+  right: 12%;
+  bottom: 12%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-fg-faint);
+}
+
+.core-slot__image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  -webkit-user-drag: none;
+}
+
+/* The fallback glyph scales with the cell instead of carrying a pixel size of its own. */
+.core-slot__glyph {
+  width: 58%;
+  height: 58%;
+  color: var(--color-fg-faint);
+}
+
+/* The inset is a percentage so the number keeps the mockup's distance from the corner in a
+   176 px inventory cell and in a 96 px hotbar cell alike. */
+.core-slot__count {
+  position: absolute;
+  right: 9%;
+  bottom: 8%;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 19px;
+  line-height: 1;
+  letter-spacing: var(--tracking-display);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  color: var(--color-fg);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+}
+
+/* The hotkey chip is a small solid key cap (--color-key tile, dark text) — its own markup on
+   purpose (K8 brief): a slot must not pull CoreKey's sizes and hold states into a 96 px cell. */
+.core-slot__hotkey {
+  position: absolute;
+  left: 7px;
+  top: 7px;
+  display: block;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: var(--radius-ui-xs);
+  background: var(--color-key);
+  color: var(--color-key-fg);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 13px;
+  line-height: 18px;
+  letter-spacing: 0.02em;
+  text-align: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+}
+
+.core-slot__badge {
+  position: absolute;
+  right: 7px;
+  top: 7px;
+  height: 17px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui-xs);
+  background: rgba(0, 0, 0, 0.55);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 11px;
+  line-height: 15px;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-dim);
+}
+
+.core-slot__overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+}
+
+/* Condition bar on the bottom edge. The colour is a state, not a tone: green down to 50 %,
+   amber down to 20 %, red under it — the component picks the class. */
+.core-slot__durability {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: var(--core-slot-edge);
+  height: 3px;
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.core-slot__durability-fill {
+  height: 100%;
+  background: var(--color-success);
+  transition: width 0.25s var(--ease-ui);
+}
+
+.core-slot__durability-fill.is-warn { background: var(--color-warning); }
+.core-slot__durability-fill.is-low { background: var(--color-error); }
+
+/* Rarity: a 2 px line plus a faint bloom rising off it, both in --tone (base.css maps the
+   core-rarity-* class the component puts on the root). Listed one by one because a plain
+   `core-slot--rarity` helper class is not in the §37.5 vocabulary. */
+.core-slot--rarity-common,
+.core-slot--rarity-uncommon,
+.core-slot--rarity-rare,
+.core-slot--rarity-epic,
+.core-slot--rarity-legendary {
+  --core-slot-edge: 2px;
+}
+
+.core-slot__rarity {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--tone);
+  box-shadow: 0 0 9px rgb(var(--tone-rgb) / 0.45);
+}
+
+.core-slot__rarity::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 26px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgb(var(--tone-rgb) / 0.14) 100%);
+  pointer-events: none;
+}
+
+/* ---- CoreSlotGrid -------------------------------------------------------------------------- */
+
+.core-slotgrid {
+  display: grid;
+  align-items: start;
+  pointer-events: auto;
+}
+
+/* ---- CoreHotbar — the four cells of mockup 2 -----------------------------------------------
+   Over the bare game, so the cells bring their own panel fill instead of the --color-panel-raise
+   that only works on top of a panel, and they are a touch rounder than an inventory cell. */
+
+.core-hotbar {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.core-hotbar .core-slot {
+  border-radius: var(--radius-ui);
+  background-color: var(--color-panel-glass);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%);
+  box-shadow: var(--shadow-ui-sm);
+}
+
+.core-hotbar .core-slot:hover { background-color: rgb(var(--core-panel-rgb) / 0.78); }
+
+.core-hotbar .core-slot.is-selected {
+  background-color: rgb(var(--core-accent-rgb) / 0.10);
+  box-shadow: var(--shadow-glow);
+}
+
+.core-hotbar .core-slot.is-empty:hover,
+.core-hotbar .core-slot.is-disabled:hover {
+  background-color: var(--color-panel-glass);
+}
+
+/* ---- CoreList / CoreListItem — the quest rows of mockup 4 ----------------------------------
+   The root class is core-listview, NOT core-list: that legacy name belongs to the old menu <ul>
+   in css/navigation.css (§37.5). Rows are cards with a gap by default; `dividers` collapses the
+   gap and swaps the frames for one hairline between rows — but never around the selected card,
+   which keeps its coral frame. Chromium 103 has no :has(), so the row AFTER the selected one is
+   silenced with the adjacent-sibling combinator instead. */
+
+.core-listview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.core-listitem {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0;
+  padding: 8px 18px 8px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui);
+  background-color: var(--color-panel);
+  background-image: linear-gradient(0deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.022));
+  color: var(--color-fg);
+  font: inherit;
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: none;
+  cursor: default;
+  transition:
+    border-color 0.12s var(--ease-ui),
+    background-color 0.12s var(--ease-ui),
+    box-shadow 0.16s var(--ease-ui);
+}
+
+/* Only an interactive row takes the mouse — a read-only row in a HUD panel stays click-through. */
+.core-listitem.is-interactive {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.core-listitem.is-interactive:hover {
+  border-color: var(--color-border-strong);
+  background-image: linear-gradient(0deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.055));
+}
+
+.core-listitem:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+
+.core-listitem.is-selected,
+.core-listitem.is-interactive.is-selected:hover {
+  border-color: var(--color-accent-hi);
+  box-shadow: var(--shadow-glow-sm);
+  background-image: linear-gradient(
+    90deg,
+    rgb(var(--core-accent-rgb) / 0.13) 0%,
+    rgb(var(--core-accent-rgb) / 0.06) 55%,
+    rgb(var(--core-accent-rgb) / 0.035) 100%
+  );
+}
+
+.core-listitem.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.core-listitem.is-disabled:hover {
+  border-color: var(--color-border);
+  background-image: linear-gradient(0deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.022));
+}
+
+.core-listview--dividers { gap: 0; }
+
+.core-listview--dividers .core-listitem {
+  border-color: transparent;
+  border-radius: 0;
+  background-color: transparent;
+  background-image: none;
+}
+
+.core-listview--dividers .core-listitem + .core-listitem { border-top-color: var(--color-border); }
+
+.core-listview--dividers .core-listitem.is-selected {
+  border-color: var(--color-accent-hi);
+  border-radius: var(--radius-ui);
+  background-color: var(--color-panel);
+  background-image: linear-gradient(
+    90deg,
+    rgb(var(--core-accent-rgb) / 0.13) 0%,
+    rgb(var(--core-accent-rgb) / 0.06) 55%,
+    rgb(var(--core-accent-rgb) / 0.035) 100%
+  );
+}
+
+.core-listview--dividers .core-listitem.is-selected + .core-listitem { border-top-color: transparent; }
+
+/* ---- CoreListItem parts --------------------------------------------------------------------- */
+
+.core-listitem__media {
+  flex: none;
+  display: block;
+  width: 96px;
+  height: 84px;
+  overflow: hidden;
+  border-radius: var(--radius-ui-xs);
+  background: var(--color-panel-sunken);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+
+.core-listitem__image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  -webkit-user-drag: none;
+}
+
+.core-listitem__icon {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  margin-left: 6px;
+  color: var(--tone, var(--color-accent));
+}
+
+.core-listitem__text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Title Case on purpose: the only display-voice text in the kit that is NOT uppercased (§37.5). */
+.core-listitem__title {
+  display: block;
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 19px;
+  line-height: 1.15;
+  letter-spacing: 0.01em;
+  color: var(--color-fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.core-listitem__subtitle {
+  display: block;
+  margin: 5px 0 0;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.3;
+  color: var(--color-fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.core-listitem__trailing {
+  flex: none;
+  align-self: flex-end;
+  padding-bottom: 16px;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.2;
+  color: var(--color-fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.core-listitem.is-completed .core-listitem__media { opacity: 0.5; }
+.core-listitem.is-completed .core-listitem__title { color: var(--color-fg-dim); }
+.core-listitem.is-completed .core-listitem__icon { opacity: 0.8; }
+
+/* ---- CoreObjective — one checklist line (mockup 4) ------------------------------------------ */
+
+.core-objective {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 28px;
+}
+
+.core-objective__ring {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--color-fg-dim);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-on-accent);
+  transition:
+    border-color 0.16s var(--ease-ui),
+    background-color 0.16s var(--ease-ui),
+    box-shadow 0.16s var(--ease-ui);
+}
+
+.core-objective__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--color-fg);
+}
+
+.core-objective__optional {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 11px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg-faint);
+}
+
+.core-objective__trailing {
+  flex: none;
+  margin-left: 6px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.2;
+  color: var(--color-fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.core-objective.is-open .core-objective__text { color: var(--color-fg); }
+
+/* Active: the coral ring with its dot, the one objective the player is chasing. */
+.core-objective.is-active .core-objective__ring {
+  border-color: var(--color-accent-hi);
+  box-shadow: 0 0 12px rgb(var(--core-accent-rgb) / 0.45);
+}
+
+.core-objective.is-active .core-objective__ring::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+
+.core-objective.is-done .core-objective__ring {
+  border-color: var(--color-accent);
+  background-color: var(--color-accent);
+}
+
+.core-objective.is-done .core-objective__text { color: var(--color-fg-dim); }
+
+.core-objective.is-failed .core-objective__ring {
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+.core-objective.is-failed .core-objective__text {
+  color: var(--color-fg-faint);
+  text-decoration: line-through;
+}
+
+/* ---- CoreTracker — the HUD quest card of mockup 2 -------------------------------------------
+   Click-through (§37.4): it is painted over the world, never clicked. The rail is the icon column
+   whose hairline runs down out of the pin and fades away — the motif of the mockup. The fill is
+   --color-hud, the kit-wide plate every HUD element is painted on.
+
+   `bloom` (the default): in mockup 2 the plate is NOT a flat fill — it is LIFTED in two soft spots,
+   a small one behind the pin and a bigger one out of the bottom-left corner, while the right edge
+   stays dark. It is exactly TWO corner radials (Liam): one on the top-left corner and a bigger one
+   on the bottom-left, each brightening and opening up the closer it gets to its corner, and the
+   stretch of left edge BETWEEN them stays a normal, fully opaque plate. So each corner carries a
+   light wash (the bloom) and a mask hole of the same footprint (the transparency), and nothing
+   spans the two — no wash down the whole side. The mask layers are INTERSECTED with
+   -webkit-mask-composite, because stacking two mask layers unions them back to opaque; since the
+   two spots do not overlap, intersecting leaves each corner at its own alpha and the middle at 1.
+   All of it lives on a ::before and not on the root, or the mask would thin the text and the icons
+   with it; `isolation: isolate` keeps the z-index: -1 layer inside the card. */
+
+.core-tracker {
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 13px;
+  box-sizing: border-box;
+  max-width: 400px;
+  padding: 13px 22px 14px 15px;
+  border-radius: var(--radius-ui-sm);
+  background: var(--color-hud);
+  box-shadow: var(--shadow-ui-sm);
+  pointer-events: none;
+}
+
+.core-tracker.has-bloom { background: transparent; }
+
+.core-tracker.has-bloom::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background-color: var(--color-hud);
+  background-image:
+    radial-gradient(68px 36px at 0% 0%, rgba(255, 255, 255, 0.12) 0, rgba(255, 255, 255, 0) 100%),
+    radial-gradient(122px 46px at 0% 100%, rgba(255, 255, 255, 0.14) 0, rgba(255, 255, 255, 0) 100%);
+  -webkit-mask-image:
+    radial-gradient(68px 36px at 0% 0%, rgba(0, 0, 0, 0.58) 0, rgba(0, 0, 0, 1) 100%),
+    radial-gradient(122px 46px at 0% 100%, rgba(0, 0, 0, 0.50) 0, rgba(0, 0, 0, 1) 100%);
+  -webkit-mask-composite: source-in;
+}
+
+.core-tracker__rail {
+  position: relative;
+  flex: none;
+  align-self: stretch;
+  width: 22px;
+  color: var(--tone, var(--color-warning));
+}
+
+.core-tracker__rail::after {
+  content: '';
+  position: absolute;
+  left: 11px;
+  top: 30px;
+  bottom: 2px;
+  width: 1px;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.30) 0%,
+    rgba(255, 255, 255, 0.14) 58%,
+    rgba(255, 255, 255, 0) 100%
+  );
+}
+
+.core-tracker__pin { display: block; }
+
+.core-tracker__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-top: 1px;
+}
+
+.core-tracker__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+}
+
+.core-tracker__text {
+  margin: 9px 0 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--color-fg-dim);
+}
+
+.core-tracker__distance {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 9px 0 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.2;
+  color: var(--color-fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.core-tracker__objectives {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.core-tracker__objectives .core-objective { min-height: 24px; }
+.core-tracker__objectives .core-objective__text { font-size: 14px; }
+
+/* ---- CoreCompass — the heading band of mockup 2 ---------------------------------------------
+   Click-through HUD. The strip is built ONCE (720 degrees of ticks, labels and marker copies) and
+   only its transform changes, so a heading update costs one composited move and no allocation.
+   The band fades at both ends with -webkit-mask-image (Chromium 103 has no unprefixed mask-image)
+   and clips the strip, so the centre triangle lives OUTSIDE it and can overhang the top edge. */
+
+.core-compass {
+  position: relative;
+  box-sizing: border-box;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.core-compass__band {
+  position: relative;
+  box-sizing: border-box;
+  height: 30px;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.11);
+  background: linear-gradient(
+    180deg,
+    rgb(var(--core-ink-rgb) / 0.06) 0%,
+    rgb(var(--core-ink-rgb) / 0.62) 22%,
+    rgb(var(--core-ink-rgb) / 0.72) 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0) 0%,
+    rgba(0, 0, 0, 1) 8%,
+    rgba(0, 0, 0, 1) 92%,
+    rgba(0, 0, 0, 0) 100%
+  );
+}
+
+.core-compass__strip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  will-change: transform;
+}
+
+/* Two layers so v-memo can freeze the static ticks while the markers still update. */
+.core-compass__marks,
+.core-compass__markers {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+}
+
+.core-compass__tick {
+  position: absolute;
+  top: 3px;
+  width: 1px;
+  height: 7px;
+  margin-left: -0.5px;
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.core-compass__tick.is-major {
+  top: 2px;
+  height: 10px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.core-compass__label {
+  position: absolute;
+  bottom: 4px;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 15px;
+  line-height: 1;
+  letter-spacing: var(--tracking-display);
+  color: var(--color-fg);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.75);
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.core-compass__label.is-inter {
+  bottom: 5px;
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: var(--tracking-label);
+  color: rgba(255, 255, 255, 0.46);
+}
+
+.core-compass__marker {
+  position: absolute;
+  top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transform: translateX(-7px);
+  color: var(--tone, var(--color-accent));
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.9));
+  white-space: nowrap;
+}
+
+.core-compass__marker-label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 11px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+}
+
+/* The coral triangle that names the centre of the band — it overhangs the top edge. */
+.core-compass__needle {
+  position: absolute;
+  left: 50%;
+  top: -7px;
+  width: 0;
+  height: 0;
+  margin-left: -10px;
+  border-left: 10px solid transparent;
+  border-right: 10px solid transparent;
+  border-top: 15px solid var(--color-accent);
+  filter: drop-shadow(0 2px 7px rgb(var(--core-accent-rgb) / 0.55));
+}
+
+.core-compass__bearing {
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  margin-top: 4px;
+  transform: translateX(-50%);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 13px;
+  line-height: 1;
+  letter-spacing: var(--tracking-display);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg-dim);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.75);
+}

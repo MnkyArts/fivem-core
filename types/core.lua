@@ -303,9 +303,16 @@
 ---@field model string|integer
 ---@field plate string
 ---@field props CoreVehicleProps
----@field stored boolean true while the vehicle sits in a garage
+---@field stored boolean true only while deliberately garaged; false means it belongs in the persistent world
 ---@field position { x: number, y: number, z: number, heading: number }
 ---@field meta table includes core `vehType`/`keyMode`; plugins use the remaining keys through Core.Vehicles.setData/getData
+
+---@class CoreVehicleAdoptOptions
+---@field ownerSrc? integer current player gaining gameplay ownership
+---@field ownerCharId? string character gaining gameplay ownership
+---@field keyMode? 'virtual'|'item' default 'virtual'
+---@field locked? boolean default false
+---@field props? CoreVehicleProps optional already trusted property snapshot
 
 ---JSON-safe vehicle appearance and condition (DESIGN §6.8). Every key is optional.
 ---@class CoreVehicleProps
@@ -1885,6 +1892,21 @@ function Core.Vehicles.getRecord(vehId) end
 ---@return integer|nil netId
 ---@return string|nil err
 function Core.Vehicles.spawnRecord(vehId, coords, heading, ownerSrc) end
+---(server) Restores one out-of-garage record at its saved or supplied world position. Yields.
+---@param vehId string
+---@param coords? vector3 defaults to record.position
+---@param heading? number defaults to record.position.heading
+---@param ownerSrc? integer client that should receive the direct property replay
+---@return integer|nil netId
+---@return string|nil err
+function Core.Vehicles.restoreRecord(vehId, coords, heading, ownerSrc) end
+---(server) Promotes an existing network vehicle into a tracked, server-owned persistent vehicle.
+---Trusted server-resource API only; no client event exposes it.
+---@param netId integer
+---@param opts CoreVehicleAdoptOptions
+---@return string|nil vehId
+---@return string|nil err
+function Core.Vehicles.adopt(netId, opts) end
 ---(server) Saves the last known position/props, then removes the entity from the world.
 ---@param netId integer
 ---@return boolean ok
@@ -1899,7 +1921,7 @@ function Core.Vehicles.saveProps(netId, props) end
 ---@param vehId string
 ---@return boolean removed
 function Core.Vehicles.deleteRecord(vehId) end
----(server) Core-spawned vehicles within `range` of `coords`, nearest first.
+---(server) Core-tracked vehicles within `range` of `coords`, nearest first.
 ---@param coords vector3
 ---@param range number
 ---@return integer[] netIds
@@ -1912,7 +1934,7 @@ function Core.Vehicles.getDriver(netId) end
 ---@param netId integer
 ---@return integer[] srcs
 function Core.Vehicles.getPassengers(netId) end
----(server) Nearest core-spawned vehicle to the player's ped.
+---(server) Nearest core-tracked vehicle to the player's ped.
 ---@param src integer
 ---@param maxDist? number default 20.0
 ---@return integer|nil netId
@@ -1980,8 +2002,8 @@ function Core.Vehicles.setEngine(veh, on) end
 ---@param veh integer
 ---@return boolean ok
 function Core.Vehicles.repair(veh) end
----(client) Asks the server to toggle the lock of `veh`, or the current/closest vehicle within
----8 m. The server re-checks keys, distance and ownership.
+---(client) Asks the server to toggle the lock of a virtual-key `veh`, or the current/closest vehicle within
+---8 m. Item-key vehicles intentionally no-op so their domain plugin can validate a physical inventory key.
 ---@param veh? integer
 function Core.Vehicles.toggleLock(veh) end
 

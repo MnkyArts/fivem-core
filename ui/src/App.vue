@@ -51,5 +51,9 @@ import { store } from './store.js'
     <Menu />
     <InputDialog />
     <AlertDialog />
+
+    <!-- §37.3: Teleport target of every kit popup (select, popover, context menu, dialog, drawer,
+         tooltip) — inside .core-root, so §31 hides it with the shell. -->
+    <div id="core-overlays" class="core-overlays"></div>
   </div>
 </template>

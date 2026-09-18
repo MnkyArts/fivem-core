@@ -222,11 +222,13 @@ The plugin's own contract is `resources/charcreator/PLAN.md` (runs B–E there);
 | Run | Owner | Files | Status |
 |---|---|---|---|
 | C1 | main (native-scout role unavailable in this environment; all calls verified with local `fxref`) | `server/vehicles.lua`, `client/vehicles.lua`, `DESIGN.md`, `README.md` | complete |
-| C2 | main | `types/core.lua`, `tests/server_tests.lua` | complete (718 server tests) |
+| C2 | main | `types/core.lua`, `tests/server_tests.lua` | complete (720 server tests) |
 
 Contract: preserve Core.Vehicles compatibility with virtual keys, add persisted item-key mode for the vehicle_system plugin, and accept the bounded 0-based property maps Core.Vehicles.getProps already produces. See `../vehicle_system/PLAN.md` for complete native/API and test lists.
 
 | C3 | main | `shared/config.lua`, `server/vehicles.lua`, `client/vehicles.lua`, `DESIGN.md`, `README.md`, `types/core.lua`, `tests/server_tests.lua` | complete — global stored/live plate uniqueness, `LS-` plates and complete condition props; `scripts/check.sh` passed |
+
+| C4 | main | `client/vehicles.lua`, `DESIGN.md`, `README.md`, `types/core.lua` | complete — core's virtual-key `U` route now intentionally no-ops for item-key vehicles, allowing their domain plugin to validate its physical key |
 
 ## Interiors / IPL loader (DESIGN §36) — 2026-09-15
 
@@ -238,3 +240,47 @@ Contract: port the IPL layer of Bob74/bob74_ipl (MIT, researched from master + D
 grouping, attribution in the data file) as boot-loaded groups with build/DLC gates; per-interior entity-set
 styling stays plugin-side via `Core.Interiors.activateSet`. Natives verified with local `fxref` (STREAMING +
 INTERIOR client, CFX shared GetGameBuildNumber, DLC client IsDlcPresent).
+
+## Persistent world vehicle run — 2026-09-15
+
+| Run | Owner | Files | Status |
+|---|---|---|---|
+| P1 | main (custom scout/implementer/reviewer roles unavailable; natives checked with local `fxref`) | `server/vehicles.lua`, `client/vehicles.lua`, `types/core.lua`, `DESIGN.md`, `README.md`, `tests/server_tests.lua`, `tests/stubs.lua` | complete — ambient adoption, out-record restoration, world-vs-garage semantics and streamed props; 735 server checks, full check and zero-warning fxlint passed |
+
+## Design system / UI kit (DESIGN §37) — 2026-09-18
+
+Contract: DESIGN §37 (tokens, conventions, catalogue). Look authority: `FiveM/DesignMockups/*.png` — the kit
+replaces the old visual direction, it does not extend it. Orchestrator (main) wrote the contract, cut the
+Storybook art (`ui/src/stories/kit/assets/`) and reviewed every gallery from screenshots; implementers were
+opus subagents with disjoint files, each with its own Vite port + `agent-browser --session`, verifying with
+`node ui/tests/kit-compile-check.mjs` and screenshots of `kit-preview.html?scene=<Scene>` against 2.5× mockup
+crops. Nobody but the orchestrator ran `npm run build` (it empties `html/`). One consolidated fix round per
+group via SendMessage, then a contract-review pass (R1) whose seven findings went back to the owners.
+
+| Run | Owner | Files | Status |
+|---|---|---|---|
+| F0a | opus | `ui/src/styles.css` (tokens, `@theme static`), `ui/src/kit/{index,icons,use}.js`, `kit/fonts.css` + `fonts/` (9 vendored Barlow woff2, OFL), `kit/css/base.css`, `kit/components/CoreIcon.vue`, `ui/src/main.js`, `ui/src/App.vue` (overlay root), `.storybook/preview.js` | complete — build, 99/99 shell regression |
+| F0b | opus | `ui/kit-preview.html`, `ui/src/kit/preview.js` (dev harness), `ui/tests/kit-compile-check.mjs`, `stories/kit/README.md`, `scenes/{KitStage,KitSection,Foundations*,IconGallery}.vue`, `Foundations.stories.js`, `Icon.stories.js` | complete |
+| K1 actions | opus | `css/actions.css`, CoreButton, CoreIconButton, CoreKey, CoreKeyHint, CoreKeyHints, CorePrompt, CorePromptGroup + stories/scenes | complete (+ fix rounds: prompt band, hint captions, tokens, IconButton `success`/`fade`) |
+| K2 surfaces | opus | `css/surfaces.css`, CorePanel, CoreCard, CoreBackground, CoreScreen, CoreHeading, CoreDivider, CoreDash, CoreTagline, CoreBrand + stories/scenes | complete (+ `hud` panel, brand `xl`, tagline shadow, background `position`/`fade`, screen `navAlign`, card `variant`, subtitle scale) |
+| K3 navigation | opus | `css/navigation.css`, CoreTabs, CoreMenu, CoreChips, CoreStepper + stories/scenes | complete (+ on-accent tokens, active tab `fg`, chips `stretch`/`minWidth`) |
+| K4 forms-text | opus | `css/forms-text.css`, CoreField, CoreInput, CoreTextarea, CoreNumberInput, CoreSelect + stories/scenes | complete (+ teleport target at setup, popup z 50, pinned `placement`) |
+| K5 forms-choice | opus | `css/forms-choice.css`, CoreCheckbox, CoreRadioGroup, CoreRadio, CoreSwitch, CoreSlider, CoreSwatches + stories/scenes | complete |
+| K6 data-meters | opus | `css/data-meters.css`, CoreProgress, CoreRing, CoreStatBar, CoreStatRow, CoreSpinner, CoreSkeleton + stories/scenes | complete (+ StatBar `iconTone`) |
+| K7 data-display | opus | `css/data-display.css`, CoreBadge, CoreTag, CoreAvatar, CorePlayerChip, CoreTable, CoreKeyValue, CoreEmpty + stories/scenes | complete (+ `--color-hud`, ping ring) |
+| K8 game | opus | `css/game.css`, CoreSlot, CoreSlotGrid, CoreHotbar, CoreList, CoreListItem, CoreObjective, CoreTracker, CoreCompass + stories/scenes | complete (+ compass fov 270 / `labels`, pointer gating, hotbar roving, tracker `bloom`) |
+| K9 feedback | opus | `css/feedback.css`, CoreAlert, CoreToast, CoreDialog, CoreDrawer, CorePopover, CoreContextMenu, CoreTooltip + stories/scenes | complete (+ overlay z-scale 40/50/60, teleport target at setup) |
+| S1 shell modals | opus | `ui/src/components/{Menu,InputDialog,AlertDialog}.vue` | complete — hooks kept, 99/99 |
+| S2a shell HUD | opus | `ui/src/components/{Hud,StatsBars,Notifications,Shard}.vue` | complete — hooks kept, 99/99 |
+| S2b shell prompts | opus | `ui/src/components/{TextUI,Progress,KeyHints,Spinner,Chat}.vue` | complete — hooks kept, 99/99 |
+| SC1 / SC2 showcase | opus | `stories/kit/Showcase{MainMenu,Hud,Inventory,Map}.stories.js` + scenes — the four mockups from kit tags only | complete; their gap lists drove the late additions above |
+| T1 tests | opus | `ui/tests/kit-regression.js` | complete — `PASS 190/190` on the build |
+| D1 docs | opus | `README.md`, `AGENTS.md`, `stories/docs/DesignSystem.mdx`, `templates/plugin/{README.md,ui/src/Page.vue}`, `../core_example/{README.md,ui/src/Page.vue}` | complete |
+| R1 reconcile | opus | `DESIGN.md` §37 rewritten from the shipped sources (58 entries) | complete |
+
+Size: 60 components (5.1k lines), 10 CSS partials (5.7k), foundation JS (1.2k), 110 story/scene files (11.4k),
+two suites (1.45k). Final gate: `scripts/check.sh` green (fxlint 0/0, Lua 385 + 764), shell regression 99/99,
+kit regression 190/190, Storybook builds (250+ stories). Open: in-game pass (the CEF's real blur, fonts and
+pointer behaviour); the existing plugin pages (inventory, charcreator, trucking) still use their own elements
+— migrating them to the kit is the next run; a global UI scale decision (the kit is calibrated to the mockups'
+1672 px frame, ~13 % small at 1080p).

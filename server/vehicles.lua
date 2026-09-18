@@ -1,6 +1,9 @@
 --- core/server/vehicles.lua — Core.Vehicles (server).
 --- Server-owned vehicle spawning, ownership/keys, lock state, and the `vehicles` document
 --- records. DESIGN §4.6 (API), §5 (vehicleLock / vehicleProps net events), §8 (state bags).
+--- Adoption natives added/verified 2026-09-15: NetworkGetEntityFromNetworkId, DoesEntityExist, GetEntityType,
+--- GetEntityModel, GetVehicleNumberPlateText, GetVehicleType, SetVehicleNumberPlateText,
+--- SetVehicleDoorsLocked, SetEntityOrphanMode, GetEntityCoords and GetEntityHeading.
 
 local Vehicles = {}
 Core.Vehicles = Vehicles
@@ -41,13 +44,21 @@ local SPAWN_SCHEMA <const> = {
     bucket = { 'integer', min = 0, max = 65535, optional = true },
 }
 
+local ADOPT_SCHEMA <const> = {
+    ownerSrc = 'src?',
+    ownerCharId = 'id?',
+    keyMode = { 'enum', 'virtual', 'item', optional = true },
+    locked = 'boolean?',
+    props = 'table?',
+}
+
 local spawned = {}      -- [netId] = info (live, includes the entity handle)
 local byEntity = {}     -- [entity handle] = netId
 local usedPlates = {}   -- [plate] = netId
 
 --- Resolves a **tracked** netId to a live entity handle (0 when untracked or gone).
---- Deliberately no NetworkGetEntityFromNetworkId fallback: the exported API must never
---- act on an entity core did not spawn (another resource's vehicle, a ped, ...).
+--- Deliberately no NetworkGetEntityFromNetworkId fallback: the exported API acts only on an entity core
+--- already tracks, whether it was server-spawned or explicitly adopted by a trusted server resource.
 local function entityOf(netId)
     if math.type(netId) ~= 'integer' then return 0 end
     local info = spawned[netId]
@@ -236,6 +247,7 @@ local function spawn(opts, restoreRecordId)
     state:set('keys', keys, true)
     state:set('keyMode', keyMode, true)
     state:set('plate', plate, true)
+    if info.props and next(info.props) then state:set('coreProps', info.props, true) end
 
     if opts.bucket then SetEntityRoutingBucket(entity, opts.bucket) end
     if opts.persistent or ownerCharId then SetEntityOrphanMode(entity, ORPHAN_KEEP_ENTITY) end
@@ -403,28 +415,108 @@ function Vehicles.getRecord(vehId)
     return Core.DB.get(COLLECTION, vehId)
 end
 
---- Spawns a stored vehicle from its record. Returns netId | nil, err.
-function Vehicles.spawnRecord(vehId, coords, heading, ownerSrc)
-    local record = Vehicles.getRecord(vehId)
-    if not record then return nil, 'no_record' end
-    if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
-    if record.stored == false then return nil, 'already_spawned' end
+local function spawnFromRecord(record, coords, heading, ownerSrc)
     for _, tracked in pairs(spawned) do
-        if tracked.vehId == vehId then return nil, 'already_spawned' end
+        if tracked.vehId == record.id then return nil, 'already_spawned' end
     end
     local netId, err = spawn({
         model = record.model, coords = coords, heading = heading or 0.0,
         type = record.meta and record.meta.vehType or nil, keyMode = record.meta and record.meta.keyMode or nil,
         plate = record.plate, ownerCharId = record.ownerCharId or nil, ownerSrc = ownerSrc,
         props = record.props, persistent = true,
-    }, vehId)
+    }, record.id)
     if not netId then return nil, err end
     local info = spawned[netId]
-    info.vehId = vehId
+    info.vehId = record.id
     local entity = entityOf(netId)
-    if entity ~= 0 then Entity(entity).state:set('vehId', vehId, true) end
-    Core.DB.update(COLLECTION, vehId, { stored = false })
+    if entity ~= 0 then Entity(entity).state:set('vehId', record.id, true) end
+    Core.DB.update(COLLECTION, record.id, { stored = false })
     return netId
+end
+
+--- Spawns a deliberately garaged record at a garage exit. Returns netId | nil, err.
+function Vehicles.spawnRecord(vehId, coords, heading, ownerSrc)
+    local record = Vehicles.getRecord(vehId)
+    if not record then return nil, 'no_record' end
+    if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
+    if record.stored == false then return nil, 'already_spawned' end
+    return spawnFromRecord(record, coords, heading, ownerSrc)
+end
+
+--- Restores an out-of-garage record into the world, normally after a server restart. Unlike spawnRecord this
+--- refuses stored vehicles, so boot recovery can never duplicate something deliberately parked in a garage.
+function Vehicles.restoreRecord(vehId, coords, heading, ownerSrc)
+    local record = Vehicles.getRecord(vehId)
+    if not record then return nil, 'no_record' end
+    if record.stored ~= false then return nil, 'record_stored' end
+    if coords == nil and type(record.position) == 'table' then
+        local p = record.position
+        if type(p.x) == 'number' and type(p.y) == 'number' and type(p.z) == 'number' then
+            coords = vector3(p.x, p.y, p.z)
+            heading = heading == nil and p.heading or heading
+        end
+    end
+    if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
+    return spawnFromRecord(record, coords, heading, ownerSrc)
+end
+
+--- Promotes one existing networked GTA vehicle (for example a validated, hotwired ambient car) into a
+--- server-owned persistent Core vehicle. The caller is a trusted server resource; no net event exposes this API.
+function Vehicles.adopt(netId, opts)
+    if not Validate.value('netId', netId) or type(opts) ~= 'table' then return nil, 'bad_opts' end
+    local valid, validationErr = Validate.checkTable(ADOPT_SCHEMA, opts)
+    if not valid then return nil, validationErr end
+    if opts.props then
+        valid, validationErr = validateProps(opts.props)
+        if not valid then return nil, validationErr end
+    end
+    if spawned[netId] then return nil, 'already_tracked' end
+    local entity = NetworkGetEntityFromNetworkId(netId)
+    if entity == 0 or not DoesEntityExist(entity) or GetEntityType(entity) ~= ENTITY_TYPE_VEHICLE then
+        return nil, 'no_vehicle'
+    end
+    local ownerSrc = opts.ownerSrc
+    local ownerCharId = opts.ownerCharId or (ownerSrc and charIdOf(ownerSrc)) or nil
+    if ownerSrc ~= nil and not Validate.value('src', ownerSrc) then return nil, 'bad_owner' end
+    if ownerCharId ~= nil and not Validate.value('id', ownerCharId) then return nil, 'bad_owner' end
+    local keyMode = opts.keyMode or 'virtual'
+    if keyMode ~= 'virtual' and keyMode ~= 'item' then return nil, 'bad_key_mode' end
+
+    local rawPlate = Utils.trim(GetVehicleNumberPlateText(entity) or '')
+    local plate = normalizePlate(rawPlate)
+    if not plate then plate = randomPlate() end
+    if not plate then return nil, 'plate_exhausted' end
+    SetVehicleNumberPlateText(entity, plate)
+
+    local keys = {}
+    if ownerCharId and keyMode == 'virtual' then keys[ownerCharId] = true end
+    local info = {
+        netId = netId, entity = entity, model = GetEntityModel(entity), plate = plate,
+        ownerCharId = ownerCharId, keys = keys, keyMode = keyMode, locked = opts.locked == true,
+        vehId = nil, spawnedBy = Core.Registry.getCaller(), createdAt = os.time(),
+        vehType = GetVehicleType(entity), props = type(opts.props) == 'table' and Utils.jsonSafe(opts.props) or nil,
+    }
+    spawned[netId], byEntity[entity], usedPlates[plate] = info, netId, netId
+    local state = Entity(entity).state
+    state:set('coreVeh', true, true)
+    state:set('locked', info.locked, true)
+    state:set('owner', ownerCharId or false, true)
+    state:set('keys', keys, true)
+    state:set('keyMode', keyMode, true)
+    state:set('plate', plate, true)
+    if info.props and next(info.props) then state:set('coreProps', info.props, true) end
+    SetVehicleDoorsLocked(entity, info.locked and LOCK_LOCKED or LOCK_UNLOCKED)
+    SetEntityOrphanMode(entity, ORPHAN_KEEP_ENTITY)
+    Core.Registry.track('vehicle', netId, info.spawnedBy)
+
+    local vehId = Vehicles.persist(netId)
+    if not vehId then
+        forget(netId)
+        state:set('coreVeh', false, true)
+        return nil, 'persist_failed'
+    end
+    Core.emitHook('vehicleSpawned', netId, publicInfo(info))
+    return vehId
 end
 
 --- Saves the last known position/props, then removes the entity from the world.
@@ -450,7 +542,11 @@ function Vehicles.saveProps(netId, props)
         Log.debug('vehicles: rejected props for netId %s (%s)', tostring(netId), tostring(err))
         return false
     end
-    info.props = Utils.jsonSafe(props)
+    local nextProps = Utils.jsonSafe(props)
+    if json.encode(info.props or {}) == json.encode(nextProps) then return true end
+    info.props = nextProps
+    local entity = entityOf(netId)
+    if entity ~= 0 then Entity(entity).state:set('coreProps', info.props, true) end
     if info.vehId then Core.DB.update(COLLECTION, info.vehId, { props = info.props }) end
     return true
 end
@@ -527,12 +623,13 @@ end)
 
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= Core.name then return end
-    -- Synchronous teardown: no Wait. A persisted vehicle must be retrievable after a core restart,
-    -- not left as `stored = false` after the entity core is about to delete has disappeared.
+    -- Synchronous teardown: no Wait. A live persistent vehicle remains logically `stored = false`; its domain
+    -- plugin restores that out record at this final position when core/server starts again. A vehicle explicitly
+    -- garaged earlier has no live entity here and remains `stored = true`.
     for _, info in pairs(spawned) do
         local entity = info.entity
         if info.vehId then
-            local patch = { stored = true, props = info.props or {} }
+            local patch = { stored = false, props = info.props or {} }
             if entity and DoesEntityExist(entity) then patch.position = positionOf(entity) end
             Core.DB.update(COLLECTION, info.vehId, patch)
         end

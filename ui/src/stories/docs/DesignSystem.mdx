@@ -1,0 +1,159 @@
+import { Meta } from '@storybook/addon-docs/blocks'
+
+<Meta title="Docs/Design System" />
+
+# The UI kit (DESIGN §37)
+
+Before §37 every plugin drew its own buttons, sliders and panels, so no two screens looked alike.
+The kit is **one visual language and one component library** for the shell and for every plugin
+page. Its look comes from the four mockups in `FiveM/DesignMockups/` (main menu, HUD, inventory,
+map) — rebuilt from kit parts only under **Kit → Showcase**, which is also the proof that the
+catalogue is complete.
+
+Three layers, each usable on its own:
+
+| layer | where | what it is |
+| --- | --- | --- |
+| tokens | the `@theme` block of `src/styles.css` | every colour, font, radius, shadow and size — each one is also a Tailwind utility |
+| classes | `src/kit/css/*.css` | the `.core-*` vocabulary, imported into the `components` layer so a utility always wins |
+| components | `src/kit/components/Core*.vue` | ~60 tags, registered globally by `src/kit/index.js` — no import in a page |
+
+## The visual language
+
+* **Surfaces** — blue-black slate. Translucent panels over the game, 1 px white-10 % hairline,
+  6 px panel radius, 4 px controls, 3 px key caps and badges. A faint sheen down from the top edge,
+  a deep soft shadow underneath. Wells (inputs, tracks) are darker than the panel, raised cells
+  (slots, chips) a touch lighter.
+* **Accent** — one coral red, `#f6503f`. Two gradient recipes carry the brand: the solid accent
+  gradient (primary buttons, active chips, checked boxes, progress fills) and the fading one — full
+  coral on the left dissolving into the panel on the right (active menu rows, the USE button).
+  Selection is a 1–2 px `accent-hi` border plus a soft glow, never a filled block.
+* **Type** — `Barlow Condensed` shouts (headings, buttons, tabs, menu rows, labels, numbers:
+  uppercase and tracked) and `Barlow` speaks (body copy, descriptions, form text). Three label
+  voices: *display* (700, tight), *label* (600, 12 px, 0.14 em), *eyebrow* (500, 13 px, 0.32 em —
+  the wide subtitle under a heading). Both families are bundled as woff2: the CEF has no network.
+* **Keys** — a key cap is a solid near-white tile with dark condensed text; mouse buttons are line
+  glyphs.
+* **Motifs** — the short accent dash, the `//` double-slash marker with an italic title, stacked
+  wide-tracked taglines beside a vertical hairline, hairline-framed stat rows.
+* **Motion** — 120 ms hovers, 160–240 ms enters, fades and 6–18 px slides. Nothing bounces.
+* **Icons** — filled glyphs on a 24 × 24 grid drawn with `currentColor` (`src/kit/icons.js`).
+
+See **Kit → Foundations → [Tokens](?path=/docs/kit-foundations-tokens--docs)** for the palette,
+the type scale and the tone ramps rendered from the live variables, and **Kit → Foundations →
+[Icon](?path=/docs/kit-foundations-icon--docs)** for the whole registry.
+
+## Tokens
+
+Utility and CSS variable share the name (`bg-panel` ⇢ `--color-panel`). Opacity modifiers such as
+`bg-accent/10` only work on the **hex** tokens: Tailwind cannot resolve an `rgba()`/`var()` token,
+and this CEF has no `color-mix()`.
+
+| group | tokens | value |
+| --- | --- | --- |
+| surfaces | `bg-ink` `bg-panel` `bg-panel-solid` `bg-panel-raise` `bg-panel-sunken` `bg-panel-popup` `bg-hud` `bg-backdrop` | `#060b0f` · `rgba(11,17,22,.90)` · `#0d1419` · white 3.5 % · black 30 % · `rgba(11,17,22,.98)` · `rgba(8,12,16,.68)` · `rgba(4,8,11,.62)` |
+| hairlines | `border-border` `border-border-strong` | white 12 % · white 22 % |
+| text | `text-fg` `text-fg-dim` `text-fg-faint` · `bg-key` `text-key-fg` | `#f3f5f7` · 66 % · 40 % · `#fbfbfb` · `#11161b` |
+| accent | `text-accent` `bg-accent-hi` `bg-accent-lo` `bg-accent-soft` `text-on-accent` | `#f6503f` · `#ff6351` · `#d53e2f` · coral 16 % · `#ffffff` |
+| states | `text-success` `text-warning` `text-error` `text-info` | `#3fd67f` · `#f5a623` · `#ff4560` · `#55b6f7` |
+| vitals | `text-health` `text-armour` `text-stamina` `text-hunger` `text-thirst` `text-oxygen` `text-stress` | `#fa5246` `#5dbbf7` `#5de395` `#f5a623` `#4fd1e8` `#9fd8ff` `#b68cff` |
+| rarity | `text-rarity-common` `text-rarity-uncommon` `text-rarity-rare` `text-rarity-epic` `text-rarity-legendary` | `#aeb6bf` `#5de395` `#5dbbf7` `#b68cff` `#f5a623` |
+| shape | `rounded-ui` `rounded-ui-sm` `rounded-ui-xs` · `shadow-ui` `shadow-ui-sm` `shadow-ui-lg` `shadow-glow` `shadow-glow-sm` · `ease-ui` | 6 / 4 / 3 px · panel shadows · the coral selection glow · `cubic-bezier(.22,.61,.36,1)` |
+| type | `font-sans` `font-display` `font-mono` · `text-ui-xs` `text-ui-sm` `text-ui` `text-ui-lg` · `text-display-sm` `text-display` `text-display-lg` `text-display-xl` · `tracking-display` `tracking-label` `tracking-eyebrow` | Barlow · Barlow Condensed · Cascadia Mono · 11 / 13 / 15 / 17 px · 18 / 24 / 34 / 48 px · 0.04 / 0.14 / 0.32 em |
+| motion | `animate-core-fade-in` `animate-core-slide-in` `animate-core-pop-in` `animate-core-slide-up` `animate-core-spin` `animate-core-shimmer` `animate-core-pulse` | the kit's entrances and loops |
+
+Recipes live in `:root` and are **not** utilities: `--core-grad-accent`,
+`--core-grad-accent-fade`, `--core-grad-accent-fade-out`, `--core-grad-sheen`, the `r g b` triplets
+(`--core-accent-rgb`, …) that alpha is written with (`rgb(var(--core-accent-rgb) / 0.16)`), the
+control heights `--core-h-sm|md|lg` (30 / 40 / 52 px) and the focus halo `--core-focus`.
+
+A server re-themes everything by overriding `--color-accent*`, `--core-accent-rgb` and the three
+gradients — nothing else hard-codes the brand colour.
+
+## A plugin page
+
+The tags resolve at runtime against the one Vue app the shell owns, so a page imports nothing,
+ships no stylesheet and gets the shell's look for free:
+
+```vue
+<script setup>
+import { ref } from 'vue'
+const { props, emit, close } = window.CoreUI.usePage('my_plugin')
+const tab = ref('bag')
+const selected = ref(null)
+</script>
+
+<template>
+  <CoreScreen background="scrim" blur>
+    <template #nav>
+      <CoreTabs v-model="tab" :items="[{ value: 'bag', label: 'Bag' }, { value: 'crate', label: 'Crate' }]" />
+    </template>
+
+    <CorePanel title="Inventory" subtitle="Gear up for what's next." slash scroll>
+      <template #actions><CoreButton icon="sort" size="sm">Sort</CoreButton></template>
+      <CoreSlotGrid v-model:selected="selected" :items="props.items || []" :columns="6" :slots="24" />
+      <template #footer>
+        <CoreButton variant="primary" kbd="F" :disabled="!selected" @click="emit('use', { id: selected })">
+          Use
+        </CoreButton>
+      </template>
+    </CorePanel>
+
+    <template #footer-end>
+      <CoreKeyHints bare :items="[{ key: 'ESC', label: 'Close' }, { key: 'F', label: 'Use' }]" />
+    </template>
+  </CoreScreen>
+</template>
+```
+
+One vocabulary runs through every component: `size` (`sm` · `md` · `lg`), `tone` (`accent`,
+`neutral`, `success`, `warning`, `danger`, `info`, plus the meter tones `health`, `armour`,
+`stamina`, `hunger`, `thirst`, `oxygen`, `stress`), `icon` (a registry name **or** raw 24 × 24 path
+data), `disabled`, `v-model` for anything carrying a value, and `items` for anything listing things
+— strings or `{ value, label, icon?, description?, disabled? }`.
+
+Popups (select, popover, context menu, dialog, drawer, tooltip) teleport into `#core-overlays` and
+register an escape layer, so Escape closes the innermost popup first and only then the page.
+
+A plugin adds its own glyphs with
+`window.CoreUI.kit.registerIcons({ 'my-icon': 'M12 2 2 22h20L12 2z' })`.
+
+## Catalogue
+
+Every entry has a **Playground** (live controls) and a **Gallery** (every variant at once).
+DESIGN §37.5 is the written contract — props, slots, emits, classes and the exact measurements.
+
+| group | components |
+| --- | --- |
+| foundation | [Tokens](?path=/docs/kit-foundations-tokens--docs) · [Icon](?path=/docs/kit-foundations-icon--docs) |
+| showcase | the mockups rebuilt from kit parts only: [Main Menu](?path=/docs/kit-showcase-main-menu--docs) · [HUD](?path=/docs/kit-showcase-hud--docs) · [Inventory](?path=/docs/kit-showcase-inventory--docs) · [Map](?path=/docs/kit-showcase-map--docs) |
+| actions | [Button](?path=/docs/kit-actions-button--docs) · [Icon Button](?path=/docs/kit-actions-icon-button--docs) · [Key & Key Hint](?path=/docs/kit-actions-key-key-hint--docs) · [Key Hints](?path=/docs/kit-actions-key-hints--docs) · [Prompt & Prompt Group](?path=/docs/kit-actions-prompt-prompt-group--docs) |
+| surfaces | [Panel](?path=/docs/kit-surfaces-panel--docs) · [Screen](?path=/docs/kit-surfaces-screen--docs) · [Background](?path=/docs/kit-surfaces-background--docs) · [Card](?path=/docs/kit-surfaces-card--docs) · [Heading](?path=/docs/kit-surfaces-heading--docs) · [Divider & Dash](?path=/docs/kit-surfaces-divider-dash--docs) · [Brand & Tagline](?path=/docs/kit-surfaces-brand-tagline--docs) |
+| navigation | [Tabs](?path=/docs/kit-navigation-tabs--docs) · [Menu](?path=/docs/kit-navigation-menu--docs) · [Chips](?path=/docs/kit-navigation-chips--docs) · [Stepper](?path=/docs/kit-navigation-stepper--docs) |
+| forms | [Field](?path=/docs/kit-forms-field--docs) · [Input & Textarea](?path=/docs/kit-forms-input-textarea--docs) · [Number Input](?path=/docs/kit-forms-number-input--docs) · [Select](?path=/docs/kit-forms-select--docs) · [Checkbox](?path=/docs/kit-forms-checkbox--docs) · [Radio & Radio Group](?path=/docs/kit-forms-radio-radio-group--docs) · [Switch](?path=/docs/kit-forms-switch--docs) · [Slider](?path=/docs/kit-forms-slider--docs) · [Swatches](?path=/docs/kit-forms-swatches--docs) |
+| data | [Progress](?path=/docs/kit-data-progress--docs) · [Ring](?path=/docs/kit-data-ring--docs) · [Stat Bar](?path=/docs/kit-data-stat-bar--docs) · [Stat Row](?path=/docs/kit-data-stat-row--docs) · [Spinner & Skeleton](?path=/docs/kit-data-spinner-skeleton--docs) · [Badge & Tag](?path=/docs/kit-data-badge-tag--docs) · [Avatar & Player Chip](?path=/docs/kit-data-avatar-player-chip--docs) · [Table](?path=/docs/kit-data-table--docs) · [Key Value](?path=/docs/kit-data-key-value--docs) · [Empty](?path=/docs/kit-data-empty--docs) |
+| game | [Slot & Grid](?path=/docs/kit-game-slot-grid--docs) · [Hotbar](?path=/docs/kit-game-hotbar--docs) · [List & List Item](?path=/docs/kit-game-list-list-item--docs) · [Objective & Tracker](?path=/docs/kit-game-objective-tracker--docs) · [Compass](?path=/docs/kit-game-compass--docs) |
+| feedback | [Alert](?path=/docs/kit-feedback-alert--docs) · [Toast](?path=/docs/kit-feedback-toast--docs) · [Dialog](?path=/docs/kit-feedback-dialog--docs) · [Drawer](?path=/docs/kit-feedback-drawer--docs) · [Popover](?path=/docs/kit-feedback-popover--docs) · [Context Menu](?path=/docs/kit-feedback-context-menu--docs) · [Tooltip](?path=/docs/kit-feedback-tooltip--docs) |
+
+The shell's own built-ins (**Built-ins →** …) keep their protocol, store logic, keyboard handling
+and test hooks and only wear the kit's skin: a notification is a CoreToast, the text UI a
+CorePrompt, an alert a dialog panel with the accent top line.
+
+## Do / don't
+
+| do | don't |
+| --- | --- |
+| compose a page from `<Core…>` tags | rebuild a panel, button or slider by hand |
+| add a utility for layout — `class="mt-4 w-full"` beats the kit rule | restyle a kit component's colours or type from the page |
+| use a token for anything you do write yourself | write a literal colour, font family or radius |
+| pass `blur` on a panel, screen, dialog, drawer or popover | filter what is behind an element — the CEF paints that area solid black; the attribute `data-core-blur` is the only glass |
+| keep 12 or fewer glass surfaces on screen | put glass on rows, slots, chips or list items — each one copies a canvas per frame |
+| write `transform:` | use the individual transform properties or their Tailwind utilities (Chrome 104+, silently dead here) |
+| stay inside Chromium 103 | reach for `:has()`, `color-mix()`, CSS nesting, container queries, `dvh`, `oklch()` or the Popover API |
+| put new kit CSS in the group's `src/kit/css/*.css` partial | add a scoped `<style>` block to a kit component |
+| let a tone (`tone="danger"`) colour a component | hard-code a status colour |
+| check a page with `node ui/tests/kit-compile-check.mjs <file>` | assume it compiles because it renders in a browser |
+
+New component? Catalogue entry in DESIGN §37.5 → the CSS partial → a `Kit/<Group>/<Name>` story with
+a playground and a gallery scene → a check in `ui/tests/kit-regression.js` → the tag lists in core's
+README and on this page (`AGENTS.md` §6).

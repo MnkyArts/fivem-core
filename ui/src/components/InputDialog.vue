@@ -108,38 +108,50 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   <Transition name="dlg">
     <div v-if="visible" class="core-backdrop dlg-back z-50">
       <div
-        ref="panel" class="core-panel core-modal dlg w-[380px] max-w-[80vw] animate-[core-pop-in_0.12s_var(--ease-ui)]"
+        ref="panel"
+        class="core-dialog core-tone-accent core-dialog--md dlg animate-[core-pop-in_0.12s_var(--ease-ui)]"
         role="dialog" :aria-label="store.input.title || 'Input'" data-core-blur
       >
-        <h2 class="core-title">{{ store.input.title || 'Input' }}</h2>
-        <div class="fields mt-2.5 max-h-[52vh] overflow-y-auto">
-          <div v-for="(f, i) in fields" :key="f.name || i" class="core-field">
-            <label v-if="f.type !== 'checkbox'" class="core-label" :for="'f-' + f.name">
-              {{ f.label || f.name }}<em v-if="f.required" class="ml-0.5 text-error not-italic">*</em>
+        <div class="core-dialog__header">
+          <div class="core-dialog__titles">
+            <h2 class="core-title core-dialog__title">{{ store.input.title || 'Input' }}</h2>
+          </div>
+        </div>
+        <!-- Native controls wearing the kit's box classes, not CoreInput/CoreSelect/CoreCheckbox:
+             onKeydown() cycles `input, select, button` and focuses `[data-field]` as DOM nodes, and
+             `values` is written by v-model on the element itself (DESIGN §37.6). -->
+        <div class="core-dialog__body core-scroll fields pt-3">
+          <div v-for="(f, i) in fields" :key="f.name || i" class="core-field" :class="{ 'is-invalid': !!errors[f.name] }">
+            <label v-if="f.type !== 'checkbox'" class="core-label core-field__label" :for="'f-' + f.name">
+              {{ f.label || f.name }}<em v-if="f.required" class="core-field__required">*</em>
             </label>
             <select
               v-if="f.type === 'select'" :id="'f-' + f.name" v-model="values[f.name]"
-              class="core-select" :data-field="f.name" @change="clearError(f.name)"
+              class="core-select" :class="{ 'is-invalid': !!errors[f.name] }"
+              :data-field="f.name" @change="clearError(f.name)"
             >
               <option v-for="(o, j) in optionsOf(f)" :key="j" :value="o.value">{{ o.label }}</option>
             </select>
             <label v-else-if="f.type === 'checkbox'" class="core-check">
               <input v-model="values[f.name]" type="checkbox" :data-field="f.name" @change="clearError(f.name)" />
-              <span>{{ f.label || f.name }}<em v-if="f.required" class="ml-0.5 text-error not-italic">*</em></span>
+              <span>{{ f.label || f.name }}<em v-if="f.required" class="core-field__required">*</em></span>
             </label>
             <input
-              v-else :id="'f-' + f.name" v-model="values[f.name]" class="core-input" :data-field="f.name"
+              v-else :id="'f-' + f.name" v-model="values[f.name]" class="core-input"
+              :class="{ 'is-invalid': !!errors[f.name] }" :data-field="f.name"
               :type="f.type === 'number' ? 'number' : 'text'" :placeholder="f.placeholder || ''"
               :min="f.min" :max="f.max" @input="clearError(f.name)"
             />
-            <p v-if="errors[f.name]" class="err mt-1 text-ui-xs text-error" :data-error="f.name">{{ errors[f.name] }}</p>
+            <p v-if="errors[f.name]" class="err core-field__error" :data-error="f.name">{{ errors[f.name] }}</p>
           </div>
           <p v-if="!fields.length" class="core-text">No fields</p>
         </div>
-        <div class="actions mt-3 flex justify-end gap-2">
-          <button v-if="cancelLabel" type="button" class="core-btn" data-role="cancel" @click="cancel">{{ cancelLabel }}</button>
-          <button type="button" class="core-btn core-btn--primary" data-role="submit" @click="submit">
-            {{ store.input.submit || 'OK' }}
+        <div class="core-dialog__footer actions">
+          <button v-if="cancelLabel" type="button" class="core-btn core-btn--secondary core-btn--md" data-role="cancel" @click="cancel">
+            <span class="core-btn__label">{{ cancelLabel }}</span>
+          </button>
+          <button type="button" class="core-btn core-btn--primary core-btn--md" data-role="submit" @click="submit">
+            <span class="core-btn__label">{{ store.input.submit || 'OK' }}</span>
           </button>
         </div>
       </div>

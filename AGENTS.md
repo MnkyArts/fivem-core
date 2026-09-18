@@ -9,7 +9,7 @@ on `core`. This file is the working agreement for anyone (human or agent) changi
 
 | file | role |
 |---|---|
-| `DESIGN.md` | **The binding contract.** ~1,900 lines, sections §0–§33. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes. Read the section you touch before editing code, and update it *with* the code — never after, never not. |
+| `DESIGN.md` | **The binding contract.** ~2,700 lines, sections §0–§37. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes; **§37 is the design system** (tokens, classes, the component catalogue — it replaces the old §7.2 look). Read the section you touch before editing code, and update it *with* the code — never after, never not. |
 | `README.md` | Integrator guide: install, config keys, API cheat sheet, plugin how-to, in-game checklist, troubleshooting. Update it whenever an API, config key or command changes. |
 | `PLAN.md` | History of the build runs (who owned which file). Append a run table for multi-agent work. |
 | `types/core.lua` | LuaLS stubs for every public function (`resources/.luarc.json` wires them). New API ⇒ new stub. |
@@ -25,6 +25,9 @@ server/*.lua            stateful modules (api, db, db_pg, player, money, faction
 client/*.lua            world scan, interactions, markers, doors, ui shell bridge, blur, visibility, …
 server/pg/index.js      Node source of the Postgres bridge → bundled into server/db_pg.js (committed)
 ui/                     Vite 7 + Vue 3.5 + Tailwind v4 shell, Storybook 10, tests/shell-regression.js
+ui/src/kit/             the design system (§37): styles.css tokens → css/*.css classes → components/Core*.vue
+                        (globally registered), plus icons.js, use.js, fonts/ (bundled Barlow, OFL)
+ui/kit-preview.html     dev-only harness: ?scene=<SceneName>&bg=game|keyart|menu|ink mounts one kit scene
 html/                   the built shell (COMMITTED — players download this, and only this)
 templates/plugin/       scaffold used by scripts/new-plugin.sh <name>
 tests/                  offline suites: run_tests.lua (libs/loader), server_tests.lua (server modules), pg_smoke.js
@@ -65,11 +68,18 @@ registries follow that pattern. Internal names are blocked through the export (`
 never logged, never printed by a tool. `server.cfg`, `sv_licenseKey` and `rcon_password` are never shown.
 
 **UI.** One dist: a plugin page is `<plugin>/ui/src/index.js` + `Page.vue`, compiled into core's bundle
-(`cd core/ui && npm run build`), and plugins ship no UI files. Tailwind v4 tokens (`bg-panel`, `text-fg-dim`,
-`rounded-ui`, `text-ui-sm`, …) and the `.core-*` classes; the root font is 16px, body 14px. **Never
-`backdrop-filter`** — it paints a black box in the CEF; glass is `data-core-blur` on the panel. Never write
+(`cd core/ui && npm run build`), and plugins ship no UI files. **Every page is composed from the kit's
+`<Core…>` components** (§37.5 is their API) — custom CSS only for what the kit lacks, and then over the
+tokens (`bg-panel`, `text-fg-dim`, `rounded-ui`, `font-display`, `--core-grad-accent`, …): never a literal
+colour, font family or radius, never a scoped style block in a kit component. Kit classes live in the
+components layer, so a utility on a tag always wins. Chromium 103: no `:has()`, no `color-mix()`, no CSS
+nesting, no container queries, no `dvh`, no Popover API, no individual `translate`/`rotate`/`scale`
+(write `transform:`, never Tailwind's `translate-*`/`rotate-*`/`scale-*`). **Never `backdrop-filter`** —
+it paints a black box in the CEF; glass is the `blur` prop (= `data-core-blur`) and only on panels
+(CorePanel, CoreScreen/CoreBackground, CoreDialog, CoreDrawer, CorePopover), ≤ 12 on screen. Never write
 `*/` inside a CSS comment and never spell the banned token in a source comment (Tailwind scans it).
-The shell auto-hides on the pause menu and fades (§31); a modal that is hidden is cancelled.
+The root font is 16px, body `--text-ui` (15px). The shell auto-hides on the pause menu and fades (§31);
+a modal that is hidden is cancelled.
 
 **Server files.** No `package.json` or `node_modules` inside a resource: FXServer's Node sandbox refuses to
 read modules behind the symlinked resource path and the server's `yarn` builder would run on every start.
@@ -96,7 +106,11 @@ Node code is bundled (`npm run build:server` in `core/ui` → `server/db_pg.js`,
 4. Client rules: interactions/markers through core's APIs (one scan loop for everyone), text UI through
    `Core.UI.textUI` (owner-tagged), keys through core's key mapping helpers.
 5. UI page: `ui/src/index.js` exports `id` and the component; the page receives props from
-   `Core.UI.open(src, id, props)` and talks back with `usePage()` events. Rebuild core's UI. A story in
+   `Core.UI.open(src, id, props)` and talks back with `usePage()` events. Build it from the kit
+   (`<CoreScreen>`, `<CorePanel>`, `<CoreButton>`, `<CoreKeyHints>`, … — globally registered, so no
+   import and no CSS of your own; catalogue in DESIGN §37.5, README "Design system (UI kit)",
+   `templates/plugin/ui/src/Page.vue` and `core_example` are the worked examples). Check it with
+   `node ui/tests/kit-compile-check.mjs <file>`, then rebuild core's UI. A story in
    `core/ui/src/stories` is welcome but not required for plugins.
 6. Locale strings in `locales/<lang>.json` (list them in `files {}`), read with `Core.Locale.t`.
 7. Test offline first (`fxlint <plugin>`, `luac5.4 -p`), then deploy (`fxserver deploy <dir>`), `refresh`,
@@ -110,11 +124,13 @@ interaction, door, cron, locale, a compiled page).
 | what | command | expect |
 |---|---|---|
 | syntax + lint + libs + server + UI build | `scripts/check.sh` (`--full` adds Storybook) | exits 0 |
-| libs and loader | `lua5.4 tests/run_tests.lua` | `379 passed, 0 failed` |
-| server modules | `lua5.4 tests/server_tests.lua` | `628 passed, 0 failed` |
+| libs and loader | `lua5.4 tests/run_tests.lua` | `385 passed, 0 failed` |
+| server modules | `lua5.4 tests/server_tests.lua` | `764 passed, 0 failed` |
 | rulebook lint | `fxlint resources/core` (and the plugin) | `0 error(s), 0 warning(s)` |
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
-| shell regression | serve `html/` over HTTP (`python3 -m http.server 8765 --directory html`), `agent-browser open http://127.0.0.1:8765/index.html`, `agent-browser eval --stdin < ui/tests/shell-regression.js` | `PASS 52/52` (file:// blocks ES modules) |
+| kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
+| shell regression | serve `html/` over HTTP (`python3 -m http.server 8765 --directory html`), `agent-browser open http://127.0.0.1:8765/index.html`, `agent-browser eval --stdin < ui/tests/shell-regression.js` | `PASS 99/99` (file:// blocks ES modules) |
+| kit regression | same recipe with `ui/tests/kit-regression.js` (mounts every component, drives models/keys/popups/focus, lints the built CSS) | `PASS 190/190` (the CSS lint needs the build; the dev page reports 183/183) |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
 | live | `fxserver logs --errors --resource core`, `fxclient logs --errors` | nothing new |
@@ -126,7 +142,11 @@ recipes), `/doorfind` (door models, registered doors), `/dbexport` and `/dbimpor
 
 - Contract first: put the section in `DESIGN.md`, then implement, then README/types/Storybook/tests.
 - New server logic ⇒ checks in `tests/server_tests.lua` (stubs in `tests/stubs.lua`); new lib ⇒
-  `tests/run_tests.lua`; new shell action ⇒ a regression check and a story.
+  `tests/run_tests.lua`; new shell action ⇒ a regression check and a story; **new kit component ⇒ a
+  catalogue entry in DESIGN §37.5, its CSS in the group's `ui/src/kit/css/*.css` partial, a
+  `Kit/<Group>/<Name>` story with a playground and a gallery scene, and a check in
+  `ui/tests/kit-regression.js`** (plus the tag list in README's "Design system (UI kit)" and
+  `ui/src/stories/docs/DesignSystem.mdx`).
 - Every subagent gets exact file ownership; parallel runs never share a file; scratch files live in the
   session scratchpad under a run-named folder. Implementers report line counts and test results; the
   orchestrator re-runs lint and tests itself before believing them.
