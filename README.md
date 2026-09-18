@@ -464,7 +464,7 @@ Grouped as in DESIGN §37.5, which is the full API (props · slots · emits · c
 | forms — choice | **CoreCheckbox** · **CoreRadioGroup** / **CoreRadio** (`radio` or `card`) · **CoreSwitch** · **CoreSlider** · **CoreSwatches** colour picker |
 | data — meters | **CoreProgress** linear bar (`inline`, `segments`, threshold tones) · **CoreRing** radial · **CoreStatBar** HUD vital · **CoreStatRow** detail stat between hairlines · **CoreSpinner** · **CoreSkeleton** |
 | data — display | **CoreBadge** count pip · **CoreTag** small chip (tones + rarities) · **CoreAvatar** · **CorePlayerChip** avatar · name · level · XP · **CoreTable** · **CoreKeyValue** ruled label/value rows · **CoreEmpty** empty state |
-| game | **CoreSlot** item slot · **CoreSlotGrid** the inventory grid · **CoreHotbar** · **CoreList** / **CoreListItem** rich rows · **CoreObjective** · **CoreTracker** HUD quest card · **CoreCompass** heading strip |
+| game | **CoreSlot** item slot · **CoreSlotGrid** the inventory grid · **CoreHotbar** · **CoreList** / **CoreListItem** rich rows · **CoreObjective** · **CoreTracker** HUD quest card · **CoreCompass** heading strip · **CoreInteractionDot** world interaction dot → key prompt |
 | feedback | **CoreAlert** inline banner · **CoreToast** notification card · **CoreDialog** modal (focus trap, escape layers) · **CoreDrawer** side sheet · **CorePopover** anchored panel · **CoreContextMenu** right-click menu · **CoreTooltip** |
 
 Props follow one vocabulary: `size` (`sm|md|lg`), `tone` (`accent|neutral|success|warning|danger|info`,

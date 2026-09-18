@@ -130,7 +130,7 @@ interaction, door, cron, locale, a compiled page).
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
 | shell regression | serve `html/` over HTTP (`python3 -m http.server 8765 --directory html`), `agent-browser open http://127.0.0.1:8765/index.html`, `agent-browser eval --stdin < ui/tests/shell-regression.js` | `PASS 99/99` (file:// blocks ES modules) |
-| kit regression | same recipe with `ui/tests/kit-regression.js` (mounts every component, drives models/keys/popups/focus, lints the built CSS) | `PASS 190/190` (the CSS lint needs the build; the dev page reports 183/183) |
+| kit regression | same recipe with `ui/tests/kit-regression.js` (mounts every component, drives models/keys/popups/focus, lints the built CSS) | `PASS 195/195` (the CSS lint needs the build; the dev page reports a few fewer) |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
 | live | `fxserver logs --errors --resource core`, `fxclient logs --errors` | nothing new |

@@ -274,13 +274,13 @@ group via SendMessage, then a contract-review pass (R1) whose seven findings wen
 | S2a shell HUD | opus | `ui/src/components/{Hud,StatsBars,Notifications,Shard}.vue` | complete — hooks kept, 99/99 |
 | S2b shell prompts | opus | `ui/src/components/{TextUI,Progress,KeyHints,Spinner,Chat}.vue` | complete — hooks kept, 99/99 |
 | SC1 / SC2 showcase | opus | `stories/kit/Showcase{MainMenu,Hud,Inventory,Map}.stories.js` + scenes — the four mockups from kit tags only | complete; their gap lists drove the late additions above |
-| T1 tests | opus | `ui/tests/kit-regression.js` | complete — `PASS 190/190` on the build |
+| T1 tests | opus | `ui/tests/kit-regression.js` | complete — `PASS 195/195` on the build |
 | D1 docs | opus | `README.md`, `AGENTS.md`, `stories/docs/DesignSystem.mdx`, `templates/plugin/{README.md,ui/src/Page.vue}`, `../core_example/{README.md,ui/src/Page.vue}` | complete |
 | R1 reconcile | opus | `DESIGN.md` §37 rewritten from the shipped sources (58 entries) | complete |
 
-Size: 60 components (5.1k lines), 10 CSS partials (5.7k), foundation JS (1.2k), 110 story/scene files (11.4k),
+Size: 61 components (5.3k lines), 10 CSS partials (5.7k), foundation JS (1.2k), 110 story/scene files (11.4k),
 two suites (1.45k). Final gate: `scripts/check.sh` green (fxlint 0/0, Lua 385 + 764), shell regression 99/99,
-kit regression 190/190, Storybook builds (250+ stories). Open: in-game pass (the CEF's real blur, fonts and
+kit regression 195/195, Storybook builds (250+ stories). Open: in-game pass (the CEF's real blur, fonts and
 pointer behaviour); the existing plugin pages (inventory, charcreator, trucking) still use their own elements
 — migrating them to the kit is the next run; a global UI scale decision (the kit is calibrated to the mockups'
 1672 px frame, ~13 % small at 1080p).

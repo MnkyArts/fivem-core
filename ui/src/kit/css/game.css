@@ -816,3 +816,298 @@
   color: var(--color-fg-dim);
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.75);
 }
+
+/* ---- CoreInteractionDot — the world marker that becomes a key -------------------------------
+   Idle it is a ring around a white core sitting ON a world point; when the player LOOKS at it
+   (`is-focused`) the ring collapses into a solid key cap on the SAME point and the band opens to
+   the `side`. So the cap is the in-flow content of `__anchor` and the ring, the core and the pulse
+   are absolutely centred inside it: whatever the cap turns out to be worth (a wide SHIFT, two
+   caps), the anchor keeps its centre on the world point, and the band hangs off its edge with
+   `left: 100%` instead of off a width guessed from a token. The root is a 0 x 0 box — `x`/`y` make
+   it `position: absolute` at that point, otherwise it is the anchor the caller places — and the
+   whole thing is click-through: a HUD element with no mouse and no emits (§37.4). */
+
+.core-interaction-dot {
+  --core-idot-ring: 14px;
+  --core-idot-core: 6px;
+  --core-idot-cap: 26px;
+  --core-idot-band: 36px;
+  --core-idot-band-min: 200px;
+  --core-idot-tail: 84px;
+  --core-idot-fade: 76px;
+  --core-idot-gap: 8px;
+  --core-idot-label: 15px;
+  position: relative;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.core-interaction-dot--sm {
+  --core-idot-ring: 10px;
+  --core-idot-core: 4px;
+  --core-idot-cap: 20px;
+  --core-idot-band: 30px;
+  --core-idot-band-min: 168px;
+  --core-idot-tail: 68px;
+  --core-idot-fade: 62px;
+  --core-idot-label: 13px;
+}
+
+.core-interaction-dot--lg {
+  --core-idot-ring: 18px;
+  --core-idot-core: 8px;
+  --core-idot-cap: 32px;
+  --core-idot-band: 42px;
+  --core-idot-band-min: 232px;
+  --core-idot-tail: 98px;
+  --core-idot-fade: 90px;
+  --core-idot-label: 17px;
+}
+
+/* The cap's own box, centred on the world point. Nothing here ever animates, so the centre the
+   band and the ring are measured against holds still through the whole focus transition. */
+.core-interaction-dot__anchor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--core-idot-cap);
+  min-height: var(--core-idot-cap);
+  transform: translate(-50%, -50%);
+}
+
+.core-interaction-dot__ring,
+.core-interaction-dot__pulse,
+.core-interaction-dot__dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  box-sizing: border-box;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+}
+
+/* The dark halo is what makes 1.5 px of white readable over a bright sky AND over asphalt. */
+.core-interaction-dot__ring {
+  width: var(--core-idot-ring);
+  height: var(--core-idot-ring);
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 0 0 3px rgb(var(--core-ink-rgb) / 0.35), 0 2px 6px rgba(0, 0, 0, 0.5);
+  transition: opacity 0.16s var(--ease-ui), transform 0.16s var(--ease-ui);
+}
+
+.core-interaction-dot__dot {
+  width: var(--core-idot-core);
+  height: var(--core-idot-core);
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 0 0 3px rgb(var(--core-ink-rgb) / 0.35), 0 2px 6px rgba(0, 0, 0, 0.5);
+  transition: opacity 0.16s var(--ease-ui), transform 0.16s var(--ease-ui);
+}
+
+/* Attention, not nagging: base.css' `core-ping` run over 2.4 s. It starts at opacity 0.7, so a
+   55 % tone border lands at the ~40 % the contract asks for, and it rides a pseudo-element so the
+   growing ring can never touch layout. */
+.core-interaction-dot__pulse {
+  width: var(--core-idot-ring);
+  height: var(--core-idot-ring);
+}
+
+.core-interaction-dot__pulse::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  border: 1.5px solid rgb(var(--tone-rgb) / 0.55);
+  border-radius: 50%;
+  animation: core-ping 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+.core-interaction-dot__cap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0;
+  transform: scale(0.7);
+  transition: opacity 0.18s var(--ease-ui), transform 0.18s var(--ease-ui);
+}
+
+.core-interaction-dot.is-focused .core-interaction-dot__cap {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.core-interaction-dot.is-focused .core-interaction-dot__ring,
+.core-interaction-dot.is-focused .core-interaction-dot__dot {
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.4);
+}
+
+/* Holding: the cap charges up behind CoreKey's own hold bar. */
+.core-interaction-dot.has-progress .core-interaction-dot__cap {
+  filter: drop-shadow(0 0 10px rgb(var(--core-accent-rgb) / 0.45));
+}
+
+/* The band slides out from behind the cap. `left: 100%` is the cap's real right edge, and the grid
+   is what keeps the two text lines beside a glyph that spans both without an extra wrapper part:
+   column 1 is the icon (0 wide when there is none, which is why the gap is a margin on the glyph
+   and not a `column-gap`). It dissolves over its last third like CorePrompt's plate, so a short
+   label still lies ON the world instead of sitting in a box that ends with the words. */
+.core-interaction-dot__band {
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  /* An absolutely positioned box shrinks to fit the space LEFT of the viewport edge, and the
+     anchor it hangs off is only a key cap wide — without max-content the label would be squeezed
+     out of its column and run over the glyph. */
+  width: max-content;
+  min-width: var(--core-idot-band-min);
+  min-height: var(--core-idot-band);
+  margin-left: var(--core-idot-gap);
+  padding: 6px var(--core-idot-tail) 6px 14px;
+  background: linear-gradient(90deg,
+    var(--color-hud) 0%,
+    var(--color-hud) calc(100% - var(--core-idot-fade)),
+    rgb(var(--core-ink-rgb) / 0) 100%);
+  opacity: 0;
+  transform: translate(-8px, -50%);
+  transition: opacity 0.18s var(--ease-ui), transform 0.18s var(--ease-ui);
+}
+
+.core-interaction-dot.is-focused .core-interaction-dot__band {
+  opacity: 1;
+  transform: translate(0, -50%);
+}
+
+.core-interaction-dot__icon {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+  margin-right: 14px;
+  color: var(--color-fg);
+}
+
+.core-interaction-dot__label {
+  grid-column: 2;
+  font-family: var(--font-display);
+  font-size: var(--core-idot-label);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-fg);
+  white-space: nowrap;
+}
+
+.core-interaction-dot__description {
+  grid-column: 2;
+  margin-top: 3px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--color-fg-dim);
+  white-space: nowrap;
+}
+
+/* Extra actions on the same object: their own short bands hanging under the main one, aligned to
+   its start (they are children of the band, so they arrive and leave with it). */
+.core-interaction-dot__options {
+  position: absolute;
+  left: 0;
+  top: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: max-content;
+  margin-top: 4px;
+}
+
+.core-interaction-dot__option {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 152px;
+  min-height: 26px;
+  padding: 0 58px 0 6px;
+  background: linear-gradient(90deg,
+    var(--color-hud) 0%,
+    var(--color-hud) calc(100% - 52px),
+    rgb(var(--core-ink-rgb) / 0) 100%);
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-fg);
+  white-space: nowrap;
+}
+
+.core-interaction-dot__option.is-disabled { opacity: 0.45; }
+
+/* Out of reach or locked: the marker greys out and the focused cap is the outline one with a lock
+   glyph instead of a letter (the component swaps it), so there is nothing to press. */
+.core-interaction-dot.is-disabled .core-interaction-dot__ring {
+  border-color: var(--color-fg-faint);
+  box-shadow: 0 0 0 3px rgb(var(--core-ink-rgb) / 0.35);
+}
+
+.core-interaction-dot.is-disabled .core-interaction-dot__dot {
+  background: var(--color-fg-faint);
+  box-shadow: 0 0 0 3px rgb(var(--core-ink-rgb) / 0.35);
+}
+
+.core-interaction-dot.is-disabled .core-interaction-dot__label { color: var(--color-fg-dim); }
+.core-interaction-dot.is-disabled .core-interaction-dot__icon { color: var(--color-fg-dim); }
+
+/* `left` is the mirror image, for a dot near the right screen edge: the band opens to the left and
+   everything in it flips, so the glyph still sits closest to the cap. */
+.core-interaction-dot--left .core-interaction-dot__band {
+  left: auto;
+  right: 100%;
+  margin-left: 0;
+  margin-right: var(--core-idot-gap);
+  padding: 6px 14px 6px var(--core-idot-tail);
+  background: linear-gradient(270deg,
+    var(--color-hud) 0%,
+    var(--color-hud) calc(100% - var(--core-idot-fade)),
+    rgb(var(--core-ink-rgb) / 0) 100%);
+  text-align: right;
+  transform: translate(8px, -50%);
+}
+
+.core-interaction-dot--left.is-focused .core-interaction-dot__band { transform: translate(0, -50%); }
+
+.core-interaction-dot--left .core-interaction-dot__icon {
+  grid-column: 2;
+  margin-right: 0;
+  margin-left: 14px;
+}
+
+.core-interaction-dot--left .core-interaction-dot__label,
+.core-interaction-dot--left .core-interaction-dot__description { grid-column: 1; }
+
+.core-interaction-dot--left .core-interaction-dot__options {
+  left: auto;
+  right: 0;
+  align-items: flex-end;
+}
+
+.core-interaction-dot--left .core-interaction-dot__option {
+  flex-direction: row-reverse;
+  padding: 0 6px 0 58px;
+  background: linear-gradient(270deg,
+    var(--color-hud) 0%,
+    var(--color-hud) calc(100% - 52px),
+    rgb(var(--core-ink-rgb) / 0) 100%);
+}

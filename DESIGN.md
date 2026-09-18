@@ -2832,6 +2832,18 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   side, so a wrap-around never pops) and two `v-memo` layers freeze it: a heading update is one
   `transform: translateX()` and no allocation.
 
+- **CoreInteractionDot** — the world interaction marker: a dot that says "you can interact here" and, when the
+  player looks at it, becomes the key to press. `focused` (false), `keys` (`'E'`), `label`, `icon`, `description`,
+  `progress` (0–1 hold, CoreKey's bar), `disabled` (locked / out of reach), `tone` (`accent`), `size:
+  'sm'|'md'|'lg'` (dot 10 / 14 / 18 px, cap sm / md / lg), `x`, `y` (CSS px — both given ⇒ the root is absolutely
+  positioned at that point, else a 0 × 0 anchor the caller places), `side: 'right'|'left'` (which way the band
+  opens), `pulse` (true), `options: [{ keys, label, icon?, disabled? }]` (extra actions under the main band) ·
+  default (replaces the band) · — · `core-interaction-dot core-interaction-dot--<size> --<side> core-tone-<tone>
+  is-focused is-disabled has-progress is-pulse` + `__anchor __dot __ring __pulse __cap __band __icon __label
+  __description __options __option` · click-through. Idle: a 14 px white ring around a 6 px core with a dark
+  halo, a slow `core-ping` ring in the tone while `pulse`. Focused: the ring collapses while a solid CoreKey
+  scales in on the SAME anchor and the band (icon · label · description, `--color-hud`, dissolving like
+  CorePrompt's) slides out to the side; disabled + focused shows an outline cap with a `lock` glyph.
 #### Feedback (`css/feedback.css`)
 
 - **CoreAlert** — inline banner. `tone` (`info`), `title`, `text`, `icon` (auto by tone; `icon=""` drops it),

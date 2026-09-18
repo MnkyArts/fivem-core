@@ -174,7 +174,7 @@
       'CoreProgress', 'CoreRing', 'CoreStatBar', 'CoreStatRow', 'CoreSpinner', 'CoreSkeleton',
       'CoreBadge', 'CoreTag', 'CoreAvatar', 'CorePlayerChip', 'CoreTable', 'CoreKeyValue', 'CoreEmpty',
       'CoreSlot', 'CoreSlotGrid', 'CoreHotbar', 'CoreList', 'CoreListItem', 'CoreObjective', 'CoreTracker',
-      'CoreCompass',
+      'CoreCompass', 'CoreInteractionDot',
       'CoreAlert', 'CoreToast', 'CoreDialog', 'CoreDrawer', 'CorePopover', 'CoreContextMenu', 'CoreTooltip',
     ]
     const missing = CATALOGUE.filter((n) => !K.components[n])
@@ -217,6 +217,7 @@
       CoreCheckbox: [{ modelValue: false, label: 'Check' }],
       CoreChips: [{ items: ITEMS, modelValue: 'a' }],
       CoreCompass: [{ heading: 90, markers: [{ heading: 180, label: 'WP' }], showBearing: true }],
+      CoreInteractionDot: [{ focused: true, keys: 'F', label: 'Enter vehicle', icon: 'steering', x: 200, y: 120, options: [{ keys: 'R', label: 'Open trunk' }] }],
       CoreContextMenu: [{ open: true, position: { x: 40, y: 40 }, items: ITEMS }],
       CoreDash: [{ width: 28 }],
       CoreDialog: [{ open: true, title: 'Dialog', subtitle: 'Sub' }, () => 'body'],
@@ -936,6 +937,37 @@
       await c.destroy()
     }
     {
+      // Interaction dot: the idle dot and the focused cap sit on the SAME anchor point, and looking
+      // at it (focused) is what reveals the key and the label.
+      c = mountCtl('CoreInteractionDot',
+        { focused: false, keys: 'F', label: 'Enter vehicle', icon: 'steering', x: 300, y: 200, options: [{ keys: 'R', label: 'Open trunk' }] },
+        { modelProp: 'focused', hostStyle: 'position:fixed;left:0;top:0;width:800px;height:500px;pointer-events:none' })
+      await tick()
+      const root = c.q('.core-interaction-dot')
+      const dot = c.q('.core-interaction-dot__dot')
+      const dotRect = dot ? dot.getBoundingClientRect() : null
+      const idleCap = c.q('.core-interaction-dot__cap')
+      check('an idle interaction dot shows its dot and keeps the cap invisible',
+        !!dot && !root.classList.contains('is-focused')
+          && (!idleCap || parseFloat(getComputedStyle(idleCap).opacity) < 0.05 || getComputedStyle(idleCap).visibility === 'hidden'),
+        idleCap && 'cap opacity ' + getComputedStyle(idleCap).opacity + ' visibility ' + getComputedStyle(idleCap).visibility)
+      check('the dot is absolutely placed at x/y',
+        !!dotRect && Math.abs((dotRect.left + dotRect.width / 2) - 300) < 2 && Math.abs((dotRect.top + dotRect.height / 2) - 200) < 2,
+        dotRect && Math.round(dotRect.left + dotRect.width / 2) + ',' + Math.round(dotRect.top + dotRect.height / 2))
+      check('an interaction dot is click-through', getComputedStyle(root).pointerEvents === 'none')
+      c.st.value = true
+      await tick(2)
+      await settle()
+      const cap = c.q('.core-interaction-dot__cap')
+      const capRect = cap ? cap.getBoundingClientRect() : null
+      check('focusing the dot reveals the key cap and the label',
+        root.classList.contains('is-focused') && !!cap && /Enter vehicle/i.test(root.textContent) && /Open trunk/i.test(root.textContent))
+      check('the cap sits on the same anchor as the dot',
+        !!capRect && Math.abs((capRect.left + capRect.width / 2) - 300) < 2 && Math.abs((capRect.top + capRect.height / 2) - 200) < 2,
+        capRect && Math.round(capRect.left + capRect.width / 2) + ',' + Math.round(capRect.top + capRect.height / 2))
+      await c.destroy()
+    }
+    {
       const MANY = ['Recent', 'Oldest', 'Rarity', 'Name', 'Weight', 'Value']
       c = mountCtl('CoreSelect', { items: MANY, modelValue: 'Recent' },
         { hostStyle: 'position:fixed;left:60px;bottom:14px;width:240px;pointer-events:none' })
@@ -1046,6 +1078,7 @@
         ['CorePrompt', { keys: 'F', label: 'Enter vehicle' }, '.core-prompt'],
         ['CoreTracker', { title: 'Repossess', text: 'Reach the garage', distance: '120 m' }, '.core-tracker'],
         ['CoreCompass', { heading: 90 }, '.core-compass'],
+        ['CoreInteractionDot', { keys: 'E', label: 'Search' }, '.core-interaction-dot'],
         ['CoreStatBar', { icon: 'check', value: 60 }, '.core-statbar'],
         ['CoreToast', { tone: 'info', title: 'Saved', message: 'ok' }, '.core-toast'],
         ['CorePlayerChip', { name: 'Ada', level: 5, progress: 0.4 }, '.core-playerchip'],
