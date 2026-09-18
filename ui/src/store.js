@@ -46,6 +46,9 @@ export const store = reactive({
   shard: { visible: false, seq: 0, title: '', subtitle: '', style: 'info', duration: 0 },
   spinner: { visible: false, text: '' },
   keys: { visible: false, items: [] },
+  // §6.7: the world interaction dots — the normalized `worldprompts:set` items, replaced
+  // wholesale (an empty list, or anything that is not an array, clears the layer).
+  worldprompts: { items: [] },
   // §23: the CEF chat — lines carry a server-computed opacity (0..1); `suggestions`
   // is the TAB completer snapshot pushed by client/chat.lua; `channels` are the chips
   // the server says this player may use; `channel` is the selected chip (the server
@@ -189,6 +192,62 @@ function keyItems(items) {
   return out
 }
 
+/** `worldprompts:set` items (§6.7): one dot per projected interaction. A slot is only drawable
+ *  with a non-empty string id and finite x/y — anything else is dropped; the normalized screen
+ *  coords are clamped to 0..1 and the text fields bounded, so a malformed Lua table cannot
+ *  break the layer. Lua encodes an empty set as `{}`, not `[]` — that is no array either. */
+const WP_MAX = { keys: 8, label: 96, icon: 32, description: 128 }
+const wpIndex = new Map()          // id -> the stable item object the layer renders
+
+function wpText(value, max) {
+  const s = String(value != null ? value : '')
+  return s.length > max ? s.slice(0, max) : s
+}
+
+/** A whole `worldprompts:set`, applied IN PLACE: an id keeps its object, so the component is
+ *  reused and only the changed bindings re-render (a new object per message would re-patch the
+ *  whole dot ~30×/s); the array identity is kept too, only reordered when the set changed. */
+function applyWorldPrompts(items) {
+  const list = Array.isArray(items) ? items : []
+  const seen = new Set()
+  const next = []
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue
+    if (typeof raw.id !== 'string' || !raw.id) continue
+    const x = Number(raw.x)
+    const y = Number(raw.y)
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+    let item = wpIndex.get(raw.id)
+    if (!item) {
+      // reactive(): the item is mutated in place on later messages, and a mutation through the
+      // RAW object would never wake the render effect — the proxy is the observable identity.
+      item = reactive({ id: raw.id, x: 0, y: 0, focused: false, disabled: false, keys: 'E', label: '', icon: '', description: '' })
+      wpIndex.set(raw.id, item)
+    }
+    item.x = Math.min(1, Math.max(0, x))
+    item.y = Math.min(1, Math.max(0, y))
+    item.focused = !!raw.focused
+    item.disabled = !!raw.disabled
+    item.keys = wpText(raw.keys, WP_MAX.keys) || 'E'
+    item.label = wpText(raw.label, WP_MAX.label)
+    item.icon = wpText(raw.icon, WP_MAX.icon)
+    item.description = wpText(raw.description, WP_MAX.description)
+    seen.add(raw.id)
+    next.push(item)
+  }
+  for (const id of Array.from(wpIndex.keys())) if (!seen.has(id)) wpIndex.delete(id)
+  const current = store.worldprompts.items
+  if (current.length !== next.length || next.some((item, i) => current[i] !== item)) {
+    current.splice(0, current.length, ...next)
+  }
+}
+
+/** Story/test helper: the world prompt layer starts empty. */
+export function clearWorldPrompts() {
+  wpIndex.clear()
+  store.worldprompts.items.splice(0, store.worldprompts.items.length)
+}
+
 /** One `stats:set` entry -> a bar. Bad numbers collapse to a 0..100 bar at 0. */
 function statEntry(name, raw) {
   const def = raw && typeof raw === 'object' ? raw : { value: raw }
@@ -226,6 +285,7 @@ export function resetExtras() {
   Object.assign(store.blur, BLUR_DEFAULTS)
   Object.assign(store.spinner, { visible: false, text: '' })
   Object.assign(store.keys, { visible: false, items: [] })
+  clearWorldPrompts()
   for (const name of Object.keys(store.stats)) delete store.stats[name]
   for (const key of Object.keys(store.state)) delete store.state[key]
   Object.assign(store.hud, { health: null, armour: null, speed: null, street: '', zone: '', minimap: null })
@@ -297,6 +357,9 @@ const actions = {
   },
   'keys:show': (m) => Object.assign(store.keys, { visible: true, items: keyItems(m.items) }),
   'keys:hide': () => Object.assign(store.keys, { visible: false, items: [] }),
+  // §6.7: whole-set replace (client/interactions.lua sends only when something changed);
+  // an empty list clears the layer.
+  'worldprompts:set': (m) => applyWorldPrompts(m.items),
   'shard:show': (m) => {
     const duration = Number(m.duration) > 0 ? Number(m.duration) : SHARD_DEFAULT_MS
     const next = store.shard.seq + 1   // re-keys the element so the animation replays

@@ -255,8 +255,10 @@ function Vehicles.getProps(veh)
     for window = 0, MAX_WINDOW do windows[window] = IsVehicleWindowIntact(veh, window) and true or false end
     props.doors, props.windows = doors, windows
 
+    -- BOOL out-values: integers 0/1 through the default invoke path, booleans through the direct one
     local _, lightsOn, highBeams = GetVehicleLightsState(veh)
-    props.lights = { lightsOn == true, highBeams == true, GetVehicleIndicatorLights(veh) }
+    props.lights = { lightsOn == true or lightsOn == 1, highBeams == true or highBeams == 1,
+        GetVehicleIndicatorLights(veh) }
 
     return props
 end

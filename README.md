@@ -46,7 +46,7 @@ and stops a client forging `cash`, `faction` or a vehicle's `locked`.
 **Operating it**: FXServer caches manifests — after adding or removing script files run `refresh` before
 `ensure core`, otherwise the restart silently runs the old file list. `ensure core` also restarts every
 resource that declares `dependency 'core'`. Status (2026-09-15): fxlint clean, 385 lib + 720 server + 999 interiors offline
-checks green, shell regression 101/101 (2026-09-18), Storybook play functions green, both resources start clean on the dev
+checks green, shell regression 107/107 (2026-09-18), Storybook play functions green, both resources start clean on the dev
 server; **the in-game checklist below has not been run yet**.
 
 The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
@@ -219,6 +219,7 @@ Core.onReady(function()                               -- runs again after every 
     Core.Interactions.add({
         coords = Config.Shop, radius = 2.0, label = 'Buy a snack',
         marker = { type = 1, size = vector3(1.5, 1.5, 0.5), color = { 0, 255, 255, 140 }, offsetZ = -0.9 },
+        worldPrompt = true,                           -- §6.7: a 3D interaction dot instead of the bottom pill
         onInteract = function()
             if Core.UI.progress({ label = 'Buying...', duration = 2000, canCancel = true }) then
                 Core.Net.emit('my_plugin:server:buy')
@@ -227,6 +228,33 @@ Core.onReady(function()                               -- runs again after every 
     })
 end)
 ```
+
+`worldPrompt` is opt-in per interaction: `true`, or `{ range = 6.0, offsetZ = 0.3, icon = 'package',
+description = '3 crates' }` to tune the dot (range in metres — how far the dot is DRAWN, keep it close to the
+interaction, `offsetZ` floats it above the target, `icon` is a kit icon name). Core draws the dot on the
+interaction's world point — an idle ring while the player is near, and the `E` cap plus the label the moment
+the player *looks* at it. Two renderers, `Config.Interactions.WorldPrompt.Renderer`:
+
+- `'native'` (default) — drawn in the game's render thread, **zero NUI messages**; the NP/qtarget-class path.
+  Every frame draws, but the script-side projection and the look-at test only run every 33 ms (the render
+  thread does the drawing projection), and an entity target's coordinates are re-read per frame only while
+  they actually change — a resting prop is read once per 250 ms. An idle dot is ONE runtime-generated
+  composite sprite (plus a pulse ring while it is in reach): 3 native calls per frame for an out-of-reach dot,
+  4 for one in reach. The ONE looked-at hint follows
+  `Config.Interactions.WorldPrompt.Hint`: `'scaleform'` (default) draws it as a single Scaleform movie
+  (`stream/core_hint.gfx`, 5 native calls per frame instead of 26 — rebuild it with
+  `scripts/build-hint-gfx.sh` and commit the `.gfx`, then `refresh` before `restart core`), `'sprites'` draws
+  the `DrawSprite` + HUD text hint, which is also the automatic fallback while the movie loads or if it never
+  does. That sprite hint's band is the kit's `--color-hud` bar and both text runs use the kit's own Barlow
+  Condensed (600 label / 700 cap), streamed as `stream/barlow_condensed{,_bold}.gfx` and registered with
+  `RegisterFontFile`/`RegisterFontId` (regenerate with `scripts/build-font-gfx.sh`; commit the `.gfx`).
+- `'nui'` — the shell's `CoreInteractionDot` (§37.5), fed by throttled `worldprompts:set` messages.
+
+Either way the dot replaces that entry's `Core.UI.textUI` pill; every other interaction and every other
+text-UI producer is untouched. The dot is `disabled` (outline lock) while the ped is farther than the entry's
+`radius`, and a disabled dot never fires. `Config.Interactions.WorldPrompt.Enabled = true` makes every
+interaction without an explicit `worldPrompt` behave that way. Picking up a dot needs no code: core handles
+the projection and the look-to-focus, the plugin only registers the entry.
 
 `core_example/` is the same thing fully built out, page included. Prefix every event, callback and page id with your resource name so two plugins never collide.
 
@@ -337,6 +365,7 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 | `Core.TextLabels` §6.5 | `add(opts)` `setText(id, text)` `update(id, partial)` `remove(id)` `removeAll()` |
 | `Core.Blips` §6.6 | `add(opts)` `update` `setLabel` `setCoords` `setRoute` `getHandle` `remove` `removeAll` `setWaypoint(coords)` `getWaypoint()` |
 | `Core.Interactions` §6.7 | `add(opts)` `remove(id)` `removeAll()` `setEnabled(id, bool)` `setLabel(id, text)` `getActive()` |
+| | `worldPrompt = true \| { range, offsetZ, icon, description }` — opt-in 3D dot; per-entry default is `Config.Interactions.WorldPrompt.Enabled` |
 | `Core.Vehicles` §6.8 | `getClosest(coords?, radius?)` `getCurrent()` `isDriver()` `getSeat()` `getNetId(veh)` `fromNetId(netId, timeout?)` |
 | | `getProps(veh)` `setProps` `getPlate` `getDisplayName` `hasKeys(veh)` `isLocked` `toggleLock(veh?)` `setEngine` `repair` `saveProps` |
 | `Core.Raycast` §6.9 | `fromCamera(distance?, flags?, ignoreEntity?)` `between(from, to, …)` `getEntityInFront(distance?)` |
@@ -1305,6 +1334,7 @@ Runtime UI platform (§38). Step 27 is the one that decides whether the whole ar
 33. **Crash isolation:** temporarily `throw` in a page's `setup` or template → a "UI page … crashed" toast, the cursor is released, and the HUD, chat and every other plugin stay alive; `F8` shows `UI error in <res>/<page> <Component>: …`. Remove the throw and re-open → it mounts again.
 34. **Focus nesting:** from a page, open a second page declared `{ type = 'modal' }` → `ESC` closes the modal first and focus *plus* `keepInput` return to the page underneath; `ESC` again closes the page.
 35. **Dev loops (optional):** set `Config.UI.Dev.Enabled = true`. `npm run dev:game` in a plugin + `/uidev <res> http://localhost:5173` → edit an SFC and the page updates with no `restart`; `/uidev <res> off` returns to the build. `/uiinspect` opens the inspector panel. (Game and editor on different machines: forward the port so the game sees `localhost:5173`.)
+36. **World interaction dots (§6.7):** with `worldPrompt = true` — `core_example`'s snack interaction and every rendered inventory ground drop are — walk toward the point: a dot sits on it and the bottom pill is gone for that interaction. Look at the dot → the ring collapses into the `E` cap with its label; look away → back to the ring. Press `E` → the action (or the pickup) fires exactly **once**. Stand still looking at a dot → no NUI messages and `resmon 1` on **core** stays at the idle figure; walk while looking → the dot follows the world point smoothly. Out of `range` → gone; inside `range` but beyond the entry's `radius` → the outline lock and `E` does nothing. `restart core` while dots are up → they come back with the registrations, nothing doubled.
 
 ## Troubleshooting
 

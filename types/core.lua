@@ -128,6 +128,15 @@
 ---@field distance number metres between the player's ped and the interaction
 ---@field data any the `data` value given to `Core.Interactions.add`
 
+---Per-entry 3D interaction dot (DESIGN §6.7). `true` takes every default from
+---`Config.Interactions.WorldPrompt`; `false` opts out of an enabled default.
+---@class CoreInteractionWorldPromptOptions
+---@field enabled? boolean default true when the table form is given
+---@field range? number collection range in metres (default Config.Interactions.WorldPrompt.Range)
+---@field offsetZ? number z offset added to the target's coords before projecting (default 0.0)
+---@field icon? string optional icon shown on the dot (≤ 32 chars)
+---@field description? string optional description shown with the dot (≤ 64 chars)
+
 ---@class CoreInteractionOptions
 ---@field coords? vector3 fixed position (one of coords/entity/netId/models is required)
 ---@field entity? integer follow a local entity handle (client only)
@@ -137,6 +146,8 @@
 ---@field label? string prompt text shown in the text UI (default 'Interact')
 ---@field key? string key shown in the prompt — display only (default 'E')
 ---@field marker? CoreMarkerOptions auto-created marker that follows the interaction
+---@field worldPrompt? boolean|CoreInteractionWorldPromptOptions draw the entry as a projected 3D dot
+---instead of the text UI pill (§6.7); `true`/`nil` resolve from Config.Interactions.WorldPrompt.Enabled
 ---@field onInteract? fun(ctx: CoreInteractionContext) client form; server form is fun(src, ctx)
 ---@field onEnter? fun(ctx: CoreInteractionContext) client form; server form is fun(src, ctx)
 ---@field onExit? fun(ctx: CoreInteractionContext) client form; server form is fun(src, ctx)

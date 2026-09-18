@@ -24,8 +24,10 @@ function Raycast.between(from, to, flags, ignoreEntity)
         from.x, from.y, from.z, to.x, to.y, to.z,
         flags or DEFAULT_FLAGS, ignoreEntity or 0, PROBE_OPTIONS)
 
+    -- `hit` is a BOOL out-value: the integer 0/1 through the runtime's default invoke path (where
+    -- `not 0` is false — a miss would read as a hit) and a real boolean through the direct one
     local _, hit, endCoords, normal, entityHit = GetShapeTestResult(handle)
-    if not hit then
+    if not hit or hit == 0 then
         return false, to, normal or vector3(0.0, 0.0, 0.0), 0
     end
     return true, endCoords, normal, entityHit or 0

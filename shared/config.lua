@@ -49,6 +49,17 @@ Config = {
     },
     Interactions = {
         Key = 'E', ScanIntervalMs = 300, FarScanIntervalMs = 1000, NearRange = 60.0, MaxModels = 8,
+        -- 3D interaction dots (DESIGN §6.7): Range/OffsetZ/MaxVisible are the defaults an
+        -- entry's own worldPrompt table overrides; FocusRadius is the normalized (aspect-scaled)
+        -- screen distance from the reticle inside which a dot counts as looked at.
+        -- Range is how far the dot is DRAWN: keep it close to the interaction radius, a dot is a
+        -- "you can interact here" hint, not a map pin. Renderer: 'native' (default) draws the dot
+        -- in the game's render thread; 'nui' draws the shell's CoreInteractionDot instead.
+        -- Hint (only with Renderer = 'native'): 'scaleform' (default) draws the looked-at hint as ONE
+        -- Scaleform movie (stream/core_hint.gfx), 'sprites' keeps the DrawSprite + HUD text hint —
+        -- sprites are also the automatic fallback while the movie loads or if it never does.
+        WorldPrompt = { Enabled = false, Renderer = 'native', Hint = 'scaleform', Range = 6.0, OffsetZ = 0.0,
+            FocusRadius = 0.15, MaxVisible = 8 },
     },
     World = {
         ScanIntervalMs = 500, GridSize = 100.0,

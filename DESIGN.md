@@ -802,6 +802,8 @@ Interactions.add({
     coords = vector3 | entity = handle | netId = n | models = { 'prop_atm_01', ... } (≤ Config.Interactions.MaxModels),
     radius = 2.0, label = 'Use ATM', key = 'E' (display only; the real key is the core_interact mapping),
     marker = markerOpts | nil (auto Markers.add following the interaction; removed with it),
+    worldPrompt = true | { enabled?, range?, offsetZ?, icon?, description? } | nil   -- the 3D dot below; default
+                                                      -- Config.Interactions.WorldPrompt.Enabled (false)
     onInteract = fn(ctx), onEnter = fn(ctx)?, onExit = fn(ctx)?, canInteract = fn(ctx) -> bool?,
     enabled = true, cooldown = 500, data = any,
 }) -> id
@@ -813,12 +815,181 @@ Scheduler (one thread, `Config.Interactions.ScanIntervalMs` ms): `pedCoords` onc
 compute the target coords: point → `coords`; entity/netId → `GetEntityCoords(entity)` if `DoesEntityExist`;
 models → for each model `GetClosestObjectOfType(px, py, pz, radius, hash, false, false, false)` → its coords
 (`GetEntityCoords`) if non-zero. The closest entry within its `radius` whose `canInteract(ctx)` (pcall) is not
-`false` becomes `active`. On change: old → `onExit` + `Core.UI.textUI.hide()`; new → `onEnter` +
-`Core.UI.textUI.show(key, label)`. The scan sleeps 1000 ms when no entry is within 60 m (cheap distance test
-first). Key: `RegisterCommand('core_interact', fn, false)` + `RegisterKeyMapping('core_interact', 'Interact',
-'keyboard', Config.Interactions.Key)`; the handler runs `onInteract(ctx)` (pcall) when `active` and enabled,
-not focused (`IsNuiFocused`), and `cooldown` elapsed. **No per-frame loop.** Callbacks that come from another
-resource are funcrefs — always `pcall` them.
+`false` becomes `active` (the `canInteract` answer is evaluated for every entry within its radius, once per
+pass). On change: old → `onExit` + `Core.UI.textUI.hide()`; new → `onEnter` + `Core.UI.textUI.show(key, label)`
+unless the entry opted into the world prompt. The scan sleeps 1000 ms when no entry is within 60 m (cheap
+distance test first). Key: `RegisterCommand('core_interact', fn, false)` + `RegisterKeyMapping('core_interact',
+'Interact', 'keyboard', Config.Interactions.Key)`; the handler runs `onInteract(ctx)` (pcall) when the target is
+enabled, not focused (`IsNuiFocused`), and `cooldown` elapsed. Callbacks that come from another resource are
+funcrefs — always `pcall` them.
+
+**World prompt (2026-09-18, native renderer 2026-09-19).** An entry whose `worldPrompt` resolves to true gets
+a 3D dot on its world position, and its text UI line is never shown — the dot IS its prompt.
+`Config.Interactions.WorldPrompt.Renderer` picks how it is drawn:
+
+- **`'native'` (default).** The projection thread draws the dot, the key cap and the band itself, in the game's
+  render thread. Sprites are runtime textures (`CreateRuntimeTxd`/`CreateRuntimeTexture`/
+  `SetRuntimeTexturePixel`/`CommitRuntimeTexture`) painted once from the kit's own geometry and tokens: the
+  whole idle dot as ONE composite texture `'idle'` (48x48, `WP_RING_PX` 36 on screen — deliberately larger than
+  the CEF dot so it reads in world), the `'ring'` texture it is built on (kept for the pulse of an enabled dot,
+  tinted and scaled), the white rounded cap with an ink rim (`WP_CAP_PX` 26, radius 3), the outline lock, and a
+  one-sprite band: a
+  `--color-hud` texture painted per measured width (last 76 px ramping to zero — one quad, so there is no
+  filtered seam between a solid body and a separate fade sprite) and cached per quantized width. Everything is
+  drawn under `SetDrawOrigin` at the world point (+`offsetZ`), so the render thread projects it and the prompt
+  stays glued to the position while the camera moves; the script-side projection is only used for the
+  look-at test and the side flip. The band follows the kit geometry exactly: near edge `cap/2 + WP_BAND_GAP_PX`
+  (8), label inset `WP_BAND_PAD_PX` (14), tail 76, height 36, and `SetScriptGfxAlignParams(0,0,0,0)` keeps the
+  origin aligned with the full screen rather than the safe zone. The label's width measurement
+  (`BeginTextCommandGetWidth`/`EndTextCommandGetWidth`) and the aspect ratio are cached — both are text-layout /
+  native reads that must not run per frame (the projection thread is a per-frame loop). The whole looked-at
+  hint's layout — the uppercased text, that measured width and the band sprite that fits it — is one cache keyed
+  on (label, text scale, resolution), and the key is the RAW `entry.label`, so an unchanged frame costs two
+  comparisons and no string work at all; a rebuild happens before the draw bracket opens, never inside it. Per
+  frame there is exactly ONE `SetScriptGfxAlignParams`/`ResetScriptGfxAlign` bracket around every draw and ONE
+  draw-origin group per visible dot (the looked-at dot opens only its own — the engine limit is 32 per frame),
+  and `GetGameTimer` is read once by the projection thread and handed down to the pass. The unit of cost here is
+  a native call from Lua (each one goes through the runtime's invoke path), so the renderer optimises the call
+  count — see the scheduling and the budget below. **The idle dot is ONE sprite** (2026-09-19): `'idle'` is
+  painted as the `'ring'` texture's layers (ink disc r 11 at 0.45, white ring 9.5 − 8.0 at 0.92) with the old
+  `'dot'` texture's layers converted into ring space and composited on top in the same source-over order — a dot
+  texel radius r becomes `r * (WP_DOT_PX / 24) / (WP_RING_PX / 48)` ring texels (halo 6.5 → 5.778, core 3.0 →
+  2.667) around the centre (24, 24), so `WP_DOT_PX` (16) survives only as that conversion's scale reference and
+  there is no `'dot'` texture and no second draw any more. Identical by construction at `dim = 255`; a
+  `disabled` dot (`dim = 150`) composites the halo/core overlap once instead of twice, which is the deliberate
+  and only visual difference. Both Barlow Condensed weights are streamed as GFx font libraries —
+  `stream/barlow_condensed.gfx` (600, `RegisterFontId('Barlow Condensed')`, the band label) and
+  `stream/barlow_condensed_bold.gfx` (700, `RegisterFontId('Barlow Condensed Bold')`, the cap letter, exactly
+  CoreKey's weight) — both written exactly like a gfxexport-built FiveM font: `ExporterInfo`,
+  `FileAttributes`, **`DefineFont3`** (the 20x-em tag Scaleform's font provider enumerates) and an
+  **`ExportAssets`** entry exporting the font under its name (that symbol is what `RegisterFontId` resolves).
+  A plain `DefineFont2` or a `DefineCompactedFont` in a `.gfx` is not picked up and renders as fallback boxes —
+  verified against a working community `.gfx`. Built from the kit's own woff2 by `scripts/build-font-gfx.sh`
+  (FFDec at build time; nothing extra at runtime). Text is calibrated so a line is exactly the kit's `WP_LABEL_PX` (15) via
+  `GetRenderedCharacterHeight`; the cap scales in on focus (130 ms), the idle dot pulses in `--color-accent`
+  (`WP_TONE`), the label is `--color-fg` and the cap `--color-key`/`--color-key-fg`; everything scales with
+  `resY/1080`, the band flips side at `x > 0.6`, dims when the dot is `disabled`, and
+  `GetActualScreenResolution` is re-read every 5 s. Sprites are warmed 2 s after start so the first dot never
+  hitches. Zero NUI messages, frame-perfect movement, nothing to throttle. This is the NP/qtarget-class path —
+  the prompt is drawn where the game draws.
+
+  **The looked-at hint (2026-09-19, `Config.Interactions.WorldPrompt.Hint`).** The idle dots stay sprites, but
+  the ONE hint under the reticle is drawn as ONE Scaleform movie: 22 of the 28 native calls a lone hint made per
+  frame were its own draws (2 sprites, 18 text natives, the draw-origin pair). The in-game probe (2026-09-18,
+  `wp_sfprobe`) proved the two facts this rests on — `DrawScaleformMovie` called between `SetDrawOrigin` and
+  `ClearDrawOrigin` IS projected by the render thread (the movie stays glued to the world point exactly like the
+  sprites), and a per-frame thread drawing one movie reads 0.03 ms in resmon where the sprite hint reads ~0.10.
+  It is deliberately a HYBRID: the game's `ScaleformMgrArray` pool is 40 movies for the WHOLE game (HUD, minimap,
+  phone, every resource — read from gameconfig.xml), so core keeps exactly ONE instance and never one per dot.
+
+  - `Hint = 'scaleform'` (default) draws the hint as the movie; `Hint = 'sprites'` keeps the DrawSprite + HUD
+    text hint, which is also the automatic fallback while the movie loads or if it never does. Only meaningful
+    with `Renderer = 'native'`.
+  - The movie is `stream/core_hint.gfx`, requested as `core_hint`: GFX (Scaleform) signature, SWF 8, AS2, ONE
+    frame, 60 fps, transparent, stage **1400 x 64 px** with the hint's origin — the CENTRE of the key cap — at
+    the stage centre (700, 32); the root timeline sets `TIMELINE = this` and defines the API as timeline
+    functions, so both `TIMELINE.<METHOD>` (what the game invokes on a script movie, FiveM's `ScaleformHacks.cpp`
+    does `GetMember("TIMELINE")` + `Invoke`) and `_root.<METHOD>` resolve. The API — argument order and types are
+    binding — is `SET_HINT(key:String, label:String, disabled:Boolean, left:Boolean, restart:Boolean)`: `key` is
+    the cap text as registered, `label` the RAW label (the movie uppercases it, Unicode-aware, like the kit's
+    CSS), `disabled` out of reach or locked (outline lock cap, dimmed label), `left` the band opening to the
+    left, `restart` replays the focus-in animation; plus `HIDE()`, which blanks the movie so a late-applied
+    `SET_HINT` can never flash the previous hint's content. The look is 1:1 with `CoreInteractionDot` focused,
+    size md. Built by `scripts/build-hint-gfx.sh` (`scripts/hint-to-gfx.java` + `scripts/hint.as`, FFDec at build
+    time, nothing extra at runtime); the `.gfx` is committed and a rebuild needs `refresh` before `restart core`.
+  - Lifecycle, on the scan cadence and never in the per-frame path: the movie is requested
+    (`RequestScaleformMovie`) when the first world prompt becomes visible, kept until the resource stops (one
+    pool slot), given up on after 10 s with ONE warning naming the fallback, and forgotten — handle and every
+    cached field — when `HasScaleformMovieLoaded` stops answering (the game dropped it), so the next scan
+    requests it again. `onClientResourceStop` releases the handle.
+  - Per frame the hint is `SetDrawOrigin` + ONE `DrawScaleformMovie(handle, 0.0, 0.0, 1400 * s / resX,
+    64 * s / resY, 255, 255, 255, 255, 0)` + `ClearDrawOrigin` (`s = resY / 1080`, the size is refreshed with the
+    resolution). `SET_HINT` goes out only when the focused entry, its key, its label, `disabled` or `left`
+    changed; `HIDE` once when focus is lost (the `promptCount == 0` early return included). The cached fields
+    mirror ONLY what the movie was really told — a `BeginScaleformMovieMethod` the engine refuses leaves them
+    untouched, so the next frame retries instead of assuming a call that never happened — and a NEW focus
+    (`restart`) is ANNOUNCED one frame before it is drawn: focus can move straight from dot A to dot B with no
+    unfocused frame in between, so no `HIDE` ran, and a method call the engine applies after that frame's render
+    would put A's content on B's position; the focus-in animation starts at alpha 0, so the one skipped frame is
+    invisible. The side flip has
+    hysteresis around the sprite path's 0.6 — left above `x > 0.62`, right below `x < 0.58` — so a dot sitting on
+    the threshold cannot send a method call per frame. In Scaleform mode nothing measures text: `measureHint`,
+    the band texture and both text draws belong to the sprite hint alone.
+  - The `SetScriptGfxAlignParams`/`ResetScriptGfxAlign` bracket belongs to the SPRITES: it is opened lazily
+    before the first sprite draw of a frame and closed only if it was opened, so a lone Scaleform hint draws with
+    no bracket at all while a frame with idle dots still has exactly one.
+  - Budget: **a lone looked-at hint is 5 native calls on a drawing frame** (`GetGameTimer`, `SetDrawOrigin`,
+    `DrawScaleformMovie`, `ClearDrawOrigin`, `Wait`) and 7 on a projection frame (+`IsNuiFocused`,
+    +`GetScreenCoordFromWorldCoord`) — ~5.7 averaged at 60 fps, where one frame in two or three projects. The
+    sprite hint costs 26 on a drawing frame (24 of them its own draws) and stays documented as the fallback's
+    number. The whole table is under "Scheduling and budget" below.
+- **`'nui'`.** The projected dots are sent to the CEF shell as `worldprompts:set` and rendered as
+  `CoreInteractionDot` (§37.5, §37.6) — the design-system look, for a page-like prompt. Position-only changes
+  are throttled to `WP_SEND_MS` (~30 Hz, structural changes bypass) and the shell applies the set IN PLACE
+  (per-id stable object) on a composited `transform: translate3d` with a 34 ms linear transition.
+
+**Scheduling and budget (2026-09-19, run N10).** Both renderers share one scan and one per-frame thread. The
+scan fills a second list: enabled entries within `range` metres of the ped (nearest
+`Config.Interactions.WorldPrompt.MaxVisible`, entries whose `canInteract` said no while within `radius`
+excluded), and writes each slot's draw anchor (`coords` + `offsetZ`) while it fills it. The second thread runs
+only while that list is non-empty (`Wait(0)`, else 250 ms). **Drawing is per frame; the projection is not** —
+everything is anchored with `SetDrawOrigin`, so the RENDER thread projects the world point and the script-side
+`GetScreenCoordFromWorldCoord` is needed only for the look-at test and the visible set, never for drawing:
+
+1. **Every frame, `entity` targets only:** re-read the world coordinates, but only as often as the entity
+   actually moves. Per slot, `sameReads` counts consecutive reads that returned exactly the previous x, y, z
+   (three scalar comparisons, never a vector or a key string) and `nextReadAt` is when the next read is due:
+   a read that differs sets `sameReads = 0` and `nextReadAt = now` (every frame — a dot on a driving vehicle
+   must not judder), 8 identical reads in a row set `nextReadAt = now + 250` (a resting prop). `DoesEntityExist`
+   answering no drops the slot from the visible set at once and sets the dirty flag; a *resting* entity that
+   vanishes is noticed at its next due read or by the scan, whichever comes first. The scan resets
+   `sameReads`/`nextReadAt` when it re-fills a slot with a DIFFERENT entry. Point/models targets keep the scan's
+   coords. `drawX/drawY/drawZ` — the draw anchor — is (re)set by that read and by the scan, never by the
+   projection.
+2. **On a projection frame** — `now - lastFocusAt >= WP_FOCUS_MS` (33 ms) or the dirty flag is set — every slot
+   is projected with `GetScreenCoordFromWorldCoord` into normalized screen x/y (a failure — behind the camera,
+   off screen — leaves it out of the visible set for this pass), `d = sqrt(((x - 0.5) * aspect)^2 +
+   (y - 0.5)^2)` is computed with the cached `GetAspectRatio(false)`, and the candidate with the smallest
+   `d ≤ Config.Interactions.WorldPrompt.FocusRadius` becomes `focused`; a candidate within the entry's `radius`
+   beats an out-of-reach one. `IsNuiFocused()` is read on projection frames only — between them the last answer
+   stands, and a focused NUI still parks the whole thread on the 250 ms idle cadence (which always lands on a
+   projection frame on wake-up). At 60 fps that is every 2nd frame, at 144 fps every 5th, at 30 fps every frame.
+3. **Every other frame** reuses that visible set and that focused slot and only draws. 33 ms is a third of the
+   focus animation and below the reaction floor, so focus still feels immediate.
+4. **The dirty flag (`focusDirty`) forces a projection on the next frame**, so a cached set can never outlive
+   the list it was built from: it is set at the end of every scan pass (the slot tables are reused and re-filled
+   there) and by `Interactions.remove` when it swap-removes a prompt slot. `setEnabled`/`setLabel` need no flag
+   — the draw path reads `entry.label` live.
+5. the frame is drawn (native) or the changed whole set is sent (`nui`);
+6. `focused` is the ONLY interact target for a worldPrompt entry: `core_interact` acts on the focused
+   entry when it has one; with no focused dot it falls back to the scan's `active` entry only when that entry
+   does NOT use the world prompt (look-at gating is what the dot promises) — same enabled/freshness/distance/
+   cooldown checks either way.
+
+Steps 2–4 are the **native renderer only**. `'nui'` needs x/y to place DOM nodes, so it projects and reads
+`IsNuiFocused` every frame exactly as before; only step 1 (which cannot change what it sends — a resting entity
+projects to the same x/y) is shared.
+
+Native call count per frame, steady state (a projection frame adds 1 `IsNuiFocused` + 1
+`GetScreenCoordFromWorldCoord` per slot; the average column is the 16 ms step, where every 3rd frame projects):
+
+| on screen | drawing frame | average |
+|---|---|---|
+| lone Scaleform hint | 5 | ~5.7 (was 7) |
+| lone enabled idle dot | 8 (bracket + origin + pulse + `'idle'` + clear + timer + `Wait`) | ~8.7 (was 11) |
+| each further enabled idle dot | 4 | ~4.33 (was 6) |
+| each disabled idle dot (the common case: drawn within `range` 6 m, usable within `radius` 2 m) | 3 | ~3.33 (was 5) |
+| a resting entity target, on top of its dot | 0 (2 on the frame its 250 ms read is due) | ~0.13 (was +2) |
+| hint + 7 disabled point dots (`MaxVisible` 8) | 28 | ~31 (was 51) |
+| hint + 7 resting entity dots (a drop-heavy scene) | 28 | ~32 (was 67) |
+| the sprite hint (fallback) instead of the movie | 26 | ~26.7 (was 28) |
+
+A dot is `disabled` (outline lock cap) while the ped is farther than the entry's `radius`. `id`, `key`, `label`,
+`icon` and `description` come from the entry; `key` stays display-only. The text UI suppression only affects
+the entry itself, so doors and drops keep their own pills. `range` is how far the dot is DRAWN, not how far it
+can be used: keep it a few metres past the `radius` (default 6.0) — a dot is a "you can interact here" hint,
+not a map pin. On `uiReady` the projection thread re-sends unconditionally (a reloaded shell forgot every
+set). The whole projection idles at 250 ms while `IsNuiFocused()` (a page or modal is reading input).
 
 ### 6.8 `Core.Vehicles` client (`client/vehicles.lua`)
 
@@ -903,6 +1074,7 @@ Wire to NUI (`SendNUIMessage({ action = ..., ... })`, table form of the runtime 
 |---|---|
 | `notify` | `id, message, type, duration, title` |
 | `textui:show` / `textui:hide` | `key, text, position` / — |
+| `worldprompts:set` | whole set: `items = { { id, x, y, focused, disabled, keys, label, icon?, description? }, … }` (`x`/`y` normalized 0..1, §6.7); `{}` clears |
 | `progress:start` / `progress:stop` | `id, label, duration, canCancel` / `id` |
 | `menu:open` / `menu:close` | `id, title, items` / — |
 | `input:open` / `input:close` | `id, title, fields, submit, cancel` / — |
@@ -1130,6 +1302,7 @@ is NOT replayed for a resource that starts later: such a resource applies its st
 |---|---|---|---|
 | world scan | client | 500 ms | grid 3×3 cells, `#(pedCoords - coords)` only |
 | world draw | client | 0 ms while `#visible > 0`, else 250 ms | markers + labels only |
+| world prompt projection (§6.7) | client | drawing 0 ms while a `worldPrompt` entry is in `Range` (else 250 ms), projecting on a 33 ms cadence | native (default): ONE composite `'idle'` DrawSprite per idle dot (a second one for the pulse of an enabled dot), the looked-at hint is ONE Scaleform movie (`Hint = 'scaleform'`) — per drawing frame **5 native calls for a lone looked-at hint**, 8 for a lone enabled idle dot, +4 per further enabled dot, +3 per disabled one, 28 for hint + 7 dots at `MaxVisible` 8 (~31 averaged with the 33 ms projection pass; entity targets add 2 natives per read and a resting one is read every 250 ms). The sprite hint (`Hint = 'sprites'`, and the automatic fallback while the movie loads) costs 26 for a lone hint. Zero NUI messages either way; nui: projects every frame, one reused `worldprompts:set` per *changed* frame, nearest `MaxVisible` dots, a still camera sends nothing |
 | interactions scan | client | 300 ms near (≤ 60 m of any entry), 1000 ms far | `GetClosestObjectOfType` ≤ MaxModels per model-interaction |
 | death watch | client | 1000 ms | `IsPedDeadOrDying` |
 | entry guard (vehicle locks) | client | 500 ms only while `GetVehiclePedIsTryingToEnter ~= 0` | |
@@ -1144,7 +1317,10 @@ is NOT replayed for a resource that starts later: such a resource applies its st
 | player grid refresh | server | 250 ms per slice, every player refreshed once per 2000 ms | two natives per player per 2 s, ONE thread (§22.1) |
 
 Targets: client idle **0.00–0.02 ms**; ≤ 10 visible markers/labels **< 0.06 ms**; NUI messages ≤ 10/s
-(**replaced by §38.10**: idle = 0 messages/s, with feeds ≤ 20 messages/s total). Never:
+(**replaced by §38.10**: idle = 0 messages/s, with feeds ≤ 20 messages/s total). The §6.7 world prompt
+projection is the one built-in allowed per-frame work because the dot tracks a world point; it defaults to the
+native renderer (DrawSprites, no messages at all), and in `'nui'` mode it uses one reused table, sends only on
+a visible change and stops entirely while the camera is still. Never:
 `TriggerClientEvent(-1)` from a loop, per-frame `.state` reads, `GetGamePool` per frame, funcref calls per frame.
 
 At 1,000–2,000 players a **full loop over every player is itself the bug**, even off a timer: `Player.getCoords`
@@ -1853,6 +2029,39 @@ The §23 rebuild replaces the stock chat's NUI with core's own shell component:
 - Slash input is stripped of its leading `/` before **client** `ExecuteCommand`, never executed as
   server console. Offline coverage: Lua bridge/metadata/routing, pure JS caret/completion tests,
   shell keyboard/fade/focus/history regressions and interactive Chat stories.
+
+### 30.4 Native invocation — the direct path (2026-09-18, under evaluation, PLAN.md N8)
+
+Read from the Cfx source (`citizen-scripting-lua/src/LuaScriptNatives.cpp`, `citizen-scripting-core/src/
+ScriptInvoker.cpp`, `ext/natives/codegen_out_lua.lua`, `codegen_out_native_lua.lua`) and the shipped
+`natives_loader.lua`. A Lua native call has two routes, chosen per RESOURCE by the manifest:
+
+- **default**: a generated Lua wrapper per native (`_ts()` + `tostring` for every string argument) into a
+  C closure that builds a generic invoke context (per-argument type switch, the pointer-safety table walk
+  whenever a string or pointer is passed, result coercion);
+- **direct** — `use_experimental_fxv2_oal 'yes'` in `fxmanifest.lua`: `Citizen.LoadNative` hands the loader a
+  generated C function that becomes the global itself (handler resolved once, typed argument parsing off the
+  Lua stack, no wrapper, no context). Only natives with int/float/bool/string/Hash arguments get one (309 of
+  the 323 natives core calls); the rest keep the default route.
+
+The per-frame cost of a draw loop is its native CALL COUNT times the per-call invoke cost (§6.7 budget), so
+core's manifest sets the key — **as an experiment until Liam's in-game resmon result is in**; removing the
+line, `refresh`, `restart core` goes back. Core's Lua must behave identically on both routes, because `lib/`
+also runs inside plugin VMs whose manifests choose for themselves. The differences, and the rule each one
+makes:
+
+- a **BOOL return** is `false` or the INTEGER `1` on the default route and a real boolean on the direct one:
+  read it by truthiness, never `== true`, `== 1` or arithmetic (`lib/net` ACE fallback fixed: it could never
+  grant);
+- a **BOOL out-value** is the integer `0`/`1` on the default route — and `0` is truthy in Lua — and a boolean
+  on the direct one: test `v == true or v == 1` / `not v or v == 0` (`Raycast.between` reported every miss
+  as a hit, `Vehicles.getProps` never saved lights as on: both fixed);
+- the direct route does **not unroll a vector** into x, y, z: pass scalars, always;
+- the direct route reads exactly the **declared arguments**: never pass a meaningful value beyond them.
+
+Audit (2026-09-18, scratch `oal_audit.py` over fxref's FiveM parameter lists): 841 call sites, 0 extra
+non-zero arguments, 0 vector-for-scalar arguments, the three BOOL sites above. `tests/stubs.lua` models
+the default route for `IsPlayerAceAllowed` (`1`/`false`), so a `== true` fails offline the way it does live.
 
 ## 31. UI visibility — auto-hide on game states, `Core.UI.hide/show` (2026-09-12, after Liam's report)
 
@@ -2944,7 +3153,8 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   __description __options __option` · click-through. Idle: a 14 px white ring around a 6 px core with a dark
   halo, a slow `core-ping` ring in the tone while `pulse`. Focused: the ring collapses while a solid CoreKey
   scales in on the SAME anchor and the band (icon · label · description, `--color-hud`, dissolving like
-  CorePrompt's) slides out to the side; disabled + focused shows an outline cap with a `lock` glyph.
+  CorePrompt's) slides out to the side; disabled + focused shows an outline cap with a `lock` glyph. The shell
+  mounts it from `worldprompts:set` (§6.7); a page may compose it directly.
 #### Feedback (`css/feedback.css`)
 
 - **CoreAlert** — inline banner. `tone` (`info`), `title`, `text`, `icon` (auto by tone; `icon=""` drops it),
@@ -3029,6 +3239,7 @@ resolved through global registration), and the store, `bridge.js`, `coreui.js`, 
 | `Notifications` | TransitionGroup of CoreToast (tone = type, `count`) |
 | `Shard` | CoreShard (a kit component: the full-bleed band, `style` wasted/success/info), keyed by `seq` |
 | `TextUI` | CorePrompt (`key` → cap, `text` → label) in the four `pos-*` placements |
+| `WorldPrompts` | one CoreInteractionDot per projected interaction (the `worldprompts:set` items of §6.7), placed at `x * innerWidth` / `y * innerHeight`, band side by screen half |
 | `Progress` | `CorePanel variant="hud"` · CoreKeyHint (cancel) · CoreProgress whose exposed `fillEl` carries the seeded transition |
 | `KeyHints` | CoreKeyHints (the store's `{ key, label }` items) |
 | `Spinner` | `CorePanel variant="hud"` · CoreSpinner |

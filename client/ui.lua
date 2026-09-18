@@ -126,6 +126,17 @@ local function send(message)
     SendNUIMessage(message)
 end
 
+--- Whole-set world prompt transport (DESIGN §6.7): false when the shell has not
+--- announced itself yet, so the caller keeps its dirty flag and re-sends later.
+--- `message` is the caller's reused `{ action, items }` table — never copied here.
+--- Defined after `send`: a function body resolves the local at CALL time, but only
+--- if the local was declared before the function itself.
+function UIInternal.worldPromptBatch(message)
+    if not nuiReady then return false end
+    send(message)
+    return true
+end
+
 local function newRequestId()
     requestSeq = requestSeq + 1
     return requestSeq

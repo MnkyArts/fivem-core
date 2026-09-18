@@ -46,7 +46,12 @@ html/                   the built SHELL (COMMITTED); a plugin's own frontend is 
 templates/plugin/       scaffold used by scripts/new-plugin.sh <name>, ui/ included
 tests/                  offline suites: run_tests.lua (libs/loader), server_tests.lua, client_ui_tests.lua
                         (focus stack, discovery, requests, patches, feeds), client_chat_tests.lua, pg_smoke.js
-scripts/                check.sh (offline gate), new-plugin.sh, pg-import.js
+scripts/                check.sh (offline gate), new-plugin.sh, pg-import.js, build-font-gfx.sh + font-to-gfx.java
+                        (Barlow -> stream/barlow_condensed.gfx), build-hint-gfx.sh + hint-to-gfx.java + hint.as
+                        (the world-prompt key hint -> stream/core_hint.gfx); FFDec is build-time only, never shipped
+stream/                 barlow_condensed{,_bold}.gfx — Scaleform GFx font libraries (600/700) for the native
+                        world prompts (§6.7); core_hint.gfx — that renderer's looked-at hint as ONE Scaleform
+                        movie (stage 1400x64, SET_HINT/HIDE); built by scripts/build-font-gfx.sh, build-hint-gfx.sh
 data/                   runtime files (exports); ignored except .gitkeep
 ```
 
@@ -165,7 +170,7 @@ interaction, door, cron, locale, a compiled page).
 | the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
 | libs and loader | `lua5.4 tests/run_tests.lua` | `401 passed, 0 failed` |
 | server modules | `lua5.4 tests/server_tests.lua` | `842 passed, 0 failed` |
-| client UI (focus stack, discovery, requests, patches, feeds) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 277 passed, 0 failed` |
+| client UI (focus stack, discovery, requests, patches, feeds, world prompts) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 470 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
 | runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 191`, `# fail 0` |
 | types | `npx vue-tsc --noEmit -p ui/tsconfig.json` | no output, exit 0 |
@@ -175,7 +180,7 @@ interaction, door, cron, locale, a compiled page).
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
 | a plugin's bundle | `npm run build -w <resource>-ui` (from `resources/`) | writes `<plugin>/ui/dist`, ~1 s |
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
-| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 101/101`, `PASS 195/195`, `PASS 152/152` |
+| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 107/107`, `PASS 195/195`, `PASS 152/152` |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
 | benchmarks | `node ui/tests/bench.mjs` | rewrites `ui/tests/BENCH.md` (never hand-edit it) |
@@ -245,3 +250,7 @@ never manual edits of live rows.
 - State-bag change handlers never fire for keys that existed before the script started: seed on load.
 - Console commands run as `src == 0`; devtools `fxclient exec --server` is that console.
 - `SaveResourceFile` cannot create directories: `data/.gitkeep` keeps `data/` present for `/dbexport`.
+- A BOOL native answers `false` or the INTEGER `1` (default invoke route) or a real boolean (direct route,
+  `use_experimental_fxv2_oal`); a BOOL OUT-value is the integer `0`/`1` on the default route and `0` is truthy in
+  Lua. Read returns by truthiness, out-values as `v == true or v == 1` — never `== true` / bare `not v` (DESIGN
+  §30.4). A stub that answers `true` hides this: `Raycast.between` reported every miss as a hit for that reason.

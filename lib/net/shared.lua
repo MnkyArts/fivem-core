@@ -102,10 +102,13 @@ if IsDuplicityVersion() then
 
     --- ACE + the `Config.Perms.Groups` fallback, same gate as `Core.Commands`.
     --- Plain `IsPlayerAceAllowed` only when `Core.Perms` cannot be reached.
+    --- A BOOL native answers `false`/`1` through the runtime's default invoke path and a real boolean
+    --- through the direct one (`use_experimental_fxv2_oal`); this lib runs in plugin VMs on either, so
+    --- the answer is read by truthiness, never compared with `true`.
     local function hasPermission(src, perm)
         local ok, allowed = pcall(function() return Core.Perms.has(src, perm) end)
         if ok then return allowed == true end
-        return IsPlayerAceAllowed(src, perm) == true
+        return IsPlayerAceAllowed(src, perm) and true or false
     end
 
     --- Register a validated client -> server event.

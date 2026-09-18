@@ -352,3 +352,282 @@ resmon averages a resource's own time over 64 frames (`ResourceMonitor.h`). The 
 Still a full loop on purpose: global/staff/faction chat, `/players`, name search, `worldsync`/`notify`
 broadcasts (genuinely global, rare). Open: `sendToPerm` asks `Perms.has` per player per staff line — a
 staff-holder index is the scale fix if staff chat ever gets busy. Nothing here was tested in game.
+
+## World prompts — 3D interaction dots (DESIGN §6.7) — 2026-09-18
+
+Liam: *"Implement 3D Interaction with WorldToScreen … using our Interaction Dot, when the Player is near
+enough and looks at the Interaction it should turn to the KeyHint. For example in Inventory Item pickups."*
+Decisions: **opt-in** per interaction (`worldPrompt`), and for those entries the world dot **replaces** the
+bottom-center textUI pill. The `CoreInteractionDot` kit component already exists (§37.5) — this run feeds it
+with real projected coordinates and mounts it. The contract lives in DESIGN §6.7 (written before this plan).
+
+Spec: the client scan additionally collects enabled `.worldPrompt` entries within `range` m (nearest
+`MaxVisible`); a second thread projects each `coords + offsetZ` with `GetScreenCoordFromWorldCoord` every frame
+while that list is non-empty, marks the one nearest the reticle (normalized screen distance, aspect-scaled)
+`focused`, and sends a whole-set `worldprompts:set` NUI message only when something visible changed (reused
+tables — a still camera sends nothing). `core_interact` prefers the focused entry over the scan's `active`
+one; `onEnter`/`onExit`/`canInteract` and the server-side checks are unchanged. Server-side entries
+(`Interactions.addGlobal/addFor`) carry `worldPrompt` through `toWire` untouched.
+
+Config (`shared/config.lua`, new block inside `Interactions`):
+`WorldPrompt = { Enabled = false, Range = 15.0, OffsetZ = 0.0, FocusRadius = 0.15, MaxVisible = 8 }`.
+
+Natives (verified with `fxref show` in this session; implementer re-verifies, apiset client):
+`GetScreenCoordFromWorldCoord(x,y,z) -> ok, normalizedX, normalizedY` (GRAPHICS; false when not visible to the
+rendering camera), `GetAspectRatio(false)` (GRAPHICS). `DoesEntityExist`/`GetEntityCoords(entity,false)` only
+for `entity` targets (already in the file's header).
+
+| Run | Owner | Files | ~Lines | Status |
+|---|---|---|---|---|
+| A | fivem-implementer | `shared/config.lua`, `client/interactions.lua`, `client/ui.lua` (one `UIInternal.worldPromptBatch` seam), `types/core.lua` (`CoreInteractionOptions`/`CoreInteractionWorldPromptOptions`) | +15, +210, +8, +10 | complete |
+| B | fivem-implementer | `ui/src/store.js`, `ui/src/shell/WorldPrompts.vue` (new), `ui/src/App.vue`, `ui/src/stories/WorldPrompts.stories.js` (new) | +30, ~45, +2, ~70 | complete |
+| C | fivem-implementer | `tests/stubs.lua` (projection stubs), `tests/client_ui_tests.lua` (new world-prompt suite), `ui/tests/shell-regression.js` (worldprompts section) | +25, +140, +40 | complete — client_ui 277 → 311, shell 101 → 107 |
+| D | main | `README.md`, `AGENTS.md` (§5 counts), `core_example/client/main.lua` (`worldPrompt = true` on the demo interaction), inventory wiring (`shared/config.lua`, `server/drops.lua`, `server/ops.lua`, `server/main.lua`, `client/drops.lua`, `client/main.lua`, inventory `DESIGN.md`, `tests/suites/drops_suite.lua`), `PLAN.md` | | complete after fix round below |
+
+Fix round (orchestrator, after run C's findings): the `UIInternal.worldPromptBatch` seam was defined ABOVE
+`local function send`, so its body called the nil global and killed the projection thread on the first send —
+moved below `send`; `focusedId` was never assigned (dead focused-preference) — `project()` now sets it from the
+focus winner and clears it when the set empties; a set whose last dot left the screen sent no clear — the dirty
+check now also compares the projected count against `sentCount`; the projection thread no longer spins at
+`Wait(0)` while NUI focus is held (it idles at 250 ms) and a failed send retries on `WP_RETRY_MS` instead of
+every frame; the scan now keeps the nearest `MaxVisible` prompts instead of the first `pairs()` order. Inventory
+ground drops register a per-prop `Core.Interactions.add({ entity = obj, worldPrompt = ... })` (removed with the
+prop) and the page-less `inventory:pickup` callback (`Inv.Ops.pickup`), replacing the aggregate count pill.
+Inventory suites 1963 → 1970, shell browser suite PASS 107/107, full `scripts/check.sh` green, `fxlint` core
+and inventory 0/0.
+
+Invariants for the implementer:
+- `client/interactions.lua` keeps its **one scan thread**; the projection thread is the only new loop
+  (`Wait(0)` only while the prompt list is non-empty, else 250 ms — fxlint-safe adaptive wait).
+- **No Lua allocation in the projection loop** on an unchanged frame; the NUI message table and its item
+  tables are reused (bounded by `MaxVisible`), positions rounded to 4 decimals, dirty check per slot
+  (`id/focused/disabled/label` string/boolean compare, `x`/`y` epsilon 0.0005, enter/leave message).
+- A slot that is seen and then projected behind the camera leaves the message that frame; the set is sorted
+  nearest-first by the scan.
+- The textUI is suppressed **only** for `entry.worldPrompt` entries in `activate()` and the label-refresh
+  branch; every other producer (doors, drops, respawn) is untouched.
+- `worldPrompt = true | { enabled?, range?, offsetZ?, icon?, description? } | false | nil`; `nil` resolves
+  from `Config.Interactions.WorldPrompt.Enabled`. `icon`/`description` sanitized (32/64).
+- Focus: `d = ((x - 0.5) * aspect)^2 + (y - 0.5)^2 ≤ FocusRadius^2`; among candidates the in-`radius`
+  (not disabled) one wins, then the smaller `d`. Interact target = focused entry, else active entry.
+- `Core.on('uiReady', …)` forces the next frame to send (a reloaded shell forgot the set).
+- The shell widget is `fixed inset-0 z-20 pointer-events-none`; item px = `x * innerWidth`, `y * innerHeight`;
+  `side = x > 0.6 ? 'left' : 'right'`; re-read the viewport on `resize`; `CoreInteractionDot` is globally
+  registered (no import). Never a literal colour/radius outside the kit.
+- No per-frame `.state` reads, no `GetGamePool`, no broadcast, no new net event; the only message is
+  `worldprompts:set` (whole set; `items = {}` clears).
+
+Test surface:
+- Lua: a new `client_ui_tests.lua` VM with `client/api.lua`, `client/interactions.lua`, `client/ui.lua`;
+  stub `GetScreenCoordFromWorldCoord` (`stubs.projectWorld`) and `GetAspectRatio` (`stubs.aspectRatio`);
+  assert: `worldPrompt` entry never shows `textui:show`; a `worldprompts:set` carries it with normalized
+  coords; center projection ⇒ `focused = true` / `disabled = false`; off-center ⇒ `focused = false`; beyond
+  radius ⇒ `disabled = true`; empty list clears; `core_interact` runs the focused entry's `onInteract`
+  (and falls back to active when nothing is focused); `setLabel` re-sends the new label.
+- Shell: `worldprompts:set` renders `.core-interaction-dot` at `x * innerWidth` px, idle by default, focused
+  item shows the key cap + label, `items = []` clears; click-through.
+- Story: `Built-ins/World Prompts` with a focused and an idle dot (mirror `TextUI.stories.js`).
+
+In-game checklist (Liam): walk up to a `worldPrompt` interaction → dot on the point (no bottom pill); look at
+it → key cap + label, press E → the action fires exactly once; look away → back to the dot; walk out → gone;
+a locked/out-of-reach dot shows the outline lock; `resmon` while a dot is visible ≤ ~0.03 ms and 0.00–0.01 ms
+idle; no NUI messages while standing still looking at a dot. Also on the list: `restart core` re-registers;
+`/uiplugins` unaffected.
+
+
+### World prompts — feedback round (Liam, in-game: too far, hovering, laggy)
+
+| run | owner | files | result |
+|---|---|---|---|
+| E1 | main | `shared/config.lua` (`WorldPrompt.Range 15 → 6.0`), `client/interactions.lua` (position sends throttled to `WP_SEND_MS` ~30 Hz, structural changes bypass; `changed` seed fixed so an empty forced set still sends), `ui/src/store.js` (`worldprompts:set` applied IN PLACE on per-id `reactive` objects — stable identity, only changed bindings re-render), `ui/src/shell/WorldPrompts.vue` (wrapper carries the point as `transform: translate3d` + 34 ms linear transition), `ui/src/stories/WorldPrompts.stories.js`, inventory `shared/config.lua` (`PromptRange 12 → 6.0`) + `client/drops.lua` (`GetModelDimensions` centre height, `PromptOffsetZ 0.2` fallback), both DESIGN docs | core 401/842/311/40, inventory 1970, shell 107/107, kit 195/195, runtime 152/152, fxlint 0/0 |
+
+Why: per-frame NUI messages are the known CEF jank source (community NUI resources update at 20–50 ms and
+interpolate; native systems like vPrompt/ox_target draw in the render thread). The dot now moves on the
+compositor between ~30 Hz sends, and its world height comes from the model it sits on.
+
+### World prompts — native renderer (Liam: "can we also draw it native / scaleform then? Read also FiveM Sourcecode")
+
+Source read (local checkout `FiveM/fivem`, master `0d8a2a6f7`): `SEND_NUI_MESSAGE` is registered in
+`nui-resources/src/ResourceUIScripting.cpp:103` and ends in `nui::PostFrameMessage` — one CEF process-message
+IPC per call, which is what made the dot janky. `extra-natives-five/src/RuntimeAssetNatives.cpp:1099` exposes
+`CREATE_RUNTIME_TXD`, `CREATE_RUNTIME_TEXTURE`, `SET_RUNTIME_TEXTURE_PIXEL`, `COMMIT_RUNTIME_TEXTURE` and
+`CREATE_RUNTIME_TEXTURE_FROM_DUI_HANDLE` (`CREATE_DUI` in `nui-resources/.../ResourceUIScripting.cpp:340`); a
+DUI is one CEF window per instance, so N dots would mean N browsers — rejected. `DrawSprite` + the HUD text
+natives run in the game render thread: no IPC, frame-perfect, which is how vPrompt/ox_target-scale systems do
+it.
+
+| run | owner | files | result |
+|---|---|---|---|
+| N1 | main | `shared/config.lua` (`WorldPrompt.Renderer = 'native'`), `client/interactions.lua` (native renderer: runtime-painted sprites ring/dot/cap/lock, DrawSprite + font-4 text, pulse, disabled lock, 1080p scaling, 5 s resolution refresh, 2 s sprite pre-warm), `tests/stubs.lua` (native stubs + draw recording), `tests/client_ui_tests.lua` (`newInteractionsClient(renderer)` + native suite), DESIGN §6.7 + §9, README | core 401/842/324/40, inventory 1970, fxlint 0/0 |
+
+Fixed during the run: the native block first referenced `frame` before its `local` declaration and `bestSlot`
+was scoped inside the projection `if` (the NUI loop then compared against a nil global) — both caught by the
+offline suites; `DrawSprite` must take the texture dict NAME, not the `CreateRuntimeTxd` handle (caught in
+review, asserted in the native suite).
+
+N1 follow-up (Liam, in-game): the label was anchored at x = 0.0 (`EndTextCommandDisplayText(0.0, ty)` — the x is
+the anchor, `SetTextWrap` only bounds the line), so it drew at the left screen edge; now the anchor is the cap
+side and the label flips with it. Idle dot enlarged 14/6 → 20/9 px (`WP_RING_PX`/`WP_DOT_PX`), cap unchanged
+(the `E` was reported good). client_ui 324/0, fxlint 0/0.
+
+N2 (Liam, in-game): dot too small, KeyHint unlike the kit, pulse not the brand red, and "can we use our font?".
+Read `FiveM/fivem` master `0d8a2a6f7`: `RegisterFontFile`/`RegisterFontId` (`TextChangingFunctions.cpp:123`) feed
+Scaleform's font manager from a streamed `.gfx` font library (`sfFontStuff.cpp:64` looks up `<name>.gfx` in the
+streamer) — no runtime TTF path, and Scaleform itself only takes Flash-era fonts. Built one with JPEXS FFDec
+26.3.0 (LGPL, build-time only): `scripts/font-to-gfx.java` imports the TTF via FFDec's font machinery and saves
+with the GFX signature; `scripts/build-font-gfx.sh` decompresses the kit's woff2 and runs it. Round-trip through
+FFDec reproduces advance widths within 0.0005 em. `stream/barlow_condensed.gfx` is committed.
+Renderer changes: ring 30 / core 13, pulse in `--color-accent` (246,80,63), label in Barlow Condensed, band =
+`--color-hud` DrawRect sized by `EndTextCommandGetWidth(true)` + a generated fading tail sprite. client_ui
+324 → 332, fxlint 0/0. New stream asset ⇒ `refresh` before `restart core`.
+
+N3 (Liam, in-game): "I only see Glyphs. Dot can be a bit bigger still. Make sure KeyHint is 1 to 1 to Kit."
+Ring 30 → 36 / core 13 → 16. The band dropped `DrawRect` for a stretched 1×1 `--color-hud` texel + the fade
+sprite (one pipeline for everything). Kit geometry now exact: near edge `cap/2 + 8`, label inset 14, tail 76,
+height 36, cap radius 3 and `--color-key` fill, label `--color-fg`, key `--color-key-fg`; the cap scales in
+(130 ms) like the kit's transition. Built the 700 weight too (`barlow_condensed_bold.gfx`, CoreKey is 700) and
+calibrated text through `GetRenderedCharacterHeight` so a line is exactly the kit's 15 px at any resolution.
+client_ui 331/0, fxlint 0/0.
+
+N4: the label rendered as boxes/fallback. Root cause found by diffing against the GFx format: a plain
+`DefineFont2` tag inside a `.gfx` is NOT enumerated by Scaleform's font provider — that is the conversion
+`gfxexport` performs (the community pipeline's missing step). FFDec exposes the target class directly, so
+`scripts/font-to-gfx.java` now builds a fresh **`DefineCompactedFont`** (tag 1005, GFx-native) and fills it
+through `addCharacter` (advances are stored per glyph; `setAdvanceValues` is unsupported there). Verified by
+FFDec dump (`DefineCompactedFont (chid: 1, fn: "Barlow Condensed")`, tagId 1005) and a TTF round-trip (only
+the soft-hyphen edge case differs by >0.01 em). No Lua/test changes; both `.gfx` rebuilt.
+
+N5 (Liam): look-gating, a 1-2 px seam between band body and fade, and the prompt "sliding" ~5% while the
+camera moves. Look-gating: `core_interact` no longer falls back to the proximity-active entry when that entry
+is a worldPrompt one. Seam: the body+fade pair became ONE `--color-hud` texture painted per measured width
+(last 76 px ramping out) and cached per quantized width — a single quad cannot have a filtered junction.
+Slide: the qb-target-proven fix — all draws now happen under `SetDrawOrigin` at the world point (plus
+`SetScriptGfxAlignParams(0,0,0,0)`), so the render thread projects the origin with the final camera instead of
+the script projecting one frame ahead of it; the script-side projection stays only for the look-at test.
+client_ui 334/0, fxlint 0/0.
+
+N6: the font still rendered as boxes. Web research (Cfx forum + community repos) surfaced a working
+`stream/supermarket.gfx`: it is `ExporterInfo` + `FileAttributes` + **`DefineFont3`** + **`ExportAssets`** (the font
+exported under its name) + ShowFrame/End — i.e. gfxexport converts the swfmill DefineFont2 to DefineFont3 and
+exports the symbol. Neither a plain DefineFont2 nor FFDec's DefineCompactedFont is enumerated by Scaleform's
+provider, which is why the glyphs stayed boxes. `scripts/font-to-gfx.java` now emits that exact structure
+(FFDec's `DefineFont3Tag` + `ExportAssetsTag` + `ExporterInfo`), verified tag-for-tag against supermarket.gfx.
+Resmon: 0.15–0.20 ms came from per-frame text measurement (`EndTextCommandGetWidth`) and `GetAspectRatio`; the
+label width is now cached per label/resolution (regression test asserts one measurement across frames) and the
+aspect is cached with the 5 s resolution refresh. client_ui 335/0, fxlint 0/0.
+
+N7 (Liam: still ~0.10 ms in resmon while the hint is up): what a per-frame renderer costs here is the number
+of native calls it makes (each goes through the runtime's invoke path), so the pass was counted with a scratch
+harness over `tests/stubs.lua` and the count cut without changing a single drawn pixel. Removed per frame: the
+looked-at dot's wasted draw-origin group (it opened one in the idle loop, drew nothing, cleared it, then opened
+its own), the duplicate `SetScriptGfxAlignParams`/`ResetScriptGfxAlign` bracket the hint added on top of the
+idle loop's, and the second `GetGameTimer` (`project(now)` now takes the projection thread's timestamp and
+hands it down). Removed per frame in Lua: `string.upper` of the label and the `widthPx .. ':' .. tailPx` concat
+inside `bandTexture` — the whole hint layout (uppercased text, measured width, band sprite + its normalized
+width) is one cache keyed on the RAW `entry.label` plus text scale and resolution, rebuilt outside the draw
+bracket. Same draws, same argument values, same order (idle dots first, hint on top), no native added or
+dropped. Measured: lone idle dot 12 → 11 calls/frame, lone looked-at hint 33 → 28, +6 per further idle dot
+unchanged (75 → 70 at `MaxVisible` 8). The suite now asserts the steady-state budget itself (draw origins,
+origin clears, one gfx-align bracket, one `GetGameTimer`, no texture creation) and that a renamed label
+rebuilds the cache exactly once. client_ui 335 → 344/0, run_tests 401/0, server 842/0, chat 40/0, fxlint 0/0.
+
+N8 (Liam: "nothing really changed" after N7 — expected in hindsight: 5 of ~30 calls is inside resmon's noise,
+the per-call invoke cost is the lever): core's manifest now sets `use_experimental_fxv2_oal 'yes'`, FiveM's
+direct native route (DESIGN §30.4) — **an experiment until the in-game resmon number is in**; one line to
+revert. Before flipping a switch that changes every native call in core, client and server, the differences
+between the two routes were read from the Cfx source and core was audited mechanically against FiveM's own
+parameter lists (scratch `oal_audit.py` over fxref's DB): 841 call sites of 323 natives (309 eligible for the
+direct route), 0 extra non-zero arguments, 0 vector-for-scalar arguments. Nothing breaks — but three places
+were WRONG on the default route and would have silently changed behaviour with the switch, so they were made
+route-agnostic first (the on/off comparison then measures performance only): `lib/net` ACE fallback
+(`IsPlayerAceAllowed(...) == true` can never be true, a BOOL return is `false`/`1`), `Raycast.between`
+(`if not hit` — the BOOL out-value is the integer 0 and `not 0` is false, so every miss was reported as a hit
+at 0,0,0) and `Vehicles.getProps` (`lightsOn == true` — lights were never saved as on). The ACE stub now
+answers `1`/`false` like the shipped wrapper, so the fallback test pins the fix instead of hiding the bug.
+run_tests 401/0, server 842/0, client_ui 344/0, chat 40/0, fxlint 0/0. In-game: resmon at an inventory drop
+(world prompt only) and at the example shop (also `world.lua` marker + label), raycast users (inventory
+context, remote, trucking delivery), headlight state across a vehicle save/restore.
+
+N9 (the looked-at hint as ONE Scaleform movie; two parallel runs off one contract — A built the movie and its
+builder, B the renderer, tests and docs): N7 counted the pass and N8 attacked the per-call cost, and what was
+left is that the HINT is the loop — 22 of the 28 native calls a lone hint makes per frame are its own draws
+(2 sprites, 18 text natives, the draw-origin pair), while an idle dot costs 5. An in-game probe (`wp_sfprobe`,
+2026-09-18) settled the two open questions before a line was written: `DrawScaleformMovie` called between
+`SetDrawOrigin` and `ClearDrawOrigin` IS projected by the render thread — the movie stays glued to the world
+point exactly like the sprites — and a per-frame thread drawing one movie reads 0.03 ms in resmon where the
+sprite hint reads ~0.10. Hence a HYBRID rather than "all Scaleform": the game's `ScaleformMgrArray` pool is 40
+movies for the WHOLE game (HUD, minimap, phone, every resource — read from gameconfig.xml), so the idle dots
+stay sprites and core holds exactly ONE movie instance, never one per dot. `stream/core_hint.gfx` (requested as
+`core_hint`) is a GFX/SWF8/AS2 one-frame movie, stage 1400x64 with the cap centre at the stage centre,
+`TIMELINE = this`, API `SET_HINT(key, label, disabled, left, restart)` + `HIDE()`, built by
+`scripts/build-hint-gfx.sh` from `scripts/hint.as` through FFDec and committed. The renderer requests it on the
+SCAN cadence when the first prompt becomes visible, keeps it until the resource stops (one pool slot),
+re-requests one the game dropped, gives up after 10 s with a single warning, and per frame draws
+`SetDrawOrigin` + one `DrawScaleformMovie(handle, 0.0, 0.0, 1400 * s / resX, 64 * s / resY, 255, 255, 255, 255,
+0)` + `ClearDrawOrigin`; `SET_HINT` goes out only when the entry, its key, its label, `disabled` or `left`
+changed (the side flip got 0.58/0.62 hysteresis, so a dot sitting on the old 0.6 threshold cannot send a method
+call per frame) and `HIDE` once when focus is lost, the `promptCount == 0` early return included. The sprite
+hint is untouched and is the automatic fallback while the movie loads or if it never does (`Hint = 'sprites'`
+pins it); in Scaleform mode nothing measures text, and the `SetScriptGfxAlignParams`/`ResetScriptGfxAlign`
+bracket now opens lazily before the first SPRITE of a frame, so a lone hint draws without one while a frame with
+idle dots still has exactly one. Two rules came out of the review: the cache mirrors only what the movie was
+really told (a refused `BeginScaleformMovieMethod` is retried next frame), and a new focus is announced one
+frame before it is drawn — focus can jump straight from dot A to dot B with no unfocused frame and therefore no
+`HIDE`, so a buffered method call would otherwise show A's content at B's position (the focus-in starts at alpha
+0, so the skipped frame is invisible). Budget: a lone looked-at hint 28 → **7** native calls per frame, +6 per idle
+dot plus the 2-call sprite bracket (70 → 51 at `MaxVisible` 8). client_ui 344 → 414/0 (the old native suite
+pinned to `Hint = 'sprites'` so every sprite check stays; a new scaleform suite covers the request by name, the
+movie geometry under its own draw origin, no text/band/measurement, every SET_HINT and HIDE transition, the
+announce-then-draw split including a direct A -> B focus move and a refused Begin, the lone-hint per-frame
+budget, the hysteresis, the never-loads fallback with its timeout release and the stop release),
+run_tests 401/0, server 842/0, chat 40/0, fxlint 0/0. New stream asset ⇒ `refresh` before
+`restart core`. In-game: baseline and letter-spacing of both texts against the sprite hint, band length vs. the
+measured one, the left flip, the lock cap, the focus-in animation, and resmon with the hint up.
+
+N9 in game (Liam, 2026-09-18, right after the deploy): the Scaleform hint works ("works great"). Not reported
+yet, so still open: resmon for `core` with the hint up vs. an idle dot only (the number this run exists for),
+the item-by-item look check above, and the probe's second round (`sfprobe e|f|g`).
+
+N10 (the idle dots: fewer native calls per dot, and fewer projections per frame): with the hint down to one
+movie, the DOTS were the loop — per visible idle dot per frame the harness counted 6 (point target, in reach:
+`GetScreenCoordFromWorldCoord`, `SetDrawOrigin`, 3 `DrawSprite` = pulse + ring + core, `ClearDrawOrigin`), 5
+out of reach (the common case: a dot is DRAWN within `range` 6 m but usable within `radius` 2 m) and +2 for an
+ENTITY target (`DoesEntityExist` + `GetEntityCoords`), so a hint plus 7 entity dots — an inventory drop pile —
+was 67 calls per frame. Three levers, all resting on the fact Liam's in-game probe (mode G) established for
+N9: everything is drawn under `SetDrawOrigin`, so the RENDER thread projects the world point and the
+script-side projection is needed only for the look-at test and the visible set, never for drawing. **D1**:
+the idle dot is ONE composite runtime texture `'idle'` (the ring texture's layers plus the old `'dot'`
+texture's layers converted into ring space — a dot texel r becomes `r * (16/24) / (36/48)` ring texels — and
+composited on top in the same source-over order), so an out-of-reach dot is a single `DrawSprite` and the
+`'dot'` texture is gone; identical at full alpha, and at `dim = 150` the halo/core overlap is composited once
+instead of twice, which is the only visual difference and is accepted. The dots deliberately stay sprites
+rather than becoming movies too: the same call count for the common out-of-reach dot, and zero of the game's
+40 `ScaleformMgrArray` slots. **D2**: the projection pass (one `GetScreenCoordFromWorldCoord` per slot, the
+visible set, the focus winner) and `IsNuiFocused` run on a 33 ms cadence — every 2nd frame at 60 fps, every
+5th at 144 — while EVERY frame still draws from the cached visible set; a dirty flag set at the end of every
+scan pass and by `Interactions.remove` pulls a projection forward, so a cached set can never outlive the slot
+list it came from (the slot tables are reused and re-filled by the scan, which is exactly how a stale dot
+would be drawn at another entry's position). **D3**: an entity target's coordinates are re-read every frame
+only while they change — 8 consecutive identical reads (three scalar comparisons, no vector, no key string)
+park the slot on a 250 ms read, any difference puts it back on every frame, a vanished entity leaves the
+visible set at once, and the scan resets the counter when it re-fills a slot with a different entry. The
+`'nui'` renderer is untouched: it needs x/y to place DOM nodes, so it projects and asks `IsNuiFocused` every
+frame as before. Budget per DRAWING frame: lone Scaleform hint 7 → **5**, lone enabled idle dot 11 → **8**,
+each further enabled dot 6 → **4**, each disabled dot 5 → **3**, a resting entity target +2 → **0**; averaged
+over the 33 ms cadence at a 16 ms step, hint + 7 dots at `MaxVisible` 8 is 51 → **~31** (point) and 67 →
+**~32** (entity). client_ui 414 → 470/0: `wpFrame(co, ms)` now advances the virtual clock (default 40 ms, so
+every frame of the three existing suites stays a projection frame and every existing assertion keeps its
+meaning — only the two "and its core dot" sprite checks changed, into the composite's), plus two new suites
+for the cadence (one projection per 33 ms window while every frame draws, `IsNuiFocused` on projection frames
+only, the focus freeze, the three dirty-flag paths including removing the looked-at entry between two 5 ms
+frames, and the exact non-projection-frame budgets) and for entity targets (8 reads then 250 ms, a push
+noticed at the next due read with the draw origin following, a re-filled slot starting over, a deleted entity
+gone on the very next frame, and the documented trade-off that a PARKED entity is noticed at its next due
+read). run_tests 401/0, server 842/0, chat 40/0, fxlint 0/0, no global write (`luac -l -l` SETTABUP _ENV = 0).
+In-game: the dots must look unchanged (a disabled one is the one to compare), focus still feels immediate,
+a dot on a MOVING vehicle must not judder, a pushed drop's dot follows within 250 ms, and resmon standing
+among several drops is the number this run exists for.
+
+N10 in game (Liam, 2026-09-19, after the deploy): "it's perfect" — the hint with the baked tracking and the
+composite idle dots are accepted as they are. Never reported, so not claimed anywhere: resmon for `core` (hint
+up, several drops in view, the direct native route before/after) and the probe's modes E/F.

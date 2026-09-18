@@ -1,6 +1,7 @@
 <script setup>
 // Root of the core UI shell (DESIGN §7.2).
 // Everything is pointer-events: none; only open pages and modals take input.
+import WorldPrompts from './shell/WorldPrompts.vue'
 import Hud from './shell/Hud.vue'
 import StatsBars from './shell/StatsBars.vue'
 import Notifications from './shell/Notifications.vue'
@@ -32,6 +33,9 @@ const Inspector = defineAsyncComponent(() => import('./shell/Inspector.vue'))
     :class="{ 'is-hidden': !store.shell.visible }"
     :aria-hidden="store.shell.visible ? null : 'true'"
   >
+    <!-- world layer: the §6.7 interaction dots (z 20 — under the HUD rail, prompts and hints) -->
+    <WorldPrompts />
+
     <!-- top-right rail: HUD, the stat bars under it, then the notification stack (z 40) -->
     <div class="rail-tr pointer-events-none absolute top-4 right-4 z-40 flex flex-col items-end gap-2.5">
       <Hud />

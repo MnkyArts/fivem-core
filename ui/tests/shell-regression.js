@@ -149,6 +149,30 @@
     check('textui:hide clears the pill', await waitFor(() => !hasText('Open shop')))
     check('notify auto-dismisses after its duration', await waitFor(() => !hasText('Regression notify'), 2500))
 
+    // ---- 2b. world prompts (DESIGN §6.7) ------------------------------------
+    // client/interactions.lua projects worldPrompt interactions into normalized screen
+    // coords and sends the WHOLE set as one `worldprompts:set`; the shell mounts one
+    // CoreInteractionDot per item at x/y * viewport (WorldPrompts.vue + store.js). A dot
+    // replaces the text-UI pill, so the layer is painted, never clicked (§37.4).
+    send({ action: 'worldprompts:set', items: [{ id: 'dot1', x: 0.5, y: 0.5, focused: false, disabled: false, keys: 'E', label: 'Pick up Bandage', icon: 'hand' }] })
+    await waitFor(() => !!q('.core-interaction-dot'), 1500)
+    check('worldprompts:set mounts exactly one interaction dot', document.querySelectorAll('.core-interaction-dot').length === 1)
+    const dot = q('.core-interaction-dot')
+    const dotRect = dot ? dot.getBoundingClientRect() : null
+    check('the dot sits at the projected screen point (0.5 of the viewport both axes)',
+      !!dotRect && Math.abs(dotRect.left - 0.5 * window.innerWidth) < 4 && Math.abs(dotRect.top - 0.5 * window.innerHeight) < 4)
+    check('the world-prompt layer stays click-through (pointer-events: none)',
+      !!dot && getComputedStyle(dot.parentElement).pointerEvents === 'none' && getComputedStyle(dot).pointerEvents === 'none')
+    send({ action: 'worldprompts:set', items: [{ id: 'dot1', x: 0.5, y: 0.5, focused: true, disabled: false, keys: 'E', label: 'Pick up Bandage', icon: 'hand' }] })
+    await waitFor(() => !!q('.core-interaction-dot.is-focused'), 1500)
+    const focusedDot = q('.core-interaction-dot')
+    check('the focused dot carries the is-focused class', !!focusedDot && focusedDot.classList.contains('is-focused'))
+    check('the focused dot renders the key and the label',
+      !!focusedDot && (focusedDot.textContent || '').indexOf('Pick up Bandage') !== -1
+        && Array.from(focusedDot.querySelectorAll('.core-key')).some((k) => (k.textContent || '').trim() === 'E'))
+    send({ action: 'worldprompts:set', items: [] })
+    check('an empty set clears the dots', await waitFor(() => !q('.core-interaction-dot'), 1500))
+
     // ---- 3. progress ------------------------------------------------------
     let m = mark()
     send({ action: 'progress:start', id: 11, label: 'Hotwiring', duration: 5000, canCancel: true })

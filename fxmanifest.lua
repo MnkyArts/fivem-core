@@ -1,6 +1,10 @@
 fx_version 'cerulean'
 game 'gta5'
 node_version '22'   -- server-side Node runtime for server/db_pg.js (DESIGN §33); FXServer ships 16 (default) and 22
+-- Direct native functions for core's own Lua, client and server (DESIGN §30.4): a native call skips the
+-- generated Lua wrapper and the generic invoke context. UNDER EVALUATION (PLAN.md N8) — remove this one
+-- line, `refresh`, `restart core` to go back; core's Lua is written to behave the same either way.
+use_experimental_fxv2_oal 'yes'
 
 author 'MnkyArts'
 description 'Framework core: shared APIs (player, money, factions, vehicles, interactions, markers, UI) for GTA-Online-style RP servers'

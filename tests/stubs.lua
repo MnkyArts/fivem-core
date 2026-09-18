@@ -293,6 +293,38 @@ stubs.playerNames = {}       -- server id -> name
 stubs.resourceStates = { core = 'started' }
 stubs.nuiFocused = false
 stubs.pauseMenu = false
+-- §6.7 world-prompt projection (client/interactions.lua): GetAspectRatio(b) reads
+-- `aspectRatio` (nil = the 16/9 default) and GetScreenCoordFromWorldCoord(x, y, z)
+-- delegates to `projectWorld(x, y, z)` when a suite installed one, else answers
+-- false = "not visible to the rendering camera" (a dot behind the camera).
+stubs.aspectRatio = nil
+stubs.projectWorld = nil
+stubs.drawSprites = {}         -- every DrawSprite: { dict, name, x, y, w, h, r, g, b, a }
+stubs.drawRects = {}           -- every DrawRect: { x, y, w, h, r, g, b, a }
+stubs.drawTexts = {}           -- every AddTextComponentSubstringPlayerName string
+stubs.textFonts = {}           -- every SetTextFont id, in order
+stubs.registeredFonts = {}     -- every RegisterFontId name, in order
+stubs.fontIdSeq = 7            -- RegisterFontId starts handing out ids after the game fonts
+stubs.runtimeTextures = {}     -- every CreateRuntimeTexture: { name, w, h }
+stubs.drawOrigins = {}         -- every SetDrawOrigin world point
+stubs.widthCommands = 0        -- BeginTextCommandGetWidth calls (the label measurement)
+stubs.clearOrigins = 0         -- ClearDrawOrigin calls (one per opened draw-origin group)
+stubs.gfxAlignSets = 0         -- SetScriptGfxAlignParams calls (the draw bracket, once a frame)
+stubs.gfxAlignResets = 0       -- ResetScriptGfxAlign calls (the other half of that bracket)
+stubs.gameTimerReads = 0       -- GetGameTimer calls (the frame timestamp is read once)
+stubs.screenProjections = 0    -- GetScreenCoordFromWorldCoord calls (one per slot per PROJECTION frame)
+stubs.nuiFocusReads = 0        -- IsNuiFocused calls (native renderer: projection frames only)
+stubs.entityCoordReads = 0     -- GetEntityCoords calls (the §6.7 resting-entity read cadence)
+-- §6.7 Scaleform key hint (the looked-at hint as ONE movie). `scaleformLoaded` is what
+-- HasScaleformMovieLoaded answers (false models a movie that never streams in, so the
+-- sprite fallback and the load timeout can be tested); the rest is the recording.
+stubs.scaleformLoaded = true
+stubs.scaleformRequests = {}   -- every RequestScaleformMovie name, in order
+stubs.scaleformCalls = {}      -- every invoked method: { method, handle, params = { … } }
+stubs.scaleformDraws = {}      -- every DrawScaleformMovie: { handle, x, y, w, h }
+stubs.scaleformReleased = 0    -- SetScaleformMovieAsNoLongerNeeded calls
+stubs.scaleformSeq = 0         -- handles handed out by RequestScaleformMovie
+stubs.scaleformBeginFails = 0  -- refuse the next N BeginScaleformMovieMethod calls (engine says no)
 -- Client NUI harness (used by tests/client_ui_tests.lua and any suite that loads
 -- client/ui.lua): every SendNUIMessage in order, every RegisterNuiCallback by name,
 -- and the last focus triple plus the raw call log.
@@ -323,6 +355,15 @@ stubs.newWorld()
 
 function stubs.clear()
     stubs.sent, stubs.printed = {}, {}
+    stubs.drawSprites, stubs.drawRects, stubs.drawTexts, stubs.textFonts = {}, {}, {}, {}
+    stubs.registeredFonts, stubs.fontIdSeq = {}, 7
+    stubs.runtimeTextures, stubs.drawOrigins, stubs.widthCommands = {}, {}, 0
+    stubs.clearOrigins, stubs.gfxAlignSets, stubs.gfxAlignResets = 0, 0, 0
+    stubs.gameTimerReads, stubs.screenProjections = 0, 0
+    stubs.nuiFocusReads, stubs.entityCoordReads = 0, 0
+    stubs.scaleformRequests, stubs.scaleformCalls, stubs.scaleformDraws = {}, {}, {}
+    stubs.scaleformReleased, stubs.scaleformSeq, stubs.scaleformLoaded = 0, 0, true
+    stubs.scaleformBeginFails = 0
 end
 
 local function readFile(path)
@@ -471,6 +512,7 @@ function stubs.resetNui()
     stubs.nuiMessages, stubs.nuiCallbacks = {}, {}
     stubs.nuiFocus = { focus = false, cursor = false, keepInput = false, calls = {} }
     stubs.resourceFiles, stubs.resourceMeta = {}, {}
+    stubs.aspectRatio, stubs.projectWorld = nil, nil   -- the §6.7 projection knobs too
 end
 
 --- Would `value` survive the JSON encode a NUI `cb` does? Functions, coroutines and
@@ -791,10 +833,22 @@ function stubs.newEnv(side, resourceName)
         local list = meta and meta[key]
         return list and list[(tonumber(index) or 0) + 1] or nil
     end
-    env.GetGameTimer = function() return math.floor(clock) end
+    env.GetGameTimer = function()
+        stubs.gameTimerReads = stubs.gameTimerReads + 1
+        return math.floor(clock)
+    end
     env.GetHashKey = hashKey
     env.GetPlayerPed = function(src) return stubs.peds[tonumber(src)] or 0 end
-    env.GetEntityCoords = function(entity) return stubs.coords[entity] or vector3(0.0, 0.0, 0.0) end
+    env.GetEntityCoords = function(entity)
+        stubs.entityCoordReads = stubs.entityCoordReads + 1
+        return stubs.coords[entity] or vector3(0.0, 0.0, 0.0)
+    end
+    -- apiset client+server (the server VM re-installs the identical one below): a §6.7 entity
+    -- world prompt reads it on the CLIENT every frame it is due, so it lives on both sides here
+    env.DoesEntityExist = function(entity)
+        local record = stubs.entities[entity]
+        return record ~= nil and record.exists == true
+    end
     env.GetPlayerName = function(src) return stubs.playerNames[tonumber(src)] end
     env.RegisterCommand = function(name, fn, restricted)
         rec.commands[name] = { fn = fn, restricted = restricted }
@@ -804,15 +858,30 @@ function stubs.newEnv(side, resourceName)
     -- side-specific natives stay missing on the other side, exactly like the engine,
     -- so a wrong-apiset call shows up here instead of being silently absorbed
     if isServer then
+        -- A BOOL native answers `false` or the INTEGER 1 through the runtime's default invoke path
+        -- (the shipped wrapper returns through `_r`), never `true`: the stub models that, so a
+        -- `== true` on a native's answer fails here the way it does on the live server.
         env.IsPlayerAceAllowed = function(src, object)
-            return stubs.aces[('%s|%s'):format(src, object)] == true
+            return stubs.aces[('%s|%s'):format(src, object)] == true and 1 or false
         end
     else
         env.RegisterKeyMapping = function(command, description, mapper, key)
             rec.keyMappings[command] = { description = description, mapper = mapper, key = key }
         end
-        env.IsNuiFocused = function() return stubs.nuiFocused end
+        env.IsNuiFocused = function()
+            stubs.nuiFocusReads = stubs.nuiFocusReads + 1
+            return stubs.nuiFocused
+        end
         env.IsPauseMenuActive = function() return stubs.pauseMenu end
+        -- §6.7 world prompts: the normalized screen projection of a world point
+        -- (both apiset client, GRAPHICS; projectWorld's ok/x/y match the native's
+        -- three returns, so a test fakes exactly what the engine answers).
+        env.GetAspectRatio = function(_b) return stubs.aspectRatio or (16 / 9) end
+        env.GetScreenCoordFromWorldCoord = function(x, y, z)
+            stubs.screenProjections = stubs.screenProjections + 1
+            if stubs.projectWorld then return stubs.projectWorld(x, y, z) end
+            return false
+        end
         -- the rest of the §31 auto-hide watchers, all apiset client
         env.IsScreenFadedOut = function() return stubs.gameState.fadedOut end
         env.IsScreenFadingOut = function() return stubs.gameState.fadingOut end
@@ -844,6 +913,93 @@ function stubs.newEnv(side, resourceName)
         env.PlayerPedId = function() return stubs.peds[stubs.clientSrc] or 101 end
         env.PlayerId = function() return 0 end
         env.GetPlayerServerId = function() return stubs.clientSrc end
+        -- world prompt native renderer (DESIGN §6.7): the runtime textures are no-ops, every
+        -- draw and text is recorded so a suite can assert what the render thread would show.
+        env.GetActualScreenResolution = function() return 1920, 1080 end
+        env.CreateRuntimeTxd = function(name) stubs.runtimeTxd = name return 1 end
+        env.CreateRuntimeTexture = function(txd, name, width, height)
+            stubs.runtimeTexSeq = (stubs.runtimeTexSeq or 0) + 1
+            stubs.runtimeTextures[#stubs.runtimeTextures + 1] = { name = name, w = width, h = height }
+            return stubs.runtimeTexSeq
+        end
+        env.SetDrawOrigin = function(x, y, z) stubs.drawOrigins[#stubs.drawOrigins + 1] = { x = x, y = y, z = z } end
+        env.ClearDrawOrigin = function() stubs.clearOrigins = stubs.clearOrigins + 1 end
+        env.SetScriptGfxAlignParams = function() stubs.gfxAlignSets = stubs.gfxAlignSets + 1 end
+        env.ResetScriptGfxAlign = function() stubs.gfxAlignResets = stubs.gfxAlignResets + 1 end
+        env.SetRuntimeTexturePixel = function() end
+        env.CommitRuntimeTexture = function() end
+        env.DrawSprite = function(dict, name, x, y, w, h, heading, r, g, b, a)
+            stubs.drawSprites[#stubs.drawSprites + 1] = {
+                dict = dict, name = name, x = x, y = y, w = w, h = h,
+                r = r, g = g, b = b, a = a,
+            }
+        end
+        env.RegisterFontFile = function() end
+        env.RegisterFontId = function(name)
+            stubs.registeredFonts[#stubs.registeredFonts + 1] = name
+            stubs.fontIdSeq = stubs.fontIdSeq + 1
+            return stubs.fontIdSeq
+        end
+        env.GetRenderedCharacterHeight = function(size) return size * 0.045 end
+        env.SetTextFont = function(font) stubs.textFonts[#stubs.textFonts + 1] = font end
+        env.SetTextScale = function() end
+        env.SetTextColour = function() end
+        env.SetTextCentre = function() end
+        env.SetTextRightJustify = function() end
+        env.SetTextWrap = function() end
+        env.SetTextDropshadow = function() end
+        env.SetTextEdge = function() end
+        env.DrawRect = function(x, y, w, h, r, g, b, a)
+            stubs.drawRects[#stubs.drawRects + 1] = { x = x, y = y, w = w, h = h, r = r, g = g, b = b, a = a }
+        end
+        env.BeginTextCommandGetWidth = function() stubs.widthCommands = stubs.widthCommands + 1 end
+        env.EndTextCommandGetWidth = function() return 0.12 end
+        env.BeginTextCommandDisplayText = function() end
+        env.AddTextComponentSubstringPlayerName = function(text)
+            stubs.drawTexts[#stubs.drawTexts + 1] = text
+        end
+        env.EndTextCommandDisplayText = function() end
+        -- §6.7 Scaleform key hint: the movie is never there offline, so the handle is a
+        -- counter and the method stack is recorded Begin → AddParam* → End. BOOL returns
+        -- answer `1`/`false` like the default invoke route (AGENTS §8), never `true`.
+        local sfMethod = nil
+        env.RequestScaleformMovie = function(name)
+            stubs.scaleformRequests[#stubs.scaleformRequests + 1] = name
+            stubs.scaleformSeq = stubs.scaleformSeq + 1
+            return stubs.scaleformSeq
+        end
+        env.HasScaleformMovieLoaded = function(handle)
+            if not stubs.scaleformLoaded then return false end
+            return (handle and handle ~= 0) and 1 or false
+        end
+        env.SetScaleformMovieAsNoLongerNeeded = function(_handle)
+            stubs.scaleformReleased = stubs.scaleformReleased + 1
+            return 0
+        end
+        env.BeginScaleformMovieMethod = function(handle, method)
+            if stubs.scaleformBeginFails > 0 then
+                stubs.scaleformBeginFails = stubs.scaleformBeginFails - 1
+                sfMethod = nil
+                return false
+            end
+            sfMethod = { handle = handle, method = method, params = {} }
+            return 1
+        end
+        env.ScaleformMovieMethodAddParamPlayerNameString = function(text)
+            if sfMethod then sfMethod.params[#sfMethod.params + 1] = text end
+        end
+        env.ScaleformMovieMethodAddParamBool = function(value)
+            if sfMethod then sfMethod.params[#sfMethod.params + 1] = value end
+        end
+        env.EndScaleformMovieMethod = function()
+            if not sfMethod then return end
+            stubs.scaleformCalls[#stubs.scaleformCalls + 1] = sfMethod
+            sfMethod = nil
+        end
+        env.DrawScaleformMovie = function(handle, x, y, w, h)
+            stubs.scaleformDraws[#stubs.scaleformDraws + 1] =
+                { handle = handle, x = x, y = y, w = w, h = h }
+        end
     end
 
     -- runtime helpers (not natives)
