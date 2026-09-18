@@ -734,12 +734,34 @@ Net.on('core:server:respawn', {}, function(src)
     Player.respawn(src, point and point.coords, point and point.heading)
 end, { cooldown = 1000, requireLoaded = true })
 
---- One autosave pass: refresh position + playtime, then persist the dirty sessions.
+--- An autosave pass is cut into chunks (DESIGN §9 "Scale"): per session it is three natives for the position
+--- and, when dirty, a document write. 2,000 of those in one server tick every five minutes is a hitch and a
+--- burst on the database; AUTOSAVE_CHUNK sessions, then AUTOSAVE_CHUNK_MS of air, spreads a full server over
+--- about twenty seconds. With fewer sessions than one chunk the pass is a single tick, exactly as before.
+local AUTOSAVE_CHUNK <const> = 25
+local AUTOSAVE_CHUNK_MS <const> = 250
+
+--- One autosave pass: refresh position + playtime, then persist the dirty sessions. Called from the
+--- autosave thread (it may yield between two chunks), so the srcs are snapshotted first — `sessions`
+--- changes while we sleep — and a session that left in between is skipped (playerDropped saved it).
 local function autosaveTick()
-    for src, session in pairs(sessions) do
-        refreshPosition(session)
-        addPlaytime(session)
-        if session.dirty then Player.save(src) end
+    local order, count = {}, 0
+    for src in pairs(sessions) do
+        count = count + 1
+        order[count] = src
+    end
+    for i = 1, count do
+        if i > 1 and (i - 1) % AUTOSAVE_CHUNK == 0 then
+            Wait(AUTOSAVE_CHUNK_MS)
+            if not autosaveRunning then return end
+        end
+        local src = order[i]
+        local session = sessions[src]
+        if session then
+            refreshPosition(session)
+            addPlaytime(session)
+            if session.dirty then Player.save(src) end
+        end
     end
 end
 

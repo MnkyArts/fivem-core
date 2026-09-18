@@ -39,6 +39,7 @@ local NATIVE_PATTERN <const> = '^%u[%w_]+$'
 local AUDIO_MAX_TARGETS <const> = 20      -- DESIGN §20: playAt never fans out further than this
 local AUDIO_DEFAULT_RANGE <const> = 20.0
 local AUDIO_MAX_RANGE <const> = 200.0
+local audioCandidates = {}                  -- reused by Audio.playAt: PlayerGrid.candidates fills it, its count is what counts
 local MAX_ATTACHMENTS <const> = 12        -- bounds the replicated state-bag payload
 local DEFAULT_BONE <const> = 28422        -- PH_R_Hand, the usual prop bone
 local RAYCAST_MAX_DISTANCE <const> = 100.0
@@ -250,16 +251,22 @@ function Audio.playAt(coords, name, set, range)
     if maxRange > AUDIO_MAX_RANGE then maxRange = AUDIO_MAX_RANGE end
 
     local payload = { name = name, set = set, coords = Utils.vector3ToTable(pos), range = math.floor(maxRange) }
-    local players = Core.Player.getPlayers()
-    local sent = 0
-    for i = 1, #players do
+    -- The player grid (DESIGN §22.1) narrows the scan to the cells around `pos`: the old loop asked two
+    -- natives of EVERY loaded player per sound, and AUDIO_MAX_TARGETS only ever capped the sends, not
+    -- the scan. The exact distance test below still uses live coords. Everybody gets the same payload,
+    -- so it is packed once (Net.emitMany).
+    local count = Core.PlayerGrid.candidates(pos, maxRange, audioCandidates)
+    local targets, sent = {}, 0
+    for i = 1, count do
         if sent >= AUDIO_MAX_TARGETS then break end
-        local ped = GetPlayerPed(players[i])
+        local target = audioCandidates[i]
+        local ped = GetPlayerPed(target)
         if ped ~= 0 and #(GetEntityCoords(ped) - pos) <= maxRange then
-            Net.emit(players[i], 'core:client:audio', 'at', payload)
             sent = sent + 1
+            targets[sent] = target
         end
     end
+    if sent > 0 then Net.emitMany(targets, 'core:client:audio', 'at', payload) end
     return sent
 end
 

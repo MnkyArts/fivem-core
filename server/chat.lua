@@ -24,6 +24,11 @@
     Config.Chat.FadeMeters { near, far }: full inside `near`, fading linearly to 0 at `far`.
     Global, system, PM and staff lines arrive at opacity 1.
 
+    Every proximity route (sendNear, the dispatch proximity branch, /s) asks Core.PlayerGrid
+    (§22.1) for the candidates around the sender and then tests the exact distance with live
+    coordinates on those only — at 2,000 players a full loop per chat line was ~6,000 natives (§9).
+    The global, staff and faction routes are unchanged: they genuinely concern a whole set.
+
     Slash input uses CLIENT ExecuteCommand (without the slash), preserving the player's
     identity and the server command wrapper's checks. Never execute as server console.
 
@@ -36,6 +41,14 @@ local Chat = {}
 Core.Chat = Chat
 
 local Utils = Core.Utils
+local PlayerGrid = Core.PlayerGrid   -- server/playergrid.lua loads before this file (manifest order)
+
+-- Reusable candidate buffers (§22.1): one per proximity call site, so a hook handler that sends its
+-- own chat line from inside `dispatch` can never clobber the buffer the caller is walking. Nothing
+-- between the query and the last sendLine yields. Only the returned count is meaningful.
+local nearBuffer = {}
+local proximityBuffer = {}
+local screamBuffer = {}
 
 local MAX_SRC <const> = 4096
 local MAX_NAME <const> = 32
@@ -254,10 +267,11 @@ function Chat.sendNear(coords, range, message, opts)
     if type(range) ~= 'number' or range ~= range or range <= 0 then range = far end
     range = math.min(range + 0.0, MAX_RANGE)
     if type(opts) ~= 'table' then opts = nil end
-    local players = Core.Player.getPlayers()
+    -- the grid answers with candidates (§22.1); the distance below is still the exact, live one
+    local candidates = PlayerGrid.candidates(origin, range, nearBuffer)
     local sent = 0
-    for i = 1, #players do
-        local target = players[i]
+    for i = 1, candidates do
+        local target = nearBuffer[i]
         local position = Core.Player.getCoords(target)
         if position then
             local dist = #(position - origin)
@@ -387,9 +401,9 @@ local function dispatch(src, channel, message, def)
         -- linearly to 0 at `far` — further speakers lose opacity, the far edge fades out.
         local near, far = fadeMeters()
         local range = def.range or far
-        local players = Core.Player.getPlayers()
-        for i = 1, #players do
-            local target = players[i]
+        local candidates = PlayerGrid.candidates(coords, range, proximityBuffer)
+        for i = 1, candidates do
+            local target = proximityBuffer[i]
             local position = Core.Player.getCoords(target)
             if position then
                 local dist = #(position - coords)
@@ -438,9 +452,9 @@ Core.Commands.register(setting('ScreamCommand', 's'), {
     })
     if not line then return false end
     local range = screamRange()
-    local players = Core.Player.getPlayers()
-    for i = 1, #players do
-        local target = players[i]
+    local candidates = PlayerGrid.candidates(coords, range, screamBuffer)
+    for i = 1, candidates do
+        local target = screamBuffer[i]
         local position = Core.Player.getCoords(target)
         if position then
             local dist = #(position - coords)

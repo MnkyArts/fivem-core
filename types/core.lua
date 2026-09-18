@@ -23,6 +23,7 @@
 ---| '"playerSaved"'        # (server) (src) after the character document was written
 ---| '"playerDied"'         # server: (src) / client: ()
 ---| '"playerRespawned"'    # server: (src) / client: ()
+---| '"pedChanged"'         # (client) (ped, previous) — the local player's ped entity changed; previous is 0 the first time
 ---| '"playerDataChanged"'  # (server) (src, topKey, value) — emitted by Core.Player.setData
 ---| '"moneyChanged"'       # (server) (src, account, amount, delta, reason)
 ---| '"factionChanged"'     # (server) (src, summary|nil) — membership or rank of an online member
@@ -553,6 +554,7 @@ Core = {}
 ---@overload fun(hook: '"playerSaved"', fn: fun(src: integer)): any
 ---@overload fun(hook: '"playerDied"', fn: fun(src: integer)): any
 ---@overload fun(hook: '"playerRespawned"', fn: fun(src: integer)): any
+---@overload fun(hook: '"pedChanged"', fn: fun(ped: integer, previous: integer)): any
 ---@overload fun(hook: '"playerDataChanged"', fn: fun(src: integer, topKey: string, value: any)): any
 ---@overload fun(hook: '"moneyChanged"', fn: fun(src: integer, account: string, amount: integer, delta: integer, reason: string)): any
 ---@overload fun(hook: '"factionChanged"', fn: fun(src: integer, summary: CoreFactionSummary|nil)): any
@@ -953,7 +955,16 @@ function Core.Net.on(name, schema, handler, opts) end
 ---@param name string|any server: the event name; client: the first payload value
 ---@param ... any
 function Core.Net.emit(src, name, ...) end
----(server) Send to every client. Never call this from a loop.
+---(server) Send ONE payload to a list of clients: msgpack-packed once, then one internal native call per
+---target (TriggerClientEvent packs per call). Scoped delivery — "the players near X". Entries that are
+---not a positive integer are skipped.
+---@param targets integer[] array of srcs
+---@param name string
+---@param ... any
+---@return integer sent how many clients were addressed
+function Core.Net.emitMany(targets, name, ...) end
+---(server) Send to every client. Never call this from a loop, and never for something only nearby
+---players need: one reliable packet goes to every connected client (use `emitMany`).
 ---@param name string
 ---@param ... any
 function Core.Net.broadcast(name, ...) end
@@ -3082,6 +3093,30 @@ Core.Security = {}
 ---@param fn fun(sender: integer, data: table): boolean|nil
 ---@return boolean accepted
 function Core.Security.setDamageFilter(fn) end
+
+--------------------------------------------------------------------------------
+-- Core.PlayerGrid (server/playergrid.lua §22.1) — internal spatial index
+--------------------------------------------------------------------------------
+
+---The server-side player grid behind `Player.getInRange`/`getClosest` and chat's proximity routes.
+---Internal: blocked in the export like `Core.Registry`, so a plugin uses the getters instead.
+---@class Core.PlayerGrid
+Core.PlayerGrid = {}
+
+---(server, internal) Fills `out[1..count]` with the srcs near `coords`; the stale tail is left
+---behind on purpose, so use the returned count. The caller still tests the exact distance.
+---@param coords vector3
+---@param range number
+---@param out table reusable array, written from index 1
+---@return integer count
+function Core.PlayerGrid.candidates(coords, range, out) end
+---(server, internal) How many players the grid holds; 0 means the full-loop fallback.
+---@return integer
+function Core.PlayerGrid.count() end
+---(server, internal) The cell key of `src`, or nil. Tests and debug.
+---@param src integer
+---@return integer|nil
+function Core.PlayerGrid.cellOf(src) end
 
 --------------------------------------------------------------------------------
 -- Core.Registry (server/api.lua + client/api.lua §2.3) — internal bookkeeping

@@ -19,7 +19,7 @@ client_scripts {
 
 server_scripts {
     'server/api.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/db_pg.js', 'server/db_pg.lua',
-    'server/notify.lua', 'server/perms.lua', 'server/player.lua',
+    'server/notify.lua', 'server/perms.lua', 'server/player.lua', 'server/playergrid.lua',
     'server/money.lua', 'server/factions.lua', 'server/vehicles.lua',
     'server/getters.lua', 'server/globals.lua', 'server/services.lua', 'server/worldsync.lua', 'server/doors.lua',
     'server/environment.lua', 'server/cron.lua', 'server/stats.lua', 'server/weapons.lua', 'server/remote.lua',

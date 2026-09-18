@@ -130,11 +130,23 @@ Net.on('core:client:spawn', { 'vector3', 'number?', 'boolean?' }, function(coord
     Core.emitHook('playerRespawned')
 end)
 
---- Death watch: one 1 s thread, countdown rendered from the same loop (§9).
+--- Death watch: one 1 s thread, countdown rendered from the same loop (§9). The same PlayerPedId() also
+--- feeds the `pedChanged (ped, previous)` hook (§8): a model swap, a spawn or a character switch hands the
+--- player a NEW ped entity, and everything bound to the entity (config flags, proofs, attachments) is gone
+--- with the old one. One handle compare per second, one local event per change — plugins re-apply their
+--- ped-bound state from the hook instead of polling the ped themselves.
+local lastPed = 0
 CreateThread(function()
     while true do
         if loaded then
-            local dead = IsPedDeadOrDying(PlayerPedId(), true)
+            local ped = PlayerPedId()
+            if ped ~= 0 and ped ~= lastPed then
+                local previous = lastPed
+                lastPed = ped
+                Core.emitHook('pedChanged', ped, previous)
+            end
+
+            local dead = IsPedDeadOrDying(ped, true)
 
             if dead and not deadSince then
                 clearDeathState()

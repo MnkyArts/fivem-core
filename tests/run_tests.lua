@@ -595,6 +595,34 @@ local function suiteNet()
     Core.Net.emit(-1, 'srv:bad')
     eq(#stubs.sent, before, 'Net.emit refuses an invalid src')
     check(printed('Net.emit: invalid src') ~= nil, 'the invalid src is logged')
+
+    -- 9b. emitMany: scoped delivery. Without msgpack in the VM it falls back to one plain call per target.
+    before = #stubs.sent
+    eq(Core.Net.emitMany({ 1, 2, 'x', 0, 3 }, 'srv:near', 'payload'), 3, 'emitMany counts the valid targets')
+    eq(#stubs.sent - before, 3, 'emitMany sends once per valid target')
+    eq(stubs.sent[before + 1].target, 1, 'emitMany keeps the target order')
+    eq(stubs.sent[#stubs.sent].target, 3, 'emitMany skips entries that are not a positive integer')
+    eq(stubs.sent[#stubs.sent].name, 'srv:near', 'emitMany sends the event name')
+    eq(Core.Net.emitMany({}, 'srv:near'), 0, 'emitMany with nobody in scope sends nothing')
+    eq(Core.Net.emitMany('nope', 'srv:near'), 0, 'emitMany refuses a non-table target list')
+    check(printed('Net.emitMany: targets must be an array') ~= nil, 'the bad target list is logged')
+    eq(Core.Net.emitMany({ 1 }, ''), 0, 'emitMany refuses an empty event name')
+
+    -- With the runtime's msgpack the payload is packed ONCE and handed to the internal native per target.
+    local packs, internal = 0, {}
+    server.msgpack = { pack_args = function(...) packs = packs + 1; return 'PACKED' .. select('#', ...) end }
+    server.TriggerClientEventInternal = function(name, target, payload, length)
+        internal[#internal + 1] = { name = name, target = target, payload = payload, length = length }
+    end
+    before = #stubs.sent
+    eq(Core.Net.emitMany({ 4, 5, 6 }, 'srv:near', 'a', 'b'), 3, 'emitMany (packed) counts its targets')
+    eq(packs, 1, 'the payload is packed once for every target')
+    eq(#internal, 3, 'one internal native call per target')
+    eq(internal[2].target, 5, 'the internal call carries the target')
+    eq(internal[2].payload, 'PACKED2', 'every target gets the same packed payload')
+    eq(internal[2].length, #'PACKED2', 'the payload length is passed along')
+    eq(#stubs.sent, before, 'the packed path never goes through TriggerClientEvent')
+    server.msgpack, server.TriggerClientEventInternal = nil, nil
     Core.Net.on(123, {}, function() end)
     check(printed('Net.on: invalid event name') ~= nil, 'Net.on refuses a non-string name')
     Core.Net.on('t:nofn', {}, 'nope')

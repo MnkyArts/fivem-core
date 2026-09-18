@@ -291,7 +291,8 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 | `Callback.awaitClient(src, name, …)` | server → one client, awaits; `nil` on timeout/error |
 | `Net.on(name, schema, handler, opts?)` | validated handler; server `opts`: `cooldown`, `requireLoaded`, `permission`, `distance`, `onReject` |
 | `Net.emit(src, name, …)` / `Net.emit(name, …)` | server → one client / client → server |
-| `Net.broadcast(name, …)` | server → everyone; never from a loop |
+| `Net.emitMany(targets, name, …)` | server → a list of srcs; the payload is packed once. Scoped delivery ("the players near X") |
+| `Net.broadcast(name, …)` | server → everyone; never from a loop, never for something only nearby players need (one reliable packet per connected client) |
 | `Commands.register(name, opts, handler)` | `opts`: `description`, `params`, `permission`, `allowConsole`; auto usage text + chat suggestions |
 
 **Client-only libs** (§3.8–§3.12)
@@ -948,6 +949,7 @@ Hooks are local events on the same side: `Core.on('playerLoaded', fn)` / `Core.e
 | server | `vehicleSpawned` / `vehicleDeleted` | `netId, info` / `netId` |
 | server | `audit` | `category, src, message` |
 | client | `ready` / `playerLoaded` / `playerDied` / `playerRespawned` / `uiReady` | — |
+| client | `pedChanged` | `ped, previous` — the player's ped entity changed (model swap, spawn); re-apply ped-bound state (config flags, attachments) here. Not replayed for a resource that starts later |
 
 State bags are server-written, client-read. Read them with `Core.Player.get(key)` or `Entity(veh).state.x`.
 
@@ -1116,6 +1118,14 @@ also shows health, armour, speed, street/zone and a bar per `hud = true` stat.
 
 Core registers `notification`, `currency`, `death`, `time` and `weather` itself; `items` stays empty until
 an inventory plugin fills it — write against `Core.Services.get('items')` and any inventory works.
+
+**Proximity is indexed, not looped (§22.1).** `getClosest`, `getInRange` and every proximity chat route go
+through `server/playergrid.lua`, a server-side grid of `Config.World.PlayerGridSize` (128 m) cells that one
+staggered thread refreshes — two natives per player, every player once per 2 s. A query takes the players of
+the cells the circle touches (plus 64 m of slack for that staleness) and then does the **exact** distance test
+with live coordinates, so results are unchanged; at 1,000–2,000 players it just no longer costs three natives
+per player per call. `Core.PlayerGrid` is internal (blocked in the export like `Core.Registry`): use the
+getters. A player who teleports further than 64 m can be missed by a query for at most one refresh period.
 
 ### Vehicle records and key modes
 

@@ -5,8 +5,11 @@
     tables; both files load before this one (fxmanifest order), so the tables are the module tables,
     not import.lua's lazy proxies.
 
-    Everything here is O(players) or O(core vehicles) per call and meant for event handlers and
-    commands — never for a per-tick loop. `Player.getStreet` asks the player's own client
+    The proximity getters (`getClosest`, `getInRange`) ask `Core.PlayerGrid` (§22.1) for the
+    candidates of the queried circle and test the EXACT distance with live coordinates on those
+    only — identical results, without the full loop over every loaded player (§9). Everything else
+    here is O(players) or O(core vehicles) per call and meant for event handlers and commands —
+    never for a per-tick loop. `Player.getStreet` asks the player's own client
     (Core.Callback.awaitClient) and therefore yields: call it from a thread/handler coroutine.
 
     Server side only: every native below is apiset server (or client+server) — note that
@@ -16,6 +19,12 @@
 local Player = Core.Player
 local Vehicles = Core.Vehicles
 local Validate = Core.Validate
+local PlayerGrid = Core.PlayerGrid   -- server/playergrid.lua loads before this file (manifest order)
+
+-- Reusable candidate buffers (§22.1): neither getter yields, and each one has its own array, so a
+-- nested call can never clobber the other's. Only the returned count is meaningful — the tail is stale.
+local closestBuffer = {}
+local inRangeBuffer = {}
 
 local DEFAULT_PLAYER_RANGE <const> = 50.0
 local DEFAULT_VEHICLE_RANGE <const> = 20.0
@@ -94,9 +103,9 @@ function Player.getClosest(src, maxDist)
     if not origin then return nil end
     local range = rangeOf(maxDist, DEFAULT_PLAYER_RANGE)
     local bestSrc, bestDist
-    local players = Player.getPlayers()
-    for i = 1, #players do
-        local other = players[i]
+    local count = PlayerGrid.candidates(origin, range, closestBuffer)
+    for i = 1, count do
+        local other = closestBuffer[i]
         if other ~= src then
             local coords = coordsOf(other)
             if coords then
@@ -117,9 +126,9 @@ function Player.getInRange(coords, range)
     local out = {}
     if not origin then return out end
     local max = rangeOf(range, DEFAULT_PLAYER_RANGE)
-    local players = Player.getPlayers()
-    for i = 1, #players do
-        local src = players[i]
+    local count = PlayerGrid.candidates(origin, max, inRangeBuffer)
+    for i = 1, count do
+        local src = inRangeBuffer[i]
         local at = coordsOf(src)
         if at then
             local dist = #(at - origin)

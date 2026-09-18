@@ -86,7 +86,8 @@ end
 
 -- Not reachable through the export: core's own plumbing. A plugin replacing a remover, the DB adapter or
 -- the session/autosave machinery would take the whole server down with it when it stops.
-local INTERNAL_NAMESPACES <const> = { Registry = true,}
+-- PlayerGrid (§22.1) is core's own spatial index; plugins reach it through Player.getInRange/getClosest.
+local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true,}
 local INTERNAL_FUNCTIONS <const> = {
     ['DB.setAdapter'] = true,
     ['Player.loadSession'] = true,

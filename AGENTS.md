@@ -23,7 +23,7 @@ import.lua              plugin-side loader: `Core` global, lazy libs, ONE export
 shared/config.lua       every tunable (Config.*); plugins read core's copy as Core.Config
 shared/ui_manifest.lua  UIManifest.API_VERSION / dirOk / validate — the plugin manifest rules, both VMs (§38.4)
 lib/<module>/{shared,client,server}.lua   pure libs compiled INTO each plugin VM (no export hop)
-server/*.lua            stateful modules (api, db, db_pg, player, money, factions, vehicles, doors, ui, …)
+server/*.lua            stateful modules (api, db, db_pg, player, playergrid, money, factions, vehicles, doors, ui, …)
 server/ui_plugins.lua   start-up validation of every resource's ui/dist, printed to the SERVER console
 client/*.lua            world scan, interactions, markers, doors, ui shell bridge, blur, visibility, …
 client/ui_plugins.lua   discovery (core_ui metadata → manifest.json), plugin:register/unregister, /uiplugins /uidev /uiinspect
@@ -72,7 +72,17 @@ client does not hold, and entity state bags reach out-of-scope clients (DESIGN �
 
 **Performance.** No `Wait(0)` loop unless something is drawn *right now*; adaptive sleeps otherwise. Keys go
 through `RegisterKeyMapping` + `+cmd`/`-cmd`, never polled. Nothing per frame that allocates, encodes JSON,
-triggers events, reads state bags or iterates pools. Target 0.00–0.02 ms idle in resmon.
+triggers events, reads state bags or iterates pools. Target 0.00–0.01 ms idle in resmon. resmon's "CPU msec" is
+the resource's OWN time averaged over the last 64 frames: a per-frame loop of ~20 µs IS a constant 0.02 ms, and one
+tick costing X shows as X/64 for a second — so periodic scans must not allocate (GC lands in whichever tick
+triggers it), and `GetGamePool` (walks the pool, packs and unpacks a fresh table) never runs on a fast timer.
+Ped-bound state (config flags, attachments) is re-applied from the client hook `pedChanged`, not by polling the ped.
+
+**Scale.** The server is planned for 1,000–2,000 players. `Core.Net.broadcast` / `TriggerClientEvent(-1)` is one
+reliable packet per connected client: never use it for anything positional or player-triggered — keep a
+subscription per area and send with `Core.Net.emitMany(targets, …)` (payload packed once). No loop over all players
+on a timer, no client cache of server-wide data, entity state bags for per-entity data (they only reach clients that
+hold the entity). The inventory's scoped drops (inventory DESIGN §3.4.1) are the worked example.
 
 **Ownership.** Everything a plugin registers through core (markers, blips, labels, interactions, pages, doors,
 hide reasons, …) is tracked by `Core.Registry` under the calling resource and removed when it stops. New
@@ -153,8 +163,8 @@ interaction, door, cron, locale, a compiled page).
 | what | command | expect |
 |---|---|---|
 | the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
-| libs and loader | `lua5.4 tests/run_tests.lua` | `385 passed, 0 failed` |
-| server modules | `lua5.4 tests/server_tests.lua` | `776 passed, 0 failed` |
+| libs and loader | `lua5.4 tests/run_tests.lua` | `401 passed, 0 failed` |
+| server modules | `lua5.4 tests/server_tests.lua` | `842 passed, 0 failed` |
 | client UI (focus stack, discovery, requests, patches, feeds) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 277 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
 | runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 191`, `# fail 0` |

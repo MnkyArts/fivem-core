@@ -336,3 +336,19 @@ merged into README steps 26–35, and step 27 (cross-resource `import()` inside 
 decides the architecture. Also open: `@lucide/vue` and `@dnd-kit/*` are now bundled per plugin rather than once,
 so two plugins using the same library ship it twice (deliberate: a shared vendor chunk would re-introduce the
 coupling §38 removes).
+
+## Runs (2026-09-18 — scale pass: 1,000–2,000 players, driven by the inventory's performance pass)
+
+Trigger: the inventory's resmon work (inventory DESIGN §11.8) plus Liam's "we will probably have 1–2k players".
+Facts read from the FiveM source first: `TriggerClientEvent(-1)` is one reliable packet per connected client
+(`ServerResources.cpp`), entity state bags only route to clients that hold the entity (`ServerGameState.cpp`),
+resmon averages a resource's own time over 64 frames (`ResourceMonitor.h`). The "Scale." rule in AGENTS §3 is new.
+
+| run | model | owns | result |
+|---|---|---|---|
+| orchestrator | — | `lib/net/shared.lua` (`Net.emitMany`: payload packed once, one `TriggerClientEventInternal` per target), `client/main.lua` (client hook `pedChanged (ped, previous)` out of the 1 s death-watch thread), `server/remote.lua` (`Audio.playAt` on grid candidates + `emitMany`), `server/stats.lua` (decay pass chunked: 100 players / 250 ms, period compensated), `server/player.lua` (autosave pass chunked: 25 sessions / 250 ms), `tests/run_tests.lua`, DESIGN §3.6 / §4 / §8 / §9 / §20, README, `types/core.lua`, AGENTS §3 + §5 | `run_tests` 385 → 401 |
+| G | opus | `server/playergrid.lua` (new, internal `Core.PlayerGrid`: 128 m cells, staggered refresh — every player once per 2 s in 250 ms slices — `candidates(coords, range, out)` with 64 m slack, empty-grid and absurd-radius fallbacks, `pending` set for sessions without a ped), `server/getters.lua` (`getInRange`, `getClosest`), `server/chat.lua` (`sendNear`, proximity, `/s`), `server/api.lua` (internal name), `fxmanifest.lua`, `tests/server_tests.lua`, DESIGN §22.1 + §9, README, `types/core.lua` | chat proximity with 60 online asks 7 players for coords instead of 60; results identical to brute force over 300 randomised players; `server_tests` 776 → 835, orchestrator +7 (audio, chunked autosave) → 842 |
+
+Still a full loop on purpose: global/staff/faction chat, `/players`, name search, `worldsync`/`notify`
+broadcasts (genuinely global, rare). Open: `sendToPerm` asks `Perms.has` per player per staff line — a
+staff-holder index is the scale fix if staff chat ever gets busy. Nothing here was tested in game.

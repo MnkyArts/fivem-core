@@ -355,7 +355,12 @@ Net.on(name, schema, handler(src, ...), opts?)
 --     onReject = fn(src, reason),     -- optional; default: Core.Log.debug
 --   }
 Net.emit(src, name, ...)             -- TriggerClientEvent
-Net.broadcast(name, ...)             -- TriggerClientEvent(name, -1, ...); never from a loop
+Net.emitMany(targets, name, ...) -> sent  -- targets = src[]; msgpack-packs the payload ONCE, then one
+                                     -- TriggerClientEventInternal per target (TriggerClientEvent packs per call).
+                                     -- Scoped delivery ("the players near X"); non-integer / < 1 entries are skipped.
+Net.broadcast(name, ...)             -- TriggerClientEvent(name, -1, ...); never from a loop, and never for
+                                     -- something only nearby players need: -1 is one reliable packet to EVERY
+                                     -- connected client (2,000 players = 2,000 packets per call) — use emitMany.
 -- client
 Net.on(name, schema, handler(...))   -- server → client events, schema-checked (catches bugs, not cheaters)
 Net.emit(name, ...)                  -- TriggerServerEvent
@@ -495,7 +500,10 @@ Flow:
    is alive in the world). Then `emitHook('playerLoaded', src)` (only on the first answer per session).
 4. Autosave every `Config.Player.SaveIntervalMs`: for each session, refresh `data.position` from
    `GetEntityCoords(GetPlayerPed(src))` + `GetEntityHeading` (skip if ped is 0 or dead), add playtime, save
-   dirty ones. `playerDropped`: same refresh, `emitHook('playerDropped', src, charId)` **before** removal,
+   dirty ones. The pass is chunked since 2026-09-18 (§9 "Scale"): the srcs are snapshotted, then 25 sessions per
+   tick with 250 ms between chunks — a full 2,000-player server is spread over ~20 s instead of three natives and a
+   document write per player in ONE tick; below 25 sessions the pass is a single tick as before. `playerDropped`:
+   same refresh, `emitHook('playerDropped', src, charId)` **before** removal,
    save, remove session, clear `deadSince`.
 
 API (all take `src`; return `nil`/`false` when there is no loaded session):
@@ -1104,8 +1112,15 @@ Hooks (local events `core:hook:<name>`, cross-resource, same side):
 | client | `ready` | — |
 | client | `playerLoaded` | — (after the first spawn) |
 | client | `playerDied` / `playerRespawned` | — |
+| client | `pedChanged` | `ped, previous` — the local player's ped ENTITY changed (model swap, spawn, character switch); `previous` is `0` the first time |
 | client | `uiReady` | — |
 | client | `core:ui:<page>:<event>` (not under `hook:`) | `data` |
+
+`pedChanged` comes out of the death-watch thread (§6.11): the `PlayerPedId()` it already reads every second is
+compared with the last handle, so the hook costs one compare per second and one local event per change. Everything
+bound to the ped entity — `SetPedConfigFlag`, proofs, attached objects — dies with the old ped; a plugin re-applies
+it from this hook instead of polling `PlayerPedId()` itself. It fires once after `playerLoaded` (`previous = 0`) and
+is NOT replayed for a resource that starts later: such a resource applies its state once at its own start as well.
 
 ---
 
@@ -1122,13 +1137,21 @@ Hooks (local events `core:hook:<name>`, cross-resource, same side):
 | idle cam reset (§35) | client | 5000 ms | two natives; only while `Config.Camera.DisableIdleCam` |
 | notify flush | client | 100 ms timer only while queue non-empty | |
 | load request | client | 5000 ms until loaded | |
-| autosave | server | `Config.Player.SaveIntervalMs` (5 min) | |
+| autosave | server | `Config.Player.SaveIntervalMs` (5 min) | chunked: 25 sessions, then 250 ms (§4) |
+| stat decay | server | `Config.Stats.TickMs` (60 s) | chunked: 100 players, then 250 ms; the next wait is shortened by the time a pass took, so `decayPerMinute` holds |
 | DB flush | server | 5000 ms (only when dirty) | |
 | invite sweep | server | 30 s | |
+| player grid refresh | server | 250 ms per slice, every player refreshed once per 2000 ms | two natives per player per 2 s, ONE thread (§22.1) |
 
 Targets: client idle **0.00–0.02 ms**; ≤ 10 visible markers/labels **< 0.06 ms**; NUI messages ≤ 10/s
 (**replaced by §38.10**: idle = 0 messages/s, with feeds ≤ 20 messages/s total). Never:
 `TriggerClientEvent(-1)` from a loop, per-frame `.state` reads, `GetGamePool` per frame, funcref calls per frame.
+
+At 1,000–2,000 players a **full loop over every player is itself the bug**, even off a timer: `Player.getCoords`
+is three natives, so one local chat line used to cost ~6,000 native calls on the single server script thread.
+Every "who is near this position" answer therefore goes through the player grid (§22.1); a loop over
+`Player.getPlayers()` is only acceptable when the answer genuinely concerns everybody (autosave, a global chat
+channel, a staff channel).
 
 ---
 
@@ -1455,7 +1478,7 @@ Native.invoke(src, name, ...)                       -- fire-and-forget: core:cli
 Native.invokeWithResult(src, name, ...) -> ...      -- Core.Callback.awaitClient('core:native', ...)
 -- allowlist: Config.Native.Allow = nil (any global function whose name matches ^%u[%w_]+$ and exists) | { 'SetEntityHealth', ... }
 Anim.play(src, dict, clip, opts?) / Anim.stop(src)  -- client lib Core.Anim (§3.10) via core:client:anim
-Audio.playFrontend(src, name, set) / Audio.playAt(coords, name, set, range?)  -- to src, or to every player within range (server iterates sessions; ≤ 20 targets)
+Audio.playFrontend(src, name, set) / Audio.playAt(coords, name, set, range?)  -- to src, or to every player within range (≤ 20 targets; the server tests the player grid's candidates (§22.1), not every session, and sends one packed payload with Net.emitMany)
 Attachments.add(src, { id, model, bone, offset = vector3, rotation = vector3 }) -> id / Attachments.remove(src, id) / Attachments.clear(src) / Attachments.list(src)
 --   persisted in data.attachments; replicated as Player(src).state.attachments (whole table); EVERY client attaches props to that ped
 --   (state-bag change handler + a 2000 ms sweep for peds that streamed in; objects are local, created with CreateObject(…, false, false, false))
@@ -1522,6 +1545,50 @@ DB.export(path?) -> path (SaveResourceFile('core', 'data/export-<timestamp>.json
 -- console/admin commands: /dbexport, /dbimport <file> [replace] (console only)
 Player hook additions: playerDataChanged (src, topKey, value) emitted by setData; Player.setReplicated (§20)
 ```
+
+### 22.1 Player grid (2026-09-18)
+
+File: `server/playergrid.lua` (manifest order: right after `server/player.lua`). Module table
+`Core.PlayerGrid`, **internal** — listed in `INTERNAL_NAMESPACES` in `server/api.lua` exactly like
+`Registry`, so a plugin can never reach it through `exports.core:call`. Plugins get its benefit through the
+unchanged `Player.getInRange` / `Player.getClosest` and through chat.
+
+Why: §9. `Player.getInRange`, `Player.getClosest`, `Chat.sendNear`, the proximity branch of the chat
+dispatcher and `/s` all answered "who is near this position" by looping over **every** loaded player and
+calling `Player.getCoords` (three natives) per player. At 2,000 players that is ~6,000 native calls per
+local chat line, on the one server script thread, per message.
+
+```lua
+PlayerGrid.candidates(coords, range, out) -> count   -- fills out[1..count] with srcs; the TAIL IS STALE
+PlayerGrid.count() -> integer                        -- players currently held by the grid
+PlayerGrid.cellOf(src) -> key|nil                    -- tests and debug only
+```
+
+- **Cells.** Size `Config.World.PlayerGridSize` (default `128.0` m), read once at start — the key encoding
+  depends on it, so a live edit does not apply. Integer key `(cx + 32768) * 65536 + (cy + 32768)` with
+  `cx = floor(x / size)`, clamped to that range; `cells[key] = { [src] = true }` and
+  `where[src] = { key, x, y, z, at }`. The record table is reused on every update, so a refresh allocates
+  nothing.
+- **Refresh.** ONE thread. Every `STEP_MS = 250` it refreshes the next slice of the loaded players so that
+  every player is refreshed once per `REFRESH_MS = 2000`: `slice = ceil(n * STEP_MS / REFRESH_MS)`, walking a
+  src array that is rebuilt only when the player set changed (`playerJoining` — where the session is created —
+  and `playerLoaded` add and refresh that player immediately, `playerDropped` removes). Per player exactly two
+  natives, `GetPlayerPed(src)` (skip on `0`) and
+  `GetEntityCoords(ped)` — no heading, no allocation. With nobody loaded the thread sleeps 1000 ms and does
+  nothing. Never `Wait(0)`.
+- **Queries are exact, the candidate set is approximate.** `candidates` returns the srcs of every cell the
+  box around `range + SLACK` touches, `SLACK = 64.0` m — two seconds of staleness at ~30 m/s (a vehicle) is
+  60 m. The caller then does the **exact** distance test with a live `Player.getCoords(src)` on the
+  candidates only, so results are identical to the old full loop. A player who moves further than `SLACK` in
+  less than one refresh period (a teleport) can be missed for at most that period.
+- **`out` is the caller's reusable array**: `candidates` writes `out[1..count]` and never clears the tail —
+  callers must use the returned count, never `#out`.
+- **Fallback.** While `count() == 0` (the first second after a start, or a suite that never ran the thread) —
+  and for an absurd radius, `range + SLACK > 4096` m, where the cell walk would cost more than the loop —
+  `candidates` answers with every loaded player, i.e. the old full loop, so a query is never wrong, only
+  slower. A loaded player whose ped does not exist yet (`GetPlayerPed == 0`) has no cell; it is kept in a
+  pending set and added to every candidate list until its ped appears, which preserves
+  `Player.getCoords`'s saved-position fallback for exactly those players.
 
 ## 23. Chat (`Core.Chat`) — CEF messenger
 

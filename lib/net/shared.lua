@@ -19,7 +19,9 @@
     Natives: IsDuplicityVersion (shared); server side GetGameTimer,
     GetPlayerPed(playerSrc), GetEntityCoords(entity) (the server form takes one
     argument), IsPlayerAceAllowed(playerSrc, object) (only as the fallback when
-    `Core.Perms` cannot be reached).
+    `Core.Perms` cannot be reached), TriggerClientEventInternal(eventName,
+    eventTarget, eventPayload, payloadLength) (CFX, server; fxref 2026-09-18 — the
+    backing function of TriggerClientEvent, used by `emitMany` to pack once).
 ]]
 
 local ns = ...
@@ -169,7 +171,54 @@ if IsDuplicityVersion() then
         TriggerClientEvent(name, src, ...)
     end
 
-    --- Send to every client. Never call this from a loop.
+    --- Send ONE payload to several clients (scoped delivery). The runtime's TriggerClientEvent
+    --- msgpack-packs its arguments on every call; this packs once and issues one
+    --- TriggerClientEventInternal(eventName, eventTarget, eventPayload, payloadLength) per target, so
+    --- "the players near X" costs one encode, not one per player. `targets` is an array of srcs; an
+    --- entry that is not a positive integer is skipped. Returns how many clients were addressed.
+    ---@param targets integer[]
+    ---@param name string
+    ---@return integer sent
+    function ns.emitMany(targets, name, ...)
+        if type(targets) ~= 'table' then
+            Core.Log.error('Net.emitMany: targets must be an array of srcs, got %s', type(targets))
+            return 0
+        end
+        if type(name) ~= 'string' or #name == 0 then
+            Core.Log.error('Net.emitMany: invalid event name %s', tostring(name))
+            return 0
+        end
+        local count = #targets
+        if count == 0 then return 0 end
+
+        local sent = 0
+        local packArgs = type(msgpack) == 'table' and msgpack.pack_args or nil
+        if packArgs and TriggerClientEventInternal then
+            local payload = packArgs(...)
+            local length = #payload
+            for i = 1, count do
+                local src = targets[i]
+                if math.type(src) == 'integer' and src >= 1 then
+                    TriggerClientEventInternal(name, src, payload, length)
+                    sent = sent + 1
+                end
+            end
+            return sent
+        end
+        -- no msgpack in this VM (the offline suites): the plain call, once per target
+        for i = 1, count do
+            local src = targets[i]
+            if math.type(src) == 'integer' and src >= 1 then
+                TriggerClientEvent(name, src, ...)
+                sent = sent + 1
+            end
+        end
+        return sent
+    end
+
+    --- Send to every client. Never call this from a loop, and never for something only the players
+    --- near a position care about: one reliable packet goes to EVERY connected client per broadcast —
+    --- that is what `emitMany` with a scoped list is for.
     function ns.broadcast(name, ...)
         if type(name) ~= 'string' or #name == 0 then
             Core.Log.error('Net.broadcast: invalid event name %s', tostring(name))

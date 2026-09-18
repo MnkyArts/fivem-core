@@ -291,12 +291,25 @@ end
 
 -- == Decay, lifecycle ==
 
---- One decay pass over every loaded player. The document is written first and the hooks fire
---- afterwards, so a handler that yields cannot interleave with the write.
+--- A decay pass is cut into chunks (DESIGN §9 "Scale"): every player's stats change on every pass, so one
+--- pass is a document write, a replicated state-bag write and possibly hooks PER PLAYER — 2,000 of those in
+--- one server tick is a hitch and a network burst. DECAY_CHUNK players, then DECAY_CHUNK_MS of air. With
+--- fewer players than one chunk nothing changes: the pass is a single tick, exactly as before.
+local DECAY_CHUNK <const> = 100
+local DECAY_CHUNK_MS <const> = 250
+
+--- One decay pass over every loaded player (called from the decay thread: it may yield between two
+--- chunks). The document is written first and the hooks fire afterwards, so a handler that yields
+--- cannot interleave with the write. A player who left between two chunks has no stats and is skipped.
 local function decayTick(elapsedMs)
     local minutes = elapsedMs / MS_PER_MINUTE
     local players = Core.Player.getPlayers()
-    for i = 1, #players do
+    local total = #players
+    for i = 1, total do
+        if i > 1 and (i - 1) % DECAY_CHUNK == 0 then
+            Wait(DECAY_CHUNK_MS)
+            if not decayRunning then return end
+        end
         local src = players[i]
         local stats = readStats(src)
         if stats then
@@ -335,10 +348,16 @@ local function startDecay()
     if interval < MIN_TICK_MS then interval = MIN_TICK_MS end
     decayRunning = true
     CreateThread(function()
+        -- a chunked pass takes a moment on a full server: the NEXT wait is shortened by it, so the period
+        -- (and with it `decayPerMinute`) stays what the config says. Below one chunk `spent` is 0.
+        local spent = 0
         while decayRunning do
-            Wait(interval)
+            Wait(interval - spent)
             if not decayRunning then break end
+            local started = GetGameTimer()
             decayTick(interval)
+            spent = GetGameTimer() - started
+            if spent < 0 or spent >= interval then spent = 0 end
         end
     end)
     return true
