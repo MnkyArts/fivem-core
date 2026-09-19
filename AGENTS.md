@@ -9,7 +9,7 @@ on `core`. This file is the working agreement for anyone (human or agent) changi
 
 | file | role |
 |---|---|
-| `DESIGN.md` | **The binding contract.** ~3,400 lines, sections §0–§38. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes; **§37 is the design system** (tokens, classes, the component catalogue — it replaces the old §7.2 look); **§38 is the runtime UI platform** and supersedes §7.1, §7.4, §6.10's focus paragraph and §9's message budget. Read the section you touch before editing code, and update it *with* the code — never after, never not. |
+| `DESIGN.md` | **The binding contract.** ~3,400 lines, sections §0–§38. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes; **§37 is the design system** (tokens, classes, the component catalogue — it replaces the old §7.2 look); **§38 is the runtime UI platform** and supersedes §7.1, §7.4, §6.10's focus paragraph and §9's message budget; **§39 is the vitals HUD** (the bottom-left strip: mic tile, HEALTH / ARMOR plates, food / drink bars) and supersedes the HUD of §7.2 / §21 and the `Hud` / `StatsBars` rows of §37.6. Read the section you touch before editing code, and update it *with* the code — never after, never not. |
 | `ui/sdk/src/contract.ts` | **The TypeScript half of the contract** (§38.6): `API_VERSION`, `CoreUIHost` and every type the shell and a plugin share. Both sides import it, so the compiler proves the shell implements what the SDK calls. Change it and DESIGN §38 in the same commit; a breaking change bumps `API_VERSION`. |
 | `README.md` | Integrator guide: install, config keys, API cheat sheet, plugin how-to, in-game checklist, troubleshooting. Update it whenever an API, config key or command changes. |
 | `PLAN.md` | History of the build runs (who owned which file). Append a run table for multi-agent work. |
@@ -169,18 +169,18 @@ interaction, door, cron, locale, a compiled page).
 |---|---|---|
 | the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
 | libs and loader | `lua5.4 tests/run_tests.lua` | `401 passed, 0 failed` |
-| server modules | `lua5.4 tests/server_tests.lua` | `842 passed, 0 failed` |
-| client UI (focus stack, discovery, requests, patches, feeds, world prompts) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 470 passed, 0 failed` |
+| server modules | `lua5.4 tests/server_tests.lua` | `863 passed, 0 failed` |
+| client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 542 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
 | runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 191`, `# fail 0` |
 | types | `npx vue-tsc --noEmit -p ui/tsconfig.json` | no output, exit 0 |
-| generated kit tags | `node ui/scripts/gen-kit-types.mjs --check` | `up to date (62 kit components)` |
-| every plugin's dist | `node ui/scripts/check-plugins.mjs` | `4 UI plugin(s) […], 0 error(s), 0 warning(s)` |
+| generated kit tags | `node ui/scripts/gen-kit-types.mjs --check` | `up to date (64 kit components)` |
+| every plugin's dist | `node ui/scripts/check-plugins.mjs` | `5 UI plugin(s) […], 0 error(s), 0 warning(s)` |
 | rulebook lint | `fxlint resources/core` (and the plugin) | `0 error(s), 0 warning(s)` |
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
 | a plugin's bundle | `npm run build -w <resource>-ui` (from `resources/`) | writes `<plugin>/ui/dist`, ~1 s |
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
-| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 107/107`, `PASS 195/195`, `PASS 152/152` |
+| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 228/228`, `PASS 152/152` |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
 | benchmarks | `node ui/tests/bench.mjs` | rewrites `ui/tests/BENCH.md` (never hand-edit it) |
@@ -246,6 +246,12 @@ never manual edits of live rows.
   fallback and keeps the `color-mix()` behind `@supports`, which `coreUI()`'s lint accepts — but individual `translate-*`/`rotate-*`/`scale-*`
   utilities are still banned; Chromium 103 ignores them silently.
 - Tailwind's rem scale assumes a 16px root; the shell keeps it and sets 14px on `body` only.
+- Tailwind v4's `max-[…]:` / `min-[…]:` variants compile to media-query RANGE syntax (`width < 1700px`), which
+  Chromium 103 does not parse — the rule silently never applies. Write the classic query through an arbitrary
+  variant: `[@media(max-width:1699px)]:bottom-[22vh]` (Progress.vue, DESIGN §39.4).
+- A skewed kit shape (`skewX` on a wrapper, content un-skewed inside): the inner `transform-origin` must be the
+  OUTER shape's centre line, not the inner box's, or the two skews leave a horizontal offset of
+  `tan(angle) · Δy` (CoreVital: 8.75 mockup px before it was found by overlaying the render on the mockup).
 - A door whose model hash does not match the object at its coords controls nothing — `/doorfind`.
 - State-bag change handlers never fire for keys that existed before the script started: seed on load.
 - Console commands run as `src == 0`; devtools `fxclient exec --server` is that console.

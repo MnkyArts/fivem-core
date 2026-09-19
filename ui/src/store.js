@@ -38,10 +38,15 @@ export const store = reactive({
   input: { visible: false, id: null, title: '', fields: [], submit: 'OK', cancel: 'Cancel' },
   alert: { visible: false, id: null, title: '', message: '', confirm: 'OK', cancel: 'Cancel' },
   // §21 adds the hudfeed fields: health / armour / speed stay null until Lua pushes a
-  // number, so a server without client/hudfeed.lua renders exactly the v1 HUD.
+  // number, so a server without client/hudfeed.lua draws no plate at all. §39 adds the
+  // voice tile and the placement: `talking` stays NULL until a voice feed pushes a boolean
+  // (no feed = no tile), `anchor` / `scale` ride along with the minimap rect. cash, bank,
+  // name, serverId, faction and speed / street / zone are no longer drawn by core — they
+  // stay here because `useHud()` hands them to plugin pages (§39.4).
   hud: {
     visible: false, cash: 0, bank: 0, name: '', serverId: 0, faction: false,
     health: null, armour: null, speed: null, street: '', zone: '', minimap: null,
+    talking: null, muted: false, anchor: 'bottom-left', scale: 1,
   },
   shard: { visible: false, seq: 0, title: '', subtitle: '', style: 'info', duration: 0 },
   spinner: { visible: false, text: '' },
@@ -54,7 +59,11 @@ export const store = reactive({
   // the server says this player may use; `channel` is the selected chip (the server
   // still validates every send).
   chat: { ...CHAT_DEFAULTS, lines: [], suggestions: [], channels: [], channel: 'local', open: false, activity: 0 },
-  stats: {},      // name -> { name, label, value, min, max } (Config.Stats defs with hud = true)
+  // name -> { name, label, value, min, max, slot?, icon? } — every Config.Stats def whose
+  // `hud` is not false. §39.4: an entry WITH a `slot` ('health' / 'armour') is drawn as the
+  // bar cut out of that vital plate by Hud.vue; one without a slot gets a rail row in
+  // StatsBars.vue. `icon` is the registry name of the glyph under a slotted bar.
+  stats: {},
   state: {},      // replicated player state, read by pages through CoreUI.state
   locale: { lang: 'en', strings: {} },
   // §38.6: the page slice is owned by runtime/pages.ts (it is attached below) — the records live
@@ -248,14 +257,22 @@ export function clearWorldPrompts() {
   store.worldprompts.items.splice(0, store.worldprompts.items.length)
 }
 
-/** One `stats:set` entry -> a bar. Bad numbers collapse to a 0..100 bar at 0. */
+/** §39.4: the only two plates a stat bar can be cut out of. Anything else is a rail row. */
+const STAT_SLOTS = ['health', 'armour']
+
+/** One `stats:set` entry -> a bar. Bad numbers collapse to a 0..100 bar at 0.
+ *  `slot` and `icon` (§39.5) are OPTIONAL and the key is omitted when the message has
+ *  nothing usable, so `entry.slot === undefined` is the plain "this is a rail row" case. */
 function statEntry(name, raw) {
   const def = raw && typeof raw === 'object' ? raw : { value: raw }
   const min = Number.isFinite(Number(def.min)) ? Number(def.min) : 0
   const maxRaw = Number.isFinite(Number(def.max)) ? Number(def.max) : 100
   const max = maxRaw > min ? maxRaw : min + 100
   const value = Math.min(max, Math.max(min, Number(def.value) || 0))
-  return { name, label: def.label ? String(def.label) : name, value, min, max }
+  const entry = { name, label: def.label ? String(def.label) : name, value, min, max }
+  if (STAT_SLOTS.indexOf(def.slot) !== -1) entry.slot = def.slot
+  if (def.icon) entry.icon = String(def.icon)
+  return entry
 }
 
 // -------------------------------------------------------------------- game blur (§32)
@@ -288,7 +305,10 @@ export function resetExtras() {
   clearWorldPrompts()
   for (const name of Object.keys(store.stats)) delete store.stats[name]
   for (const key of Object.keys(store.state)) delete store.state[key]
-  Object.assign(store.hud, { health: null, armour: null, speed: null, street: '', zone: '', minimap: null })
+  Object.assign(store.hud, {
+    health: null, armour: null, speed: null, street: '', zone: '', minimap: null,
+    talking: null, muted: false, anchor: 'bottom-left', scale: 1,
+  })
   store.chat.lines.splice(0, store.chat.lines.length)
   store.chat.suggestions = []
   Object.assign(store.chat, CHAT_DEFAULTS, { channels: [], channel: 'local', open: false, activity: store.chat.activity + 1 })
@@ -316,6 +336,8 @@ export const pageProps = Pages.propsFor
 const HUD_KEYS = [
   'visible', 'cash', 'bank', 'name', 'serverId', 'faction',
   'health', 'armour', 'speed', 'street', 'zone', 'minimap',
+  // §39.5, the same four client/ui.lua lets through
+  'talking', 'muted', 'anchor', 'scale',
 ]
 
 const actions = {
@@ -386,8 +408,15 @@ const actions = {
       if (name === 'action' || name === 'stats') continue
       seen[name] = true
       const entry = statEntry(name, src[name])
-      if (store.stats[name]) Object.assign(store.stats[name], entry)
-      else store.stats[name] = entry
+      const current = store.stats[name]
+      if (current) {
+        // The object identity is kept (a page holds it through `CoreUI.stats`), but the
+        // merge has to drop what the new message no longer carries: a def that stops being
+        // `hud = 'health'` would otherwise keep its stale `slot` and never come back to the
+        // rail (§39.5).
+        for (const key of Object.keys(current)) if (!(key in entry)) delete current[key]
+        Object.assign(current, entry)
+      } else store.stats[name] = entry
     }
     for (const name of Object.keys(store.stats)) if (!seen[name]) delete store.stats[name]
   },

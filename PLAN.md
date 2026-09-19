@@ -631,3 +631,39 @@ among several drops is the number this run exists for.
 N10 in game (Liam, 2026-09-19, after the deploy): "it's perfect" — the hint with the baked tracking and the
 composite idle dots are accepted as they are. Never reported, so not claimed anywhere: resmon for `core` (hint
 up, several drops in view, the direct native route before/after) and the probe's modes E/F.
+
+## Run H1 — the vitals HUD (2026-09-19, DESIGN §39)
+
+Liam: "update core's HUD to [mockup] … exactly, 1to1", then three rulings while it was built: each vital is ONE
+parallelogram whose cut-off bottom slice is the food / drink bar, the two are exactly the same size; "remove the
+red and blue" end caps and "make sure the progressbar angle is the same angle as the parallelogram — the mockup
+was AI generated so it has some geometry issues that make no sense"; after the first build (30 px unit, viewport
+scaled, ≈ 440 px) "way too huge … it must be like 200 width max"; and after the 13 px build "it looks great but the
+200 width was way too small, make it like 365" — the default unit is 24 px (≈ 351 × 76 px, fixed px).
+
+Method: the orchestrator measured the 2048 × 682 image (edge fits, colour samples, glyph boxes), rebuilt it as a
+to-scale HTML prototype in the scratchpad, overlaid and diffed it against the image until geometry and colour were
+within 1–3 px, THEN normalised it per the rulings (one 20° angle for sides and both progress edges — the fill is a
+`clip-path: inset()` inside the skewed shape, so a second angle is impossible by construction; equal gaps; centred
+content; point-symmetric corners; tile as tall as the vitals) and wrote §39 from the prototype's numbers. Glyphs:
+mic rebuilt from primitives (+ a knocked-out muted twin), heart and shield traced from the mockup and mirrored
+(potracer), food / drink = Lucide `hamburger` / `coffee` outlined to one filled path each (picosvg / skia-pathops),
+so CoreIcon needed no stroke mode. The built shell was diffed against the prototype at identical scale: 0.5 % of
+pixels beyond an 8 % fuzz.
+
+| agent (Opus) | owned | result |
+|---|---|---|
+| K — kit | `ui/sdk/theme.css`, `kit/icons.js` (`hud-*` group), `CoreVital.vue`, `CoreHudTile.vue`, their blocks in `css/data-meters.css` / `css/game.css`, `Kit/Data/Vital` + `Kit/Game/Hud Tile` stories and scenes, `FoundationsColors.vue`, `kit-regression.js`, generated `client.d.ts` | 62 → 64 components, 7 tokens, 6 glyphs; kit suite 195 → 213; follow-up: the active tile keeps its drop shadow, the sub bar fades through real background colours |
+| L — Lua | `shared/config.lua`, `client/hudfeed.lua`, `client/ui.lua` (HUD + stats bridge), `client/stats.lua`, `server/stats.lua`, `locales/*.json`, `types/core.lua`, `tests/{client_ui,server}_tests.lua`, `tests/stubs.lua` | feed at 100 ms (mic every tick, vitals 250 ms, mumble link 1000 ms, reused payload table, speed / street opt-in), `hud.set` keys `talking` / `muted` / `anchor` / `scale` (bad values dropped, not clamped), stat `hud = true \| 'health' \| 'armour'` + `icon`; server 842 → 863, client UI 470 → 542 |
+| S — shell | `shell/Hud.vue`, `shell/StatsBars.vue`, `App.vue`, `store.js`, `sdk/src/contract.ts`, `coreui.js`, `shell/Progress.vue`, the HUD / Stat Bars / Shell / GameBlur stories, `shell-regression.js`, `html/`; from round 2 also the two kit blocks and gallery scenes | the strip next to the minimap, slotted stats as sub bars, unslotted ones stay on the rail; three review rounds (box contains the sub glyph; anchors cut to `minimap` \| `bottom-left`; progress lift under 1700 px; locale-driven tile label; then the 13 px unit and 0.92 em glyphs — F later moved the default to 24 px); shell suite 107 → 122, kit 213 → 217 |
+| D — docs | `README.md`, `stories/docs/{DesignSystem,Protocol,Introduction,PluginPages}.mdx` | config rows, tag list, token row, §18 / §21 prose, checklist steps 1 / 11 / 18 / 21 / 23 rewritten + new step 37 |
+| orchestrator | `DESIGN.md` (§39, §37.2, §37.5, §37.6, §18, §28), `AGENTS.md`, this file; one direct fix: `Hud.vue` imports its two kit components by path (§37.6) | `scripts/check.sh --full` exit 0 on the final tree |
+
+| F — effect | `CoreVital.vue`, its CSS block, `theme.css` (+2 tokens), the Vital gallery / story, `FoundationsColors.vue`, both regression suites, `html/` | §39.3.1, from Liam's two reference clips (health loss, health gain — "it has some cool effect, I also want that"), measured frame by frame at 30 fps: one extra layer under the fill with the SAME clip target, direction classes that only swap transition durations (loss: fill 0.3 s, red chunk 0.65 s; gain: green chunk 0.15 s, fill 0.55 s), cleared after 900 ms; kit suite 217 → 228, shell 122 → 124 |
+
+Review decisions worth keeping: a centre or right anchor was specified, built and then REMOVED (the bottom centre
+is the progress bar's and the text UI's, the bottom right the key hints' and the spinner's); `ShowSpeed` /
+`ShowStreet` default to false because core no longer draws them (plugins reading `useHud().speed/street/zone`
+turn them on); the unit is fixed px like the rest of the shell, `Config.Hud.Scale` is the knob. In game (open, the
+README's step 37): placement against the real minimap / `sf_minimap`, the mic tile with pma-voice, resmon with the
+100 ms tick, legibility of the 13 px unit at Liam's resolution.

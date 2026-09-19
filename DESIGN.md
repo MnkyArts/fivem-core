@@ -1412,7 +1412,7 @@ Client (inside `Core.onReady`): blip (sprite 52, colour 2, "Example shop"), mark
 "Example 24/7", interaction `{ coords, radius = 2.0, label = 'Buy a snack ($5)', marker = {...}, onInteract = function()
 if Core.UI.progress({ label = 'Buying...', duration = 2000, canCancel = true }) then Core.Net.emit('core_example:server:buySnack') end end }`;
 `Core.Net.on('core_example:client:snack', { 'integer' }, function(heal) SetEntityHealth(...) end)`; `Core.Keys.register({ name =
-'page', key = 'F5', description = 'Example page', onPress = function() Core.UI.open('core_example', { opened = GetGameTimer() }) end })`;
+'page', key = 'F9', description = 'Example page', onPress = function() Core.UI.open('core_example', { opened = GetGameTimer() }) end })`;
 `Core.UI.registerPage('core_example', { type = 'page' })` (the page component lives in `core_example/ui/src/index.js` + `Page.vue` and is compiled into core's bundle);
 `Core.UI.on('core_example', 'greet', function(data) local reply = Core.Callback.await('core_example:greet', data.name)
 Core.UI.send('core_example', 'greeting', { text = reply }) end)`; `Core.UI.on('core_example', 'menu', function() local v =
@@ -1428,7 +1428,7 @@ Core.UI.menu.open({ title = 'Example', items = { { label = 'Notify me', value = 
 2. `/car adder` (admin) → vehicle spawns, you are warped in, `U` toggles the lock (notify + doors), a second player without keys pressing `U` → "no keys".
 3. Walk to the Strawberry 24/7 → blip on the map, marker + text label within 30 m, `[E] Buy a snack ($5)` within 2 m → E → progress bar 2 s → cash −5, health +25; press X during the progress → nothing charged.
 4. Stand 4 m away and trigger `core_example:server:buySnack` manually (F8 console) → nothing happens.
-5. F5 → example page opens with cursor, ESC closes it and the cursor is gone; restart `core_example` while open → page closed, focus released.
+5. F9 → example page opens with cursor, ESC closes it and the cursor is gone; restart `core_example` while open → page closed, focus released.
 6. `/faction create Test TST` → $25,000 leaves the bank, HUD shows `TST`; invite a second player, accept → both show it; `/faction leave`.
 7. Die → "Respawn in 8 s" countdown → respawn at the nearest hospital, `dead` state false; `/revive` from console works.
 8. Disconnect and rejoin → position, money and faction persisted; restart `core` while online → no re-spawn, HUD refreshed, markers/interactions of core_example re-registered.
@@ -1605,11 +1605,14 @@ Files: `server/stats.lua`, `client/stats.lua`. Config:
 Config.Stats = {
     Enabled = true, TickMs = 60000,
     Defs = {
-        hunger = { min = 0, max = 100, default = 100, decayPerMinute = 0.4, thresholds = { 25, 10 }, hud = true },
-        thirst = { min = 0, max = 100, default = 100, decayPerMinute = 0.6, thresholds = { 25, 10 }, hud = true },
+        hunger = { min = 0, max = 100, default = 100, decayPerMinute = 0.4, thresholds = { 25, 10 }, hud = 'health', icon = 'hud-food' },
+        thirst = { min = 0, max = 100, default = 100, decayPerMinute = 0.6, thresholds = { 25, 10 }, hud = 'armour', icon = 'hud-drink' },
     },
 }
 ```
+
+`hud` is `true` (a bar on the rail plate), `'health'` / `'armour'` (the bar cut out of that HUD plate, §39) or
+`false`; `icon` is a kit icon name for the slot's glyph.
 
 ```lua
 Stats.get(src, name) -> number, Stats.set(src, name, value) -> bool, Stats.add(src, name, delta), Stats.sub(src, name, delta)
@@ -1880,7 +1883,8 @@ the NUI (`locale:set` on `ui_ready`); plugin pages import their own locale JSON 
 'CLOUDS', 'OVERCAST', 'RAIN', 'CLEARING', 'THUNDER', 'SMOG', 'FOGGY', 'XMAS', 'SNOW', 'SNOWLIGHT', 'BLIZZARD', 'HALLOWEEN' },
 DefaultWeather = 'CLEAR', WeatherCycle = nil }`, `Stats` (§18), `Weapons = { Allowed = nil, SnapshotIntervalMs = 60000 }`,
 `Native = { Allow = nil }`, `Chat` (§23), `Security` (§25), `Doors = { InteractDistance = 2.0 }`, `DB.Adapter = 'kvp'`,
-`Hud = { ShowHealth = true, ShowArmour = true, ShowStats = true, ShowSpeed = true, ShowStreet = true }`.
+`Hud = { ShowHealth = true, ShowArmour = true, ShowStats = true, ShowSpeed = true, ShowStreet = true }` (superseded by §39.5:
+`ShowVoice`, `Anchor`, `Scale` joined and `ShowSpeed` / `ShowStreet` default to false).
 
 ## 29. Wave 2 implementation notes (decisions taken while building)
 
@@ -2576,6 +2580,13 @@ values change and new ones join. `@theme` (→ Tailwind utilities) :
 --color-fg: #f3f5f7;  --color-fg-dim: rgba(231, 237, 243, 0.66);  --color-fg-faint: rgba(231, 237, 243, 0.40);
 --color-key: #fbfbfb; --color-key-fg: #11161b;
 
+/* §39 — the vitals HUD: white plates over the game, their ink, the drained track, glyphs ON the plate, the mic tile */
+--color-plate: #f2f3f6;  --color-plate-lo: #eaedf1;  --color-plate-fg: #11171f;
+--color-plate-track: rgba(62, 66, 74, 0.92);
+--color-plate-health: #c6022a;  --color-plate-armour: #0152b0;
+--color-plate-loss: #f00645;  --color-plate-gain: #0bfd69;   /* §39.3.1: the chunk a vital just lost / gained */
+--color-hud-tile: rgba(32, 36, 39, 0.85);
+
 --radius-ui: 6px;  --radius-ui-sm: 4px;  --radius-ui-xs: 3px;
 --shadow-ui: 0 14px 40px rgba(0, 0, 0, 0.50);  --shadow-ui-sm: 0 4px 14px rgba(0, 0, 0, 0.40);
 --shadow-ui-lg: 0 30px 80px rgba(0, 0, 0, 0.60);
@@ -3022,6 +3033,15 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   core-tone-<tone> is-low` + `__icon __track __fill __value` · click-through; icon 20 px in the tone, bar
   10 px in a `panel-sunken` well, value display 600 19 px tabular with a 44 px floor width, so 100 → 75 cannot
   resize the plate around it.
+- **CoreVital** — the HUD's slanted vital plate (§39: one parallelogram, the top slice the vital, the cut-off
+  bottom slice a second stat's bar, its glyph underneath). `label`, `icon`, `tone` (`health`), `value`, `max`
+  (100), `lowBelow` (25 → the icon pulses), `subValue` (`null` = no bar, `--solo`), `subMax` (100), `subIcon`,
+  `subLabel`, `subWarnBelow` (25), `subDangerBelow` (10), `unit` (px | CSS length → `--core-hud-unit`) · — · — ·
+  `core-vital core-vital--solo core-tone-<tone> is-low is-loss is-gain is-sub-warning is-sub-danger is-sub-loss
+  is-sub-gain` + `__shape __plate __content __icon __label __chunk __fill __bar __subchunk __subfill __subicon` · click-through; every length in `em` (1 em = 100 mockup px,
+  default unit 24 px), `skewX(-20deg)` shape, fills are `clip-path: inset()` driven by `--core-vital-value` /
+  `--core-vital-sub` (0..1) so every progress edge has the parallelogram's angle; the content is drawn twice
+  (track look under the fill, plate look inside it) for the two-tone label. Geometry, colours and structure: §39.1–§39.3.
 - **CoreStatRow** — detail stat (`♥ HEALTH RESTORE … +75`). `icon`, `label`, `value`, `tone` (no default — an
   untoned row keeps its value in `fg`, exactly like the mockup), `hairlines:
   'both'|'top'|'bottom'|'none'` (`both`) · `value` · — · `core-statrow core-statrow--line-<hairlines>
@@ -3155,6 +3175,10 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   scales in on the SAME anchor and the band (icon · label · description, `--color-hud`, dissolving like
   CorePrompt's) slides out to the side; disabled + focused shows an outline cap with a `lock` glyph. The shell
   mounts it from `worldprompts:set` (§6.7); a page may compose it directly.
+- **CoreHudTile** — the slanted dark HUD tile next to the vitals (§39: the mic tile). `icon` (`hud-mic`), `active`
+  (false → `fg` ring + soft glow), `dimmed` (false → glyph at 40 %), `label` (a11y name), `unit` · — · — ·
+  `core-hudtile is-active is-dimmed` + `__shape __icon` · click-through; 2.25 × 2.05 em in the vital's unit
+  system, `skewX(-20deg)`, `--color-hud-tile`, hairline `--color-border`, the glyph upright and centred (§39.3).
 #### Feedback (`css/feedback.css`)
 
 - **CoreAlert** — inline banner. `tone` (`info`), `title`, `text`, `icon` (auto by tone; `icon=""` drops it),
@@ -3234,8 +3258,8 @@ resolved through global registration), and the store, `bridge.js`, `coreui.js`, 
 
 | widget | composed from |
 |---|---|
-| `Hud` | `CorePanel variant="hud"` (glass) · CoreKeyValue money rows in the display voice · CoreStatBar health/armour (tone by threshold, `iconTone`) · CoreKeyValue speed/place · CoreTag faction (tone from its colour) · CoreDivider |
-| `StatsBars` | `CorePanel variant="hud"` · one inline CoreProgress per stat (vital tone, warning/danger thresholds) |
+| `Hud` | **§39**: the bottom strip — CoreHudTile (mic: `talking` → `active`, `muted` → `hud-mic-off` + `dimmed`) · CoreVital health · CoreVital armour, the slotted `stats:set` entries as their sub bars; placed by `hud.anchor`, sized by `--core-hud-unit` |
+| `StatsBars` | `CorePanel variant="hud"` · one inline CoreProgress per stat WITHOUT a HUD slot (§39.4; vital tone, warning/danger thresholds) — empty with the default config |
 | `Notifications` | TransitionGroup of CoreToast (tone = type, `count`) |
 | `Shard` | CoreShard (a kit component: the full-bleed band, `style` wasted/success/info), keyed by `seq` |
 | `TextUI` | CorePrompt (`key` → cap, `text` → label) in the four `pos-*` placements |
@@ -3752,3 +3776,191 @@ and the kit. inventory, charcreator, trucking, core_example and `templates/plugi
 side effects at module scope (inventory's store subscriptions and window listeners) move into `setup(ctx)`.
 `Core.UI.registerPage(id, { script, style })` logs an error pointing here. Their Lua is otherwise untouched —
 `registerPage`/`open`/`send`/`on` keep their signatures.
+
+---
+
+## 39. The vitals HUD — mic tile, HEALTH and ARMOR plates, food and drink bars (2026-09-19, Liam's mockup)
+
+Liam's mockup (`DesignMockups`-style AI image, 2048 × 682) replaces the top-right HUD plate of §7.2 / §21 / the
+`Hud` + `StatsBars` rows of §37.6. **This section overrides them.** The HUD is ONE horizontal strip:
+
+```
+ ╱▔▔▔▔╱  ╱▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔╱  ╱▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔╱
+╱ mic ╱  ╱  ♥  HEALTH        ╱  ╱  ⛨  ARMOR         ╱      plate  = health / armour (0–100 %)
+▔▔▔▔▔▔  ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔  ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔       — the cut —
+        ╱▂▂▂▂▂▂▂▂▂▂▂▂▂▂▒▒▒▒╱  ╱▂▂▂▂▂▂▂▂▂▂▂▂▂▒▒▒▒▒╱        bar    = food / drink (the stat in that slot)
+               🍔                     ☕
+```
+
+Liam's rulings on the mockup (it is AI generated and its geometry is not self-consistent): each vital is **one
+parallelogram** whose bottom slice is cut off and used as the food / drink progress bar; the two parallelograms
+are **exactly the same size**; the red and blue end caps of the image are **removed**; **every slanted edge —
+the sides, the progress edges of plate and bar — has the same angle**; everything else that "makes no sense"
+is normalised (equal gaps, equal heights, centred content, point-symmetric corners). Colours, type, glyphs,
+proportions and the cut are the mockup's, measured.
+
+### 39.1 Geometry (one unit system)
+
+Every length is in **`em`, and `1em` = 100 px of the mockup**. The unit is the font size of the component root:
+`font-size: var(--core-hud-unit, 24px)`. **24 px is the default** — Liam's rulings on the rendered size: the
+first build (30 px, viewport-scaled, ≈ 440 px wide) was "way too huge, it must be like 200 px wide max"; the 13 px
+build that followed (≈ 200 px) "looks great but … was way too small, make it like 365". 24 px ⇒ the strip is
+≈ 351 × 76 px of layout, ≈ 369 px of ink with the skew overhang. The unit is FIXED px like the rest of the shell
+(rail 268 px, progress 340 px), not viewport-relative; `Config.Hud.Scale` is the one knob. Nothing in the two components is written in px except
+`max(1px, …)` floors on hairlines.
+
+| measure | value |
+|---|---|
+| slant | `skewX(-20deg)` on the `__shape` wrapper (top leans right); content is un-skewed with `skewX(20deg)` about the SHAPE's centre line, so icon and label stand upright and exactly where the layout puts them |
+| vital | shape 6 × 2.05 em = plate 1.57 + cut 0.18 + bar 0.30; the component's BOX is 6 × 3.17 em, because it contains the sub glyph under the bar (so a caller that places the strip by its bottom edge places the glyphs, not the bars); without a sub stat (`--solo`) shape and box are 6 × 1.57 em |
+| tile | 2.25 × 2.05 em (the vital's height; 1.57 em next to `--solo` vitals is the caller's business: `height` follows `--core-hudtile-h`) |
+| gap between strip items | 0.19 em (the 0.18 em cut seen across a 20° edge: 0.18 / cos 20°) — the shell's spacing, not the components' |
+| corners | obtuse (top-left, bottom-right) `0.22em`; acute (top-right, bottom-left) `0.3em / 0.24em` (h / v — a sheared corner needs the longer horizontal radius to read as round); the four corners on the cut `0.035em`. Point-symmetric, so plate + bar read as one rounded parallelogram. `--solo` plates and the tile wear the four outer radii. |
+| content | flex row, vertically centred in the plate, `padding-left: 0.9em`; icon box 1.2 em; label `margin-left: 0.62em` |
+| label | `--font-display` 600, `0.757em` (cap height 0.53 em), uppercase, `line-height: 1`, no tracking, `transform: scaleX(1.25)` from its left edge — Barlow Condensed SemiBold widened to the mockup's letterforms (H = 0.35 em wide, stems 0.10 em) |
+| sub icon | 0.92 em box, top at 2.25 em, horizontally centred on the BAR's visual centre: `left: calc(50% - 0.32em - 0.46em)` (the bar sits 0.875 em under the shape's centre line: 0.875 · tan 20° = 0.32 em to the left). The mockup draws it at 0.69 em; the design carries it a third larger — the proportion Liam approved on the compact 13 px build (where 0.69 em was a 9 px glyph with sub-pixel strokes), kept at 24 px so the look is the same and a `Scale = 0.5` strip still gets an ≈ 11 px glyph |
+| shadow | `0 0.04em 0.18em rgba(0, 0, 0, 0.35)` on plate, bar and tile — white plates need an edge over a bright sky |
+
+### 39.2 Tokens (added to `ui/sdk/theme.css`, §37.2)
+
+```css
+--color-plate: #f2f3f6;      --color-plate-lo: #eaedf1;   /* the white plate: a top → bottom gradient */
+--color-plate-fg: #11171f;                                 /* label ink on the plate */
+--color-plate-track: rgba(62, 66, 74, 0.92);               /* the drained part of plate and bar */
+--color-plate-health: #c6022a;  --color-plate-armour: #0152b0;   /* glyph colours ON the white plate */
+--color-plate-loss: #f00645;    --color-plate-gain: #0bfd69;     /* the change chunk of §39.3.1 (sampled from Liam's clips) */
+--color-hud-tile: rgba(32, 36, 39, 0.85);                  /* the mic tile */
+```
+
+On the dark track a glyph wears the ordinary vital tone (`--tone`: `--color-health` / `--color-armour`, made for
+dark ground); on the white fill it wears `--color-plate-<tone>` (health, armour) or `--tone` for any other tone.
+
+### 39.3 Kit components (catalogue entries in §37.5)
+
+**CoreVital** (`css/data-meters.css`) — props `label`, `icon`, `tone` (`health`, any METER_TONE), `value`, `max`
+(100), `lowBelow` (25; 0 = off → the ICON pulses, nothing else moves), `subValue` (`null` = no bar: `--solo`),
+`subMax` (100), `subIcon`, `subLabel` (a11y name of the bar), `subWarnBelow` (25), `subDangerBelow` (10), `unit`
+(number px | CSS length → `--core-hud-unit` inline; omitted = inherit the variable). Structure:
+
+```html
+<div class="core-vital core-tone-health [core-vital--solo] [is-low] [is-sub-warning|is-sub-danger]"
+     style="--core-vital-value: 0.81; --core-vital-sub: 0.8" role="progressbar" aria-label="Health" aria-valuenow…>
+  <div class="core-vital__shape">
+    <div class="core-vital__plate">                      <!-- track + hairline, overflow hidden, the radii -->
+      <div class="core-vital__content">icon + label</div>            <!-- the look ON THE TRACK: fg label, --tone glyph -->
+      <div class="core-vital__chunk" aria-hidden="true"></div>       <!-- §39.3.1: the loss / gain chunk, under the fill -->
+      <div class="core-vital__fill" aria-hidden="true">              <!-- the white plate, clipped to the value -->
+        <div class="core-vital__content">icon + label</div>          <!-- the same content, plate ink + plate tone -->
+      </div>
+    </div>
+    <div class="core-vital__bar" role="progressbar" aria-label="…"><div class="core-vital__subchunk"></div><div class="core-vital__subfill"></div></div>
+  </div>
+  <CoreIcon class="core-vital__subicon" />
+</div>
+```
+
+The fill is `clip-path: inset(0 calc((1 - var(--core-vital-value)) * 100%) 0 0)` **inside the skewed shape**: a
+vertical clip edge in local space IS the parallelogram's angle on screen — no polygon, no second angle. The
+content exists twice, pixel-identical, so a half-drained plate shows a two-tone label split along that edge.
+`transition: clip-path 0.3s var(--ease-ui)`; values arrive as 0..1 custom properties, never as widths. Sub bar:
+plate white while healthy, `--color-warning` under `subWarnBelow`, `--color-error` + pulsing icon under
+`subDangerBelow` (fill and sub icon together). Hairline on plate and bar (visible on the drained part only, the
+fill covers it): `inset 0 max(1px, 0.02em) 0 rgba(255,255,255,.3), inset 0 0 0 max(1px, 0.015em) rgba(255,255,255,.16)`.
+Click-through, like every HUD read-out.
+
+#### 39.3.1 The change effect — a red chunk on loss, a green chunk on gain (Liam's two reference clips)
+
+Liam: "it has some cool effect, I also want that" — two 30 fps screen captures of a HUD in the same style, one
+taking damage, one healing, measured frame by frame. Both are the SAME mechanism: the plate has two edges that
+travel to the new value at different speeds, and the span between them is a solid colour that hides the label.
+
+| | the edge that LEADS | the edge that LAGS | the chunk between them |
+|---|---|---|---|
+| **loss** | the white fill drops to the new value: `0.3s` ease-out (90 % of the way in ≈ 170 ms) | the chunk's right edge leaves the OLD value at once and arrives after `0.65s` ease-out | `--color-plate-loss` — "this is what you just lost", shrinking into the fill's edge |
+| **gain** | the chunk's right edge races to the NEW value: `0.15s` ease-out | the white fill follows: `0.55s` ease-out | `--color-plate-gain` — "this is what you are getting", eaten from the left by the fill |
+
+Implementation: one more layer, `core-vital__chunk`, between the track content and `__fill` — same box, no
+content, `clip-path: inset(0 calc((1 - var(--core-vital-value)) * 100%) 0 0)`, i.e. the SAME target as the fill.
+Only the transition durations differ, chosen by a direction class the component sets in the same render as the
+new value: `is-loss` / `is-gain` (from a watcher comparing the new percentage with the previous one; the first
+value never animates). Because the chunk lies UNDER the white fill, only the span between the two edges shows,
+and it needs no geometry of its own — it inherits the parallelogram's angle like everything else in the shape.
+The class is dropped 900 ms after the last change (longer than the longest transition), which makes the chunk
+transparent again: two anti-aliased edges resting on the same line would otherwise leave a coloured fringe along
+the fill's edge. A change arriving mid-animation simply retargets both edges with the new direction's timings.
+The cut-off bar gets the same layer and classes (`__subchunk`, `is-sub-loss` / `is-sub-gain`) — eating flashes
+green; a decay tick is sub-pixel and shows nothing. Both plates behave alike (armour damage is red too).
+
+**CoreHudTile** (`css/game.css`) — the slanted dark tile. Props `icon` (`hud-mic`), `active` (false → a
+`max(2px, 0.04em)` `fg` ring and a soft white glow: "you are transmitting"), `dimmed` (false → glyph at 40 %),
+`label` (a11y), `unit`. `core-hudtile is-active is-dimmed` + `__shape __icon`; `--color-hud-tile`, hairline
+`inset 0 0 0 max(1px, 0.025em) var(--color-border)`, glyph box 1.226 em centred and NOT skewed.
+
+**Glyphs** (`kit/icons.js`, a hand-made group — the generator's MDI map does not know them): `hud-mic`,
+`hud-mic-off` (capsule, holder arc, stem, foot — rebuilt from primitives; the muted twin is the same glyph
+knocked out by a slash), `hud-heart`, `hud-shield` (traced from the mockup, mirrored), `hud-food`, `hud-drink`
+(Lucide `hamburger` / `coffee`, ISC, strokes outlined to ONE filled path so CoreIcon needs no stroke mode).
+
+### 39.4 Shell (`ui/src/shell/Hud.vue`, `StatsBars.vue`, `App.vue`)
+
+`Hud` = the strip: `CoreHudTile` (only when `hud.talking !== null`) + `CoreVital` health (when `hud.health !==
+null`) + `CoreVital` armour (when `hud.armour !== null`), in a flex row with `gap: 0.19em`, wrapped in the
+`core-slide-up` transition on `hud.visible`. Labels: `t('hud_health')` / `t('hud_armour')` from core's locale
+table (`store.locale.strings`, fallbacks `Health` / `Armor`); the tile's a11y name is `t('hud_voice')` /
+`t('hud_voice_muted')`. Next to `--solo` plates the strip sets `--core-hudtile-h: 1.57em`, so the tile shrinks with
+them. The sub bars are the `stats:set` entries whose
+`slot` is `'health'` / `'armour'` (first by name when several claim a slot); `subIcon` = the entry's `icon`, else
+`hud-food` / `hud-drink`. Hook classes for tests and stories: `.hud`, `.hud__tile`, `.hud__vital.is-health`,
+`.hud__vital.is-armour`. Cash, bank, speed, street, zone, faction, name and server id are **no longer drawn** by
+core — they stay in `store.hud` / `useHud()` for plugins (§38.6 unchanged apart from the additions below).
+
+Placement (`hud.anchor`, from `Config.Hud.Anchor`): `'bottom-left'` (default) — a fixed 24 px from both edges; it
+never reads the map rect, so the strip stays put whatever corner the map resource draws the minimap in (the
+streamed `sf_minimap` cluster sits in a top corner, not in the vanilla bottom-left).
+`'minimap'` — `left` = the minimap rect's right edge (`(x + w) · innerWidth`) + 0.6 em (≈ 14 px at the
+default unit), `bottom` = `max(24px, (1 − (y + h)) · innerHeight)`, i.e. the glyphs' bottom edge sits on
+the minimap's bottom edge; while no rect has arrived the vanilla 16:9 rect at the default safe zone,
+`{ x: 0.025, y: 0.779, w: 0.141, h: 0.176 }`, is assumed. There is
+deliberately no centre or right anchor: the bottom centre belongs to the progress bar and the text UI, the bottom
+right to the key hints and the spinner. On viewports narrower than 1700 px the strip's right end reaches the
+progress panel (at 1600 × 900 already with the default unit), so `Progress.vue` lifts itself to `bottom: 22vh` there (above the text UI) — a classic
+`@media (max-width: 1699px)`, never the range syntax Chromium 103 cannot parse. Unit: `--core-hud-unit = 24px ·
+hud.scale` (`Config.Hud.Scale`, 0.5–2.0 ⇒ 12–48 px, a ≈ 175–700 px strip).
+
+`StatsBars` keeps its rail plate for every `stats:set` entry WITHOUT a slot, so a plugin's extra need still has a
+home; with the default config it has no rows and renders nothing. The rail stays top-right (notifications).
+
+### 39.5 Data: `hud:set`, `stats:set`, config, feed
+
+- `hud:set` gains `talking: boolean`, `muted: boolean`, `anchor: string`, `scale: number` (`HUD_KEYS` in
+  `client/ui.lua` and `store.js`; `HudState` in `contract.ts` gains `talking: boolean | null`, `muted: boolean`,
+  `anchor: string`, `scale: number` — additive, no `API_VERSION` bump). `talking === null` = no voice feed = no tile.
+- `stats:set` entries gain optional `slot: 'health' | 'armour'` and `icon: string` (`StatBar` in `contract.ts`).
+  `Config.Stats.Defs.<name>.hud` is now `true` (a rail bar) | `'health'` | `'armour'` (the bar under that
+  plate) | `false`; `icon` is a registry name. Defaults: `hunger = { …, hud = 'health', icon = 'hud-food' }`,
+  `thirst = { …, hud = 'armour', icon = 'hud-drink' }`. `client/stats.lua` forwards `slot` / `icon`,
+  `UI.stats.set` lets them through (sanitised, `slot` from the two literals only), `server/stats.lua` keeps
+  `hud` as given when it is one of the four values.
+- `Config.Hud = { ShowHealth = true, ShowArmour = true, ShowStats = true, ShowVoice = true, ShowSpeed = false,
+  ShowStreet = false, Anchor = 'bottom-left', Scale = 1.0 }` (`Anchor`: `'bottom-left'` | `'minimap'`; `Scale`: 0.5–2.0; an
+  unknown anchor or an out-of-range scale is DROPPED by `UI.hud.set`, never clamped — the shell keeps what it
+  had). `ShowSpeed` / `ShowStreet` default to **false** now:
+  core no longer draws them, so the feed no longer reads or sends them unless a server turns them on for a
+  plugin that reads `useHud().speed/street/zone`.
+- `client/hudfeed.lua`: the one thread now ticks at **100 ms** while the HUD is visible. Every tick reads
+  `MumbleIsPlayerTalking(PlayerId())` (`ShowVoice`); every 250 ms health / armour (/ speed); every 1000 ms
+  `MumbleIsConnected()` → `muted = not connected` (and street / zone when on). Only changed values are pushed,
+  through `UI.hud.set` (100 ms coalescing, §6.10) — an idle, silent player sends nothing. BOOL returns are read as
+  `v == true or v == 1` (§30.4). `anchor` / `scale` ride along with the one-per-shell `minimap` push. A voice
+  resource that wants to own the tile sets `ShowVoice = false` and pushes `Core.UI.hud.set({ talking = …, muted = … })` itself.
+- Locale: `hud_health`, `hud_armour`, `hud_voice`, `hud_voice_muted` in `locales/*.json`.
+
+### 39.6 Tests, stories, docs
+
+Kit: `Kit/Data/Vital` and `Kit/Game/Hud Tile` (playground + gallery scene each), kit-regression checks (mount,
+`--core-vital-value` follows `value`, `--solo`, threshold classes, the tile's `is-active` / `is-dimmed`, the six
+glyphs resolve). Shell: `Built-ins/HUD` and `Built-ins/Stats bars` stories rewritten, shell-regression section 7
+(strip renders, plates follow `hud:set`, slot bars follow `stats:set`, the tile appears with `talking`, an
+unslotted stat still gets a rail bar). Lua: `tests/client_ui_tests.lua` (`hud.set` lets the four new keys through
+and drops wrong types; `stats.set` forwards `slot` / `icon`), `tests/server_tests.lua` (`hud` normalisation).
+README (config keys, HUD paragraph, kit tag list, in-game checklist), `DesignSystem.mdx`, AGENTS §5 counts.

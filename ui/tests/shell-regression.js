@@ -271,14 +271,94 @@
     check('alert_result is confirmed with the id', !!ar && !!ar.data && ar.data.confirmed === true && String(ar.data.id) === '41')
     check('alert closes after confirm', await waitFor(() => !hasText('Line one')))
 
-    // ---- 7. hud -----------------------------------------------------------
-    send({ action: 'hud:set', visible: true, cash: 1234, bank: 56789, name: 'Tester', serverId: 7,
-      faction: { name: 'Police', tag: 'LSPD', color: '#5b8cff' } })
-    await waitFor(() => /1[.,\s']?234/.test(text()))
-    check('hud renders cash', /1[.,\s']?234/.test(text()))
-    check('hud renders bank', /56[.,\s']?789/.test(text()))
-    check('hud renders the faction or the player name',
-      hasText('LSPD') || hasText('Police') || hasText('Tester'))
+    // ---- 7. hud (DESIGN §39: the vitals strip) -----------------------------
+    // The values never become widths: CoreVital publishes them as the 0..1 custom properties
+    // `--core-vital-value` / `--core-vital-sub` and the CSS clips the fill inside the skewed
+    // shape, so reading the inline style is reading exactly what the shell decided.
+    const vitalVar = (which, name) => {
+      const el = q('.hud__vital.is-' + which)
+      return el ? el.style.getPropertyValue(name).trim() : null
+    }
+    send({ action: 'hud:set', visible: true, health: 81, armour: 40, talking: false })
+    await waitFor(() => !!q('.hud'))
+    check('hud:set renders the strip', !!q('.hud'))
+    check('hud:set renders both plates and the mic tile',
+      document.querySelectorAll('.hud .hud__vital').length === 2
+      && document.querySelectorAll('.hud .hud__tile').length === 1)
+    check('the health plate publishes its value as --core-vital-value', vitalVar('health', '--core-vital-value') === '0.81')
+
+    // A `slot` moves a stat OUT of the rail and under a plate (§39.4) — every stat has one home.
+    send({ action: 'stats:set',
+      hunger: { value: 80, min: 0, max: 100, label: 'Hunger', slot: 'health', icon: 'hud-food' },
+      thirst: { value: 5, min: 0, max: 100, label: 'Thirst', slot: 'armour', icon: 'hud-drink' },
+      stress: { value: 50, min: 0, max: 100 } })
+    await waitFor(() => vitalVar('health', '--core-vital-sub') === '0.8')
+    check('a slot = health stat becomes the bar under the HEALTH plate', vitalVar('health', '--core-vital-sub') === '0.8')
+    check('a slotted bar under 10 % turns the plate is-sub-danger',
+      !!q('.hud__vital.is-armour') && q('.hud__vital.is-armour').classList.contains('is-sub-danger'))
+    check('only the unslotted stat gets a rail row',
+      !!q('.stats') && document.querySelectorAll('.stats .stat').length === 1 && hasText('stress'))
+
+    // §39.4: the unit is FIXED px, never a viewport unit — the rest of the shell is fixed px too
+    // (rail 268, progress 340). 24px x 14.63em wide x 3.17em tall is the ~351 x 76 px strip.
+    // Both plates carry a sub bar by now, so this is the full-height strip, not the --solo one.
+    const unitPx = () => getComputedStyle(q('.hud')).fontSize
+    const stripBox = () => q('.hud').getBoundingClientRect()
+    check('the strip runs at the fixed 24px unit', unitPx() === '24px', unitPx())
+    check('the strip measures about 351 x 76 px',
+      Math.abs(stripBox().width - 351.1) < 1.5 && Math.abs(stripBox().height - 76.1) < 1.5,
+      Math.round(stripBox().width) + ' x ' + Math.round(stripBox().height))
+    check('the sub glyph is inside the vital box, not hanging out of it',
+      !!q('.core-vital__subicon')
+        && q('.core-vital__subicon').getBoundingClientRect().bottom <= q('.hud__vital').getBoundingClientRect().bottom + 0.5)
+    send({ action: 'hud:set', scale: 2 })
+    check('Config.Hud.Scale multiplies the unit', await waitFor(() => unitPx() === '48px'), unitPx())
+    send({ action: 'hud:set', scale: 9 })
+    check('an out-of-range scale is clamped to 2', await waitFor(() => unitPx() === '48px'), unitPx())
+    send({ action: 'hud:set', scale: 1 })
+    await waitFor(() => unitPx() === '24px')
+
+    send({ action: 'hud:set', talking: true })
+    check('talking lights the mic tile', await waitFor(() => !!q('.hud__tile.is-active')))
+    send({ action: 'hud:set', muted: true })
+    check('muted dims the mic tile and drops the ring', await waitFor(() => !!q('.hud__tile.is-dimmed') && !q('.hud__tile.is-active')))
+
+    // §39.4 has exactly two placements. A bottom-centre / bottom-right strip would land on the
+    // progress bar, the text UI, the key hints and the spinner, so those were cut from the
+    // contract: an anchor the shell does not know falls back to the default, never to a guess.
+    send({ action: 'hud:set', anchor: 'minimap', minimap: { x: 0.025, y: 0.779, w: 0.141, h: 0.176 } })
+    check('anchor minimap places the strip off the live map rect',
+      await waitFor(() => !!q('.hud.hud--minimap') && !q('.hud--bottom-left')))
+    send({ action: 'hud:set', anchor: 'bottom-left' })
+    check('anchor bottom-left moves the strip into the corner',
+      await waitFor(() => !!q('.hud.hud--bottom-left') && Math.round(q('.hud').getBoundingClientRect().left) === 24))
+    send({ action: 'hud:set', anchor: 'bottom-center' })
+    check('an anchor that is no longer in the contract falls back to bottom-left',
+      await waitFor(() => !!q('.hud.hud--bottom-left') && !q('.hud--bottom-center')))
+
+    // The HUD is still a PARTIAL update: a key nothing draws any more must not disturb the strip
+    // (cash, bank, faction, name and speed stay in the store for a plugin's `useHud()`).
+    send({ action: 'hud:set', cash: 5 })
+    await tick()
+    check('a hud:set with only an undrawn key leaves the strip alone',
+      !!q('.hud') && document.querySelectorAll('.hud .hud__vital').length === 2
+      && vitalVar('health', '--core-vital-value') === '0.81')
+    check('CoreUI.hud still mirrors cash for plugin pages',
+      !!window.CoreUI && !!window.CoreUI.hud && Number(window.CoreUI.hud.cash) === 5)
+
+    // §39.3.1: a health value arriving from Lua is a CHANGE, and the plate says which way it
+    // went — the direction class is what picks the chunk's colour and the two edge speeds. Last
+    // in this section on purpose: it moves `health` off the 81 the checks above read back.
+    const healthClass = (name) => !!q('.hud__vital.is-health') && q('.hud__vital.is-health').classList.contains(name)
+    send({ action: 'hud:set', health: 40 })
+    check('damage makes the health plate is-loss (red chunk trailing the fill)',
+      await waitFor(() => healthClass('is-loss') && !healthClass('is-gain')))
+    send({ action: 'hud:set', health: 95 })
+    check('healing makes it is-gain instead (green chunk leading it)',
+      await waitFor(() => healthClass('is-gain') && !healthClass('is-loss')))
+
+    send({ action: 'hud:set', visible: false })
+    check('hud:set { visible = false } removes the strip', await waitFor(() => !q('.hud')))
 
     // ---- 8. plugin page host ----------------------------------------------
     const CoreUI = window.CoreUI

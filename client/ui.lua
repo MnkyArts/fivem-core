@@ -1014,7 +1014,16 @@ local FIELD_TYPES <const> = { text = true, number = true, select = true, checkbo
 local HUD_KEYS <const> = {
     visible = 'boolean', cash = 'number', bank = 'number', name = 'string', serverId = 'number',
     health = 'number', armour = 'number', speed = 'number', street = 'string', zone = 'string',
+    -- §39: the mic tile (`talking` absent = no voice feed = no tile) and where the strip sits
+    talking = 'boolean', muted = 'boolean', anchor = 'string', scale = 'number',
 }
+--- The two placements of §39.4; anything else is dropped rather than guessed at. The bottom
+--- centre and right belong to the progress bar / text UI and to the key hints / spinner.
+local HUD_ANCHORS <const> = { minimap = true, ['bottom-left'] = true }
+local HUD_SCALE_MIN <const> = 0.5
+local HUD_SCALE_MAX <const> = 2.0
+--- Only `slot`s the shell knows: a stat bar is cut out of one of the two vitals plates (§39.4).
+local STAT_SLOTS <const> = { health = true, armour = true }
 
 --- UI.menu.open({ title, items }) -> value|nil — awaits, nil on ESC/close.
 --- Items are sent with their list index as `value`; the real value never leaves
@@ -1163,6 +1172,10 @@ local function hudSet(partial)
             end
         end
     end
+    -- §39 placement: an unknown anchor or an absurd unit multiplier is dropped, never clamped —
+    -- the shell keeps whatever it had rather than jumping somewhere nobody asked for.
+    if out.anchor ~= nil and not HUD_ANCHORS[out.anchor] then out.anchor = nil end
+    if out.scale ~= nil and (out.scale < HUD_SCALE_MIN or out.scale > HUD_SCALE_MAX) then out.scale = nil end
     local minimap = partial.minimap
     if type(minimap) == 'table' and Utils.isNumber(minimap.x) and Utils.isNumber(minimap.y)
         and Utils.isNumber(minimap.w) and Utils.isNumber(minimap.h) then
@@ -1282,7 +1295,9 @@ local function flushStats()
     send(message)
 end
 
---- UI.stats.set({ hunger = { value = 80, min = 0, max = 100 }, thirst = 40 }) — coalesced.
+--- UI.stats.set({ hunger = { value = 80, min = 0, max = 100, slot = 'health', icon = 'hud-food' },
+--- thirst = 40 }) — coalesced. `slot` cuts the bar out of that vitals plate (§39.4), anything else
+--- keeps its rail bar; `icon` is a kit icon name, so only the registry's own character set.
 local function statsSet(values)
     if type(values) ~= 'table' then return false end
     local count = 0
@@ -1296,6 +1311,10 @@ local function statsSet(values)
                 bar = { value = entry }
             elseif type(entry) == 'table' and type(entry.value) == 'number' then
                 bar = { value = entry.value, min = tonumber(entry.min), max = tonumber(entry.max) }
+                if STAT_SLOTS[entry.slot] then bar.slot = entry.slot end
+                if type(entry.icon) == 'string' and #entry.icon <= 32 and entry.icon:find('^[%w_%-]+$') then
+                    bar.icon = entry.icon
+                end
             end
             if bar then
                 statsPending[name] = bar

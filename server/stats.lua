@@ -76,9 +76,16 @@ local function normalizeDef(name, def)
         table.sort(thresholds, function(a, b) return a > b end)   -- highest first
     end
 
+    -- `hud` places the bar (§18, §39.5): true = a bar on the rail plate, 'health' / 'armour' = the
+    -- bar cut out of that vitals plate. Anything else — including a typo'd slot name — is `false`,
+    -- so a bad def loses its bar instead of sending the shell a slot it cannot draw.
+    local hud = def.hud
+    if hud ~= true and hud ~= 'health' and hud ~= 'armour' then hud = false end
+
     return {
         name = name, min = min, max = max, default = roundValue(default),
-        decayPerMinute = decay, thresholds = thresholds, hud = def.hud == true,
+        decayPerMinute = decay, thresholds = thresholds, hud = hud,
+        icon = type(def.icon) == 'string' and def.icon or nil,   -- kit icon name for the slot glyph
     }
 end
 
@@ -275,7 +282,9 @@ local function registerDef(name, def)
     return true, isNew
 end
 
---- Registers a stat definition `{ min, max, default, decayPerMinute, thresholds, hud }`.
+--- Registers a stat definition `{ min, max, default, decayPerMinute, thresholds, hud, icon }`.
+--- `hud` is `true` (a bar on the rail plate), `'health'` / `'armour'` (the bar cut out of that
+--- vitals plate, §39) or `false`; anything else becomes `false`. `icon` is a kit icon name.
 --- Meant for resource start, before players load; a later call still gives already loaded players
 --- the default, but only stats present in the client's Config.Stats.Defs get a HUD bar (§21).
 function Stats.define(name, def)

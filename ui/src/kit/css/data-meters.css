@@ -1,6 +1,6 @@
 /* core UI kit — Data — meters (DESIGN §37.5).
    CoreProgress, CoreRing, CoreStatBar, CoreStatRow, CoreSpinner,
-   CoreSkeleton.
+   CoreSkeleton, CoreVital.
    Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
    following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
 
@@ -367,3 +367,268 @@
 
 /* A paragraph never ends flush: the last line of a multi-line block is short, like real copy. */
 .core-skeleton--lines .core-skeleton__line:last-child { width: 62%; }
+
+/* ---- CoreVital -----------------------------------------------------------------------------
+   The vitals HUD plate of DESIGN §39, ported 1 : 1 from the approved prototype. ONE rounded
+   parallelogram, cut in two: the plate (health / armour) and the 0.3em slice under it (food /
+   drink). Every length is `em` and 1em = 100 px of Liam's mockup, so `--core-hud-unit` (24 px by
+   default) scales the whole strip off one number; the only px in here are the `max(1px, ...)`
+   hairline floors. The unit is FIXED px, not viewport-based: the rest of the shell is fixed px
+   too (the rail is 268px, the progress panel 340px), and a strip that grew with the screen
+   would be the one element that does not match them.
+
+   Two tricks are not obvious from the numbers:
+
+   1. The fill is clipped, never sized. `clip-path: inset(0 calc((1 - var(--core-vital-value)) *
+      100%) 0 0)` runs INSIDE the skewed `__shape`, so a vertical clip edge in local space comes
+      out on screen at the parallelogram's own 20° — the progress edge, the sides and the bar's
+      edge are all the same angle with no polygon and no second number to keep in sync.
+   2. The content is drawn TWICE, exactly on top of itself: once on the dark track, once inside
+      the white fill. Along the clip edge the label is therefore two-tone (ink on the plate,
+      white on the track) with no extra masking. Both copies are un-skewed with
+      `transform-origin: 50% 1.025em` — the SHAPE's centre line, not the content's own, so the
+      -20 and +20 skews cancel exactly and the glyph lands where the flex row put it. A `--solo`
+      vital has no cut, so its shape centre IS its content centre: `50% 50%`.
+   3. The LAYOUT BOX and the SHAPE are two different heights. The parallelogram is 2.05em
+      (plate 1.57 + cut 0.18 + bar 0.30), but the sub glyph hangs under the bar and ends at
+      3.17em — so the root is 3.17em and `__shape` carries the 2.05em explicitly instead of
+      stretching to `bottom: 0`. That keeps every transform-origin above true AND makes the
+      component's box contain everything it paints: a caller that puts the strip 24px off the
+      bottom edge gets 24px under the GLYPH, not under the bar with the glyph off screen.
+      A `--solo` vital paints no bar and no glyph, so there box and shape are both 1.57em.
+   4. The sub glyph is BIGGER than the mockup's. The mockup draws it at 0.69em; the design
+      carries it at 0.92em, which is the proportion Liam approved when the strip was still
+      built compact — and it is what keeps the burger and the coffee cup legible at the small
+      end of the knob: a server on `Config.Hud.Scale = 0.5` draws them at ~11 px instead of
+      ~8 px, where their strokes fall under a pixel and read as mush. The extra 0.23em is what
+      the box grew by (2.96em -> 3.17em).
+
+   Click-through, like every HUD read-out (§37.4). */
+
+.core-vital {
+  --core-vital-value: 1;
+  --core-vital-sub: 1;
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: 6em;
+  height: 3.17em;
+  font-size: var(--core-hud-unit, 24px);
+  color: var(--color-fg);
+  pointer-events: none;
+}
+
+/* No sub stat: the cut, the bar and the glyph are gone, the plate wears all four outer radii,
+   and the box shrinks to the shape because there is nothing hanging under it any more. */
+.core-vital--solo { height: 1.57em; }
+
+/* On the dark track a glyph wears the ordinary vital tone (made for dark ground); on the white
+   fill it wears the plate colour of §39.2. Any other tone keeps `--tone` on both sides. */
+.core-vital.core-tone-health { --core-vital-plate-tone: var(--color-plate-health); }
+.core-vital.core-tone-armour { --core-vital-plate-tone: var(--color-plate-armour); }
+
+/* 2.05em, NOT `bottom: 0`: the root is 3.17em so that the sub glyph fits inside the component's
+   own box (see 3. above), and the parallelogram must keep the height the geometry of §39.1 is
+   written in — `__bar { bottom: 0 }`, the 0.18em cut and `transform-origin: 50% 1.025em` all
+   measure against THIS box. */
+.core-vital__shape {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  height: 2.05em;
+  transform: skewX(-20deg);
+}
+
+.core-vital--solo .core-vital__shape { height: 1.57em; }
+
+.core-vital__plate,
+.core-vital__bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  overflow: hidden;
+  background: var(--color-plate-track);
+  box-shadow:
+    inset 0 max(1px, 0.02em) 0 rgba(255, 255, 255, 0.3),
+    inset 0 0 0 max(1px, 0.015em) rgba(255, 255, 255, 0.16),
+    0 0.04em 0.18em rgba(0, 0, 0, 0.35);
+}
+
+/* Point-symmetric radii: obtuse corners 0.22em, acute ones 0.3em / 0.24em (a sheared corner needs
+   the longer horizontal radius to read as round), the four on the cut stay crisp at 0.035em — so
+   plate and bar read as one parallelogram that was sliced, not as two shapes. */
+.core-vital__plate {
+  top: 0;
+  height: 1.57em;
+  border-radius: 0.22em 0.3em 0.035em 0.035em / 0.22em 0.24em 0.035em 0.035em;
+}
+
+.core-vital__bar {
+  bottom: 0;
+  height: 0.3em;
+  border-radius: 0.035em 0.035em 0.22em 0.3em / 0.035em 0.035em 0.22em 0.24em;
+}
+
+.core-vital--solo .core-vital__plate {
+  border-radius: 0.22em 0.3em 0.22em 0.3em / 0.22em 0.24em 0.22em 0.24em;
+}
+
+/* background-color and background-image are set SEPARATELY, never through the shorthand: the
+   threshold states below swap the gradient for a flat colour, and only a real colour underneath
+   can be transitioned. With the shorthand the plate would reset to transparent the instant the
+   image went away and the bar would flash the dark track before the new colour faded in. */
+.core-vital__fill,
+.core-vital__subfill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  background-color: var(--color-plate);
+  background-image: linear-gradient(var(--color-plate), var(--color-plate-lo));
+  transition: clip-path 0.3s var(--ease-ui), background-color 0.3s var(--ease-ui);
+}
+
+.core-vital__fill { clip-path: inset(0 calc((1 - var(--core-vital-value)) * 100%) 0 0); }
+.core-vital__subfill { clip-path: inset(0 calc((1 - var(--core-vital-sub)) * 100%) 0 0); }
+
+/* The change chunk of §39.3.1. Same box and the SAME clip target as the fill it lies under —
+   only the durations differ, so the two edges travel to one value at two speeds and the span
+   between them is the chunk. No geometry of its own: it inherits the parallelogram's angle from
+   the skewed shape like everything else in here, and it sits OVER the track content, which is
+   what hides the label while it travels. Transparent at rest, because two anti-aliased edges
+   resting on the same line would leave a coloured fringe along the fill's edge. */
+.core-vital__chunk,
+.core-vital__subchunk {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  background-color: transparent;
+  transition: clip-path 0.3s var(--ease-ui);
+}
+
+.core-vital__chunk { clip-path: inset(0 calc((1 - var(--core-vital-value)) * 100%) 0 0); }
+.core-vital__subchunk { clip-path: inset(0 calc((1 - var(--core-vital-sub)) * 100%) 0 0); }
+
+/* `left: 0; right: 0` rather than the prototype's literal `width: 6em`: the copy inside the fill
+   and the copy on the track then always measure the same, whatever the root is sized to. */
+.core-vital__content {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  height: 1.57em;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  padding-left: 0.9em;
+  color: var(--color-fg);
+  transform: skewX(20deg);
+  transform-origin: 50% 1.025em;
+}
+
+.core-vital--solo .core-vital__content { transform-origin: 50% 50%; }
+.core-vital__fill .core-vital__content { color: var(--color-plate-fg); }
+
+.core-vital__icon {
+  flex: none;
+  width: 1.2em;
+  height: 1.2em;
+  color: var(--tone);
+}
+
+.core-vital__fill .core-vital__icon { color: var(--core-vital-plate-tone, var(--tone)); }
+
+/* Barlow Condensed SemiBold widened from its left edge to the mockup's letterforms (H = 0.35em
+   wide, stems 0.10em). Cap height lands on 0.53em at 0.757em type, with no tracking at all. */
+.core-vital__label {
+  margin-left: 0.62em;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 0.757em;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transform: scaleX(1.25);
+  transform-origin: 0 50%;
+}
+
+/* The bar sits 0.875em under the shape's centre line, so its visual centre has slid
+   0.875 · tan 20° = 0.32em to the left; half the 0.92em glyph box takes off the other 0.46em.
+   (0.92em, not the mockup's 0.69em — see 4. in the block header.) */
+.core-vital__subicon {
+  position: absolute;
+  top: 2.25em;
+  left: calc(50% - 0.32em - 0.46em);
+  width: 0.92em;
+  height: 0.92em;
+  transition: color 0.3s var(--ease-ui);
+}
+
+/* Under `lowBelow` the GLYPH pulses and nothing else moves — a twitching plate is unreadable
+   exactly when it matters (the same rule CoreStatBar follows). */
+.core-vital.is-low .core-vital__icon { animation: core-pulse 1.2s var(--ease-ui) infinite; }
+
+/* Plate white -> amber -> red, all three as background-COLOUR, so the 0.3s transition above has
+   two real colours to interpolate between. The gradient is dropped explicitly (`none`) instead of
+   by a shorthand reset — that is what keeps the track from showing through for a frame. */
+.core-vital.is-sub-warning .core-vital__subfill {
+  background-image: none;
+  background-color: var(--color-warning);
+}
+.core-vital.is-sub-warning .core-vital__subicon { color: var(--color-warning); }
+
+.core-vital.is-sub-danger .core-vital__subfill {
+  background-image: none;
+  background-color: var(--color-error);
+}
+.core-vital.is-sub-danger .core-vital__subicon {
+  color: var(--color-error);
+  animation: core-pulse 1.2s var(--ease-ui) infinite;
+}
+
+/* §39.3.1, measured off Liam's two 30 fps clips. One mechanism, two speeds, and which edge
+   leads is the whole difference between the two reads:
+
+     loss   white fill 0.30s (it drops at once)  |  chunk 0.65s  -> red, shrinking into the edge
+     gain   chunk 0.15s (it shoots ahead)        |  fill  0.55s  -> green, eaten from the left
+
+   The direction class is set in the same render as the new value, so the browser starts THIS
+   transition with THIS direction's timings; 900 ms later the component drops it again. The fill
+   restates its WHOLE transition list every time: it carries a background-colour transition too
+   (the sub bar's threshold colours), and a bare duration would silently re-time that as well. */
+.core-vital.is-loss .core-vital__chunk {
+  background-color: var(--color-plate-loss);
+  transition-duration: 0.65s;
+}
+.core-vital.is-loss .core-vital__fill {
+  transition: clip-path 0.3s var(--ease-ui), background-color 0.3s var(--ease-ui);
+}
+
+.core-vital.is-gain .core-vital__chunk {
+  background-color: var(--color-plate-gain);
+  transition-duration: 0.15s;
+}
+.core-vital.is-gain .core-vital__fill {
+  transition: clip-path 0.55s var(--ease-ui), background-color 0.3s var(--ease-ui);
+}
+
+.core-vital.is-sub-loss .core-vital__subchunk {
+  background-color: var(--color-plate-loss);
+  transition-duration: 0.65s;
+}
+.core-vital.is-sub-loss .core-vital__subfill {
+  transition: clip-path 0.3s var(--ease-ui), background-color 0.3s var(--ease-ui);
+}
+
+.core-vital.is-sub-gain .core-vital__subchunk {
+  background-color: var(--color-plate-gain);
+  transition-duration: 0.15s;
+}
+.core-vital.is-sub-gain .core-vital__subfill {
+  transition: clip-path 0.55s var(--ease-ui), background-color 0.3s var(--ease-ui);
+}

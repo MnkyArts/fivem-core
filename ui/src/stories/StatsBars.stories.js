@@ -1,11 +1,16 @@
-// Stat bars (DESIGN §18 + §21 `stats:set`) — one thin bar per `Config.Stats` def with
-// `hud = true`, stacked directly under the HUD in the top-right rail.
+// Stat bars (DESIGN §18 + §21 `stats:set`, §39.4) — the top-right rail plate, one thin bar per
+// `Config.Stats` def that did NOT claim a vital slot.
 //
 // Lua side: nothing calls this by hand. The server decays `data.stats` once per
 // `Config.Stats.TickMs`, replicates the whole table as `Player(src).state.stats`, and
-// `client/ui.lua` turns that bag into ONE `stats:set` carrying `{ value, min, max }` per
-// stat. Scripts move the numbers with `Core.Stats.add(src, 'hunger', -10)` and read them
-// back with `Core.Stats.get(name)`; the bars follow on their own. Output only.
+// `client/ui.lua` turns that bag into ONE `stats:set` carrying `{ value, min, max, slot?, icon? }`
+// per stat. Scripts move the numbers with `Core.Stats.add(src, 'hunger', -10)` and read them back
+// with `Core.Stats.get(name)`; the bars follow on their own. Output only.
+//
+// §39.4 split the stack in two. A def with `hud = 'health'` / `'armour'` arrives with a `slot`
+// and is drawn by Hud.vue as the bar cut out of that plate — this plate skips it. So with the
+// two defs core ships (hunger -> health, thirst -> armour) the rail is EMPTY, and everything
+// here is what a plugin adds on top with `Core.Stats.define`.
 import { h } from 'vue'
 import { within, expect, waitFor } from 'storybook/test'
 import StatsBars from '../shell/StatsBars.vue'
@@ -14,7 +19,7 @@ import { resetExtras } from '../store.js'
 import { send, liveScene, rail, note, clone } from './storeHelpers.js'
 
 // StatsBars.vue has no positioning of its own — App.vue hangs it in the top-right rail,
-// under Hud.vue and above the toast stack.
+// above the toast stack. (The HUD strip left the rail in §39.4; it places itself.)
 const view = () => rail(h(StatsBars))
 
 /** `stats:set` carries the stat names at the TOP level, like `hud:set` carries its fields. */
@@ -50,39 +55,49 @@ export default {
           + 'follows the def\'s thresholds (§18): accent above 25 %, amber under it, red under 10 % '
           + '(the label turns red too, so a drained stat is readable without looking at the bar). '
           + 'Lua tables have no order, so the stack is sorted by name and never reshuffles between '
-          + 'two messages.',
+          + 'two messages.\n\n'
+          + 'Only stats WITHOUT a `slot` land here (§39.4) — a `slot` means the bar belongs under '
+          + 'the HEALTH or ARMOR plate of the HUD strip instead, so no stat is ever drawn twice.',
       },
     },
   },
   argTypes: {
     stats: {
       control: 'object',
-      description: '`{ [name] = { value, min, max } }` — the message body verbatim. `label` is optional.',
+      description: '`{ [name] = { value, min, max, slot?, icon? } }` — the message body verbatim. '
+        + '`label` is optional; `slot` moves the bar to the HUD strip.',
       table: { category: 'stats:set' },
     },
   },
-  args: { stats: { hunger: { value: 62, min: 0, max: 100 }, thirst: { value: 44, min: 0, max: 100 } } },
+  args: { stats: { stamina: { value: 62, min: 0, max: 100 }, stress: { value: 44, min: 0, max: 100 } } },
 }
 
 export const Default = {
   ...base,
   name: 'Healthy',
-  args: { stats: { hunger: { value: 62, min: 0, max: 100 }, thirst: { value: 44, min: 0, max: 100 } } },
+  args: { stats: { stamina: { value: 62, min: 0, max: 100 }, stress: { value: 44, min: 0, max: 100 } } },
   parameters: {
     ...base.parameters,
     lua: {
       ...base.parameters.lua,
-      call: call({ hunger: { value: 62 }, thirst: { value: 44 } }),
+      call: "Core.Stats.define('stamina', { min = 0, max = 100, default = 100, hud = true })\n"
+        + "Core.Stats.define('stress', { min = 0, max = 100, default = 0, hud = true })\n"
+        + call({ stamina: { value: 62 }, stress: { value: 44 } }),
     },
-    docs: { description: { story: 'The two defs core ships. Both above 25 %, so both bars stay on the accent colour.' } },
+    docs: {
+      description: {
+        story: 'Two plugin stats with `hud = true` — no slot, so both take a rail row. Above 25 % '
+          + 'each wears its own vital tone.',
+      },
+    },
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     await waitFor(() => expect(canvasElement.querySelectorAll('.stats .stat').length).toBe(2))
-    expect(canvas.getByText('hunger')).toBeInTheDocument()
+    expect(canvas.getByText('stamina')).toBeInTheDocument()
     // sorted by name, never in Lua table order
     expect(Array.from(canvasElement.querySelectorAll('.stats .core-progress__label')).map((e) => e.textContent))
-      .toEqual(['hunger', 'thirst'])
+      .toEqual(['stamina', 'stress'])
     expect(canvasElement.querySelector('.stats .stat').classList.contains('is-ok')).toBe(true)
   },
 }
@@ -92,9 +107,9 @@ export const Thresholds = {
   name: 'Warning and critical',
   args: {
     stats: {
-      hunger: { value: 22, min: 0, max: 100 },
-      thirst: { value: 7, min: 0, max: 100 },
       stamina: { value: 80, min: 0, max: 100 },
+      stress: { value: 22, min: 0, max: 100 },
+      oxygen: { value: 7, min: 0, max: 100 },
     },
   },
   parameters: {
@@ -108,18 +123,18 @@ export const Thresholds = {
     },
     docs: {
       description: {
-        story: 'Amber under 25 %, red under 10 %. `stamina` is a plugin-defined stat (`Core.Stats.define`) '
-          + 'to show that the stack is not limited to core\'s two.',
+        story: 'Amber under 25 %, red under 10 %. All three are plugin-defined stats '
+          + '(`Core.Stats.define`) — core\'s own two live under the HUD plates now.',
       },
     },
   },
   play: async ({ canvasElement }) => {
     await waitFor(() => expect(canvasElement.querySelectorAll('.stats .stat').length).toBe(3))
     const level = (i) => canvasElement.querySelectorAll('.stats .stat')[i].className
-    expect(level(0)).toContain('is-warning')  // hunger 22 %
+    expect(level(0)).toContain('is-error')    // oxygen 7 %
     expect(level(1)).toContain('is-ok')       // stamina 80 %
-    expect(level(2)).toContain('is-error')    // thirst 7 %
-    expect(canvasElement.querySelectorAll('.stats .core-progress__fill')[2].style.width).toBe('7%')
+    expect(level(2)).toContain('is-warning')  // stress 22 %
+    expect(canvasElement.querySelectorAll('.stats .core-progress__fill')[0].style.width).toBe('7%')
   },
 }
 
@@ -148,55 +163,53 @@ export const CustomRange = {
   },
 }
 
-export const UnderTheHud = {
+export const SlottedAndRail = {
   ...base,
-  name: 'Under the HUD (full rail)',
+  name: 'Slotted vs rail (the whole split)',
   args: {
-    stats: { hunger: { value: 62, min: 0, max: 100 }, thirst: { value: 18, min: 0, max: 100 } },
+    stats: {
+      hunger: { value: 62, min: 0, max: 100, label: 'Hunger', slot: 'health', icon: 'hud-food' },
+      thirst: { value: 18, min: 0, max: 100, label: 'Thirst', slot: 'armour', icon: 'hud-drink' },
+      stress: { value: 44, min: 0, max: 100 },
+    },
   },
   parameters: {
     ...base.parameters,
     lua: {
       ...base.parameters.lua,
       message: 'hud:set + stats:set',
-      call: '-- client/hudfeed.lua, at most every 250 ms and only on change:\n'
-        + 'Core.UI.hud.set({ health = 68, armour = 40, speed = 87, street = …, zone = … })\n'
-        + '-- the bars come from the stats bag, independently of the feed',
+      call: '-- shared/config.lua, the two defs core ships:\n'
+        + "Config.Stats.Defs.hunger = { …, hud = 'health', icon = 'hud-food' }\n"
+        + "Config.Stats.Defs.thirst = { …, hud = 'armour', icon = 'hud-drink' }\n"
+        + "-- a plugin's own need, with no plate to hang under:\n"
+        + "Core.Stats.define('stress', { min = 0, max = 100, default = 0, hud = true })",
+      note: '`hud` is `true` (rail row) | `\'health\'` | `\'armour\'` (a bar under that plate) | `false`.',
     },
     docs: {
       description: {
-        story: 'How it actually looks in game: the HUD with its §21 rows (health / armour bars, speed, '
-          + 'street + zone) and the stat stack under it. The 54 px label column is shared by both, so '
-          + 'the four bars line up across the two panels.',
+        story: 'One message, two destinations. `hunger` and `thirst` carry a `slot`, so they are '
+          + 'the bars cut out of the HEALTH and ARMOR plates bottom left; `stress` has none, so it '
+          + 'is the single row left in the rail top right. Nothing is drawn twice, and a plugin '
+          + 'still has somewhere to put a need that does not fit a vital.',
       },
     },
   },
   render: liveScene((args) => {
     resetExtras()
-    send({
-      action: 'hud:set',
-      visible: true,
-      cash: 4238,
-      bank: 182450,
-      name: 'Liam Robinson',
-      serverId: 12,
-      faction: { name: 'Los Santos Police Department', tag: 'LSPD', color: '#5b8cff' },
-      health: 68,
-      armour: 40,
-      speed: 87,
-      street: 'Vespucci Boulevard',
-      zone: 'Del Perro',
-    })
+    send({ action: 'hud:set', visible: true, health: 68, armour: 40, talking: false })
     setStats(args.stats)
-  }, () => rail(h(Hud), h(StatsBars))),
+  }, () => [h(Hud), rail(h(StatsBars))]),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    await waitFor(() => expect(canvasElement.querySelectorAll('.stats .stat').length).toBe(2))
-    expect(canvas.getByText('87')).toBeInTheDocument()
-    expect(canvas.getByText('Vespucci Boulevard')).toBeInTheDocument()
-    // health 68 % is fine, armour is always accent-blue
-    expect(canvasElement.querySelector('.hud .bar').className).toContain('is-ok')
-    expect(canvasElement.querySelectorAll('.hud .core-statbar__fill')[0].style.width).toBe('68%')
+    await waitFor(() => expect(canvasElement.querySelector('.hud__vital.is-health')).toBeTruthy())
+    // exactly one rail row, and it is the unslotted stat
+    await waitFor(() => expect(canvasElement.querySelectorAll('.stats .stat').length).toBe(1))
+    expect(canvas.getByText('stress')).toBeInTheDocument()
+    expect(canvas.queryByText('Hunger')).toBeNull()
+    // …because hunger is the bar under the HEALTH plate: 62 % of its span
+    const health = canvasElement.querySelector('.hud__vital.is-health')
+    expect(health.style.getPropertyValue('--core-vital-sub').trim()).toBe('0.62')
+    expect(canvasElement.querySelector('.hud__vital.is-armour').classList.contains('is-sub-warning')).toBe(true)
   },
 }
 
@@ -208,12 +221,13 @@ export const Empty = {
     ...base.parameters,
     lua: {
       ...base.parameters.lua,
-      call: 'Config.Stats.Enabled = false   -- or no def has hud = true',
+      call: 'Config.Stats.Enabled = false   -- or every def has hud = false / a slot',
     },
     docs: {
       description: {
-        story: 'With `Config.Stats.Enabled = false` the bag is never written, no `stats:set` arrives '
-          + 'and the panel is not rendered at all — the HUD keeps its place in the rail.',
+        story: 'With `Config.Stats.Enabled = false` the bag is never written, no `stats:set` '
+          + 'arrives and the plate is not rendered at all. This is also what the DEFAULT config '
+          + 'looks like: hunger and thirst both claim a slot, so the rail keeps nothing.',
       },
     },
   },

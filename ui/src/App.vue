@@ -36,9 +36,15 @@ const Inspector = defineAsyncComponent(() => import('./shell/Inspector.vue'))
     <!-- world layer: the §6.7 interaction dots (z 20 — under the HUD rail, prompts and hints) -->
     <WorldPrompts />
 
-    <!-- top-right rail: HUD, the stat bars under it, then the notification stack (z 40) -->
+    <!-- §39.4: the vitals HUD is no longer a rail plate. It is a strip of its own, placed
+         against the minimap (or a screen corner) by `hud.anchor` and sized by
+         `--core-hud-unit`, so it carries its own `position: fixed` and sits under the rail's
+         z 40 — a toast that grows down must never end up behind it. -->
+    <Hud />
+
+    <!-- top-right rail: the stat bars that did NOT claim a vital slot, then the notification
+         stack (z 40). With the two defs core ships the plate renders nothing. -->
     <div class="rail-tr pointer-events-none absolute top-4 right-4 z-40 flex flex-col items-end gap-2.5">
-      <Hud />
       <StatsBars />
       <Notifications />
     </div>

@@ -32,7 +32,8 @@ dropped before it reaches any handler.
 | `input:close` | — | closes without a callback |
 | `alert:open` | `id, title, message, confirm, cancel` | `message` may be a string or an array of lines; `cancel = false` drops the button |
 | `alert:close` | — | closes without a callback |
-| `hud:set` | partial of `visible, cash, bank, name, serverId, faction` | copies only the keys present; `faction` is `{ name, tag, color }` or `false` |
+| `hud:set` | partial of `visible, cash, bank, name, serverId, faction, health, armour, speed, street, zone, minimap, talking, muted, anchor, scale` | copies only the keys present; `faction` is `{ name, tag, color }` or `false`. `health` / `armour` are 0–100 and `speed` is km/h, pushed by `client/hudfeed.lua` on change only; `talking` / `muted` drive the §39 mic tile (`talking === null` = no voice feed, so no tile at all) and `anchor` / `scale` place and size the strip, riding along with the one-per-shell `minimap` rect |
+| `stats:set` | `{ <name> = { value, min, max, label?, slot?, icon? }, … }` | replaces the whole bar table, like the `stats` state bag it mirrors — a name that is gone loses its bar. `slot` is `'health'` or `'armour'`: the bar is cut out of the bottom of that vitals plate with `icon` as its glyph (§39.4). Without a slot the entry gets a rail bar top right |
 | `page:register` | `id, type, keepInput, owner` | `type` is `page`, `overlay` or `modal`; `owner` is the resource whose UI plugin provides the component (§38.5 — `script`/`style` are gone) |
 | `page:unregister` | `id` | drops the record, the overlay and the open page |
 | `page:open` | `id, props` | `type = 'page'` becomes the one `openPage`; `type = 'overlay'` joins `store.overlays` |

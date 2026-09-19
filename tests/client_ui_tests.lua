@@ -1676,12 +1676,289 @@ local function suiteWorldPromptsEntity()
     eq(#stubs.drawSprites - parkedMark, 1, 'which drops it, 250 ms after the last read at the latest')
 end
 
+--- The §39.5 wire contract of `hud:set` and `stats:set`: which keys reach the shell.
+local function suiteHudKeys()
+    suite('hud keys')
+    local _, Core = newClient()
+    local UI = Core.UI
+    stubs.nui('ui_ready', {})
+
+    --- The first hud:set logged at or after `from`. core mirrors serverId/faction into the HUD on
+    --- its own schedule, so the NEWEST hud:set is not necessarily the one under test.
+    local function hudFrom(from)
+        for i = from, #stubs.nuiMessages do
+            if stubs.nuiMessages[i].action == 'hud:set' then return stubs.nuiMessages[i] end
+        end
+        return nil
+    end
+
+    --- Every key of `message` except `action`, sorted and joined.
+    local function keysOf(message)
+        if not message then return '?' end
+        local keys = {}
+        for key in pairs(message) do
+            if key ~= 'action' then keys[#keys + 1] = key end
+        end
+        table.sort(keys)
+        return table.concat(keys, ',')
+    end
+
+    local mark = #stubs.nuiMessages + 1
+    eq(UI.hud.set({ talking = true, muted = false, anchor = 'bottom-left', scale = 1.5 }), true,
+        'the four §39 keys are accepted')
+    stubs.tick(150)
+    local message = hudFrom(mark)
+    eq(message and message.talking, true, 'talking reaches the shell')
+    eq(message and message.muted, false, 'muted reaches the shell — false is a real answer')
+    eq(message and message.anchor, 'bottom-left', 'the anchor reaches the shell')
+    eq(message and message.scale, 1.5, 'the scale reaches the shell')
+
+    local from = #stubs.nuiMessages + 1
+    eq(UI.hud.set({ talking = 'yes', muted = 1, anchor = 42, scale = 'big' }), false,
+        'a wrong type for each of the four leaves nothing to send')
+    eq(UI.hud.set({ anchor = 'top-left' }), false, 'an unknown anchor is dropped')
+    eq(UI.hud.set({ anchor = '' }), false, 'and so is an empty one')
+    -- the contract is two placements: the bottom centre and right belong to the progress bar /
+    -- text UI and to the key hints / spinner, so the strip may not be sent there any more
+    eq(UI.hud.set({ anchor = 'bottom-center' }), false, "'bottom-center' is no longer a placement")
+    eq(UI.hud.set({ anchor = 'bottom-right' }), false, "nor is 'bottom-right'")
+    eq(UI.hud.set({ scale = 2.5 }), false, 'a scale above 2.0 is dropped')
+    eq(UI.hud.set({ scale = 0.25 }), false, 'a scale below 0.5 is dropped')
+    eq(UI.hud.set({ scale = 0 / 0 }), false, 'NaN is not a scale')
+    stubs.tick(150)
+    eq(actionsSince(from), '', 'none of them reached the shell at all')
+
+    mark = #stubs.nuiMessages + 1
+    eq(UI.hud.set({ scale = 0.5 }), true, 'the lower bound is allowed')
+    stubs.tick(150)
+    eq(hudFrom(mark).scale, 0.5, 'and travels')
+    mark = #stubs.nuiMessages + 1
+    eq(UI.hud.set({ scale = 2.0 }), true, 'so is the upper one')
+    stubs.tick(150)
+    eq(hudFrom(mark).scale, 2.0, 'and travels too')
+    eq(UI.hud.set({ anchor = 'minimap' }), true, "'minimap' is a placement")
+    stubs.tick(150)
+    mark = #stubs.nuiMessages + 1
+    eq(UI.hud.set({ anchor = 'bottom-left' }), true, "and 'bottom-left' is the other one — those two only")
+    stubs.tick(150)
+    eq(keysOf(hudFrom(mark)), 'anchor', 'one changed key is one key on the wire')
+
+    -- a reloaded shell forgot them, so the ui_ready snapshot carries them like every HUD field
+    stubs.tick(1100)                    -- past the 1/s ui_ready rate limit
+    mark = #stubs.nuiMessages + 1
+    stubs.nui('ui_ready', {})
+    local snapshot = hudFrom(mark)
+    eq(snapshot and snapshot.talking, true, 'the replay re-sends talking')
+    eq(snapshot and snapshot.muted, false, 'and muted')
+    eq(snapshot and snapshot.anchor, 'bottom-left', 'and the last accepted anchor')
+    eq(snapshot and snapshot.scale, 2.0, 'and the last accepted scale')
+end
+
+--- `stats:set` (§39.4): a slotted bar is cut out of a vitals plate, everything else keeps its rail.
+local function suiteHudStats()
+    suite('hud stats')
+    local _, Core = newClient()
+    local UI = Core.UI
+    stubs.nui('ui_ready', {})
+
+    eq(UI.stats.set({
+        hunger = { value = 80, min = 0, max = 100, slot = 'health', icon = 'hud-food' },
+        thirst = { value = 40, min = 0, max = 100, slot = 'nonsense', icon = 'hud-drink' },
+        stress = { value = 10, min = 0, max = 100, slot = 'armour', icon = 'not a name' },
+        focus  = { value = 5, min = 0, max = 100, slot = 'health', icon = ('x'):rep(33) },
+    }), true, 'the stat payload is accepted')
+    stubs.tick(300)
+    local stats = lastMessage('stats:set')
+    eq(stats and stats.hunger and stats.hunger.slot, 'health', 'a health slot travels')
+    eq(stats and stats.hunger and stats.hunger.icon, 'hud-food', 'with its icon')
+    eq(stats and stats.stress and stats.stress.slot, 'armour', 'an armour slot travels')
+    eq(stats and stats.thirst and stats.thirst.value, 40, 'an entry with a bad slot still travels')
+    eq(stats and stats.thirst and stats.thirst.slot, nil, 'but without the slot')
+    eq(stats and stats.thirst and stats.thirst.icon, 'hud-drink', 'and keeps its own icon')
+    eq(stats and stats.stress and stats.stress.icon, nil, 'an icon with a space is dropped')
+    eq(stats and stats.focus and stats.focus.icon, nil, 'and so is one over 32 characters')
+
+    eq(UI.stats.set({ hunger = 55 }), true, 'a bare number is still a valid entry')
+    stubs.tick(300)
+    stats = lastMessage('stats:set')
+    eq(stats and stats.hunger and stats.hunger.value, 55, 'and carries just the value')
+    eq(stats and stats.hunger and stats.hunger.slot, nil, 'with no slot')
+    eq(UI.stats.set({ hunger = { value = 1, slot = true } }), true, 'a non-string slot is no slot')
+    stubs.tick(300)
+    eq(lastMessage('stats:set').hunger.slot, nil, 'and is dropped')
+end
+
+--- Every hud:set key logged at or after `from`, merged in order — the 100 ms coalescing of
+--- client/ui.lua may split one feed tick across two messages.
+local function hudMerged(from)
+    local out = {}
+    for i = from, #stubs.nuiMessages do
+        local message = stubs.nuiMessages[i]
+        if message.action == 'hud:set' then
+            for key, value in pairs(message) do
+                if key ~= 'action' then out[key] = value end
+            end
+        end
+    end
+    return out
+end
+
+--- How many hud:set messages were logged at or after `from`.
+local function hudCount(from)
+    local n = 0
+    for i = from, #stubs.nuiMessages do
+        if stubs.nuiMessages[i].action == 'hud:set' then n = n + 1 end
+    end
+    return n
+end
+
+--- Stops that VM's feed thread through its own onClientResourceStop path. The stub scheduler is
+--- global and outlives newClient(), so a feed left running would keep reading natives and pushing
+--- into the shared NUI log while a later suite counts both.
+local function stopFeed(env)
+    env.TriggerEvent('onClientResourceStop', 'core')
+    stubs.tick(1)
+end
+
+--- A client VM with client/hudfeed.lua on top, a loaded session and the HUD up; `configure` may
+--- edit Config.Hud before the feed reads it. Returns the env, Core and the message index the
+--- playerLoaded hook started at.
+local function newFeedClient(configure)
+    local env, Core = newClient()
+    stubs.nui('ui_ready', {})
+    if configure then configure(env.Config) end
+    stubs.loadFile(env, 'client/hudfeed.lua')
+    env.LocalPlayer.state.loaded = true
+    Core.UI.hud.setVisible(true)
+    local mark = #stubs.nuiMessages + 1
+    Core.emitHook('playerLoaded')
+    return env, Core, mark
+end
+
+--- client/hudfeed.lua (§39.5): the three cadences, the placement riding with the minimap rect,
+--- and the promise that a silent, idle player sends nothing at all.
+local function suiteHudFeed()
+    suite('hud feed')
+    local env, _, mark = newFeedClient(function(cfg)
+        cfg.Hud.Scale = 1.25
+    end)
+    stubs.tick(150)
+    local seeded = hudMerged(mark)
+    check(type(seeded.minimap) == 'table', 'the first push carries the minimap rect')
+    eq(seeded.anchor, 'bottom-left', 'the default anchor rides with it')
+    eq(seeded.scale, 1.25, 'and the configured scale')
+    eq(seeded.talking, false, 'the mic starts silent')
+    eq(seeded.muted, false, 'and connected')
+    eq(seeded.health, 100, 'a full ped seeds 100 % health')
+    eq(seeded.armour, 0, 'and no armour')
+    eq(seeded.speed, nil, 'ShowSpeed is opt-in now: no speed key at all')
+    eq(seeded.street, nil, 'and ShowStreet: no street')
+    eq(seeded.zone, nil, 'nor zone')
+
+    -- an idle, silent player is silent on the wire too
+    local idle = #stubs.nuiMessages + 1
+    stubs.tick(1000)
+    eq(hudCount(idle), 0, 'ten ticks with nothing changing send nothing')
+
+    -- the mic beat: one flip, one message, one key
+    local talkMark = #stubs.nuiMessages + 1
+    stubs.vitals.talking = true
+    stubs.tick(150)
+    eq(hudCount(talkMark), 1, 'a talking player produces exactly one hud:set')
+    local talkMsg = hudMerged(talkMark)
+    eq(talkMsg.talking, true, 'which says talking = true')
+    eq(talkMsg.muted, nil, 'and nothing else rides along')
+    eq(talkMsg.health, nil, 'not even the unchanged vitals')
+    stubs.tick(1000)
+    eq(hudCount(talkMark), 1, 'and it is not repeated while it stays true')
+
+    -- the three cadences: the mic every 100 ms, the connection every 1000 ms
+    stubs.vitals.talkingReads, stubs.vitals.connectedReads = 0, 0
+    stubs.tick(1000)
+    check(stubs.vitals.talkingReads >= 9 and stubs.vitals.talkingReads <= 11,
+        'MumbleIsPlayerTalking is read about ten times a second',
+        'got ' .. stubs.vitals.talkingReads)
+    check(stubs.vitals.connectedReads <= 2, 'MumbleIsConnected only on the slow beat',
+        'got ' .. stubs.vitals.connectedReads)
+
+    -- the vitals beat: a changed value travels, and the percentage is the span above 100
+    local hpMark = #stubs.nuiMessages + 1
+    stubs.vitals.health, stubs.vitals.armour = 150, 42
+    stubs.tick(400)
+    local hp = hudMerged(hpMark)
+    eq(hp.health, 50, 'a ped at 150 of 200 reads 50 %')
+    eq(hp.armour, 42, 'armour travels as it is')
+
+    -- muted follows the voice server, on the slow beat
+    local muteMark = #stubs.nuiMessages + 1
+    stubs.vitals.connected = false
+    stubs.tick(1100)
+    eq(hudMerged(muteMark).muted, true, 'losing the voice server mutes the tile')
+
+    -- ShowSpeed is opt-in: turning it on starts the reads, and nothing else changes
+    local speedMark = #stubs.nuiMessages + 1
+    env.Config.Hud.ShowSpeed = true
+    stubs.vitals.speed = 10.0
+    stubs.tick(400)
+    eq(hudMerged(speedMark).speed, 36, '10 m/s is 36 km/h once ShowSpeed is on')
+
+    -- the resource stop kills the thread, synchronously
+    local stopMark = #stubs.nuiMessages + 1
+    stopFeed(env)
+    stubs.vitals.talking, stubs.vitals.talkingReads = false, 0
+    stubs.tick(1000)
+    eq(stubs.vitals.talkingReads, 0, 'onClientResourceStop ends the thread on the spot')
+    eq(hudCount(stopMark), 0, 'and nothing else leaves')
+end
+
+--- The feed with the voice tile handed to someone else, and with an unusable placement.
+local function suiteHudFeedConfig()
+    suite('hud feed config')
+    local env, _, mark = newFeedClient(function(cfg) cfg.Hud.ShowVoice = false end)
+    stubs.vitals.talking = true
+    stubs.tick(1100)
+    local merged = hudMerged(mark)
+    eq(merged.talking, nil, 'ShowVoice = false sends no talking')
+    eq(merged.muted, nil, 'and no muted — a voice resource owns the tile')
+    eq(stubs.vitals.talkingReads, 0, 'and never touches the Mumble natives')
+    eq(merged.health, 100, 'while the vitals still travel')
+    stopFeed(env)
+
+    local env2, _, mark2 = newFeedClient(function(cfg)
+        cfg.Hud.Anchor = 'top-left'
+        cfg.Hud.Scale = 99
+    end)
+    stubs.tick(150)
+    local placed = hudMerged(mark2)
+    eq(placed.anchor, 'bottom-left', 'an anchor the shell cannot draw falls back to the default')
+    eq(placed.scale, 1.0, 'and an absurd scale to 1.0')
+    stopFeed(env2)
+
+    -- a config written against the OLD four-value contract must not place the strip on top of
+    -- the key hints: 'bottom-center' / 'bottom-right' are unknown now, so placement() falls back
+    local env3, _, mark3 = newFeedClient(function(cfg) cfg.Hud.Anchor = 'bottom-center' end)
+    stubs.tick(150)
+    eq(hudMerged(mark3).anchor, 'bottom-left', "'bottom-center' is no placement any more")
+    stopFeed(env3)
+
+    local env4, _, mark4 = newFeedClient(function(cfg) cfg.Hud.Anchor = 'bottom-right' end)
+    stubs.tick(150)
+    eq(hudMerged(mark4).anchor, 'bottom-left', "and neither is 'bottom-right'")
+    stopFeed(env4)
+
+    local env5, _, mark5 = newFeedClient(function(cfg) cfg.Hud.Anchor = 'bottom-left' end)
+    stubs.tick(150)
+    eq(hudMerged(mark5).anchor, 'bottom-left', "while 'bottom-left' is passed through")
+    stopFeed(env5)
+end
+
 --------------------------------------------------------------------------------
 -- runner
 --------------------------------------------------------------------------------
 
 local SUITES <const> = { suiteManifest, suiteDiscovery, suiteFocus, suitePatch, suitePaths,
-    suiteFeed, suiteRequests, suiteServerForward, suiteWorldPrompts, suiteWorldPromptsNative,
+    suiteFeed, suiteRequests, suiteServerForward, suiteHudKeys, suiteHudStats,
+    suiteHudFeed, suiteHudFeedConfig, suiteWorldPrompts, suiteWorldPromptsNative,
     suiteWorldPromptsScaleform, suiteWorldPromptsCadence, suiteWorldPromptsEntity }
 
 for i = 1, #SUITES do SUITES[i]() end

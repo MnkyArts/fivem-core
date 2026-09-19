@@ -65,6 +65,17 @@
   --color-key: #fbfbfb;
   --color-key-fg: #11161b;
 
+  /* The vitals HUD of §39 — a white plate over a dark track, measured from Liam's mockup. */
+  --color-plate: #f2f3f6;
+  --color-plate-lo: #eaedf1;            /* the white plate: a top -> bottom gradient */
+  --color-plate-fg: #11171f;            /* label ink on the plate */
+  --color-plate-track: rgba(62, 66, 74, 0.92);  /* the drained part of plate and bar */
+  --color-plate-health: #c6022a;        /* glyph colour ON the white plate */
+  --color-plate-armour: #0152b0;        /* the same, for armour */
+  --color-plate-loss: #f00645;          /* §39.3.1: the chunk you just lost (sampled from Liam's clip) */
+  --color-plate-gain: #0bfd69;          /* ...and the one you are getting */
+  --color-hud-tile: rgba(32, 36, 39, 0.85);     /* the mic tile */
+
   --radius-ui: 6px;
   --radius-ui-sm: 4px;
   --radius-ui-xs: 3px;

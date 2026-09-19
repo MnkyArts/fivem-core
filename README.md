@@ -67,6 +67,11 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 | `Config.DB.Adapter` | `'kvp'` | `'postgres'` is the production backend (setup under "Where data lives"); `'mysql'` switches to the oxmysql adapter — **untested**, see "DB tools" below |
 | `Config.Interiors.Enabled` | `true` | master switch for the §36 IPL loader (`false` loads nothing — only for debugging map issues) |
 | `Config.Interiors.<group>` | per-group | `base heists bikers casino tuner …` default on; `north_yankton ufo red_carpet` default off; newer DLC groups self-gate on the game build / DLC (`/interiors` prints the effective state) |
+| `Config.Hud.Anchor` | `'bottom-left'` | where the §39 vitals strip sits: 24 px from both screen edges, never reading the map rect (the streamed `sf_minimap` cluster draws the map in a top corner, so the vanilla bottom-left maths would only offset the strip), or `'minimap'` — right of the live minimap rect, its glyphs flush with the map's bottom edge. No centre or right anchor on purpose: those corners belong to the progress bar / text UI and to the key hints |
+| `Config.Hud.Scale` | `1.0` | multiplies the strip's one unit (`--core-hud-unit`, 24 px ⇒ a ≈ 365 px wide strip; clamped 0.5–2.0 ⇒ 12–48 px) — the whole HUD grows or shrinks with this number, in fixed px like the rest of the shell |
+| `Config.Hud.ShowVoice` | `true` | the mic tile, read from Mumble; `false` hands the tile to a voice resource, which pushes `Core.UI.hud.set({ talking = …, muted = … })` itself |
+| `Config.Hud.ShowSpeed` · `.ShowStreet` | `false` | core draws neither any more — turn one on only for a plugin that reads `useHud().speed` / `.street` / `.zone`, because the feed then pays for those natives |
+| `Config.Stats.Defs.<name>.hud` | `'health'` / `'armour'` | `'health'` / `'armour'` cut the stat's bar out of that vitals plate (where `hunger` and `thirst` sit), `true` puts it on the top-right stat rail instead, `false` draws nothing; `.icon` is the kit glyph under a slotted bar |
 
 Discord logging is a convar, never a config value, so the URL never lands in git:
 
@@ -734,7 +739,7 @@ so nothing drifts apart. The look is Liam's four mockups: blue-black translucent
 |---|---|---|
 | tokens | the `@theme static` blocks of `ui/sdk/theme.css` (imported by `ui/src/styles.css`, referenced by every plugin build) | every colour, font, radius, shadow, size — each one also a Tailwind utility (`bg-panel`, `text-fg-dim`, `rounded-ui`, `font-display`, `text-display-lg`) |
 | classes | `ui/src/kit/css/*.css` | the `.core-*` vocabulary (`core-btn`, `core-panel`, `core-slot`, …); plain HTML may wear them |
-| components | `ui/src/kit/components/Core*.vue` | ~60 tags registered **globally** on the shell's one Vue app — `<CoreButton>` works in any page with no import |
+| components | `ui/src/kit/components/Core*.vue` | 64 tags registered **globally** on the shell's one Vue app — `<CoreButton>` works in any page with no import |
 
 #### The tags
 
@@ -742,15 +747,15 @@ Grouped as in DESIGN §37.5, which is the full API (props · slots · emits · c
 
 | group | components |
 |---|---|
-| foundation | **CoreIcon** a registry glyph (`kit/icons.js`, 185 names, 24 × 24, `currentColor`) |
+| foundation | **CoreIcon** a registry glyph (`kit/icons.js`, 191 names, 24 × 24, `currentColor`) — the `hud-*` six (`hud-mic`, `hud-mic-off`, `hud-heart`, `hud-shield`, `hud-food`, `hud-drink`) are hand-made for the §39 HUD and survive a regeneration of the file |
 | actions | **CoreButton** every button (`primary` `secondary` `ghost` `danger` `success`, `fade`, `kbd`, `loading`, `block`) · **CoreIconButton** square icon-only · **CoreKey** a key cap or mouse glyph · **CoreKeyHint** cap + caption · **CoreKeyHints** the hint bar of a footer · **CorePrompt** `[F] ENTER VEHICLE` · **CorePromptGroup** stacked prompts |
 | surfaces | **CorePanel** the bordered panel (title/subtitle/eyebrow, `actions` + `footer` slots, `blur`) · **CoreScreen** full-page scaffold (header · body · footer) · **CoreBackground** the scrim over the game · **CoreCard** media + text card · **CoreHeading** title block with the `//` marker · **CoreDivider** hairline · **CoreDash** the short accent bar · **CoreTagline** stacked wide-tracked lines · **CoreBrand** logo lockup |
 | navigation | **CoreTabs** top row with the glowing underline · **CoreMenu** vertical rows (main menu, sidebar) · **CoreChips** filter chips / segmented control · **CoreStepper** `‹ value ›` cycler |
 | forms — text | **CoreField** label + control + hint/error (`inline` = settings row) · **CoreInput** text field · **CoreTextarea** with counter · **CoreNumberInput** `[−] 12 [+]` · **CoreSelect** dropdown (`box` or the inline `SORT: RECENT ⌄`) |
 | forms — choice | **CoreCheckbox** · **CoreRadioGroup** / **CoreRadio** (`radio` or `card`) · **CoreSwitch** · **CoreSlider** · **CoreSwatches** colour picker |
-| data — meters | **CoreProgress** linear bar (`inline`, `segments`, threshold tones) · **CoreRing** radial · **CoreStatBar** HUD vital · **CoreStatRow** detail stat between hairlines · **CoreSpinner** · **CoreSkeleton** |
+| data — meters | **CoreProgress** linear bar (`inline`, `segments`, threshold tones) · **CoreRing** radial · **CoreVital** the §39 HUD plate — a slanted white plate over a dark track, with the food / drink bar cut out of its bottom · **CoreStatBar** HUD vital row · **CoreStatRow** detail stat between hairlines · **CoreSpinner** · **CoreSkeleton** |
 | data — display | **CoreBadge** count pip · **CoreTag** small chip (tones + rarities) · **CoreAvatar** · **CorePlayerChip** avatar · name · level · XP · **CoreTable** · **CoreKeyValue** ruled label/value rows · **CoreEmpty** empty state |
-| game | **CoreSlot** item slot · **CoreSlotGrid** the inventory grid · **CoreHotbar** · **CoreList** / **CoreListItem** rich rows · **CoreObjective** · **CoreTracker** HUD quest card · **CoreCompass** heading strip · **CoreInteractionDot** world interaction dot → key prompt |
+| game | **CoreSlot** item slot · **CoreSlotGrid** the inventory grid · **CoreHotbar** · **CoreList** / **CoreListItem** rich rows · **CoreObjective** · **CoreTracker** HUD quest card · **CoreHudTile** the slanted dark tile that opens the vitals strip (`active` = transmitting, `dimmed` = muted) · **CoreCompass** heading strip · **CoreInteractionDot** world interaction dot → key prompt |
 | feedback | **CoreAlert** inline banner · **CoreToast** notification card · **CoreDialog** modal (focus trap, escape layers) · **CoreDrawer** side sheet · **CorePopover** anchored panel · **CoreContextMenu** right-click menu · **CoreTooltip** · **CoreShard** centre-screen banner |
 
 Props follow one vocabulary: `size` (`sm|md|lg`), `tone` (`accent|neutral|success|warning|danger|info`,
@@ -809,6 +814,7 @@ Utilities and CSS variables are the same names. Opacity modifiers (`bg-accent/10
 | accent | `text-accent` `bg-accent-hi` `bg-accent-lo` `bg-accent-soft` `text-on-accent` | `#f6503f` · `#ff6351` · `#d53e2f` · `rgba(246,80,63,.16)` · `#fff` |
 | states | `text-success` `text-warning` `text-error` `text-info` | `#3fd67f` · `#f5a623` · `#ff4560` · `#55b6f7` |
 | vitals | `text-health` `text-armour` `text-stamina` `text-hunger` `text-thirst` `text-oxygen` `text-stress` (also the meter `tone` names) | `#fa5246` `#5dbbf7` `#5de395` `#f5a623` `#4fd1e8` `#9fd8ff` `#b68cff` |
+| HUD plates (§39) | `bg-plate` `bg-plate-lo` `text-plate-fg` `bg-plate-track` `text-plate-health` `text-plate-armour` · `bg-plate-loss` `bg-plate-gain` · `bg-hud-tile` | `#f2f3f6` · `#eaedf1` (the plate's top → bottom gradient) · `#11171f` ink · `rgba(62,66,74,.92)` drained · `#c6022a` · `#0152b0` (glyph colours **on** the white fill; on the dark track a glyph keeps its ordinary vital tone) · `#f00645` · `#0bfd69` (the chunk a vital just lost / is gaining, §39.3.1) · `rgba(32,36,39,.85)` the mic tile |
 | rarity | `text-rarity-common` `text-rarity-uncommon` `text-rarity-rare` `text-rarity-epic` `text-rarity-legendary` | `#aeb6bf` `#5de395` `#5dbbf7` `#b68cff` `#f5a623` |
 | shape | `rounded-ui` `rounded-ui-sm` `rounded-ui-xs` · `shadow-ui` `shadow-ui-sm` `shadow-ui-lg` `shadow-glow` `shadow-glow-sm` · `ease-ui` | 6 / 4 / 3 px · the panel shadows · the coral selection glow · `cubic-bezier(.22,.61,.36,1)` |
 | type | `font-sans` `font-display` `font-mono` · `text-ui-xs` `text-ui-sm` `text-ui` `text-ui-lg` · `text-display-sm` `text-display` `text-display-lg` `text-display-xl` · `tracking-display` `tracking-label` `tracking-eyebrow` | Barlow · Barlow Condensed · Cascadia Mono · 11 / 13 / 15 / 17 px · 18 / 24 / 34 / 48 px · 0.04 / 0.14 / 0.32 em |
@@ -939,9 +945,10 @@ sets it), and it works on an element that appears later. `--core-glass-tint` on 
 the panel colour the wrapper paints (default `--color-panel-glass`, `rgba(11,17,22,.64)`).
 
 Each consumer costs one small canvas copy per frame, so put it on **panels, never on list rows** or
-per-item elements, and keep **12 or fewer on screen** — core's own ten built-ins (the three modals,
-the HUD box, the stat bars, each toast, the text UI pill, the progress box, the key hints and the
-spinner) already carry it. The loop runs only while the blur is enabled, at least one consumer is
+per-item elements, and keep **12 or fewer on screen** — core's own built-ins (the three modals,
+the stat rail, each toast, the progress box, the key hints, the chat input and the spinner) already
+carry it. The §39 vitals strip does **not**: its plates are opaque white over the live game and
+never wear `data-core-blur`. The loop runs only while the blur is enabled, at least one consumer is
 visible, the shell is visible (§31) and the tab is not hidden; otherwise it stops completely.
 
 | `Config.UI.Blur` key | default | what it does |
@@ -1082,9 +1089,13 @@ manual) drives weather. Hooks: `timeChanged (h, m)`, `weatherChanged (type)`.
 | `Core.Stats.get(src, name)` `getAll(src)` `set` `add` `sub` `reset(src, name?)` `define(name, def)` | stored in `data.stats`, clamped to the def; `define` runs at start, before players load |
 | `Core.Stats.get(name)` `getAll()` `onChange(fn)` *(client)* | reads `LocalPlayer.state.stats`, no hop |
 
-Defs live in `Config.Stats.Defs` (`min`, `max`, `default`, `decayPerMinute`, `thresholds`, `hud`); one
-thread decays every player once per `Config.Stats.TickMs`, and `hud = true` puts a bar in the HUD. Hooks:
-`statChanged (src, name, value)` (never on decay) and `statThreshold (src, name, threshold, value)`.
+Defs live in `Config.Stats.Defs` (`min`, `max`, `default`, `decayPerMinute`, `thresholds`, `hud`, `icon`);
+one thread decays every player once per `Config.Stats.TickMs`. `hud` says where the bar goes (§39):
+`'health'` / `'armour'` cut it out of the bottom of that vitals plate — where `hunger` (`hud-food`) and
+`thirst` (`hud-drink`) sit by default — `true` puts it on the top-right stat rail instead, and `false`
+draws nothing; `icon` is the kit glyph shown under a slotted bar. The bar turns amber under 25 % and red
+with a pulsing glyph under 10 %. Hooks: `statChanged (src, name, value)` (never on decay) and
+`statThreshold (src, name, threshold, value)`.
 
 ### Weapons (§19)
 
@@ -1131,8 +1142,11 @@ if pick == 'snack' then Core.UI.shard(src, { title = 'Bought', style = 'success'
 | `Core.UI.shard(src, { title, subtitle?, duration = 4000, style = 'wasted'\|'success'\|'info' })` · `spinner.show(src, text)` / `spinner.hide(src)` · `hud.setVisible(src, bool)` | the big centre card, the spinner, the HUD toggle |
 | `Core.UI.hide(src, reason?)` / `Core.UI.show(src, reason?)` (§31) | hide the whole shell for one player — stored client-side as `server:<reason>`; see "Visibility" under UI |
 
-The same `keys`, `shard`, `spinner` and `hud` calls exist on the client without the `src`. The HUD now
-also shows health, armour, speed, street/zone and a bar per `hud = true` stat.
+The same `keys`, `shard`, `spinner` and `hud` calls exist on the client without the `src`. What core
+actually *draws* is the §39 vitals strip at the bottom left: the mic tile, the HEALTH and ARMOR plates
+and the food / drink bars cut out of them. `cash`, `bank`, `name`, `serverId`, `faction`, `speed`,
+`street` and `zone` still travel in `hud:set` and stay readable through `useHud()` — core simply leaves
+them to a plugin to render.
 
 ### Getters, Globals, Services, Api, Perms (§22)
 
@@ -1281,7 +1295,7 @@ up — see "Editor support (LuaLS)" below.
 
 `resmon 1` needs the client started with `+set moo 31337`. Steps 3, 4, 7 and 8 are the negative tests: they must *fail quietly*, with nothing changed server-side.
 
-1. Fresh join → you spawn at LSIA arrivals, the HUD shows your name, id, `$5,000` cash / `$25,000` bank, and a `core_example loaded` notification appears (the `playerLoaded` hook).
+1. Fresh join → you spawn at LSIA arrivals, the vitals strip slides in at the bottom left (mic tile, HEALTH and ARMOR plates), and a `core_example loaded` notification appears (the `playerLoaded` hook). Core no longer draws your name, id or money anywhere: `/id` prints the server id, and `F9` opens the example page, which reads name, `$5,000` cash and `$25,000` bank straight out of `useHud()`.
 2. `/car adder` as an admin → the car spawns and you are warped in; press `U` → "Vehicle locked" notify and the doors lock, `U` again unlocks.
 3. **No keys:** a second player stands at your car and presses `U` → "You have no keys for this vehicle"; the doors do not move.
 4. **No permission:** a player without `core.admin` runs `/car adder` → a "You are not allowed to do that" notification and no vehicle; the same for `/tp`, `/setcash` and `/ban`.
@@ -1289,9 +1303,9 @@ up — see "Editor support (LuaLS)" below.
 6. Press `E` → a 2 s progress bar → cash −$5, +25 health, a notification; press `X` during the bar → it cancels and nothing is charged.
 7. **Distance:** stand ~10 m away and run `TriggerServerEvent('core_example:server:buySnack')` in `F8` → nothing happens, no money moves, no error.
 8. **Cooldown:** stand in the marker and spam `E` for 10 s → at most one purchase per second, the rest is dropped silently, no kick and no duplicate charge.
-9. Press `F5` (or `/example`) → the page opens with a cursor and your HUD values; `ESC` → it closes and the cursor is gone.
+9. Press `F9` (or `/example`) → the page opens with a cursor and your HUD values; `ESC` → it closes and the cursor is gone.
 10. `restart core_example` while the page is open → the page closes, focus is released, and the blip, marker, label and interaction all disappear with no leftovers.
-11. `/faction create Test TST` → $25,000 leaves the bank and the HUD shows `TST`; invite a second player, they run `/faction accept` → both see it; `/faction leave` clears it.
+11. `/faction create Test TST` → $25,000 leaves the bank and the `TST` tag appears on the `F9` example page (core's own HUD does not draw the faction); invite a second player, they run `/faction accept` → both see it; `/faction leave` clears it.
 12. Die → "Respawn in 8 s" counts down → you respawn at the nearest hospital and `dead` goes false; `/revive <id>` from the console works too. Then reconnect → position, money and faction persisted; `restart core` while online → **no** re-spawn, HUD refreshed, core_example's registrations back. Finally `resmon 1`: idle far away `0.00–0.02 ms`, standing in the marker `< 0.06 ms`.
 
 Wave 2 (§15–§26). Steps 13 and 15 are the negative tests — same rule: they must fail quietly. The FXServer console cannot evaluate Lua, so where a step calls a `Core.*` function, wrap it in a throwaway `Core.Commands.register` in `core_example/server/main.lua` first.
@@ -1301,13 +1315,13 @@ Wave 2 (§15–§26). Steps 13 and 15 are the negative tests — same rule: they
 15. **Server-side distance and cooldown:** from ~10 m away run `TriggerServerEvent('core:server:worldInteract', '<id>')` in `F8` → nothing happens, no money moves. Spam `E` in the marker for 10 s → at most one purchase per second.
 16. **Weapons persist:** `/weapon <your id> WEAPON_PISTOL 50` → the pistol appears with 50 rounds. Fire ~10, wait for the 60 s snapshot (or die), then `/quit` and reconnect → the pistol is back with the *reduced* ammo. `/weapons clear <your id>` → it is gone and stays gone after a relog. Bonus negative: `/weapon` as a non-admin → "You are not allowed to do that".
 17. **Time and weather for everyone:** with a second player connected, `Core.World.setTime(2, 0)` and `Core.World.setWeather('THUNDER', 5)` → **both** clients go to 02:00 and roll into thunder within ~5 s. `Core.World.setWeatherFor(<id>, 'XMAS', 2)` changes that one player only, `clearWeatherFor` puts them back, and `Core.World.freezeTime(true)` stops the clock for everyone.
-18. **Stats decay and thresholds:** watch the hunger/thirst bars in the HUD — they drop by `decayPerMinute` every `TickMs`. Put one just above a threshold (`Core.Stats.set(<id>, 'hunger', 26)`) and let it decay past 25 → the threshold notification fires **once**, not every tick. Buy a snack → hunger jumps +20 and the bar follows immediately.
+18. **Stats decay and thresholds:** watch the food and drink bars cut out of the bottom of the HEALTH and ARMOR plates — they drop by `decayPerMinute` every `TickMs`. Put one just above a threshold (`Core.Stats.set(<id>, 'hunger', 26)`) and let it decay past 25 → the threshold notification fires **once**, not every tick. Buy a snack → hunger jumps +20 and the bar follows immediately.
 19. **Chat channels (CEF):** stop the stock `chat` resource, then press `T` → only core's slim top-left input opens, keyboard-only, no GTA chat. Send plain text → `Name: message` has a visible space. After eight seconds the feed fades; `T` restores history. Type `/p`, navigate with arrows and complete `/pm` with Tab → `<target>` is highlighted; enter an id and a space → `<message>` is highlighted, including across words. Move the caret back → the hint follows. Check `/car`'s optional plate hint as an admin, plugin commands after plugin restart, PageUp/PageDown, unsent draft restoration, Escape, and pause/menu focus takeover. A second player within ~20 m sees local text at full opacity, one at ~50 m sees it faded, one 300 m away sees nothing. `/s WRENCH` reaches ~60 m at full opacity. `/fc warehouse run` reaches only your faction, `/a test` only `core.mod` staff, `/pm <id> hi` only that player, `/ooc hi` everyone. Spam → cooldown drops extras. F8 `TriggerServerEvent('core:server:chat:send', 'hi', 'a')` as non-staff → nothing is delivered. Confirm no duplicate chat opens with `T` or the GTA team-chat key, and check idle resmon; offline tests cannot verify these native/game behaviours.
 20. **Server-opened menu, key hints and shard:** run `/exmenu` → a menu opens on *your* screen although `server/main.lua` called it; pick "Heal me" → health goes to 200 and a green **HEALED** shard slides in; press `ESC` instead → the menu returns `nil` and nothing happens. Walk into the 24/7 marker → the `[E]` key hints appear on `onEnter` and go on `onExit`; `restart core_example` while they are up → they disappear with it, no leftovers.
 
 UI visibility (§31). Step 22 is where the two keyboards meet: while the NUI holds focus the game never sees `ESC`.
 
-21. **The shell hides behind the pause menu:** stand in the 24/7 marker so the HUD, the stat bars and the `[E]` pill are all up, raise a long notification, then press `ESC` → the moment the map opens *everything* core draws is gone, and it is all back unchanged (same values, the toast with its remaining time) when you close it. `Core.Screen.fade(<id>, 800)` does the same for a fade. Then hide it by hand: `Core.UI.hide('test')` from a throwaway **client** command in `core_example/client/main.lua` → the shell stays gone until `Core.UI.show('test')`, `Core.UI.isHidden()` is `true` and `Core.UI.hiddenReasons()` lists `core_example:test`; `restart core_example` while it still holds that reason → the shell comes straight back (the plugin's `uihide` registrations die with it).
+21. **The shell hides behind the pause menu:** stand in the 24/7 marker so the vitals strip and the `[E]` pill are both up, raise a long notification, then press `ESC` → the moment the map opens *everything* core draws is gone, and it is all back unchanged (same values, the toast with its remaining time) when you close it. `Core.Screen.fade(<id>, 800)` does the same for a fade. Then hide it by hand: `Core.UI.hide('test')` from a throwaway **client** command in `core_example/client/main.lua` → the shell stays gone until `Core.UI.show('test')`, `Core.UI.isHidden()` is `true` and `Core.UI.hiddenReasons()` lists `core_example:test`; `restart core_example` while it still holds that reason → the shell comes straight back (the plugin's `uihide` registrations die with it).
 22. **A modal cancels instead of hiding:** run `/exmenu` and press `ESC` **once** while the menu is up → the NUI has focus, so the menu swallows the key, returns `nil` and closes; the pause menu does **not** open. Press `ESC` again → now the pause menu opens and the rest of the shell hides with it. Same rule from the server: `Core.UI.hide(<id>, 'cutscene')` with the menu open → the menu closes with `nil` and focus is released, no invisible cursor left behind (hiding with a modal open equals cancelling it).
 
 Idle cameras (§35).
@@ -1320,13 +1334,13 @@ Interiors (§36).
 
 Game blur (§32).
 
-23. **Glass panels:** run `/exmenu` and look at the game *behind* the menu panel — it is blurred, and it keeps up as you turn the camera (the HUD box, the toasts and the `[E]` pill are glass too). `resmon 1` on `core` must not move measurably: the copy runs in the CEF, not in the script. Set `Config.UI.Blur.Enabled = false`, `restart core` → the panels are flat `bg-panel` again and nothing else changes; a throwaway client command calling `Core.UI.setBlur(false)` does the same without a restart, and `Core.UI.setBlur(true)` brings it back.
+23. **Glass panels:** run `/exmenu` and look at the game *behind* the menu panel — it is blurred, and it keeps up as you turn the camera (the toasts, the progress box and the chat input are glass too; the vitals strip is deliberately **not** — its plates stay opaque white). `resmon 1` on `core` must not move measurably: the copy runs in the CEF, not in the script. Set `Config.UI.Blur.Enabled = false`, `restart core` → the panels are flat `bg-panel` again and nothing else changes; a throwaway client command calling `Core.UI.setBlur(false)` does the same without a restart, and `Core.UI.setBlur(true)` brings it back.
 
 Runtime UI platform (§38). Step 27 is the one that decides whether the whole architecture works in the real CEF; everything after it assumes it passed.
 
 26. **Deploy:** `refresh`, `restart core`, then `ensure core_example inventory charcreator trucking`. The *server* console shows one `<res>: UI plugin ok (build …, N css)` line per plugin and no `core_ui` error; the *client* console (`F8`) shows one `<res>: UI plugin ready in N ms (n pages)` per plugin and no `failed` / `incompatible` line. `/uiplugins` lists all four in state `ready`.
 27. **Cross-resource ES module import in the real CEF 103** — the #1 risk. Step 26 showing `ready` for every plugin *is* the proof: core's page imported `https://cfx-nui-<res>/ui/dist/plugin.<hash>.js` from four other origins and attached their stylesheets. If a plugin stays `failed during fetch` or `failed during evaluate`, open NUI DevTools (`nui_devtools` or `http://localhost:13172`) and read the console and network tabs there.
-28. **core_example, the new request path:** `F5` → the page opens with your HUD values; type a name and press Greet → the reply arrives over `Core.UI.onRequest('greet', …)` ↔ `nui.invoke('greet')`. The Menu demo → "Ask a question" still arrives as a plain event (`Core.UI.send`). `ESC` closes it and the cursor is gone.
+28. **core_example, the new request path:** `F9` → the page opens with your HUD values; type a name and press Greet → the reply arrives over `Core.UI.onRequest('greet', …)` ↔ `nui.invoke('greet')`. The Menu demo → "Ask a question" still arrives as a plain event (`Core.UI.send`). `ESC` closes it and the cursor is gone.
 29. **inventory, restarted without core:** `TAB` opens the grid; drag between panels, split a stack, right-click an item, use hotbar `1`–`5` and the overlay. Then `restart inventory` **without touching core** → re-open: the page comes back and every action fires exactly **once** (no doubled sounds, emits or toasts — that is the module-scope rule holding), while the HUD and chat never flicker because core's NUI did not reload.
 30. **charcreator and trucking:** `/charcreator` → all seven tabs; the stylesheet moved under `.cc-root`, so the tab strip, tiles, active blocks, sliders and swatches must look unchanged — and the soft warning/success tints are now *visible* (they were invisible `color-mix()` before). `/truck`, `/tcompany` and `/dispatch` (the server-opened page must render even right after a restart); run a delivery → the `trucking_hud` overlay card sits horizontally centred.
 31. **Hot deploy of a resource core has never seen:** `core/scripts/new-plugin.sh casino`, `npm install` at `resources/`, `npm run build -w casino-ui`, then `refresh` and `ensure casino` → its page opens, and core was neither rebuilt nor restarted. `stop casino` → the page is gone, the cursor is free, `/uiplugins` no longer lists it and nothing else is disturbed.
@@ -1335,6 +1349,10 @@ Runtime UI platform (§38). Step 27 is the one that decides whether the whole ar
 34. **Focus nesting:** from a page, open a second page declared `{ type = 'modal' }` → `ESC` closes the modal first and focus *plus* `keepInput` return to the page underneath; `ESC` again closes the page.
 35. **Dev loops (optional):** set `Config.UI.Dev.Enabled = true`. `npm run dev:game` in a plugin + `/uidev <res> http://localhost:5173` → edit an SFC and the page updates with no `restart`; `/uidev <res> off` returns to the build. `/uiinspect` opens the inspector panel. (Game and editor on different machines: forward the port so the game sees `localhost:5173`.)
 36. **World interaction dots (§6.7):** with `worldPrompt = true` — `core_example`'s snack interaction and every rendered inventory ground drop are — walk toward the point: a dot sits on it and the bottom pill is gone for that interaction. Look at the dot → the ring collapses into the `E` cap with its label; look away → back to the ring. Press `E` → the action (or the pickup) fires exactly **once**. Stand still looking at a dot → no NUI messages and `resmon 1` on **core** stays at the idle figure; walk while looking → the dot follows the world point smoothly. Out of `range` → gone; inside `range` but beyond the entry's `radius` → the outline lock and `E` does nothing. `restart core` while dots are up → they come back with the registrations, nothing doubled.
+
+The vitals HUD (§39). This one is all eyes — the offline suites can prove the data path but not the picture.
+
+37. **The vitals strip:** after the spawn it sits at the bottom left, 24 px from both edges (`Config.Hud.Anchor = 'bottom-left'`, the default — no minimap maths involved) — mic tile, then the HEALTH plate, then ARMOR, same size, same 20° lean, equal gaps. Take damage → the white HEALTH fill drops at once along that same slanted edge and the span it left stays **red** for about half a second, shrinking into the fill's edge (the label splits two-tone across the edge and is hidden under the chunk); `/revive <id>` → a **green** chunk shoots ahead to the new value and the white fill catches up with it. `Core.Player.setArmour(<id>, 50)` → the ARMOR plate is half drained. `Core.Stats.set(<id>, 'hunger', 20)` → the food bar under HEALTH turns amber; `… 5` → red with a pulsing burger glyph; `thirst` does the same under ARMOR with the cup. Talk on push-to-talk → the mic tile rings and glows for as long as you transmit; stop the voice resource (or lose Mumble) → the tile keeps the crossed-out mic at 40 %. Set `Config.Hud.Anchor = 'minimap'` and `Config.Hud.Scale = 1.4`, `restart core` → the strip anchors to the computed minimap rect and grows, still one piece; set both back. Finally `resmon 1` standing still and silent: `core` stays at the idle `0.00–0.01 ms` — the 100 ms feed only sends what changed.
 
 ## Troubleshooting
 

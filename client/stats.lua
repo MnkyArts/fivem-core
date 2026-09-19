@@ -3,9 +3,11 @@
 
     The server owns the values and writes `player:<serverId>.stats` at most once per second (§8);
     this side only reads that bag, hands the table to `Core.Stats.onChange` listeners and pushes the
-    HUD payload `{ [name] = { value, min, max } }` — built from Core.Config.Stats.Defs entries with
-    `hud = true` — into `Core.UI.stats.set` (§21) when client/ui.lua provides it and
-    Core.Config.Hud.ShowStats is not false.
+    HUD payload `{ [name] = { value, min, max, slot?, icon? } }` — built from the
+    Core.Config.Stats.Defs entries whose `hud` is `true` (a rail bar), `'health'` or `'armour'` (the
+    bar cut out of that vitals plate, §39.4, forwarded as `slot`, with the def's `icon` as its glyph)
+    — into `Core.UI.stats.set` (§21) when client/ui.lua provides it and Core.Config.Hud.ShowStats is
+    not false.
 
     Every state-bag read deserializes the whole value, so read once into a local, never per frame.
 
@@ -61,17 +63,26 @@ function Stats.onChange(fn)
     return true
 end
 
---- `{ [name] = { value, min, max } }` for the defs that asked for a HUD bar; nil when none do.
+--- The two vitals plates a stat bar can be cut out of (DESIGN §39.4); `hud = true` is the rail bar.
+local HUD_SLOTS <const> = { health = true, armour = true }
+
+--- `{ [name] = { value, min, max, slot?, icon? } }` for the defs that asked for a HUD bar; nil
+--- when none do. `slot` travels only for `hud = 'health'` / `'armour'`, `icon` only as a string —
+--- client/ui.lua re-checks both, this side just forwards what the config says.
 local function hudPayload(stats, cfg)
     local stats_cfg = cfg.Stats
     local defs = type(stats_cfg) == 'table' and stats_cfg.Defs or nil
     if type(defs) ~= 'table' then return nil end
     local out, any = {}, false
     for name, def in pairs(defs) do
-        if type(def) == 'table' and def.hud == true then
+        local slot = type(def) == 'table' and HUD_SLOTS[def.hud] and def.hud or nil
+        if type(def) == 'table' and (def.hud == true or slot) then
             local min = tonumber(def.min) or 0
             local max = tonumber(def.max) or 100
-            out[name] = { value = stats[name] or tonumber(def.default) or min, min = min, max = max }
+            out[name] = {
+                value = stats[name] or tonumber(def.default) or min, min = min, max = max,
+                slot = slot, icon = type(def.icon) == 'string' and def.icon or nil,
+            }
             any = true
         end
     end

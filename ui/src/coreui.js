@@ -40,8 +40,10 @@ export function installCoreUI() {
 
     post,
 
-    /** Read-only reactive HUD snapshot (cash / bank / name / serverId / faction,
-     *  plus the §21 feed: health / armour / speed / street / zone / minimap). */
+    /** Read-only reactive HUD snapshot: `visible`, the §39 strip (health / armour / talking /
+     *  muted / anchor / scale / minimap) and the fields core keeps for plugins but no longer
+     *  draws itself (cash / bank / name / serverId / faction / speed / street / zone). Core
+     *  paints only the §39.4 strip — anything else on this object is yours to render. */
     hud: Vue.readonly(store.hud),
 
     /** Read-only reactive mirror of the replicated player state (`state:set`, §21). */

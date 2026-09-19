@@ -1,7 +1,13 @@
 <script setup>
-// Need bars under the HUD (DESIGN §18 + §21 `stats:set`) — one thin bar per
-// `Config.Stats` def with `hud = true`. App.vue hangs this in the top-right rail
-// directly under Hud.vue, so the component does no positioning of its own.
+// Need bars in the top-right rail (DESIGN §18 + §21 `stats:set`, §39.4) — one thin bar per
+// `Config.Stats` def with `hud = true`. App.vue hangs this in the rail, so the component does
+// no positioning of its own.
+//
+// §39.4 split the stats in two: a def whose `hud` is `'health'` or `'armour'` arrives with a
+// `slot` and is drawn by Hud.vue as the bar cut out of that vital plate, so it is SKIPPED here.
+// What is left is a plugin's extra need, which still gets a rail row — and with the two defs
+// core ships (hunger -> health, thirst -> armour) that leaves nothing, so the plate renders
+// nothing at all.
 //
 // State -> render (§37.6): the plate is a <CorePanel variant="hud">, every row an inline
 // <CoreProgress>. The thresholds of §18 are the kit's own (`warnBelow` / `dangerBelow` swap the
@@ -34,6 +40,7 @@ function okTone (name) {
 // between two `stats:set` messages.
 const rows = computed(() => Object.keys(store.stats)
   .sort()
+  .filter((name) => !(store.stats[name] && store.stats[name].slot))
   .map((name) => {
     const stat = store.stats[name]
     const pct = percent(stat)

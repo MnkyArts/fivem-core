@@ -13,15 +13,27 @@ const view = () => h(App)
 let seq = 0
 const rid = (p) => 'sb-shell-' + p + '-' + ++seq
 
+/** §39.4: the HUD is the bottom-left strip now, and its food / drink bars are `stats:set`
+ *  entries with a `slot` — so "the HUD" is two messages, exactly as in game. `stress` has no
+ *  slot and is what keeps the top-right rail plate in the picture. */
 function hud (args) {
   send({
     action: 'hud:set',
     visible: true,
-    cash: args.cash,
-    bank: args.bank,
+    health: args.health,
+    armour: args.armour,
+    talking: args.talking,
+    // Still in the store for `useHud()`, still not drawn by core (§39.4).
+    cash: 4238,
+    bank: 182450,
     name: 'Liam Robinson',
     serverId: 12,
-    faction: args.faction ? { name: 'Los Santos Police Department', tag: 'LSPD', color: '#5b8cff' } : false,
+  })
+  send({
+    action: 'stats:set',
+    hunger: { value: 72, min: 0, max: 100, label: 'Hunger', slot: 'health', icon: 'hud-food' },
+    thirst: { value: 41, min: 0, max: 100, label: 'Thirst', slot: 'armour', icon: 'hud-drink' },
+    stress: { value: 58, min: 0, max: 100 },
   })
 }
 
@@ -70,21 +82,23 @@ export default {
     layout: 'fullscreen',
     docs: {
       description: {
-        component: 'App.vue mounts every built-in at once: `<Hud>` and `<Notifications>` in the '
-          + 'top-right rail, `<TextUI>` and `<Progress>` bottom centre, `<PageHost>` in the middle '
-          + 'and the three modals on top (z-index 50). Everything is `pointer-events: none` except '
-          + 'an open modal or page, which is what lets the player keep playing while a toast is up.',
+        component: 'App.vue mounts every built-in at once: `<Hud>` as the ~351 × 76 px vitals strip '
+          + 'next to the minimap (§39.4, z 35), `<StatsBars>` and `<Notifications>` in the top-right '
+          + 'rail (268px wide, z 40), '
+          + '`<TextUI>` and `<Progress>` bottom centre, `<PageHost>` in the middle and the three '
+          + 'modals on top (z-index 50). Everything is `pointer-events: none` except an open modal '
+          + 'or page, which is what lets the player keep playing while a toast is up.',
       },
     },
   },
   argTypes: {
-    cash: { control: { type: 'number', step: 100 }, table: { category: 'hud:set' } },
-    bank: { control: { type: 'number', step: 1000 }, table: { category: 'hud:set' } },
-    faction: { control: 'boolean', description: 'Show the LSPD row in the HUD.', table: { category: 'hud:set' } },
+    health: { control: { type: 'range', min: 0, max: 100, step: 1 }, table: { category: 'hud:set' } },
+    armour: { control: { type: 'range', min: 0, max: 100, step: 1 }, table: { category: 'hud:set' } },
+    talking: { control: 'boolean', description: 'Lights the mic tile. `null` would remove it.', table: { category: 'hud:set' } },
     prompt: { control: 'text', description: '`textui:show.text`.', table: { category: 'textui:show' } },
     promptKey: { control: 'text', description: '`textui:show.key`.', table: { category: 'textui:show' } },
   },
-  args: { cash: 4238, bank: 182450, faction: true, promptKey: 'E' },
+  args: { health: 86, armour: 64, talking: false, promptKey: 'E' },
 }
 
 export const Playground = {
@@ -100,12 +114,12 @@ export const Playground = {
   },
   parameters: {
     lua: {
-      message: 'hud:set + notify ×2 + textui:show + progress:start',
+      message: 'hud:set + stats:set + notify ×2 + textui:show + progress:start',
       callback: 'progress_cancel / progress_done',
       resolve: (name, body) => (name === 'progress_cancel'
         ? 'Core.UI.progress{...}  ->  false    -- the player pressed X'
         : (name === 'progress_done' ? 'Core.UI.progress{...}  ->  true' : null)),
-      call: "Core.UI.hud.setVisible(true)\n"
+      call: "Core.UI.hud.setVisible(true)   -- client/hudfeed.lua fills the plates by itself\n"
         + "Core.UI.notify({ title = 'On duty', message = 'Signed in as unit 12-A.', type = 'success' })\n"
         + "Core.UI.notify({ title = 'Dispatch', message = '10-31 in progress…', type = 'warning' })\n"
         + "Core.UI.textUI.show('E', 'Search the vehicle')\n"
@@ -154,7 +168,7 @@ export const MenuOverHud = {
   },
   parameters: {
     lua: {
-      message: 'hud:set + notify + textui:show + menu:open',
+      message: 'hud:set + stats:set + notify + textui:show + menu:open',
       callback: 'menu_result',
       resolve: (name, body) => (name === 'menu_result'
         ? 'Core.UI.menu.open{...}  ->  ' + (body.value == null ? 'nil' : JSON.stringify(body.value))

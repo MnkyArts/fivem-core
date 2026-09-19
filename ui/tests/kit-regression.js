@@ -171,10 +171,10 @@
       'CoreTabs', 'CoreMenu', 'CoreChips', 'CoreStepper',
       'CoreField', 'CoreInput', 'CoreTextarea', 'CoreNumberInput', 'CoreSelect',
       'CoreCheckbox', 'CoreRadioGroup', 'CoreRadio', 'CoreSwitch', 'CoreSlider', 'CoreSwatches',
-      'CoreProgress', 'CoreRing', 'CoreStatBar', 'CoreStatRow', 'CoreSpinner', 'CoreSkeleton',
+      'CoreProgress', 'CoreRing', 'CoreStatBar', 'CoreStatRow', 'CoreSpinner', 'CoreSkeleton', 'CoreVital',
       'CoreBadge', 'CoreTag', 'CoreAvatar', 'CorePlayerChip', 'CoreTable', 'CoreKeyValue', 'CoreEmpty',
       'CoreSlot', 'CoreSlotGrid', 'CoreHotbar', 'CoreList', 'CoreListItem', 'CoreObjective', 'CoreTracker',
-      'CoreCompass', 'CoreInteractionDot',
+      'CoreCompass', 'CoreInteractionDot', 'CoreHudTile',
       'CoreAlert', 'CoreToast', 'CoreShard', 'CoreDialog', 'CoreDrawer', 'CorePopover', 'CoreContextMenu',
       'CoreTooltip',
     ]
@@ -228,6 +228,7 @@
       CoreField: [{ label: 'Label', hint: 'Hint' }, () => 'control'],
       CoreHeading: [{ title: 'Heading', subtitle: 'Sub', slash: true }],
       CoreHotbar: [{ items: [{ id: 1, count: 2 }], active: 0 }],
+      CoreHudTile: [{ icon: 'hud-mic', label: 'Voice', active: true }],
       CoreIcon: [{ name: 'check' }],
       CoreIconButton: [{ icon: 'close', label: 'Close' }],
       CoreInput: [{ modelValue: 'x', placeholder: 'p', clearable: true }],
@@ -270,6 +271,7 @@
       CoreToast: [{ tone: 'success', title: 'Saved', message: 'ok', dismissible: true }],
       CoreTooltip: [{ text: 'Tip' }, () => 'anchor'],
       CoreTracker: [{ title: 'Quest', text: 'Go', distance: '120 m' }],
+      CoreVital: [{ label: 'Health', icon: 'hud-heart', value: 80, subValue: 60, subIcon: 'hud-food', subLabel: 'Hunger' }],
     }
     const noProps = NAMES.filter((n) => !MOUNT[n])
     const threw = []
@@ -1074,6 +1076,200 @@
       await c.destroy()
     }
 
+    // ---- 9b. CoreVital + CoreHudTile (§39: the vitals HUD) -------------------------------------
+    // The value is a 0..1 custom property, never a width, and the white plate is CLIPPED inside
+    // the skewed shape — so the two things worth pinning are the published number and the fact
+    // that the fill really carries a clip-path and the shape really carries the skew matrix.
+    {
+      const VITAL = {
+        label: 'Health', icon: 'hud-heart', tone: 'health', value: 81, max: 100,
+        subValue: 80, subMax: 100, subIcon: 'hud-food', subLabel: 'Hunger', unit: 100,
+      }
+      c = mountCase({ render: () => h(K.components.CoreVital, VITAL) })
+      const root = c.q('.core-vital')
+      check('the vital publishes its value as a 0..1 custom property',
+        root.style.getPropertyValue('--core-vital-value').trim() === '0.81',
+        root.style.getPropertyValue('--core-vital-value'))
+      check('the vital publishes its sub stat the same way',
+        root.style.getPropertyValue('--core-vital-sub').trim() === '0.8',
+        root.style.getPropertyValue('--core-vital-sub'))
+      check('the unit prop becomes --core-hud-unit and the root font size',
+        root.style.getPropertyValue('--core-hud-unit').trim() === '100px'
+          && getComputedStyle(root).fontSize === '100px', getComputedStyle(root).fontSize)
+      check('the vital reports itself to assistive tech',
+        root.getAttribute('role') === 'progressbar' && root.getAttribute('aria-label') === 'Health'
+          && root.getAttribute('aria-valuenow') === '81' && root.getAttribute('aria-valuemax') === '100')
+      check('the bar is its own progressbar, named by subLabel',
+        c.q('.core-vital__bar').getAttribute('role') === 'progressbar'
+          && c.q('.core-vital__bar').getAttribute('aria-label') === 'Hunger')
+      check('the content is drawn twice and the fill copy is hidden from the a11y tree',
+        c.all('.core-vital__content').length === 2
+          && c.q('.core-vital__fill').getAttribute('aria-hidden') === 'true',
+        c.all('.core-vital__content').length + ' content node(s)')
+      const clip = getComputedStyle(c.q('.core-vital__fill')).clipPath
+      check('the fill really clips (no width, no polygon)', String(clip).indexOf('inset(') !== -1, clip)
+      const skew = getComputedStyle(c.q('.core-vital__shape')).transform
+      check('the shape carries the -20deg skew matrix', String(skew).indexOf('matrix(1, 0, -0.36') === 0, skew)
+      // §39.1: the LAYOUT box is 3.17em (shape 2.05 + the sub glyph under it), so the component
+      // contains everything it paints and a caller's bottom offset is real air under the glyph.
+      const vitalBox = root.getBoundingClientRect()
+      const glyphBox = c.q('.core-vital__subicon').getBoundingClientRect()
+      check('the box is 3.17em and 6em wide at unit 100',
+        Math.abs(vitalBox.height - 317) < 1 && Math.abs(vitalBox.width - 600) < 1,
+        Math.round(vitalBox.width) + ' x ' + Math.round(vitalBox.height))
+      check('the sub glyph is 0.92em and sits INSIDE that box',
+        Math.abs(glyphBox.height - 92) < 1 && glyphBox.bottom <= vitalBox.bottom + 0.5,
+        Math.round(glyphBox.height) + ', bottom ' + Math.round(glyphBox.bottom - vitalBox.bottom))
+      await c.destroy()
+
+      c = mountCase({ render: () => h(K.components.CoreVital, { label: 'Armor', icon: 'hud-shield', tone: 'armour', value: 70 }) })
+      check('subValue = null drops the bar and wears --solo',
+        /core-vital--solo/.test(c.q('.core-vital').className) && c.q('.core-vital__bar') === null
+          && c.q('.core-vital__subicon') === null, c.q('.core-vital').className)
+      // No `unit` and no ancestor variable: the kit's own default. FIXED px, never a viewport
+      // unit — the rail (268px) and the progress panel (340px) are fixed px too (§39.4).
+      check('the default --core-hud-unit is 24px',
+        getComputedStyle(c.q('.core-vital')).fontSize === '24px',
+        getComputedStyle(c.q('.core-vital')).fontSize)
+      await c.destroy()
+
+      c = mountCase({ render: () => h(K.components.CoreVital, Object.assign({}, VITAL, { value: 10 })) })
+      check('a vital under lowBelow wears is-low', /is-low/.test(c.q('.core-vital').className),
+        c.q('.core-vital').className)
+      await c.destroy()
+
+      c = mountCase({ render: () => h(K.components.CoreVital, Object.assign({}, VITAL, { subValue: 20 })) })
+      check('a sub stat under subWarnBelow wears is-sub-warning',
+        /is-sub-warning/.test(c.q('.core-vital').className), c.q('.core-vital').className)
+      await c.destroy()
+
+      c = mountCase({ render: () => h(K.components.CoreVital, Object.assign({}, VITAL, { subValue: 5 })) })
+      check('a sub stat under subDangerBelow wears is-sub-danger and NOT is-sub-warning',
+        /is-sub-danger/.test(c.q('.core-vital').className) && !/is-sub-warning/.test(c.q('.core-vital').className),
+        c.q('.core-vital').className)
+      await c.destroy()
+
+      // §39.3.1 — the change effect. Nothing here screenshots a moving edge: what the effect IS
+      // is a direction class landing in the same render as the new value, so that the browser
+      // starts THIS transition with THIS direction's durations. Class + the two computed
+      // durations + the chunk colour is the whole contract, and all four are readable at rest.
+      {
+        const st = V.reactive({ value: 80, subValue: 80 })
+        c = mountCase({
+          render: () => h(K.components.CoreVital,
+            Object.assign({}, VITAL, { value: st.value, subValue: st.subValue })),
+        })
+        const vital = c.q('.core-vital')
+        const chunk = c.q('.core-vital__chunk')
+        const subchunk = c.q('.core-vital__subchunk')
+        const fill = c.q('.core-vital__fill')
+        const bg = (el) => getComputedStyle(el).backgroundColor
+        /** One property's duration out of a multi-property transition list (the fill has two). */
+        const durOf = (el, prop) => {
+          const s = getComputedStyle(el)
+          const names = String(s.transitionProperty).split(',').map((x) => x.trim())
+          const times = String(s.transitionDuration).split(',').map((x) => x.trim())
+          const i = names.indexOf(prop)
+          return i === -1 || times.length === 0 ? '' : times[i % times.length]
+        }
+        check('a vital mounted with a value animates nothing (no `immediate` on the watcher)',
+          !!chunk && !!subchunk && !/is-loss|is-gain/.test(vital.className)
+            && bg(chunk) === 'rgba(0, 0, 0, 0)',
+          vital.className + ' / ' + (chunk ? bg(chunk) : 'no chunk'))
+
+        st.value = 40
+        await tick()
+        check('a falling value wears is-loss, never is-gain',
+          /is-loss/.test(vital.className) && !/is-gain/.test(vital.className), vital.className)
+        check('the loss chunk is --color-plate-loss', bg(chunk) === 'rgb(240, 6, 69)', bg(chunk))
+        check('on a loss the chunk LAGS: 0.65s chunk against a 0.3s fill',
+          durOf(chunk, 'clip-path') === '0.65s' && durOf(fill, 'clip-path') === '0.3s',
+          durOf(chunk, 'clip-path') + ' chunk / ' + durOf(fill, 'clip-path') + ' fill')
+
+        st.value = 90
+        await tick()
+        check('a rising value wears is-gain, never is-loss',
+          /is-gain/.test(vital.className) && !/is-loss/.test(vital.className), vital.className)
+        check('the gain chunk is --color-plate-gain', bg(chunk) === 'rgb(11, 253, 105)', bg(chunk))
+        check('on a gain the chunk LEADS: 0.15s chunk against a 0.55s fill',
+          durOf(chunk, 'clip-path') === '0.15s' && durOf(fill, 'clip-path') === '0.55s',
+          durOf(chunk, 'clip-path') + ' chunk / ' + durOf(fill, 'clip-path') + ' fill')
+
+        st.subValue = 30
+        await tick()
+        check('the bar has its own direction state: a falling sub stat is is-sub-loss',
+          /is-sub-loss/.test(vital.className) && bg(subchunk) === 'rgb(240, 6, 69)',
+          vital.className + ' / ' + bg(subchunk))
+
+        // 900 ms after the LAST change every class goes and the chunk turns transparent again:
+        // two anti-aliased edges resting on one line would leave a fringe along the fill's edge.
+        const cleared = await waitFor(
+          () => !/is-loss|is-gain|is-sub-loss|is-sub-gain/.test(vital.className), 1600)
+        check('a direction clears itself ~900 ms after the last change', cleared, vital.className)
+        check('and the chunk is fully transparent at rest again',
+          bg(chunk) === 'rgba(0, 0, 0, 0)' && bg(subchunk) === 'rgba(0, 0, 0, 0)',
+          bg(chunk) + ' / ' + bg(subchunk))
+        await c.destroy()
+      }
+
+      // A bar ARRIVING (a plugin's first `stats:set`) is not a gain of anything — without this
+      // the plate would flash a full-width green chunk the moment a stat claims the slot.
+      {
+        const st = V.reactive({ subValue: null })
+        c = mountCase({
+          render: () => h(K.components.CoreVital, Object.assign({}, VITAL, { subValue: st.subValue })),
+        })
+        st.subValue = 50
+        await tick()
+        check('a sub bar appearing (null -> 50) sets no direction class',
+          !/is-sub-loss|is-sub-gain/.test(c.q('.core-vital').className)
+            && c.q('.core-vital__bar') !== null, c.q('.core-vital').className)
+        await c.destroy()
+      }
+
+      c = mountCase({ render: () => h(K.components.CoreHudTile, { icon: 'hud-mic', label: 'Voice', active: true }) })
+      check('the tile wears is-active when it is transmitting',
+        /is-active/.test(c.q('.core-hudtile').className) && !/is-dimmed/.test(c.q('.core-hudtile').className),
+        c.q('.core-hudtile').className)
+      check('a labelled tile is an img to assistive tech',
+        c.q('.core-hudtile').getAttribute('role') === 'img'
+          && c.q('.core-hudtile').getAttribute('aria-hidden') === null)
+      check('the tile shares the vital\'s 24px default unit',
+        getComputedStyle(c.q('.core-hudtile')).fontSize === '24px',
+        getComputedStyle(c.q('.core-hudtile')).fontSize)
+      await c.destroy()
+
+      c = mountCase({ render: () => h(K.components.CoreHudTile, { icon: 'hud-mic-off', dimmed: true }) })
+      check('the tile wears is-dimmed when it is muted',
+        /is-dimmed/.test(c.q('.core-hudtile').className) && !/is-active/.test(c.q('.core-hudtile').className),
+        c.q('.core-hudtile').className)
+      check('an unlabelled tile is decoration',
+        c.q('.core-hudtile').getAttribute('aria-hidden') === 'true'
+          && c.q('.core-hudtile').getAttribute('role') === null)
+      await c.destroy()
+
+      // The six hand-made §39 glyphs are NOT in the MDI generator map: a regeneration that drops
+      // them would leave the HUD with empty plates and nothing else would notice.
+      const HUD_ICONS = ['hud-mic', 'hud-mic-off', 'hud-heart', 'hud-shield', 'hud-food', 'hud-drink']
+      const badGlyph = HUD_ICONS.filter((n) => {
+        const d = K.icons && K.icons[n]
+        if (typeof d !== 'string' || d.length < 40 || d.charAt(0) !== 'M') return true
+        // `iconPath` is not on CoreUI.kit (only components / icons / registerIcons are), so the
+        // resolver is checked through the component the shell actually draws with.
+        return false
+      })
+      check('the six §39 hud-* glyphs are in the registry, non-empty', badGlyph.length === 0,
+        badGlyph.join(', '))
+      const drawn = []
+      for (const name of HUD_ICONS) {
+        c = mountCase({ render: () => h(K.components.CoreIcon, { name }) })
+        const path = c.q('path')
+        if (!path || path.getAttribute('d') !== K.icons[name]) drawn.push(name)
+        await c.destroy()
+      }
+      check('every §39 hud-* glyph resolves through CoreIcon', drawn.length === 0, drawn.join(', '))
+    }
+
     // ---- 10. pointer events (§37.4: the shell is click-through) --------------------------------
     {
       const HUD = [
@@ -1082,6 +1278,8 @@
         ['CoreCompass', { heading: 90 }, '.core-compass'],
         ['CoreInteractionDot', { keys: 'E', label: 'Search' }, '.core-interaction-dot'],
         ['CoreStatBar', { icon: 'check', value: 60 }, '.core-statbar'],
+        ['CoreVital', { label: 'Health', icon: 'hud-heart', value: 60, subValue: 40, subIcon: 'hud-food' }, '.core-vital'],
+        ['CoreHudTile', { icon: 'hud-mic', label: 'Voice' }, '.core-hudtile'],
         ['CoreToast', { tone: 'info', title: 'Saved', message: 'ok' }, '.core-toast'],
         ['CoreShard', { title: 'WASTED', variant: 'wasted' }, '.core-shard'],
         ['CorePlayerChip', { name: 'Ada', level: 5, progress: 0.4 }, '.core-playerchip'],

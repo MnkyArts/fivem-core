@@ -253,6 +253,8 @@
 ---@field duration? integer ms on screen (default 4000, clamped to 500..60000)
 ---@field style? CoreShardStyle default 'info'
 
+---@alias CoreHudAnchor '"minimap"' | '"bottom-left"'
+
 ---@class CoreHudPartial
 ---@field visible? boolean
 ---@field cash? integer
@@ -261,9 +263,14 @@
 ---@field serverId? integer
 ---@field health? integer
 ---@field armour? integer
----@field speed? number km/h
----@field street? string
----@field zone? string
+---@field speed? number km/h (core does not draw it: Config.Hud.ShowSpeed is opt-in, §39.5)
+---@field street? string (Config.Hud.ShowStreet is opt-in, §39.5)
+---@field zone? string (Config.Hud.ShowStreet is opt-in, §39.5)
+---@field talking? boolean voice activity — the mic tile (§39); never sent means no tile at all
+---@field muted? boolean not connected to the voice server (§39)
+---@field anchor? CoreHudAnchor where the strip sits — 'minimap' or 'bottom-left' only, anything else is dropped (§39.4)
+---@field scale? number HUD unit multiplier, 0.5..2.0; outside that range it is dropped
+---@field minimap? { x: number, y: number, w: number, h: number } minimap rect, screen fractions
 ---@field faction? table|false { name, tag, color } or false when in no faction
 
 --------------------------------------------------------------------------------
@@ -402,7 +409,8 @@
 ---@field default? number value a fresh character starts at
 ---@field decayPerMinute? number subtracted every Config.Stats.TickMs
 ---@field thresholds? number[] values that fire `statThreshold` when crossed downwards
----@field hud? boolean draw a bar in core's HUD
+---@field hud? boolean|'"health"'|'"armour"' true = a bar on the rail plate, 'health'/'armour' = the bar cut out of that vitals plate (§39); anything else = no bar
+---@field icon? string kit icon name for the slotted bar's glyph (default 'hud-food'/'hud-drink', §39.4)
 
 ---@class CoreFactionSummary
 ---@field id string
@@ -534,7 +542,7 @@
 ---@field Security table EntityLockdown, EnforceLoadout, BlockExplosions, WeaponDamage, …
 ---@field Doors { InteractDistance: number }
 ---@field Interiors table Enabled + one boolean per IPL group (base, casino, tuner, …; §36)
----@field Hud table ShowHealth, ShowArmour, ShowStats, ShowSpeed, ShowStreet
+---@field Hud { ShowHealth: boolean, ShowArmour: boolean, ShowStats: boolean, ShowVoice: boolean, ShowSpeed: boolean, ShowStreet: boolean, Anchor: CoreHudAnchor, Scale: number } the vitals HUD (§39.5); ShowSpeed/ShowStreet are opt-in
 ---@field UI table NotifyDurationMs, MaxNotifyPerSecond, HudEnabled, ModalTimeoutMs, CancelKey
 ---@field DB { KeyPrefix: string, FlushIntervalMs: integer, Adapter: string }
 ---@field Admin { CarDefaultModel: string }
@@ -1504,7 +1512,9 @@ function CoreUISpinner.hide(src) end
 ---@class Core.UI.stats
 local CoreUIStats = {}
 ---(client, internal) Pushes the stat bars into the HUD; core's `client/stats.lua` owns this.
----@param values table<string, { value: number, min: number, max: number }>
+---`slot` cuts the bar out of that vitals plate (§39.4), `icon` is a kit icon name; both are
+---dropped unless `slot` is 'health'/'armour' and `icon` matches `^[%w_%-]+$` (<= 32 chars).
+---@param values table<string, { value: number, min: number, max: number, slot: string?, icon: string? }>
 ---@return boolean ok
 function CoreUIStats.set(values) end
 

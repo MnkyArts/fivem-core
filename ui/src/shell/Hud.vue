@@ -1,163 +1,192 @@
 <script setup>
-// Top-right HUD: cash / bank / vitals / location / faction / name + server id
-// (DESIGN §7.2, hud:set in §6.10, health / armour / speed / street / zone in §21).
+// The vitals HUD (DESIGN §39.4): the mic tile, the HEALTH plate and the ARMOR plate as ONE
+// horizontal strip, bottom-left by default (or next to the minimap rect when the config says so).
+// §39 replaces the top-right HUD plate of §7.2 / §21 —
+// cash, bank, speed, street, zone, faction, name and server id are no longer DRAWN by core;
+// they stay in `store.hud` because `useHud()` hands them to plugin pages.
 //
-// State -> render (§37.6): the plate is a <CorePanel variant="hud">, the money / place /
-// faction / identity rows are <CoreKeyValue> lists (label voice left, display voice right, one
-// hairline per row), the vitals are <CoreStatBar> rows (mockup 2's icon · chunky bar · big
-// number) and the faction chip is a <CoreTag> wearing the faction's own colour. Nothing here
-// paints: every hairline, size and colour belongs to the kit.
+// This file is a §37.6 shell widget: store bindings, hook classes and layout, nothing else.
+// Every pixel belongs to <CoreVital> and <CoreHudTile>; the only geometry here is WHERE the
+// strip sits and HOW BIG one `em` is:
 //
-// The §21 fields are optional: `client/hudfeed.lua` pushes them at most every 250 ms and
-// only on change, so a server that never sends them renders exactly the v1 HUD.
+//   * `--core-hud-unit` is the strip's font size (1em = 100 px of Liam's mockup), so the whole
+//     strip scales with one number. It is set as BOTH the custom property and `font-size`: the
+//     kit components read the variable, and the root's own `gap` / `left` offsets are in the
+//     same `em`. 24 px is the default, and it is FIXED px — the rest of the shell is fixed px
+//     too (the rail is 268px, the progress panel 340px), so a strip that grew with the screen
+//     height would be the one element that stops matching them. `Config.Hud.Scale` is the knob
+//     for a player who wants it bigger.
+//   * `--core-hudtile-h` is how the tile matches the plates next to it. It is a variable, not a
+//     prop: 2.05em beside full vitals, 1.57em beside `--solo` ones (no slotted stat at all).
+//
+// The sub bars are the `stats:set` entries carrying a `slot` — those rows are NOT in the rail
+// (StatsBars.vue skips them), so every stat has exactly one home.
 import { computed } from 'vue'
 import { store } from '../store.js'
-import CorePanel from '../kit/components/CorePanel.vue'
-import CoreKeyValue from '../kit/components/CoreKeyValue.vue'
-import CoreStatBar from '../kit/components/CoreStatBar.vue'
-import CoreTag from '../kit/components/CoreTag.vue'
+import CoreHudTile from '../kit/components/CoreHudTile.vue'
+import CoreVital from '../kit/components/CoreVital.vue'
 
-const WARNING_PCT = 25
-const ERROR_PCT = 10
+/** 24 px from the screen edge for the fixed anchor (§39.4). */
+const EDGE = 24
 
-// The plate is 268 px wide with 12 px of padding: icon 20 + gap 14 + BAR + gap 14 + value 44
-// fills the 242 px content box exactly, and StatsBars aligns its own tracks to the same end.
-const BAR_WIDTH = 150
+/** The TWO placements client/ui.lua lets through; anything else falls back to the default
+ *  (`'bottom-left'`). A bottom-centre or bottom-right strip was cut from the contract: it lands
+ *  on the progress bar and the text UI in the middle, and on the key hints and the spinner on
+ *  the right. */
+const ANCHORS = ['minimap', 'bottom-left']
 
-// Health thresholds as kit tones; `is-ok` / `is-warning` / `is-error` stay on the row as hook
-// classes (the stories read them back off `.hud .bar`). Health is the `health` vital until it
-// crosses a threshold, then it borrows the warning / danger tone.
-const HEALTH_TONE = { ok: 'health', warning: 'warning', error: 'danger' }
+/** Vanilla 16:9 minimap at the default safe zone — assumed until a `minimap` rect arrives, so
+ *  the strip never starts in the wrong corner and then jumps (§39.4). */
+const DEFAULT_MINIMAP = { x: 0.025, y: 0.779, w: 0.141, h: 0.176 }
 
-function money (n) {
-  const v = Math.round(Number(n) || 0)
-  return '$' + v.toLocaleString('en-US')
+/** The default `--core-hud-unit` in px (1em = 100 px of the mockup): the strip is 14.63em, so
+ *  24 px puts it at about 351 px of layout (≈ 369 px of ink once the skew overhangs) and 76 px
+ *  tall. Liam's ruling after seeing it at 13 px: "the 200 width was way too small, make it like
+ *  365" — same look, one number. */
+const UNIT_PX = 24
+
+/** `Config.Hud.Scale` is validated in Lua; a bad value from anywhere else is clamped here.
+ *  0.5..2 of the 24 px unit = 12 px .. 48 px. */
+const SCALE_MIN = 0.5
+const SCALE_MAX = 2
+
+/** core's locale table, with the English fallback the contract names (§39.4). */
+function t (key, fallback) {
+  const strings = store.locale && store.locale.strings
+  const value = strings ? strings[key] : null
+  return typeof value === 'string' && value !== '' ? value : fallback
 }
 
-/** 0..100 for a bar, or null when Lua has not sent the field (so the row stays hidden). */
+/** 0..100 for a plate, or null when Lua has not sent the field (so the plate stays hidden). */
 function pct (n) {
   return typeof n === 'number' && isFinite(n) ? Math.min(100, Math.max(0, n)) : null
 }
 
-/** `#f5a623` -> `245 166 35`, the triplet kit CSS writes its alphas with (Chromium 103, §37.4). */
-function triplet (hex) {
-  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(hex || '').trim())
-  if (!m) return null
-  let h = m[1]
-  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2]
-  const n = parseInt(h, 16)
-  return ((n >> 16) & 255) + ' ' + ((n >> 8) & 255) + ' ' + (n & 255)
+/** A stat's 0..100 over its own span — the same maths StatsBars.vue uses for a rail row. */
+function percent (stat) {
+  const span = stat.max - stat.min
+  if (!(span > 0)) return 0
+  return Math.min(100, Math.max(0, ((stat.value - stat.min) / span) * 100))
 }
 
-const moneyItems = computed(() => [
-  { label: 'Cash', value: money(store.hud.cash), tone: 'success' },
-  { label: 'Bank', value: money(store.hud.bank) },
-])
+/** Trims the float noise out of a computed vw / vh so the inline style stays readable. */
+const round = (n) => Math.round(n * 10000) / 10000
 
 const health = computed(() => pct(store.hud.health))
 const armour = computed(() => pct(store.hud.armour))
-const healthLevel = computed(() => {
-  const v = health.value
-  if (v === null || v >= WARNING_PCT) return 'ok'
-  return v < ERROR_PCT ? 'error' : 'warning'
+
+// `talking` is null while no voice feed is running (`Config.Hud.ShowVoice = false` and no
+// voice resource pushing its own state): null means NO TILE, false means an idle one.
+const talking = computed(() => (store.hud.talking === null || store.hud.talking === undefined
+  ? null
+  : !!store.hud.talking))
+const muted = computed(() => !!store.hud.muted)
+
+const anchor = computed(() => (ANCHORS.indexOf(store.hud.anchor) === -1 ? 'bottom-left' : store.hud.anchor))
+const scale = computed(() => {
+  const n = Number(store.hud.scale)
+  return isFinite(n) && n > 0 ? Math.min(SCALE_MAX, Math.max(SCALE_MIN, n)) : 1
 })
 
-const speed = computed(() => (
-  typeof store.hud.speed === 'number' && isFinite(store.hud.speed)
-    ? Math.max(0, Math.round(store.hud.speed))
-    : null
-))
-const street = computed(() => store.hud.street || '')
-const zone = computed(() => store.hud.zone || '')
+/** Lua tables have no order, so "first by name" is the sorted one: two defs claiming the same
+ *  slot always resolve to the same bar instead of flapping between two `stats:set` messages. */
+function slotStat (slot) {
+  const names = Object.keys(store.stats).sort()
+  for (const name of names) {
+    const stat = store.stats[name]
+    if (stat && stat.slot === slot) return stat
+  }
+  return null
+}
 
-// The place row reads as a key/value pair of its own: the zone is the label, the street the
-// value — which is exactly how the mockups' read-out rows are built.
-const placeItems = computed(() => [{ label: zone.value, value: street.value }])
+const healthStat = computed(() => slotStat('health'))
+const armourStat = computed(() => slotStat('armour'))
 
-// faction is { name, tag, color } or false/null
-const faction = computed(() => (store.hud.faction ? store.hud.faction : null))
-const factionItems = computed(() => (faction.value ? [{ label: faction.value.name || '' }] : []))
-// A faction brands its own chip: the colour becomes the tag's --tone, so the kit's soft fill,
-// hairline and label are all in it. An unparseable colour falls back to the accent tone.
-const factionStyle = computed(() => {
-  const rgb = faction.value ? triplet(faction.value.color) : null
-  return rgb ? { '--tone': faction.value.color, '--tone-rgb': rgb } : null
+/** `null` = the plate has no cut and goes `--solo` (CoreVital's own prop contract). */
+const subValue = (stat) => (stat ? percent(stat) : null)
+
+// A tile next to `--solo` plates has to shrink with them. "Solo" is a property of the STRIP:
+// the tile only drops to 1.57em when at least one plate is rendered and NONE of the rendered
+// plates has a bar under it — a mixed strip keeps the full height so the tops still line up.
+const soloStrip = computed(() => {
+  const plates = []
+  if (health.value !== null) plates.push(healthStat.value)
+  if (armour.value !== null) plates.push(armourStat.value)
+  return plates.length > 0 && plates.every((stat) => !stat)
 })
 
-const identItems = computed(() => [{
-  label: store.hud.name || '',
-  value: store.hud.serverId ? '#' + store.hud.serverId : '',
-  tone: 'accent',
-}])
+const place = computed(() => {
+  // 24 px of real air under the GLYPHS: CoreVital's box is 3.17em and contains everything it
+  // paints, so the offset means what it says (§39.1).
+  if (anchor.value === 'bottom-left') return { left: EDGE + 'px', bottom: EDGE + 'px' }
+  const r = store.hud.minimap && typeof store.hud.minimap === 'object' ? store.hud.minimap : DEFAULT_MINIMAP
+  const x = Number(r.x), y = Number(r.y), w = Number(r.w), h = Number(r.h)
+  const rect = [x, y, w, h].every((n) => isFinite(n)) ? { x, y, w, h } : DEFAULT_MINIMAP
+  return {
+    // The right edge of the minimap plus a little air (0.6em = 14.4 px at the default unit; it
+    // is `em` so the gap grows with `Config.Hud.Scale`), and its bottom edge — the strip lines
+    // up with the map however the player moved their safe zone. Since the vital's box ends
+    // under the sub glyph, that bottom edge is the GLYPHS' baseline, which is what makes the
+    // strip and the map read as one band.
+    left: 'calc(' + round((rect.x + rect.w) * 100) + 'vw + 0.6em)',
+    bottom: 'max(' + EDGE + 'px, ' + round((1 - (rect.y + rect.h)) * 100) + 'vh)',
+  }
+})
+
+const rootStyle = computed(() => {
+  const style = {
+    '--core-hud-unit': 'calc(' + UNIT_PX + 'px * ' + scale.value + ')',
+    fontSize: 'var(--core-hud-unit)',
+  }
+  if (soloStrip.value) style['--core-hudtile-h'] = '1.57em'
+  return Object.assign(style, place.value)
+})
 </script>
 
 <template>
-  <Transition name="core-slide-down">
-    <CorePanel
+  <Transition name="core-slide-up">
+    <div
       v-if="store.hud.visible"
-      tag="div"
-      variant="hud"
-      padding="sm"
-      blur
-      class="hud w-[268px]"
+      class="hud fixed z-[35] flex items-start gap-[0.19em] pointer-events-none"
+      :class="'hud--' + anchor"
+      :style="rootStyle"
     >
-      <CoreKeyValue class="money" :items="moneyItems" />
+      <!-- The label has to stay non-empty: CoreHudTile hides the tile from the a11y tree
+           without one. It goes through the locale table like the two plate labels do. -->
+      <CoreHudTile
+        v-if="talking !== null"
+        class="hud__tile"
+        :icon="muted ? 'hud-mic-off' : 'hud-mic'"
+        :active="talking === true && !muted"
+        :dimmed="muted"
+        :label="muted ? t('hud_voice_muted', 'Microphone muted') : t('hud_voice', 'Microphone')"
+      />
 
-      <div v-if="health !== null || armour !== null" class="vitals flex flex-col gap-[10px] py-[11px]">
-        <CoreStatBar
-          v-if="health !== null"
-          class="bar"
-          :class="'is-' + healthLevel"
-          icon="heart"
-          :tone="HEALTH_TONE[healthLevel]"
-          :value="health"
-          :width="BAR_WIDTH"
-          :low-below="WARNING_PCT"
-        />
-        <!-- Mockup 2 draws the shield white over the blue bar, and armour never pulses. -->
-        <CoreStatBar
-          v-if="armour !== null"
-          class="bar is-armour"
-          icon="shield"
-          icon-tone="fg"
-          tone="armour"
-          :value="armour"
-          :width="BAR_WIDTH"
-          :low-below="0"
-        />
-      </div>
+      <CoreVital
+        v-if="health !== null"
+        class="hud__vital is-health"
+        tone="health"
+        icon="hud-heart"
+        :label="t('hud_health', 'Health')"
+        :value="health"
+        :sub-value="subValue(healthStat)"
+        :sub-icon="(healthStat && healthStat.icon) || 'hud-food'"
+        :sub-label="healthStat ? healthStat.label : ''"
+      />
 
-      <CoreKeyValue v-if="speed !== null" class="meta" :items="[{ label: 'Speed', value: speed }]">
-        <template #value-0>
-          <span class="speed">{{ speed }}</span>
-          <span class="core-label inline-block ml-[4px]">km/h</span>
-        </template>
-      </CoreKeyValue>
-
-      <CoreKeyValue v-if="street || zone" class="place" :items="placeItems" />
-
-      <CoreKeyValue v-if="faction" class="faction" :items="factionItems">
-        <!-- A faction name is as long as its owner made it; the label column is what gives. -->
-        <template #label-0>
-          <span class="fname block min-w-0 truncate">{{ faction.name }}</span>
-        </template>
-        <template #value-0>
-          <CoreTag
-            class="tag"
-            size="sm"
-            variant="soft"
-            tone="accent"
-            :style="factionStyle"
-            :label="faction.tag || '?'"
-          />
-        </template>
-      </CoreKeyValue>
-
-      <CoreKeyValue class="ident" :items="identItems" :last-rule="false">
-        <template #label-0>
-          <span class="name block min-w-0 truncate">{{ store.hud.name }}</span>
-        </template>
-      </CoreKeyValue>
-    </CorePanel>
+      <!-- Armour never pulses: an empty vest is the normal state, not a warning (§39.3). -->
+      <CoreVital
+        v-if="armour !== null"
+        class="hud__vital is-armour"
+        tone="armour"
+        icon="hud-shield"
+        :label="t('hud_armour', 'Armor')"
+        :value="armour"
+        :low-below="0"
+        :sub-value="subValue(armourStat)"
+        :sub-icon="(armourStat && armourStat.icon) || 'hud-drink'"
+        :sub-label="armourStat ? armourStat.label : ''"
+      />
+    </div>
   </Transition>
 </template>

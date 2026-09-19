@@ -26,19 +26,19 @@ const setBlur = (args) => send({
   scale: args.scale,
 })
 
-/** Every widget in this scene is a blur consumer, so the panels can be compared against each
- *  other: the HUD box, the toast card, the text UI pill and the menu panel all carry the
- *  attribute. The menu and the toast are only sent once — dragging a slider must not reopen
- *  the modal or make the toast's count badge climb; the glass follows `blur:set` alone. */
+/** Every PANEL in this scene is a blur consumer, so they can be compared against each other:
+ *  the stat plate, the toast card, the text UI pill and the menu panel all carry the attribute.
+ *  The vitals strip deliberately does NOT — its plates are opaque white and its tile is a flat
+ *  dark shape (§39.2), so it is in the picture only to show what a non-consumer looks like next
+ *  to glass. The menu and the toast are only sent once — dragging a slider must not reopen the
+ *  modal or make the toast's count badge climb; the glass follows `blur:set` alone. */
 function blurScene (args) {
+  send({ action: 'hud:set', visible: true, health: 86, armour: 64, talking: false })
   send({
-    action: 'hud:set',
-    visible: true,
-    cash: 4238,
-    bank: 182450,
-    name: 'Liam Robinson',
-    serverId: 12,
-    faction: { name: 'Los Santos Police Department', tag: 'LSPD', color: '#5b8cff' },
+    action: 'stats:set',
+    hunger: { value: 72, min: 0, max: 100, label: 'Hunger', slot: 'health', icon: 'hud-food' },
+    thirst: { value: 41, min: 0, max: 100, label: 'Thirst', slot: 'armour', icon: 'hud-drink' },
+    stress: { value: 58, min: 0, max: 100 },
   })
   if (!store.notifications.length) {
     send({
@@ -121,7 +121,7 @@ export const Glass = {
   },
   parameters: {
     lua: {
-      message: 'blur:set (+ hud:set + notify + textui:show + menu:open)',
+      message: 'blur:set (+ hud:set + stats:set + notify + textui:show + menu:open)',
       call: '-- shared/config.lua: the only knobs. client/ui.lua sends them once on ui_ready\n'
         + '-- and again on every Core.UI.setBlur call — nothing is polled per frame.\n'
         + 'Config.UI.Blur = { Enabled = true, Strength = 4, Fps = 30, Scale = 0.5 }\n'
@@ -143,8 +143,9 @@ export const Glass = {
     },
     docs: {
       description: {
-        story: 'The HUD box, the toast card, the `[E]` pill and the menu panel are all blur '
-          + 'consumers. Drag **strength** and watch the gradient behind them soften; **scale** '
+        story: 'The stat plate, the toast card, the `[E]` pill and the menu panel are all blur '
+          + 'consumers — the vitals strip bottom left is not, by design. Drag **strength** and '
+          + 'watch the gradient behind the panels soften; **scale** '
           + 'changes how many pixels are copied (it is blurred anyway, so 0.5 is plenty) and '
           + '**fps** how often. Turning **enabled** off removes every `.core-glass` wrapper and '
           + 'stops the loop — the panels fall back to their flat `bg-panel`.\n\n'

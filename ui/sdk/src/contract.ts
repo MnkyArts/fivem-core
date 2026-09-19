@@ -179,8 +179,22 @@ export interface HudState {
   health: number | null; armour: number | null; speed: number | null
   street: string; zone: string
   minimap: { x: number; y: number; w: number; h: number } | null
+  /** §39.5: the voice tile. `null` = the server sends no voice feed, so there is no tile at all. */
+  talking: boolean | null
+  /** §39.5: muted dims the tile's glyph and swaps it for `hud-mic-off`. */
+  muted: boolean
+  /** §39.4: `'minimap'` (default), `'bottom-left'`, `'bottom-center'`, `'bottom-right'`. */
+  anchor: string
+  /** §39.4: multiplier on `--core-hud-unit`, 0.5–2 (`Config.Hud.Scale`). */
+  scale: number
 }
-export interface StatBar { name: string; label: string; value: number; min: number; max: number }
+export interface StatBar {
+  name: string; label: string; value: number; min: number; max: number
+  /** §39.5: the bar is cut out of that vital plate instead of getting a rail row. */
+  slot?: 'health' | 'armour'
+  /** §39.5: icon registry name for the glyph under the slotted bar (`hud-food`, `hud-drink`). */
+  icon?: string
+}
 
 // ---------------------------------------------------------------- the host object
 

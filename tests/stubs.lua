@@ -343,6 +343,15 @@ stubs.gameState = { fadedOut = false, fadingOut = false, switch = false,
 stubs.sounds = {}            -- every PlaySoundFrontend(id, name, set)
 stubs.net = { drop = false, latency = 0 }   -- drop = packets vanish, latency = ms before delivery
 stubs.clientSrc = 1
+-- §39.5 vitals feed (client/hudfeed.lua): what the client-side sampling natives answer, plus the
+-- read counters a suite asserts the cadence with. `talking`/`connected` are the booleans a test
+-- sets; the stubs hand them back as `1`/`false`, the way a BOOL native answers on the default
+-- invoke route (AGENTS §8), so `v == true or v == 1` is what the feed has to be written with.
+stubs.vitals = {
+    health = 200, maxHealth = 200, armour = 0, speed = 0.0, safeZone = 1.0,
+    talking = false, connected = true, talkingReads = 0, connectedReads = 0,
+    streetHash = 0, street = '', zoneCode = '', zoneLabel = nil,
+}
 
 local world = { server = {}, client = {} }
 
@@ -364,6 +373,11 @@ function stubs.clear()
     stubs.scaleformRequests, stubs.scaleformCalls, stubs.scaleformDraws = {}, {}, {}
     stubs.scaleformReleased, stubs.scaleformSeq, stubs.scaleformLoaded = 0, 0, true
     stubs.scaleformBeginFails = 0
+    local vitals = stubs.vitals
+    vitals.health, vitals.maxHealth, vitals.armour, vitals.speed = 200, 200, 0, 0.0
+    vitals.safeZone, vitals.talking, vitals.connected = 1.0, false, true
+    vitals.talkingReads, vitals.connectedReads = 0, 0
+    vitals.streetHash, vitals.street, vitals.zoneCode, vitals.zoneLabel = 0, '', '', nil
 end
 
 local function readFile(path)
@@ -913,6 +927,26 @@ function stubs.newEnv(side, resourceName)
         env.PlayerPedId = function() return stubs.peds[stubs.clientSrc] or 101 end
         env.PlayerId = function() return 0 end
         env.GetPlayerServerId = function() return stubs.clientSrc end
+        -- §39.5 vitals feed (client/hudfeed.lua), every one apiset client. The two Mumble BOOLs
+        -- answer `1`/`false` like the default invoke route, never `true` (AGENTS §8), and the
+        -- read counters let a suite prove the 100/250/1000 ms cadences apart.
+        env.GetEntityHealth = function(_entity) return stubs.vitals.health end
+        env.GetEntityMaxHealth = function(_entity) return stubs.vitals.maxHealth end
+        env.GetPedArmour = function(_entity) return stubs.vitals.armour end
+        env.GetEntitySpeed = function(_entity) return stubs.vitals.speed end
+        env.GetSafeZoneSize = function() return stubs.vitals.safeZone end
+        env.MumbleIsPlayerTalking = function(_player)
+            stubs.vitals.talkingReads = stubs.vitals.talkingReads + 1
+            return stubs.vitals.talking and 1 or false
+        end
+        env.MumbleIsConnected = function()
+            stubs.vitals.connectedReads = stubs.vitals.connectedReads + 1
+            return stubs.vitals.connected and 1 or false
+        end
+        env.GetStreetNameAtCoord = function() return stubs.vitals.streetHash, 0 end
+        env.GetStreetNameFromHashKey = function() return stubs.vitals.street end
+        env.GetNameOfZone = function() return stubs.vitals.zoneCode end
+        env.GetFilenameForAudioConversation = function(code) return stubs.vitals.zoneLabel or code end
         -- world prompt native renderer (DESIGN §6.7): the runtime textures are no-ops, every
         -- draw and text is recorded so a suite can assert what the render thread would show.
         env.GetActualScreenResolution = function() return 1920, 1080 end

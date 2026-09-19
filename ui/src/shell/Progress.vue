@@ -6,6 +6,12 @@
 // The bar is a kit CoreProgress on a kit HUD panel; the seeded transition reaches the fill
 // element through CoreProgress's `fillEl` expose (§37.5) — `value` stays 0 and is never patched
 // again, so nothing of the kit's fights the imperative width.
+//
+// Placement: 7vh up normally, but 22vh under 1700px, because that is where the §39 vitals strip
+// (bottom left, next to the minimap) grows into the centred 340px panel — at 1600x900 their
+// boxes already touch. The breakpoint is written as a CLASSIC media query through an arbitrary
+// variant, never Tailwind's `max-[...]`: v4 compiles that one to media-query RANGE syntax
+// (`width < 1700px`), which Chromium 103 does not parse and silently drops (§37.4).
 import { ref, watch, onMounted, nextTick } from 'vue'
 import { store } from '../store.js'
 import CorePanel from '../kit/components/CorePanel.vue'
@@ -49,7 +55,7 @@ onMounted(paint)
       variant="hud"
       padding="sm"
       blur
-      class="progress fixed z-30 left-1/2 bottom-[7vh] w-[340px] -ml-[170px] pointer-events-none"
+      class="progress fixed z-30 left-1/2 bottom-[7vh] [@media(max-width:1699px)]:bottom-[22vh] w-[340px] -ml-[170px] pointer-events-none"
     >
       <!-- The label is CoreProgress's own caption and the cancel hint takes the read-out slot, so
            the head row (caption left, value right) is the kit's, not the shell's. -->

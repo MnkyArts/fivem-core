@@ -1,6 +1,6 @@
 /* core UI kit — Game (DESIGN §37.5).
    CoreSlot, CoreSlotGrid, CoreHotbar, CoreList, CoreListItem, CoreObjective,
-   CoreTracker, CoreCompass.
+   CoreTracker, CoreCompass, CoreHudTile.
    Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
    following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5. */
 
@@ -1111,3 +1111,69 @@
     var(--color-hud) calc(100% - 52px),
     rgb(var(--core-ink-rgb) / 0) 100%);
 }
+
+/* ---- CoreHudTile ---------------------------------------------------------------------------
+   The voice tile that opens the vitals strip of DESIGN §39, ported 1 : 1 from the approved
+   prototype. It shares CoreVital's unit system — `font-size: var(--core-hud-unit, 24px)` with
+   1em = 100 px of the mockup, fixed px like the rest of the shell — and its 20° lean, so the
+   strip is one shape language.
+
+   Two details that are easy to get wrong:
+
+   1. Only `__shape` is skewed. The glyph is a SIBLING, centred with a negative margin of half its
+      own box, so it stays upright: a sheared mic reads as a broken one, and DESIGN §39.3 asks for
+      it explicitly.
+   2. The height is `--core-hudtile-h`, not a prop. Next to full vitals the tile is 2.05em; next
+      to `--solo` ones the caller sets 1.57em and nothing in here has to know about it.
+
+   Click-through, like every HUD read-out (§37.4). */
+
+.core-hudtile {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: 2.25em;
+  height: var(--core-hudtile-h, 2.05em);
+  font-size: var(--core-hud-unit, 24px);
+  color: var(--color-fg);
+  pointer-events: none;
+}
+
+.core-hudtile__shape {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  border-radius: 0.22em 0.3em 0.22em 0.3em / 0.22em 0.24em 0.22em 0.24em;
+  background: var(--color-hud-tile);
+  box-shadow:
+    inset 0 0 0 max(1px, 0.025em) var(--color-border),
+    0 0.04em 0.18em rgba(0, 0, 0, 0.35);
+  transform: skewX(-20deg);
+  transition: box-shadow 0.15s var(--ease-ui), background-color 0.15s var(--ease-ui);
+}
+
+.core-hudtile__icon {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 1.226em;
+  height: 1.226em;
+  margin: -0.613em 0 0 -0.613em;
+  transition: color 0.15s var(--ease-ui), opacity 0.15s var(--ease-ui);
+}
+
+/* Transmitting: a thick fg ring and a soft white glow, bright enough to catch the eye in the
+   corner of a 1080p screen without lighting the plate next to it. The drop shadow of the idle
+   tile is repeated here on purpose — box-shadow is one property, so a state that only names the
+   ring and the glow would DROP the shadow and the tile would flatten onto a bright sky every
+   time the player speaks (the prototype did exactly that). */
+.core-hudtile.is-active .core-hudtile__shape {
+  box-shadow:
+    inset 0 0 0 max(2px, 0.04em) var(--color-fg),
+    0 0 0.35em rgba(255, 255, 255, 0.28),
+    0 0.04em 0.18em rgba(0, 0, 0, 0.35);
+}
+
+.core-hudtile.is-dimmed .core-hudtile__icon { opacity: 0.4; }

@@ -70,9 +70,14 @@ Config = {
     Locale = 'en',
     Stats = {
         Enabled = true, TickMs = 60000,
+        -- `hud` places the stat's bar (DESIGN §18, §39): true = a bar on the rail plate,
+        -- 'health' / 'armour' = the bar cut out of that vitals plate, false = not shown at all.
+        -- `icon` is a kit icon name (§39.3) for the glyph under a slotted bar.
         Defs = {
-            hunger = { min = 0, max = 100, default = 100, decayPerMinute = 0.4, thresholds = { 25, 10 }, hud = true },
-            thirst = { min = 0, max = 100, default = 100, decayPerMinute = 0.6, thresholds = { 25, 10 }, hud = true },
+            hunger = { min = 0, max = 100, default = 100, decayPerMinute = 0.4, thresholds = { 25, 10 },
+                hud = 'health', icon = 'hud-food' },
+            thirst = { min = 0, max = 100, default = 100, decayPerMinute = 0.6, thresholds = { 25, 10 },
+                hud = 'armour', icon = 'hud-drink' },
         },
     },
     Weapons = { Allowed = nil, SnapshotIntervalMs = 60000 },
@@ -111,7 +116,22 @@ Config = {
         mercenaries = true, chopshop = true, bounties = true, agents = true,
         money_fronts = true, mansions = true, kortz = true,
     },
-    Hud = { ShowHealth = true, ShowArmour = true, ShowStats = true, ShowSpeed = true, ShowStreet = true },
+    -- The vitals HUD (DESIGN §39): the mic tile, the HEALTH and ARMOR plates and the food/drink
+    -- bars cut out of them. One flag per element of the strip, plus where it sits and how big.
+    Hud = {
+        ShowHealth = true,    -- the HEALTH plate
+        ShowArmour = true,    -- the ARMOR plate
+        ShowStats = true,     -- the stat bars: slotted under a plate, or a rail bar without a slot
+        ShowVoice = true,     -- the mic tile, fed from Mumble; false hands the tile to a voice
+                              -- resource, which pushes Core.UI.hud.set({ talking = , muted = }) itself
+        ShowSpeed = false,    -- core draws NEITHER speed nor street/zone any more: turn these on only
+        ShowStreet = false,   -- for a plugin that reads useHud().speed / .street / .zone (§38.6)
+        Anchor = 'bottom-left', -- 'bottom-left' (fixed 24 px from both edges) | 'minimap' (right of
+                              -- the minimap rect). Those two only: the bottom centre and right are the
+                              -- progress bar / text UI and the key hints / spinner, and the strip
+                              -- would land on top of them
+        Scale = 1.0,          -- multiplies the HUD unit (--core-hud-unit), clamped to 0.5-2.0
+    },
     -- GTA's idle cameras (DESIGN §35): the AFK pan after 30 s without input, the passenger pan and the
     -- cinematic vehicle idle mode. They trip the §31 cinematic watcher (the shell hides, an open page
     -- closes), so core switches them off. `false` keeps the game's behaviour.

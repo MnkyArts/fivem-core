@@ -103,9 +103,11 @@ export default defineUIPlugin({ pages: { bank: definePage({ component: Page }) }
 ```
 
 Besides the page plumbing, `window.CoreUI` hands a page the shell's own live data —
-`hud` (money plus health / armour / speed / street / zone), `state`, `stats`, `minimap`,
-`lang` / `t(key, vars)` for core's strings and `playSound(name, set)` — all readonly and
-reactive, so a page never has to ask Lua for something the HUD already knows.
+`hud` (money, name, server id and faction plus the live feed: health / armour / speed / street /
+zone / voice), `state`, `stats`, `minimap`, `lang` / `t(key, vars)` for core's strings and
+`playSound(name, set)` — all readonly and reactive, so a page never has to ask Lua for something
+the shell already knows. Core itself only *draws* the §39 vitals strip out of that; money,
+identity, faction and location are there for a plugin to render.
 
 The SDK a plugin builds against is the npm workspace package `@core/ui` (`core/ui/sdk`): the
 typed host contract, a facade under 2 KB, the `coreUI()` Vite plugin and core's tokens. Dev
@@ -172,8 +174,9 @@ background. `src/gameblur.js` does the same — one hidden source canvas holding
 with `--core-glass-tint` so the panel keeps its own colour. A plugin page needs no JavaScript: the
 attribute is the whole API (`data-core-blur="18"` for a custom radius, `"0"` to opt out). It costs
 one small canvas copy per consumer per frame, so consumers are **panels, never list rows** — the
-shell's own ten built-ins keep the count at 12 or fewer. Outside the CEF there is no hook, so the
-module probes once and falls back to a procedural gradient (`<html data-game-blur="fallback">`),
+shell's own built-ins keep the count at 12 or fewer (the §39 vitals strip is not one of them: its
+plates are opaque). Outside the CEF there is no hook, so the module probes once and falls back to
+a procedural gradient (`<html data-game-blur="fallback">`),
 which is what every story in this Storybook shows. See **Shell → Game blur**.
 
 ## Working offline

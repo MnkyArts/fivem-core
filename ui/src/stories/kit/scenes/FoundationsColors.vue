@@ -22,6 +22,15 @@ const GROUPS = [
   { label: 'Rarity', names: ['rarity-common', 'rarity-uncommon', 'rarity-rare', 'rarity-epic', 'rarity-legendary'] },
   { label: 'Text', names: ['fg', 'fg-dim', 'fg-faint'] },
   { label: 'Keys', note: 'A key cap is a near-white tile with dark condensed text.', names: ['key', 'key-fg'] },
+  {
+    label: 'HUD plates',
+    note: 'The vitals strip of §39: a white plate over a dark track. The two plate-<vital> colours are '
+      + 'the glyph ON the white fill — the ordinary --color-health / --color-armour are made for dark ground. '
+      + 'plate-loss / plate-gain are the change chunk of §39.3.1, sampled from Liam\'s two reference clips: '
+      + 'they are only ever seen for the length of one change, which is why they are this loud.',
+    names: ['plate', 'plate-lo', 'plate-fg', 'plate-track', 'plate-health', 'plate-armour',
+      'plate-loss', 'plate-gain', 'hud-tile'],
+  },
 ]
 
 const GRADIENTS = [

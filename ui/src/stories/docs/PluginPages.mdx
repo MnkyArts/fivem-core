@@ -75,9 +75,9 @@ time, so the page imports no component and ships no kit CSS.
 | `emit(pageId, event, data)` | `post('ui_event', { page, event, data })` |
 | `on(pageId, event, fn) -> off` | receives `page:event` from Lua |
 | `close(pageId)` | `post('ui_close', { page })` |
-| `hud` | readonly reactive `{ visible, cash, bank, name, serverId, faction }` plus the live feed `health, armour, speed, street, zone, minimap` |
+| `hud` | readonly reactive `{ visible, cash, bank, name, serverId, faction }` plus the live feed `health, armour, speed, street, zone, minimap, talking, muted, anchor, scale`. Core draws only the §39 vitals strip from it — money, identity, faction and location are yours to render |
 | `state` | readonly reactive mirror of the replicated player state (`state:set`) |
-| `stats` | readonly reactive stat bars: `name -> { label, value, min, max }` |
+| `stats` | readonly reactive stat bars: `name -> { label, value, min, max, slot?, icon? }`; `slot` is `'health'` / `'armour'` when the bar belongs under that vitals plate |
 | `minimap` | the minimap's anchor rect `{ x, y, w, h }` in CSS pixels, or `null` before the client measured it — park a panel next to the minimap with this |
 | `lang` | the NUI's current language (`locale:set`) |
 | `t(key, vars)` | core's translation of `key` with `{{var}}` substitution; an unknown key comes back verbatim, exactly like `Core.Locale.t`. It is **core's** string table — a plugin page bundles its own |

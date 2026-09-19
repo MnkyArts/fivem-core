@@ -33,6 +33,8 @@ export function resetStore () {
   send({ action: 'input:close' })
   send({ action: 'alert:close' })
   send({ action: 'textui:hide' })
+  // `resetExtras()` below puts health / armour / talking / muted / anchor / scale back, so this
+  // only has to clear the fields core no longer draws but still hands to `useHud()` (§39.4).
   send({ action: 'hud:set', visible: false, cash: 0, bank: 0, name: '', serverId: 0, faction: false })
   // §38: the page/plugin/focus state lives in runtime/*.ts (it writes into these same store
   // slices), so a story starts from a shell with no page, no modal and no focus stack at all.
@@ -61,7 +63,8 @@ export function scene (build, view) {
   })
 }
 
-/** The fixed top-right rail App.vue puts the HUD and the toast stack in. */
+/** The fixed top-right rail App.vue puts the stat bars and the toast stack in. (§39.4 took the
+ *  HUD out of it: the vitals strip is `position: fixed` on its own and needs no wrapper.) */
 export function rail (...children) {
   return h('div', {
     style: {

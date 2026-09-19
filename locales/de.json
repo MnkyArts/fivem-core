@@ -18,5 +18,10 @@
   "chat_cooldown": "Nicht so schnell - warte kurz, bevor du wieder schreibst",
   "chat_too_long": "Deine Nachricht ist zu lang (max. {{max}} Zeichen)",
   "stat_low": "Dein {{stat}} wird langsam knapp",
-  "stat_critical": "Dein {{stat}} ist kritisch niedrig"
+  "stat_critical": "Dein {{stat}} ist kritisch niedrig",
+
+  "hud_health": "Leben",
+  "hud_armour": "Rüstung",
+  "hud_voice": "Mikrofon",
+  "hud_voice_muted": "Mikrofon stumm"
 }
