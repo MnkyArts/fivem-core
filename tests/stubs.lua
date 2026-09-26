@@ -445,7 +445,14 @@ local function makeExports(rec)
                         if not fn then
                             error(("No such export %s in resource %s"):format(exportName, resourceName), 2)
                         end
-                        return fn(...)
+                        -- like the engine: inside a cross-resource export call GetInvokingResource()
+                        -- answers the CALLING resource (the invoking script runtime), restored after
+                        local previous = stubs.invokingResource
+                        stubs.invokingResource = rec.resourceName
+                        local result = table.pack(pcall(fn, ...))
+                        stubs.invokingResource = previous
+                        if not result[1] then error(result[2], 0) end
+                        return table.unpack(result, 2, result.n)
                     end
                 end,
             })
@@ -848,6 +855,8 @@ function stubs.newEnv(side, resourceName)
         return readFile(stubs.root .. '/' .. file)
     end
     env.GetResourceState = function(res) return stubs.resourceStates[res] or 'missing' end
+    -- apiset shared (CFX): the resource whose runtime invoked the current one; nil outside an export call
+    env.GetInvokingResource = function() return stubs.invokingResource end
     env.GetNumResources = function() return #sortedKeys(stubs.resourceStates) end
     env.GetResourceByFindIndex = function(index)     -- 0-based, like the engine
         return sortedKeys(stubs.resourceStates)[(tonumber(index) or 0) + 1]

@@ -2602,6 +2602,32 @@ local function suiteKeyCapture()
     stubs.resourceStates.core = 'started'
     eq(Core.Keys.capture('bad reason'), false, 'an invalid reason is refused')
     check(printed('Keys.capture: invalid reason') ~= nil, 'and logged with the API name')
+
+    -- a SPOOFED caller: the `call` export takes the owner from GetInvokingResource(), never from the
+    -- declared name (§54.1, §2.2) — a resource that claims to be admin is refused and changes nothing
+    AdmCore.Keys.capture('editor')
+    local UI = Core.UI
+    hudNatives(env)
+    asPlugin(Core, 'admin', function() UI.hideHud('editor') end)
+    local rogue = stubs.newEnv('client', 'rogue')
+    local function spoof(ns, fn, ...)
+        return pcall(function(...) return rogue.exports.core:call('admin', ns, fn, ...) end, ...)
+    end
+    local okRelease = spoof('Keys', 'release', 'editor')
+    eq(okRelease, false, "a resource declaring itself as admin cannot release admin's capture")
+    eq(Core.Keys.isCaptured(), true, 'the capture is still held')
+    local okShow = spoof('UI', 'showHud', 'editor')
+    eq(okShow, false, "nor drop admin's hideHud reason")
+    eq(UI.isHudHidden(), true, 'the HUD stays hidden')
+    local okAsk = spoof('Keys', 'isCaptured')
+    eq(okAsk, false, "nor pass admin's capture off as its own")
+    check(printed('call() refused: resource rogue declared itself as admin') ~= nil, 'the spoof is logged')
+    local captured, byRogue = rogue.exports.core:call('rogue', 'Keys', 'isCaptured')
+    eq(captured == true and byRogue == false, true, 'under its own name it learns the capture is not its own')
+    eq(rogue.exports.core:call('rogue', 'Keys', 'release', 'editor'), false,
+        'and its own release names rogue:editor, which it does not hold')
+    eq(AdmCore.Keys.release('editor'), true, 'the real admin still releases its capture')
+    asPlugin(Core, 'admin', function() UI.showHud('editor') end)
 end
 
 --- §54 + doors: `core_door` is a RAW key mapping on the interact key (E — the editor's fly-up key), so the lib's

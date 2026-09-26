@@ -11,8 +11,10 @@
       in place         a changed networked element keeps its entity (and net id) when type, kind, model and
                        bucket are the same and a client owns the living entity: the config goes out as RPCs
                        + the `mapCfg` bag, the pose as `core:maps:pose` to the owning client (SET_ENTITY_COORDS
-                       offsets peds and vehicles; client/maps.lua applies it with the no-offset native), checked
-                       ~2 s later against the synced position. Everything else is re-created as before.
+                       offsets peds and vehicles; client/maps.lua applies it with the no-offset native); ~2 s
+                       later an entity still at its pre-move pose is re-created at the target. Everything else
+                       is re-created as before. Handles are reused: only an entity whose `mapEl` is the uid is
+                       ever deleted or treated as alive.
       paint            a vehicle without a `color` field gets a paint pair picked from its uid (stable across
                        re-creations and between the editor bucket and the target bucket)
       events           Maps.on(typeId|'*', fn) listeners get 'added'|'changed'|'removed' for active content,
@@ -35,7 +37,8 @@
       client/maps.lua); SetEntityRoutingBucket(entity, bucket), GetEntityRoutingBucket(entity),
       SetEntityOrphanMode(entity, mode), DoesEntityExist(entity), DeleteEntity(entity), GetEntityCoords(entity),
       GetEntityHeading(entity), GetEntityHealth(entity) (the synced health node: 0 until a client synced it),
-      NetworkGetNetworkIdFromEntity(entity) (server); NetworkGetEntityOwner(entity) (shared: a player's net
+      NetworkGetNetworkIdFromEntity(entity), GetPedInVehicleSeat(vehicle, seatIndex) (server; 0 = empty);
+      NetworkGetEntityOwner(entity) (shared: a player's net
       id, -1 while the server owns it). Entity(e).state, CreateThread, Wait, SetTimeout, GetGameTimer and
       TriggerClientEvent are runtime helpers.
 ]]
@@ -214,7 +217,8 @@ local contexts = {}         -- [ctxKey] = ctx
 local byMap = {}            -- [mapId] = { [bucket] = ctx }
 local perBucket = {}        -- [bucket] = number of contexts in it (clearBucket only when alone)
 -- ['<bucket>|<uid>'] = { key, ctxKey, elementId, uid, bucket, entity?, cancelled?, done? (the worker took
--- it), ready? (configured) + what the entity was made with: type, kind, model, pose, cfg, looks, poseSeq? }
+-- it), ready? (configured) + what the entity was made with: type, kind, model, pose, cfg, looks; in-place moves:
+-- poseSeq, prevPose, anchor, verifying }
 local instances = {}
 local netTotal = 0          -- networked elements active in every context (desired, spawned or not)
 -- [spawnHead..spawnTail] = queued instances; an explicit tail, since `#` of a queue whose consumed head is nil
@@ -226,8 +230,15 @@ local function instKey(bucket, uid)
     return bucket .. '|' .. uid
 end
 
-local function deleteEntity(entity)
-    if entity and entity ~= 0 and DoesEntityExist(entity) then DeleteEntity(entity) end
+--- Is `entity` still the map entity of `uid`? Server handles are pool slots handed to the next entity once one is
+--- gone (a client may delete a map entity), so the handle alone never proves it: the `mapEl` bag does.
+local function ours(entity, uid)
+    return entity ~= nil and entity ~= 0 and DoesEntityExist(entity) and Entity(entity).state.mapEl == uid
+end
+
+--- Deletes the instance's entity, never a foreign one that reused its handle.
+local function deleteEntity(entity, uid)
+    if ours(entity, uid) then DeleteEntity(entity) end
 end
 
 --- The paint pair of a vehicle without a `color` field: the same for a uid on every spawn.
@@ -354,7 +365,8 @@ local function spawnOne(inst)
         Wait(SPAWN_POLL_MS)
     end
     if inst.cancelled or instances[inst.key] ~= inst then
-        deleteEntity(entity)
+        -- the handle the create native just returned (no mapEl yet): the one unchecked delete
+        if DoesEntityExist(entity) then DeleteEntity(entity) end
         return
     end
     if not DoesEntityExist(entity) then
@@ -394,7 +406,7 @@ local function spawnFor(ctx, el)
     local old = instances[key]
     if old then
         old.cancelled = true
-        deleteEntity(old.entity)
+        deleteEntity(old.entity, uid)
     end
     local inst = { key = key, ctxKey = ctx.key, elementId = el.id, uid = uid, bucket = ctx.bucket }
     instances[key] = inst
@@ -407,23 +419,48 @@ local function despawn(bucket, uid)
     if not inst then return end
     instances[key] = nil
     inst.cancelled = true
-    deleteEntity(inst.entity)
+    deleteEntity(inst.entity, uid)
 end
 
---- ~VERIFY_MS after an in-place move: did the owning client apply it? The synced pose must be near the
---- target (horizontally; plus the heading of vehicles and peds), else the element is re-created there.
+local function near(c, p)
+    local dx, dy = c.x - p[1], c.y - p[2]
+    return dx * dx + dy * dy <= VERIFY_DIST * VERIFY_DIST
+end
+
+local function nearHeading(h, p)
+    local d = (h - p[6]) % 360
+    return math.min(d, 360 - d) <= VERIFY_HEADING
+end
+
+--- A vehicle somebody sits in is theirs to move: never re-created under them (seats -1..15).
+local function occupied(entity)
+    for seat = -1, 15 do
+        if GetPedInVehicleSeat(entity, seat) ~= 0 then return true end
+    end
+    return false
+end
+
+--- ~VERIFY_MS after an in-place move: did the owning client apply it? Re-created only when the synced pose is
+--- still where the entity was BEFORE the move (the pose before the last move, or before the first of a burst)
+--- and not at the target — an entity that landed and then moved on (driven, kicked, bumped) is left alone, and
+--- so is any vehicle with an occupant. Horizontal position, plus the heading of vehicles and peds while they
+--- stand at the target position (a physics prop's rotation rides mapCfg.rot).
 local function verifyPose(inst, seq)
     if instances[inst.key] ~= inst or inst.cancelled or inst.poseSeq ~= seq then return end
+    inst.verifying = false
     local entity = inst.entity
-    if not entity or not DoesEntityExist(entity) then return end    -- destroyed meanwhile: Maps.respawn's job
-    local p, c = inst.pose, GetEntityCoords(entity)
-    local dx, dy = c.x - p[1], c.y - p[2]
-    local landed = dx * dx + dy * dy <= VERIFY_DIST * VERIFY_DIST
-    if landed and inst.kind ~= 'prop' then
-        local d = (GetEntityHeading(entity) - p[6]) % 360
-        landed = math.min(d, 360 - d) <= VERIFY_HEADING
+    if not ours(entity, inst.uid) then return end   -- destroyed or its handle reused: Maps.respawn's job
+    if inst.kind == 'vehicle' and occupied(entity) then return end
+    local p, prev, anchor, c = inst.pose, inst.prevPose, inst.anchor, GetEntityCoords(entity)
+    local stuck
+    if near(c, p) then
+        if inst.kind == 'prop' then return end
+        local h = GetEntityHeading(entity)
+        stuck = not nearHeading(h, p) and (nearHeading(h, prev) or nearHeading(h, anchor))
+    else
+        stuck = near(c, prev) or near(c, anchor)
     end
-    if landed then return end
+    if not stuck then return end
     local ctx = contexts[inst.ctxKey]
     local el = ctx and ctx.els[inst.elementId]
     if not el or ctx.reps[el.id] ~= 'net' then return end
@@ -448,11 +485,8 @@ local function moveInPlace(inst, def, el)
     if not def or def.kind ~= inst.kind or el.type ~= inst.type or R.modelOf(def, el) ~= inst.model then
         return false
     end
-    if not entity or not DoesEntityExist(entity) or GetEntityRoutingBucket(entity) ~= inst.bucket then
-        return false
-    end
+    if not ours(entity, inst.uid) or GetEntityRoutingBucket(entity) ~= inst.bucket then return false end
     local state = Entity(entity).state
-    if state.mapEl ~= inst.uid then return false end
     local owner = NetworkGetEntityOwner(entity)
     if type(owner) ~= 'number' or owner < 1 then return false end
     if def.kind ~= 'prop' and GetEntityHealth(entity) <= 0 then return false end
@@ -471,7 +505,10 @@ local function moveInPlace(inst, def, el)
     inst.cfg, inst.looks = cfg, looks
     local pose = poseOf(el)
     if not samePose(inst.kind, inst.pose, pose) then
-        inst.pose, inst.poseSeq = pose, (inst.poseSeq or 0) + 1
+        -- a burst of moves before the check keeps the pose before its first move as the anchor
+        if not inst.verifying then inst.anchor = inst.pose end
+        inst.prevPose, inst.pose = inst.pose, pose
+        inst.poseSeq, inst.verifying = (inst.poseSeq or 0) + 1, true
         TriggerClientEvent(POSE_EVENT, owner, NetworkGetNetworkIdFromEntity(entity), inst.uid,
             pose[1], pose[2], pose[3], pose[4], pose[5], pose[6])
         local seq = inst.poseSeq
@@ -766,7 +803,9 @@ function R.respawn(mapId, elementId)
         for id, rep in pairs(ctx.reps) do
             if rep == 'net' and (elementId == nil or id == elementId) then
                 local inst = instances[instKey(ctx.bucket, uidOf(mapId, id))]
-                local alive = inst and (not inst.done or (inst.entity and DoesEntityExist(inst.entity)))
+                -- queued, being created, or spawned and still ours (a reused handle is someone else's entity)
+                local alive = inst and (not inst.done or (not inst.ready and inst.entity ~= nil)
+                    or (inst.ready and ours(inst.entity, inst.uid)))
                 if not alive and ctx.els[id] then
                     spawnFor(ctx, ctx.els[id])
                     count = count + 1
@@ -804,7 +843,7 @@ AddEventHandler('onResourceStop', function(resource)
     if resource ~= Core.name then return end
     for _, inst in pairs(instances) do
         inst.cancelled = true
-        deleteEntity(inst.entity)
+        deleteEntity(inst.entity, inst.uid)
     end
     instances = {}
 end)

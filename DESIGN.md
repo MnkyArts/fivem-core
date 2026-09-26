@@ -208,6 +208,17 @@ caller awaits — callers must therefore be inside a coroutine (thread, event ha
 normal call site is. Cost: one msgpack hop per call — fine for everything in this design, which never calls
 core per frame; per-frame work (drawing, proximity) runs inside core's own loops.
 
+**Who the caller is (2026-09-26, §54 review F3).** The `caller` argument is a DECLARATION, not the truth: both
+sides take the owner from `GetInvokingResource()` (CFX, apiset shared — the resource whose script runtime invoked the
+export; the engine sets it for every cross-resource export call) and only CHECK the declared name against it. A call
+whose declared name differs from the invoking resource is refused (`error`, plus one `Core.Log.warn` per
+invoker/declared pair), so no resource can act under another one's name — release its key capture, drop its §31/§54
+hide reason, close its page or remove its registrations. The honest proxy always declares `GetCurrentResourceName()`,
+which IS the invoking resource. Without an invoking resource (the offline suites calling the export function
+directly) the declared name stands; the test stubs model the engine (`exports.x:y()` sets `GetInvokingResource()` to
+the calling VM for the duration of the call). Before this, the server silently replaced a mismatching name and the
+client trusted it.
+
 Nested namespaces (`Core.UI.menu.open`) are represented as **flat function names with a dot**:
 `Core.UI.menu.open(...)` is `call(caller, 'UI', 'menu.open', ...)`; the proxy builds sub-proxies for one
 nesting level (`Core.UI.menu`, `Core.UI.input`, `Core.UI.alert`, `Core.UI.progress`, `Core.UI.textUI`,
@@ -2629,6 +2640,9 @@ values change and new ones join. `@theme` (→ Tailwind utilities) :
 --color-plate-health: #c6022a;  --color-plate-armour: #0152b0;
 --color-plate-loss: #f00645;  --color-plate-gain: #0bfd69;   /* §39.3.1: the chunk a vital just lost / gained */
 --color-hud-tile: rgba(32, 36, 39, 0.85);
+
+/* the world axes — X / Y / Z of a gizmo or a transform read-out (Blender's; admin editor, 2026-09-26) */
+--color-axis-x: #ff3352;  --color-axis-y: #8bdc00;  --color-axis-z: #2890ff;
 
 --radius-ui: 6px;  --radius-ui-sm: 4px;  --radius-ui-xs: 3px;
 --shadow-ui: 0 14px 40px rgba(0, 0, 0, 0.50);  --shadow-ui-sm: 0 4px 14px rgba(0, 0, 0, 0.40);
@@ -5135,9 +5149,20 @@ Maps.records(typeId) -> array                         -- active world content of
   `SetEntityCoordsNoOffset(e, x, y, z, keepTasks = true, keepIK = false, warp = true)` + `SetEntityHeading(rz % 360)`
   (vehicles, peds — they are created with a heading) or `SetEntityRotation(rx, ry, rz, 2)` (physics props), only
   while it has network control and the entity's `mapEl` is that uid. **Verification**: `SetTimeout(2000)` later the
-  server reads the synced `GetEntityCoords` (horizontal distance ≤ 0.75 m) and, for vehicles and peds,
-  `GetEntityHeading` (≤ 20°); a move that did not land (control migrated meanwhile) is re-created at the target.
-  Only the latest move of an instance is checked (`poseSeq`).
+  server reads the synced `GetEntityCoords` / `GetEntityHeading` and re-creates the element at the target only when
+  the move did NOT land (control migrated meanwhile): the entity is > 0.75 m (horizontal) from the target and within
+  0.75 m of its pre-move pose — the pose before the last move or, for a burst of moves before one check, before the
+  first (`prevPose`, `anchor`) — or, for vehicles and peds standing at the target position, its heading is > 20°
+  off the target and within 20° of a pre-move heading. An entity that landed and then moved on (driven away, a
+  kicked prop, a bumped ped) is left alone (review F2), and so is a vehicle with any occupant
+  (`GetPedInVehicleSeat` seats −1..15 ≠ 0). Only the latest move of an instance is checked (`poseSeq`).
+- **Reused handles (review F1)**: server entity handles are script-handle pool slots that the next entity gets once
+  one is gone (a client may delete a map entity). The runtime therefore deletes an instance's entity (re-create,
+  despawn, deactivation, core stop) and treats it as alive (`Maps.respawn`, `moveInPlace`, the pose check) only while
+  `DoesEntityExist(e)` and `Entity(e).state.mapEl == uid` (`ours`); a foreign entity on the handle is never deleted,
+  and the element counts as destroyed (respawn path). The one unchecked delete is the handle the create native just
+  returned (an instance cancelled while it was being created). `Maps.respawn` also leaves an instance that is still
+  being created alone now, as its contract said.
 - **Stable paint**: `configureEntity` calls `SetVehicleColours(e, primary, secondary)` with a pair picked by
   `joaat(uid) % 22` from a curated list of normal paints (metallic black, graphite, silver, dark silver, shadow
   silver, gun metal, white, frost white, red, cabernet, orange, race yellow, green, racing green, dark blue, blue,
@@ -5151,10 +5176,11 @@ Maps.records(typeId) -> array                         -- active world content of
   unchanged or moved networked elements without re-creating them. Activation, deactivation, a draft opening or
   closing and a `targetBucket` change still create/delete (the content appears/disappears or changes bucket).
 - Natives added (fxref + natives_cfx.json, server): `SetVehicleColours`, `ClearPedTasks`, `GetEntityRoutingBucket`,
-  `GetEntityHealth`, `GetEntityCoords`, `GetEntityHeading`, `NetworkGetNetworkIdFromEntity`,
+  `GetEntityHealth`, `GetEntityCoords`, `GetEntityHeading`, `NetworkGetNetworkIdFromEntity`, `GetPedInVehicleSeat`,
   `NetworkGetEntityOwner` (shared); client: `SetEntityCoordsNoOffset`, `SetEntityHeading`.
-- Tests: `tests/maps_tests.lua` 385 (was 301; new section "networked elements updated in place, stable vehicle
-  paint"), `tests/client_maps_tests.lua` 250 (was 239; section 19b2 the pose event). Harness: `H.owners[e]` /
+- Tests: `tests/maps_tests.lua` 409 (was 301; new sections "networked elements updated in place, stable vehicle
+  paint" and "review fixes" — reused handles, the pose check), `tests/client_maps_tests.lua` 250 (was 239; section
+  19b2 the pose event). Harness: `H.owners[e]` /
   `H.owner` (NetworkGetEntityOwner), `H.rpcs` + `H.rpcCalls(name)`, `H.poses(from)`.
 
 ### 52.3 Server regions
@@ -5356,7 +5382,7 @@ hold/release, area readiness).
 
 **Implementation notes (2026-09-26).** `Config.Maps` also has `PackBudgetBytes = 2000000` and
 `PackBudgetWindowMs = 10000` (§52.3 notes); settings `maps.journalMaxOps` (20000) joined `maps.journalMax`. Tests
-as run: `tests/maps_tests.lua` 385 (was 301 before run UX C2) + `tests/maps_store_tests.lua` 72, `tests/maps_regions_tests.lua` 272,
+as run: `tests/maps_tests.lua` 409 (was 301 before run UX C2) + `tests/maps_store_tests.lua` 72, `tests/maps_regions_tests.lua` 272,
 `tests/client_maps_tests.lua` 250 (two `[bench]` lines).
 In game (open): resmon flying through ≥ 1000 props within 400 m, DLC prop streaming, a teleport onto an event
 platform, a hide over a world bench (it must come back), `mapCfg` on an entity placed before a client joined.
@@ -5434,7 +5460,9 @@ Core.on('hudHiddenChanged', function(hidden) end)   -- client hook, on the hidde
 
 - Reasons follow §31.1 exactly (`reasonKeyFor`): pattern `^[%w_%-%.:]+$`, default `default`, ≤ 48 characters after
   prefixing; a plugin's reason is stored as `<resource>:<reason>`, core's verbatim; a plugin can never clear another
-  one's. Registry kinds `uihud` and `keycapture`: a stopping owner drops every reason it held (the HUD, the radar and
+  one's — the owner is the engine's invoking resource, and a call that declares another resource's name is refused
+  (§2.2), so `exports.core:call('admin', 'Keys', 'release', 'editor')` from any other resource fails. Registry kinds
+  `uihud` and `keycapture`: a stopping owner drops every reason it held (the HUD, the radar and
   the keys come back with it).
 - **The holder keeps its own things.** The owner resources holding a hideHud reason form the KEEP list: their overlay
   pages, their text UI and their key hints stay; a capture holder's own `Core.Keys` bindings keep firing.
@@ -5521,6 +5549,6 @@ While ≥ 1 hideHud reason is held:
   text UI + key hints, the §31 watcher, the ui_ready order, owner stop, core stop), `hud hide prompts` (nothing
   projected or sent while hidden, `core_interact`, re-send on show) and `key capture` (REAL VMs: core's client VM + two
   plugin VMs from import.lua whose proxy reaches core's `call` export; swallowed / own / `whileCaptured` / release /
-  chat / owner stop / core down) — 773 total; `run_tests.lua` keys suite (+15: lib-side proxy use, cheap checks first,
+  chat / owner stop / core down / a SPOOFED caller refused) — 795 total with the other packages' suites; `run_tests.lua` keys suite (+15: lib-side proxy use, cheap checks first,
   failure = not captured) — 417; `ui/tests/unit/layers.test.ts` (+2) — `# pass 216`; `runtime-regression.js` section
   9b (+11) — `PASS 212/212`; Storybook `Shell/HUD hidden (editor focus)` with a play function.

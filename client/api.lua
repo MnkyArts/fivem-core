@@ -2,7 +2,9 @@
     core/client/api.lua -- loads FIRST on the client (DESIGN §1).
 
     Owns:
-      * the single `call` export every plugin VM proxies into (DESIGN §2.2),
+      * the single `call` export every plugin VM proxies into (DESIGN §2.2) — its caller is the
+        engine's GetInvokingResource() (shared native, verified with fxref 2026-09-26); the name the
+        proxy declares must match it or the call is refused (§54.1),
       * `Core.Registry`: who registered what, and the automatic sweep when that
         owner's resource stops (DESIGN §2.3).
 
@@ -144,10 +146,37 @@ local function resolve(ns, fn)
     return type(f) == 'function' and f or nil
 end
 
+-- (invoker .. '>' .. declared) -> true: a spoofing resource is logged once per pair, not per call
+local spoofWarned = {}
+
+--- The owner of an export call (DESIGN §2.2, §54): the RUNTIME's view of the invoking resource
+--- (`GetInvokingResource()`, set by the engine for every cross-resource export call) is the truth;
+--- the name import.lua's proxy declares is only checked against it. A resource that declares another
+--- one's name is refused, so nobody can drop another resource's key capture, HUD or shell hide reason,
+--- page or registration by passing its name. Without an invoking resource (offline suites, a direct
+--- Lua call) the declared name stands. Returns owner, or nil + the refusal message.
+local function exportCaller(declared)
+    local claimed = (type(declared) == 'string' and declared ~= '') and declared or nil
+    local invoker = GetInvokingResource()
+    if type(invoker) ~= 'string' or invoker == '' then return claimed end
+    if claimed and claimed ~= invoker then
+        local pair = invoker .. '>' .. claimed
+        if not spoofWarned[pair] then
+            spoofWarned[pair] = true
+            Core.Log.warn('call() refused: resource %s declared itself as %s', invoker, claimed)
+        end
+        return nil, ('core: call() refused: %s is not %s'):format(invoker, claimed)
+    end
+    return invoker
+end
+
 exports('call', function(callerName, namespace, fn, ...)
     if type(namespace) ~= 'string' or type(fn) ~= 'string' then
         error('core: call(namespace, fn) expects two strings', 2)
     end
+
+    local owner, refused = exportCaller(callerName)
+    if refused then error(refused, 2) end
 
     if INTERNAL_NS[namespace] then
         error(('core: %s is internal to core'):format(namespace), 2)
@@ -162,7 +191,7 @@ exports('call', function(callerName, namespace, fn, ...)
     -- withCaller pcalls, so the caller is restored even when the API function errors; pcall is
     -- yieldable in Lua 5.4, so an API that waits (NUI, callbacks) still works. Inside a coroutine only
     -- that coroutine's entry changes: an overlapping yielding call can never leak its owner.
-    local ret = table.pack(Registry.withCaller(callerName, f, ...))
+    local ret = table.pack(Registry.withCaller(owner, f, ...))
 
     if not ret[1] then error(ret[2], 0) end
     return table.unpack(ret, 2, ret.n)

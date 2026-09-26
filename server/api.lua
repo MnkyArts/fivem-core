@@ -155,12 +155,27 @@ local function resolve(namespace, fn)
     return type(f) == 'function' and f or nil
 end
 
+-- (invoker .. '>' .. declared) -> true: a spoofing resource is logged once per pair, not per call
+local spoofWarned = {}
+
 -- The one export of the server side. `caller` is what import.lua's proxy declares; the runtime's own view
--- of the invoking resource wins when it has one.
+-- of the invoking resource (GetInvokingResource) is the truth, and a declared name that differs from it is
+-- REFUSED (DESIGN §2.2, §54.1) instead of silently corrected — a resource that claims another one's name is
+-- either broken or spoofing. Without an invoking resource (offline suites) the declared name stands.
 exports('call', function(caller, namespace, fn, ...)
     local owner = (type(caller) == 'string' and caller ~= '') and caller or nil
     local invoker = GetInvokingResource()
-    if type(invoker) == 'string' and invoker ~= '' then owner = invoker end
+    if type(invoker) == 'string' and invoker ~= '' then
+        if owner and owner ~= invoker then
+            local pair = invoker .. '>' .. owner
+            if not spoofWarned[pair] then
+                spoofWarned[pair] = true
+                Core.Log.warn('call() refused: resource %s declared itself as %s', invoker, owner)
+            end
+            error(('core: call() refused: %s is not %s'):format(invoker, owner), 0)
+        end
+        owner = invoker
+    end
     local f, blocked = resolve(namespace, fn)
     if not f then
         if blocked then

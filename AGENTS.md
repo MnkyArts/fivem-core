@@ -200,9 +200,9 @@ interaction, door, cron, locale, a compiled page).
 | the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
 | libs and loader | `lua5.4 tests/run_tests.lua` | `417 passed, 0 failed` |
 | development services | `lua5.4 tests/{geometry,client_zones,client_actions,context_streaming,hooks,ui_forms}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 190, 36, 74, 122, 94, 98 passed; 0 failed |
-| admin platform (§41–§53) | `lua5.4 tests/{raycast,schema,settings,perms,buckets,audit,bans,targets,admin_api,registry_caller,client_registry_caller,client_adminstate,callback,maps,maps_store,maps_regions,client_maps,chat_hook}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 100, 338, 149, 241, 48, 140, 193, 154, 349, 26, 31, 34, 34, 385, 72, 272, 250, 52 passed; 0 failed |
-| server modules | `lua5.4 tests/server_tests.lua` | `1108 passed, 0 failed` |
-| client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed, §41 input modes + hide policy + plain ids, §54 HUD hiding + key capture) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 786 passed, 0 failed` |
+| admin platform (§41–§53) | `lua5.4 tests/{raycast,schema,settings,perms,buckets,audit,bans,targets,admin_api,registry_caller,client_registry_caller,client_adminstate,callback,maps,maps_store,maps_regions,client_maps,chat_hook}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 100, 338, 149, 241, 48, 140, 193, 154, 349, 26, 31, 34, 34, 409, 72, 272, 250, 52 passed; 0 failed |
+| server modules | `lua5.4 tests/server_tests.lua` | `1112 passed, 0 failed` |
+| client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed, §41 input modes + hide policy + plain ids, §54 HUD hiding + key capture) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 795 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
 | runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 216`, `# fail 0` |
 | types | `npx vue-tsc --noEmit -p ui/tsconfig.json` | no output, exit 0 |
@@ -333,6 +333,9 @@ never manual edits of live rows.
   runs in every VM and the import.lua proxy only fills in what the lib table LACKS. core defines it on its own copy
   (client/ui.lua), plugins reach it through the proxy. The proxy caches each closure with `rawset`, so `rawget` on a
   plugin's lib table cannot tell a lib function from a proxied one — test `capture`, not a name a press already used.
+- The `call` export's first argument is only a DECLARATION: the owner is `GetInvokingResource()` on both sides and a
+  mismatching name is refused (DESIGN §2.2). A test that calls `stubs.exports.core.call(name, …)` directly acts as
+  `name` (no invoking resource); one that goes through `env.exports.core:call(…)` acts as that VM's resource.
 - `IsHudHidden()` / `IsRadarHidden()` are pure read-backs of the `DISPLAY_HUD` / `DISPLAY_RADAR` flags (GTA
   `commands_hud.cpp`), so core's own `DisplayHud(false)` (§54 `Core.UI.hideHud`) reads as "the game hid the HUD": the §31
   `hud` watcher excludes it, or `Config.UI.AutoHide.HudHidden = true` would hide the whole shell and close the editor.

@@ -76,6 +76,12 @@
   --color-plate-gain: #0bfd69;          /* ...and the one you are getting */
   --color-hud-tile: rgba(32, 36, 39, 0.85);     /* the mic tile */
 
+  /* The three world axes (admin editor 2026-09-26: gizmo, transform read-out) — Blender's X / Y / Z, the
+     same values the in-world gizmo sprites use, so the page and the world never disagree. */
+  --color-axis-x: #ff3352;
+  --color-axis-y: #8bdc00;
+  --color-axis-z: #2890ff;
+
   --radius-ui: 6px;
   --radius-ui-sm: 4px;
   --radius-ui-xs: 3px;

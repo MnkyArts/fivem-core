@@ -1777,11 +1777,17 @@ local function suiteApi()
         'the first caller was not clobbered by the dispatch that overlapped it')
     eq(Core.Registry.getCaller(), 'core', 'the global caller is back to core once both finished')
 
-    -- the runtime's own view of the invoking resource wins over the declared caller
+    -- the runtime's own view of the invoking resource is the caller; a declared name that differs from it is
+    -- REFUSED (DESIGN §2.2, §54.1) — nobody acts under another resource's name
     stubs.invokingResource = 'real_plugin'
     Core.Testing.owner = function() return Core.Registry.getCaller() end
-    eq(call('lying_plugin', 'Testing', 'owner'), 'real_plugin',
-        'GetInvokingResource() overrides the caller name the proxy declared')
+    local spoofOk, spoofErr = pcall(call, 'lying_plugin', 'Testing', 'owner')
+    eq(spoofOk, false, 'a declared caller that is not the invoking resource is refused')
+    check(tostring(spoofErr):find('refused', 1, true) ~= nil, 'with a refusal message', tostring(spoofErr))
+    check(printed('call() refused: resource real_plugin declared itself as lying_plugin') ~= nil,
+        'and a warning naming both')
+    eq(call('real_plugin', 'Testing', 'owner'), 'real_plugin', 'the matching declared name passes')
+    eq(call(nil, 'Testing', 'owner'), 'real_plugin', 'no declared name: the invoking resource is the caller')
     stubs.invokingResource = nil
     eq(call(nil, 'Testing', 'owner'), 'core', 'an absent caller name falls back to core')
 

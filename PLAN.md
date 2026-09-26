@@ -822,11 +822,13 @@ in `resources/admin/PLAN.md` → *Run UX*; core's two packages and the orchestra
 | admin: gizmo + modal G / R | A1 | `resources/admin` only (see its PLAN) | admin editor_gizmo 302 |
 | admin: editor UX Lua + server | A2 | `resources/admin` only; consumes §54 pcall-safe | admin editor_ux 155 |
 | admin UI (Vue) | V1 | `resources/admin/ui` only | typecheck 0, kit-compile 0/0, check-plugins 0/0 |
+| hotfix after Liam's first in-game test | orchestrator | `client/ui.lua`: every close of a page / modal / overlay reaches its Lua owner as `core:ui:<id>:closed { reason = 'close'\|'replaced'\|'closeAll'\|'hidden'\|'unregister', by? }` (§41 notes) — the F10 panel replaced the admin editor's page silently and left the admin soft-locked; the editor now parks and returns (admin DESIGN §7.2) | client_ui 779 → 786 (suite `page closed reasons`) |
+| review fixes (REVIEW-CORE F1–F3) | C2, C1 | `server/maps_runtime.lua` F1: a recycled server handle is checked with `ours(e, uid)` before anything deletes it (the `mapEl` check used to detect a foreign entity and then delete it anyway); F2: the 2 s pose verification re-creates only when the move did not land, and never an occupied vehicle. `server/api.lua` F3: the `call` export takes the caller from `GetInvokingResource()` (a declared name that differs is ignored), so a plugin can no longer release another one's §54 reasons | maps 385 → 409, client_ui 786 → 795, server 1108 → 1112 |
 | orchestrator | — | `client/doors.lua` (+3: `Doors.tryToggleNearest` returns false while `Core.Keys.isCaptured()` — `core_door` is a RAW key mapping on E, which the capture does not swallow by itself, and E flies the editor camera up) + its check in `tests/client_ui_tests.lua`; admin `actions_self` perm count, manifest, locale key | client_ui 773 → 779 |
 
-Verification (orchestrator, 2026-09-26): client_ui 779 · run_tests 417 · maps 385 · client_maps 250 · server 1108 —
-all 0 failed; node units `# pass 216`, `# fail 0`; browser suites shell 125/125, kit 312/312, runtime 212/212;
-admin runner 3572 / 0; admin_probe 157; `fxlint core` and `fxlint admin` 0 errors, 0 warnings. Deploy: `refresh`,
-`restart core`, then `ensure admin` and restart every resource that uses `Core.Keys` (inventory …) — the key lib is
-compiled into each VM, an old copy never checks the capture. In-game checklist: core README items 38–40 (§54) and
-admin README §3 / §6 / §7 / §10.
+Verification (orchestrator, 2026-09-26, after the hotfix and the review fixes): client_ui 795 · run_tests 417 · maps 409
+· client_maps 250 · server 1112 — all 0 failed; node units `# pass 216`, `# fail 0`; browser suites shell 125/125, kit
+312/312, runtime 212/212; admin runner 3647 / 0 (3747 after the admin browser run, see its PLAN); admin_probe 157; `fxlint core` and `fxlint admin` 0 errors, 0 warnings.
+Deploy: `refresh`, `restart core`, then `ensure admin` and restart every resource that uses `Core.Keys` (inventory …) —
+the key lib is compiled into each VM, an old copy never checks the capture. In-game checklist: core README items 38–40
+(§54) and admin README §3 / §6 / §7 / §10.

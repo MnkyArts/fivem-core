@@ -609,6 +609,104 @@ do
 end
 
 --------------------------------------------------------------------------------
+-- review fixes: reused server handles are never deleted (F1); the pose check re-creates only a move that did not
+-- land (F2)
+--------------------------------------------------------------------------------
+do
+    local env, Core = newServer()
+    local Maps = Core.Maps
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local map = Maps.create({ name = 'Reuse', mode = 'live', targetBucket = 5 }, 1)
+    local function uid(id) return map.id .. ':' .. id end
+    local function entityOf(id)
+        for handle, rec in pairs(stubs.entities) do
+            if rec.exists and stubs.entityState(env, handle).mapEl == uid(id) then return handle, rec end
+        end
+    end
+    local function update(id, set) return Maps.apply(map.id, { { op = 'update', id = id, set = set } }, 1) end
+    --- a client deleted the map entity and the server gave its handle to someone else's entity (fresh bag)
+    local function reuse(h) stubs.entityState(env, h).mapEl, stubs.entityState(env, h).mapCfg = nil, nil end
+    check(Maps.apply(map.id, {
+        { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 30 }, fields = { model = 'sultan' } },
+        { op = 'create', type = 'core:vehicle', pos = { x = 20, y = 0, z = 30 }, fields = { model = 'sultan' } },
+        { op = 'create', type = 'core:physprop', pos = { x = 40, y = 0, z = 30 }, fields = { model = 'prop_ball' } },
+        { op = 'create', type = 'core:ped', pos = { x = 60, y = 0, z = 30 }, fields = { model = 'a_m_y_x' } },
+    }, 1), 'two vehicles, a ball and a ped')
+
+    -- F1: a reused handle
+    local h1, r1 = entityOf(1)
+    reuse(h1)
+    eq(Maps.respawn(map.id), 1, "respawn sees the element's entity as gone (the handle is someone else's)")
+    eq(r1.exists, true, 'and leaves the foreign entity alone')
+    local n1 = entityOf(1)
+    check(n1 and n1 ~= h1, 'the element has a new entity')
+    reuse(n1)
+    check(update(1, { pos = { x = 2, y = 0, z = 30 } }), 'move an element whose handle was reused')
+    check(stubs.entities[n1].exists and entityOf(1) ~= nil and entityOf(1) ~= n1,
+        'not moved in place, not deleted: the element is re-created')
+    local h2, r2 = entityOf(2)
+    reuse(h2)
+    local lastOf1 = entityOf(1)
+    check(Maps.setActive(map.id, false, 1), 'deactivate')
+    check(r2.exists and not stubs.entities[lastOf1].exists, 'deactivation deletes its own entities only')
+    check(Maps.setActive(map.id, true, 1), 'activate again')
+    local h3 = entityOf(1)
+    reuse(h3)
+    stop(env, 'core')
+    eq(stubs.entities[h3].exists, true, 'core stop never deletes a foreign entity either')
+end
+
+do
+    local env, Core = newServer()
+    local Maps = Core.Maps
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local map = Maps.create({ name = 'Verify', mode = 'live', targetBucket = 5 }, 1)
+    local function entityOf(id)
+        for handle, rec in pairs(stubs.entities) do
+            if rec.exists and stubs.entityState(env, handle).mapEl == map.id .. ':' .. id then return handle, rec end
+        end
+    end
+    local function update(id, set) return Maps.apply(map.id, { { op = 'update', id = id, set = set } }, 1) end
+    local function at(h, x, y, z, heading) stubs.coords[h], stubs.headings[h] = stubs.vector3(x, y, z), heading end
+    check(Maps.apply(map.id, {
+        { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 30 }, fields = { model = 'sultan' } },
+        { op = 'create', type = 'core:physprop', pos = { x = 40, y = 0, z = 30 }, fields = { model = 'prop_ball' } },
+        { op = 'create', type = 'core:ped', pos = { x = 60, y = 0, z = 30 }, fields = { model = 'a_m_y_x', frozen = false } },
+    }, 1), 'a vehicle, a ball and a ped')
+    local vh = entityOf(1)
+    check(update(1, { pos = { x = 5, y = 0, z = 30 } }), 'move the vehicle')
+    at(vh, 5, 0, 30, 0.0)               -- landed …
+    at(vh, 40, 30, 30, 120.0)           -- … and was driven away within the 2 s
+    stubs.tick(2100)
+    eq(entityOf(1), vh, 'landed, then driven away: kept (far from the target AND from where it was)')
+    check(update(1, { pos = { x = 45, y = 30, z = 30 } }), 'move it again')
+    stubs.vehicleSeats[vh] = { [-1] = 101 }   -- a player sits in it; the move never landed
+    stubs.tick(2100)
+    eq(entityOf(1), vh, 'a vehicle with an occupant is never re-created under them')
+    stubs.vehicleSeats[vh] = nil
+    at(vh, 45, 30, 30, 0.0)             -- the player got out; the owner applied the move after all
+    check(update(1, { rot = { x = 0, y = 0, z = 90 } }), 'rotate it')
+    stubs.tick(2100)
+    local v2 = entityOf(1)
+    check(v2 ~= vh, 'the heading still the old one at the target position: re-created')
+    check(update(1, { pos = { x = 50, y = 30, z = 30 } }), 'a burst: move once')
+    check(update(1, { pos = { x = 55, y = 30, z = 30 } }), 'and again before the check')
+    stubs.tick(2100)
+    check(entityOf(1) ~= v2, 'neither landed (still at the pose before the burst): re-created')
+
+    local bh = entityOf(2)
+    check(update(2, { pos = { x = 42, y = 0, z = 30 } }), 'move the ball')
+    at(bh, 48, 6, 29, 0.0)              -- landed and rolled away
+    stubs.tick(2100)
+    eq(entityOf(2), bh, 'a prop that landed and rolled away is kept')
+    local ph = entityOf(3)
+    check(update(3, { rot = { x = 0, y = 0, z = 90 } }), 'turn the ped')
+    at(ph, 60, 0, 30, 200.0)            -- turned, then bumped round by a car
+    stubs.tick(2100)
+    eq(entityOf(3), ph, 'a ped that turned and was bumped round is kept (neither heading)')
+end
+
+--------------------------------------------------------------------------------
 -- expect / conflict and invert (undo, redo)
 --------------------------------------------------------------------------------
 do
