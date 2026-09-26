@@ -50,6 +50,7 @@
   // `send` is a SendNUIMessage; the transport below is every RegisterNuiCallback at once.
   const send = (msg) => window.__core.send(msg)
   const posts = []
+  let menuReply = null
   const NEVER = Symbol('never answers')
   /** `ui_request` handlers, keyed by the request name — this is `Core.UI.onRequest` in Lua. */
   const handlers = Object.create(null)
@@ -57,6 +58,7 @@
     resource: 'core',
     send(name, body, signal, timeoutMs) {
       posts.push({ name, body })
+      if (name === 'menu_change') return menuReply ? menuReply(body) : Promise.resolve({ ok: true, ...body })
       if (name !== 'ui_request') return Promise.resolve({})
       const fn = handlers[body && body.n]
       if (!fn) return Promise.resolve({ ok: false, error: { code: 'no_handler', message: 'no Lua handler "' + (body && body.n) + '"' } })
@@ -535,6 +537,149 @@
     await frame()
     check('toggling it off unmounts it again', store.dev.inspector === false)
     send({ action: 'dev:set', enabled: false, log: false, inspector: false, loadTimeoutMs: 4000 })
+
+    // ================================================================= 14. development services (§40)
+    // Actual DOM controls and the real NUI result transport; no source-text assertions.
+    send({ action: 'focus', focused: false, stack: [] })
+    send({ action: 'shell:visible', visible: true })
+    const press = (key, target = window) => target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }))
+    const field = (name) => q('.dlg [data-field="' + name + '"]')
+    const edit = (el, value) => { if (el) { el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })) } }
+    m = mark()
+    send({ action: 'input:open', id: 'c40-form', title: 'Development fields', fields: [
+      { name: 'notes', label: 'Notes', type: 'textarea', default: 'First line' },
+      { name: 'secret', label: 'Secret', type: 'password', default: 'private' },
+      { name: 'volume', label: 'Volume', type: 'slider', min: 0, max: 10, step: 1, default: 3 },
+      { name: 'roles', label: 'Roles', type: 'multiselect', searchable: true, options: [{ label: 'Alpha', value: 'alpha' }, { label: 'Disabled', value: false }] },
+      { name: 'enabled', label: 'Enabled', type: 'select', options: [{ label: 'No', value: false }, { label: 'Yes', value: true }], default: false },
+      { name: 'day', label: 'Day', type: 'date', default: '2026-09-21' },
+      { name: 'time', label: 'Time', type: 'time', default: '12:34' },
+      { name: 'color', label: 'Color', type: 'color', default: '#abcdef' },
+    ] })
+    await frame()
+    check('expanded form renders textarea/password/range/date/time/color controls', !!q('.dlg textarea') && !!q('.dlg input[type="password"]') && !!q('.dlg input[type="range"]') && !!q('.dlg input[type="date"]') && !!q('.dlg input[type="time"]') && !!q('.dlg input[type="color"]'))
+    const multiline = q('.dlg textarea')
+    edit(multiline, 'First line\nSecond line')
+    press('Enter', multiline)
+    check('textarea Enter does not submit the form', !find(m, 'input_result'))
+    edit(q('.dlg input[type="range"]'), '7')
+    const falseChoice = Array.from(field('roles')?.querySelectorAll('label') || []).find((el) => el.textContent.includes('Disabled'))
+    falseChoice?.click()
+    edit(field('roles')?.querySelector('input[type="search"]'), 'Alpha')
+    await frame()
+    check('searchable multi-select filters by label', field('roles')?.textContent.includes('Alpha') && !field('roles')?.textContent.includes('Disabled'))
+    q('.dlg [data-role="submit"]')?.click()
+    await frame()
+    const expandedValues = find(m, 'input_result')?.body.values
+    check('expanded form submits multiline/password/numeric slider', expandedValues?.notes === 'First line\nSecond line' && expandedValues.secret === 'private' && expandedValues.volume === 7)
+    check('expanded form preserves false option and hidden multiselect choice', expandedValues?.enabled === false && Array.isArray(expandedValues?.roles) && expandedValues.roles.length === 1 && expandedValues.roles[0] === false)
+    check('date/time/color round-trip unchanged', expandedValues?.day === '2026-09-21' && expandedValues.time === '12:34' && expandedValues.color === '#abcdef')
+
+    m = mark()
+    send({ action: 'input:open', id: 'c40-form-validation', fields: [
+      { name: 'amount', type: 'number', min: 0, step: 2 },
+      { name: 'note', type: 'text', minLength: 2, maxLength: 4 },
+    ] })
+    await frame()
+    edit(field('amount'), '3')
+    edit(field('note'), 'ok')
+    q('.dlg [data-role="submit"]')?.click()
+    await frame()
+    check('off-step numeric input stays editable without a result', store.input.visible && !find(m, 'input_result') && !!q('.dlg [data-error="amount"]'))
+    edit(field('amount'), '4')
+    edit(field('note'), '')
+    q('.dlg [data-role="submit"]')?.click()
+    await frame()
+    check('optional empty string still obeys declared minLength', store.input.visible && !find(m, 'input_result') && !!q('.dlg [data-error="note"]'))
+    edit(field('note'), 'ééé')
+    q('.dlg [data-role="submit"]')?.click()
+    await frame()
+    check('string maximum uses Lua-compatible UTF-8 byte length', store.input.visible && !find(m, 'input_result') && !!q('.dlg [data-error="note"]'))
+    edit(field('note'), 'éé')
+    q('.dlg [data-role="submit"]')?.click()
+    await frame()
+    check('corrected form submits numeric step and UTF-8-bound values', !store.input.visible && find(m, 'input_result')?.body.values.amount === 4 && find(m, 'input_result')?.body.values.note === 'éé')
+
+    m = mark()
+    send({ action: 'menu:open', id: 'c40-menu-ack', items: [
+      { label: 'Toggle', value: 1, checked: false }, { label: 'Finish', value: 2 },
+    ] })
+    await frame()
+    menuReply = () => Promise.resolve({ ok: false })
+    q('.menu [data-index="0"]')?.click()
+    await frame()
+    check('rejected menu change preserves displayed checkbox', store.menu.items[0]?.checked === false && store.menu.visible)
+    let resolveMenuChange
+    menuReply = () => new Promise((resolve) => { resolveMenuChange = resolve })
+    q('.menu [data-index="0"]')?.click()
+    await frame()
+    check('pending menu change is not displayed optimistically', store.menu.items[0]?.checked === false)
+    q('.menu [data-index="1"]')?.click()
+    await frame()
+    check('selection waits for pending menu change acknowledgement', store.menu.visible && !find(m, 'menu_result'))
+    resolveMenuChange?.({ ok: true })
+    await frame()
+    check('acknowledged menu change updates displayed checkbox', store.menu.items[0]?.checked === true)
+    q('.menu [data-index="0"]')?.click()
+    await frame()
+    send({ action: 'menu:open', id: 'c40-menu-replacement', items: [{ label: 'Replacement', value: 1, checked: false }] })
+    await frame()
+    resolveMenuChange?.({ ok: true })
+    await frame()
+    check('late change acknowledgement cannot mutate replacement menu', store.menu.id === 'c40-menu-replacement' && store.menu.items[0]?.checked === false)
+    menuReply = null
+    send({ action: 'menu:close' })
+    await frame()
+
+    m = mark()
+    send({ action: 'menu:open', id: 'c40-menu', title: 'Development menu', items: [
+      { label: 'Enabled', value: 1, checked: false, metadata: [{ label: 'Mode', value: 'Preview' }], progress: 35 },
+      { label: 'Quality', value: 2, values: ['Low', 'High'], selected: 1 },
+      { label: 'More', value: 3, items: [{ label: 'Nested choice', value: 4 }] },
+    ] })
+    await frame()
+    check('menu displays metadata and progress', !!q('.menu dl') && q('.menu dl')?.textContent.includes('Preview') && !!q('.menu .core-progress'))
+    q('.menu [data-index="0"]')?.click()
+    await frame()
+    check('checkbox menu posts change without closing', find(m, 'menu_change')?.body.checked === true && store.menu.visible && !find(m, 'menu_result'))
+    press('ArrowDown'); press('ArrowRight')
+    await frame()
+    check('side-scroll menu posts 1-based selected index', !!find(m, 'menu_change', (b) => b.value === 2 && b.selected === 2))
+    q('.menu [data-index="2"]')?.click()
+    await frame()
+    check('submenu opens without resolving parent', q('.menu')?.textContent.includes('Nested choice') && !find(m, 'menu_result'))
+    press('Escape')
+    await frame()
+    check('submenu Escape goes back rather than closing menu', store.menu.visible && q('.menu')?.textContent.includes('Quality') && !find(m, 'menu_result'), JSON.stringify({visible:store.menu.visible,text:q('.menu')?.textContent,posts:since(m)}))
+    q('.menu [data-index="2"]')?.click()
+    await frame()
+    q('.menu [data-index="0"]')?.click()
+    await frame()
+    check('nested menu returns original unique row id', find(m, 'menu_result')?.body.value === 4)
+
+    const startCheck = (id, extra = {}) => send({ action: 'skillcheck:open', id, difficulty: [{ speed: 200, areaSize: 80 }], keys: ['e'], canCancel: true, ...extra })
+    m = mark()
+    startCheck('c40-hit', { difficulty: [{ speed: 200, areaSize: 80 }, { speed: 200, areaSize: 80 }], keys: ['e', 'q'] })
+    const inWindow = () => { const pos = Number(q('.skillcheck-track')?.getAttribute('aria-valuenow')); return pos >= 30 && pos <= 65 }
+    check('skill-check indicator actually advances into target', await waitFor(inWindow, 1200))
+    press('e'); await frame()
+    check('skill-check advances stage without early result', store.skillcheck.visible && !find(m, 'skillcheck_result'))
+    await waitFor(inWindow, 1200); press('q'); await frame()
+    check('all timed stages must succeed', find(m, 'skillcheck_result')?.body.success === true && !store.skillcheck.visible)
+    m = mark(); startCheck('c40-wrong'); await frame(); press('x'); await frame()
+    check('wrong key fails skill-check', find(m, 'skillcheck_result')?.body.success === false)
+    m = mark(); startCheck('c40-miss', { difficulty: [{ speed: 200, areaSize: 5 }] }); await frame()
+    check('missed timing window expires', await waitFor(() => find(m, 'skillcheck_result')?.body.success === false, 1500))
+    m = mark(); startCheck('c40-old'); await frame(); startCheck('c40-new'); await frame()
+    send({ action: 'skillcheck:close', id: 'c40-old' }); await frame()
+    check('stale close cannot dismiss replacement skill-check', store.skillcheck.visible && store.skillcheck.id === 'c40-new')
+    press('Escape'); await frame()
+    check('Escape cancels replacement exactly once', count(m, 'skillcheck_result', (b) => b.id === 'c40-new' && b.success === false) === 1)
+    m = mark(); startCheck('c40-pause'); await frame(); send({ action: 'shell:visible', visible: false, reasons: ['pause'] }); await frame()
+    check('hidden shell cancels skill-check', find(m, 'skillcheck_result')?.body.success === false && !store.skillcheck.visible)
+    send({ action: 'shell:visible', visible: true }); await frame()
+    m = mark(); startCheck('c40-close'); await frame(); send({ action: 'skillcheck:close', id: 'c40-close' }); await sleep(600)
+    check('host close stops animation and late result', !store.skillcheck.visible && !find(m, 'skillcheck_result'))
 
     say('PASS ' + pass + '/' + total)
     return out.join('\n')

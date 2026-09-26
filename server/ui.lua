@@ -33,9 +33,8 @@ local PROGRESS_GRACE_MS <const> = 5000
 local PROGRESS_TOLERANCE_MS <const> = 250
 local MAX_TITLE <const> = 96
 local MAX_BUTTON <const> = 32
-local MAX_MENU_ITEMS <const> = 200
-local MAX_FIELDS <const> = 32
-local FIELD_TYPES <const> = { text = true, number = true, select = true, checkbox = true }
+local Forms = Core.UIForms
+local menus, menuSequence = {}, 0
 -- Shell visibility (DESIGN §31.5): the reason a server push adds to the client's
 -- hide set, namespaced as 'server:<reason>' so no plugin can clear it.
 local MAX_REASON <const> = 32
@@ -328,131 +327,70 @@ end
 --- The real values never leave the server: the client is sent one index per row
 --- and its answer counts only as an index into the server's own item list.
 local function menuOpen(src, opts)
-    if type(opts) ~= 'table' or type(opts.items) ~= 'table' then
-        Log.error('UI.menu.open: { items = { { label = ..., value = ... } } } is required')
-        return nil
-    end
-    if #opts.items > MAX_MENU_ITEMS then
-        Log.warn('UI.menu.open: %d items truncated to %d', #opts.items, MAX_MENU_ITEMS)
-    end
-    local kept, sent = {}, {}
-    for i = 1, math.min(#opts.items, MAX_MENU_ITEMS) do
-        local item = opts.items[i]
-        if type(item) == 'table' and type(item.label) == 'string' and item.label ~= '' then
-            local index = #kept + 1
-            kept[index] = item
-            sent[index] = {
-                label = Utils.sanitize(item.label, MAX_LABEL),
-                description = type(item.description) == 'string'
-                    and Utils.sanitize(item.description, MAX_TEXT) or nil,
-                icon = type(item.icon) == 'string' and Utils.sanitize(item.icon, 64) or nil,
-                value = index,                       -- all the client ever learns
-                disabled = item.disabled == true,
-            }
-        end
-    end
-    if #sent == 0 then
-        Log.error('UI.menu.open: no usable { label = ..., value = ... } item')
-        return nil
-    end
+    if not toSrc(src) or type(opts) ~= 'table' then return nil end
+    if opts.onChange ~= nil and not Utils.isCallable(opts.onChange) then return nil end
+    local sent, records = Forms.menu(opts.items)
+    if not sent then return nil end
+    menuSequence = menuSequence + 1
+    local token = menuSequence
+    local owner = Core.Registry.getCaller()
+    local entry = { token = token, records = records, owner = owner, onChange = opts.onChange, changedAt = -1000 }
+    if menus[src] then Core.Registry.untrack('serverMenu', tostring(menus[src].token)) end
+    menus[src] = entry
+    Core.Registry.track('serverMenu', tostring(token), owner)
     local answer = awaitModal(src, 'menu', {
         title = type(opts.title) == 'string' and Utils.sanitize(opts.title, MAX_TITLE) or '',
-        items = sent,
+        items = sent, _menuToken = token,
     })
-    local index = type(answer) == 'number' and math.tointeger(answer) or nil
-    if not index or index < 1 or index > #kept or sent[index].disabled then return nil end
-    local value = kept[index].value
-    if value == nil then value = kept[index].label end   -- `value = false` is a real answer
-    return value
+    if menus[src] ~= entry then return nil end
+    menus[src] = nil
+    Core.Registry.untrack('serverMenu', tostring(token))
+    return Forms.menuValue(records, answer)
 end
 
---- Checks one answered field against its server-side declaration.
---- @return boolean ok, any value   -- ok = false cancels the whole dialog
-local function checkField(field, value)
-    if field.type == 'checkbox' then
-        if value == nil then return true, false end
-        if type(value) ~= 'boolean' then return false end
-        return true, value
+Core.Callback.register('core:ui:menuChange', { 'number', 'table' }, function(src, token, data)
+    local entry = menus[src]
+    if not entry or entry.busy or entry.token ~= token or GetGameTimer() - entry.changedAt < 100 then return false end
+    local ok, item, selected = Forms.menuChange(entry.records, data)
+    if not ok then return false end
+    entry.changedAt = GetGameTimer()
+    local callback = item.onChange or entry.onChange
+    if callback then
+        entry.busy = true
+        local success, err = Core.Registry.withCaller(entry.owner, callback, item.value, selected, item.row.selected)
+        entry.busy = false
+        if not success then Log.error('UI.menu onChange failed: %s', tostring(err)) end
     end
-    if value == nil then
-        if field.required then return false end
-        return true, nil
-    end
-    if field.type == 'number' then
-        if type(value) ~= 'number' or value ~= value or value == math.huge or value == -math.huge then
-            return false
+    return true
+end)
+
+Core.Registry.onOwnerStop('serverMenu', function(key)
+    for src, entry in pairs(menus) do
+        if tostring(entry.token) == key then
+            menus[src] = nil
+            TriggerClientEvent(UI_EVENT, src, 'menu.close', { entry.token })
+            break
         end
-        if field.min and value < field.min then return false end
-        if field.max and value > field.max then return false end
-        return true, value
     end
-    if field.type == 'select' then
-        if not Utils.contains(field.options, value) then return false end
-        return true, value
-    end
-    if type(value) ~= 'string' then return false end
-    if #value > (field.max or MAX_TEXT) then return false end
-    if field.required and value == '' then return false end
-    return true, value
-end
+    Core.Registry.untrack('serverMenu', key)
+end)
 
---- UI.input.open(src, { title, fields, submit, cancel }) -> values|nil.
---- The answer is rebuilt from the server's own field list: unknown names, wrong
---- types, out-of-range numbers, undeclared select options and empty required
---- fields all cancel the dialog.
+AddEventHandler('playerDropped', function()
+    local src = source
+    local entry = menus[src]
+    if entry then Core.Registry.untrack('serverMenu', tostring(entry.token)); menus[src] = nil end
+end)
+
 local function inputOpen(src, opts)
-    if type(opts) ~= 'table' or type(opts.fields) ~= 'table' then
-        Log.error('UI.input.open: { fields = { { name = ..., label = ... } } } is required')
-        return nil
-    end
-    local fields, sent = {}, {}
-    for i = 1, math.min(#opts.fields, MAX_FIELDS) do
-        local field = opts.fields[i]
-        local kind = type(field) == 'table' and (field.type or 'text') or nil
-        if kind and FIELD_TYPES[kind] and Validate.value('id', field.name) then
-            local options = (kind == 'select' and type(field.options) == 'table') and field.options or nil
-            if kind ~= 'select' or options then
-                local declared = {
-                    name = field.name, type = kind, required = field.required == true,
-                    min = tonumber(field.min), max = tonumber(field.max), options = options,
-                }
-                fields[#fields + 1] = declared
-                sent[#sent + 1] = {
-                    name = declared.name, type = kind, required = declared.required,
-                    min = declared.min, max = declared.max, options = options,
-                    label = type(field.label) == 'string' and Utils.sanitize(field.label, MAX_TITLE)
-                        or declared.name,
-                    default = field.default,
-                    placeholder = type(field.placeholder) == 'string'
-                        and Utils.sanitize(field.placeholder, 64) or nil,
-                }
-            end
-        end
-    end
-    if #fields == 0 then
-        Log.error('UI.input.open: no usable { name = ..., label = ... } field')
-        return nil
-    end
+    if type(opts) ~= 'table' then return nil end
+    local fields = Forms.fields(opts.fields)
+    if not fields then return nil end
     local answer = awaitModal(src, 'input', {
-        title = type(opts.title) == 'string' and Utils.sanitize(opts.title, MAX_TITLE) or '',
-        fields = sent,
+        title = type(opts.title) == 'string' and Utils.sanitize(opts.title, MAX_TITLE) or '', fields = fields,
         submit = type(opts.submit) == 'string' and Utils.sanitize(opts.submit, MAX_BUTTON) or 'OK',
         cancel = type(opts.cancel) == 'string' and Utils.sanitize(opts.cancel, MAX_BUTTON) or 'Cancel',
     })
-    if type(answer) ~= 'table' then return nil end
-    local declared = {}
-    for i = 1, #fields do declared[fields[i].name] = true end
-    for key in pairs(answer) do
-        if not declared[key] then return nil end          -- only declared names
-    end
-    local out = {}
-    for i = 1, #fields do
-        local field = fields[i]
-        local ok, value = checkField(field, answer[field.name])
-        if not ok then return nil end
-        out[field.name] = value
-    end
-    return out
+    return Forms.answer(fields, answer)
 end
 
 define('menu', 'open', menuOpen)

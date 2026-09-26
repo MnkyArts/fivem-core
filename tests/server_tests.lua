@@ -79,7 +79,7 @@ end
 
 -- manifest order; a file that does not exist yet is skipped so the suite keeps running
 local SERVER_FILES <const> = {
-    'server/api.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/globals.lua', 'server/notify.lua',
+    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/globals.lua', 'server/notify.lua',
     'server/perms.lua', 'server/player.lua', 'server/playergrid.lua', 'server/money.lua', 'server/factions.lua',
     'server/vehicles.lua',
 }
@@ -636,15 +636,15 @@ local function suiteMoney()
     eq(M.get(1, 'cash'), 4000, 'a refused transfer moved nothing')
     eq(M.get(2, 'cash'), 6000, '... on either side')
 
-    -- the receiver cannot take it: the sender is rolled back
+    -- the receiver cannot take it: reject before either balance changes
     M.set(2, 'cash', MAX, 'fill')
     local hooksBefore = #hooks
     eq(M.transfer(1, 2, 'cash', 100), false, 'a transfer the receiver cannot take fails')
-    eq(M.get(1, 'cash'), 4000, 'the sender was rolled back')
+    eq(M.get(1, 'cash'), 4000, 'the sender is unchanged')
     eq(M.get(2, 'cash'), MAX, 'the receiver is unchanged')
-    eq(env.Player(1).state.cash, 4000, 'the rolled-back balance replicated')
-    eq(#hooks - hooksBefore, 2, 'the failed transfer emitted the removal and its rollback')
-    eq(hooks[#hooks].reason, 'transfer rollback', 'the rollback is audited as such')
+    eq(env.Player(1).state.cash, 4000, 'the unchanged balance remains replicated')
+    eq(#hooks - hooksBefore, 0, 'a capped recipient is rejected before any mutation hook')
+    eq(Core.Money.get(1, 'cash'), 4000, 'preflight rejection leaves the sender unchanged')
 end
 
 --- Core.Factions (DESIGN §4.5, §8): create, the membership chain, permission denials,

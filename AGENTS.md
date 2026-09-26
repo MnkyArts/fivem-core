@@ -16,6 +16,10 @@ on `core`. This file is the working agreement for anyone (human or agent) changi
 | `types/core.lua` | LuaLS stubs for every public function (`resources/.luarc.json` wires them). New API ⇒ new stub. |
 | `AGENTS.md` | This file. `CLAUDE.md` only points here. |
 
+DESIGN §40 adds dependency-free geometry/zones/points, controls/actions, player context, streaming helpers,
+rich forms/menus, skill checks and cancellable hook pipelines. Keep client results advisory and preserve
+owner cleanup and coroutine-scoped callback ownership.
+
 ## 2. Layout
 
 ```
@@ -168,19 +172,20 @@ interaction, door, cron, locale, a compiled page).
 | what | command | expect |
 |---|---|---|
 | the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
-| libs and loader | `lua5.4 tests/run_tests.lua` | `401 passed, 0 failed` |
+| libs and loader | `lua5.4 tests/run_tests.lua` | `402 passed, 0 failed` |
+| development services | `lua5.4 tests/{geometry,client_zones,client_actions,context_streaming,hooks,ui_forms}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 190, 36, 48, 122, 94, 98 passed; 0 failed |
 | server modules | `lua5.4 tests/server_tests.lua` | `863 passed, 0 failed` |
-| client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 542 passed, 0 failed` |
+| client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 575 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
-| runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 191`, `# fail 0` |
+| runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 202`, `# fail 0` |
 | types | `npx vue-tsc --noEmit -p ui/tsconfig.json` | no output, exit 0 |
 | generated kit tags | `node ui/scripts/gen-kit-types.mjs --check` | `up to date (64 kit components)` |
-| every plugin's dist | `node ui/scripts/check-plugins.mjs` | `5 UI plugin(s) […], 0 error(s), 0 warning(s)` |
+| every plugin's dist | `node ui/scripts/check-plugins.mjs` | `0 error(s), 0 warning(s)` for every discovered plugin |
 | rulebook lint | `fxlint resources/core` (and the plugin) | `0 error(s), 0 warning(s)` |
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
 | a plugin's bundle | `npm run build -w <resource>-ui` (from `resources/`) | writes `<plugin>/ui/dist`, ~1 s |
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
-| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 228/228`, `PASS 152/152` |
+| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 228/228`, `PASS 182/182` |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
 | benchmarks | `node ui/tests/bench.mjs` | rewrites `ui/tests/BENCH.md` (never hand-edit it) |

@@ -78,6 +78,9 @@ command -v lua5.4 >/dev/null 2>&1 || fail 'lua5.4 is not on PATH'
 
 step '3/9  lua5.4 tests/run_tests.lua + the client suites'
 lua5.4 tests/run_tests.lua || fail 'tests/run_tests.lua'
+for suite in geometry client_zones client_actions context_streaming hooks ui_forms; do
+    lua5.4 tests/${suite}_tests.lua || fail "tests/${suite}_tests.lua"
+done
 lua5.4 tests/client_chat_tests.lua || fail 'tests/client_chat_tests.lua'
 lua5.4 tests/client_interiors_tests.lua || fail 'tests/client_interiors_tests.lua'
 # §38.4/§38.9: the focus stack, plugin discovery, ui_request dispatch, the patch queue.

@@ -94,6 +94,7 @@ local function newClient()
     stubs.loadImport(env)
     stubs.loadFile(env, 'shared/config.lua')
     stubs.loadFile(env, 'shared/ui_manifest.lua')
+    stubs.loadFile(env, 'shared/ui_forms.lua')
     for i = 1, #CLIENT_FILES do stubs.loadFile(env, CLIENT_FILES[i]) end
     return env, env.Core
 end
@@ -836,6 +837,7 @@ local function newInteractionsClient(renderer, hint, focusRadius)
     if hint then wp.Hint = hint end
     if focusRadius then wp.FocusRadius = focusRadius end
     stubs.loadFile(env, 'shared/ui_manifest.lua')
+    stubs.loadFile(env, 'shared/ui_forms.lua')
     stubs.loadFile(env, 'client/api.lua')
     local frame = {}
     local realCreateThread = env.CreateThread
@@ -1952,11 +1954,80 @@ local function suiteHudFeedConfig()
     stopFeed(env5)
 end
 
+local function suiteSkillCheck()
+    suite('skill check lifecycle')
+    local env, Core = newClient()
+    local UI = Core.UI
+    eq(UI.skillCheck({difficulty={'easy'}}), false, 'not-ready skill check fails closed')
+    stubs.nui('ui_ready', {})
+    for _, options in ipairs({ {}, {difficulty={}}, {difficulty={'unknown'}},
+        {difficulty={{speed=0,areaSize=20}}}, {difficulty={{speed=50,areaSize=0/0}}},
+        {difficulty={'easy'},keys={}}, {difficulty={'easy'},keys={'Escape'}},
+        {difficulty={'easy'},keys={[1]='e',[3]='r'}}, {difficulty={'easy'},canCancel='yes'} }) do
+        eq(UI.skillCheck(options), false, 'invalid skill options rejected')
+    end
+    local outcome = 'pending'
+    local function open(owner, options)
+        Core.Registry.setCaller(owner)
+        env.CreateThread(function() outcome = UI.skillCheck(options or {difficulty={'easy','medium'},keys={'E','r'}}) end)
+        Core.Registry.setCaller(nil)
+        return lastMessage('skillcheck:open').id
+    end
+    local id = open('skill_owner')
+    eq(UI['skillCheck.isActive'](),true,'skill check is active')
+    eq(stubs.nuiFocus.focus,true,'skill check takes focus')
+    eq(lastMessage('skillcheck:open').keys[1],'e','key normalized')
+    eq(lastMessage('skillcheck:open').canCancel,true,'cancellation defaults true')
+    stubs.nui('skillcheck_result',{id=id+1,success=true}); stubs.tick(1)
+    eq(outcome,'pending','unknown reply ignored')
+    stubs.nui('menu_result',{id=id,value=1}); stubs.tick(1)
+    eq(outcome,'pending','wrong callback kind ignored')
+    Core.Registry.setCaller('foreign')
+    eq(UI['skillCheck.cancel'](),false,'foreign owner cannot cancel')
+    Core.Registry.setCaller(nil)
+    stubs.nui('skillcheck_result',{id=id,success=true}); stubs.tick(1)
+    eq(outcome,true,'success roundtrip')
+    eq(UI['skillCheck.isActive'](),false,'completed no longer active')
+    eq(stubs.nuiFocus.focus,false,'success releases focus')
+    id = open('skill_owner')
+    stubs.nui('skillcheck_result',{id=id,success=1}); stubs.tick(1)
+    eq(outcome,false,'numeric success is not true')
+    id = open('skill_owner',{difficulty={{speed=50,areaSize=20}},canCancel=false})
+    Core.Registry.setCaller('skill_owner')
+    eq(UI['skillCheck.cancel'](),true,'programmatic owner cancel overrides escape flag')
+    Core.Registry.setCaller(nil); stubs.tick(1)
+    eq(outcome,false,'cancel resolves false')
+    id = open('skill_owner')
+    env.TriggerEvent('onResourceStop','foreign'); stubs.tick(1)
+    eq(UI['skillCheck.isActive'](),true,'foreign stop preserves modal')
+    env.TriggerEvent('onResourceStop','skill_owner'); stubs.tick(1)
+    eq(outcome,false,'owner stop fails closed')
+    eq(stubs.nuiFocus.focus,false,'owner stop releases focus')
+    id = open('skill_owner')
+    UI.hide('test'); stubs.tick(1)
+    eq(outcome,false,'hidden shell cancels skill check')
+    UI.show('test')
+    id = open('skill_owner')
+    stubs.tick(11000)
+    eq(outcome,false,'bounded watchdog resolves false')
+    eq(stubs.nuiFocus.focus,false,'watchdog releases focus')
+    id = open('skill_owner')
+    env.CreateThread(function() UI.alert({message='replace'}) end)
+    stubs.tick(1)
+    eq(outcome,false,'new modal replaces skill check with false')
+    eq(lastMessage('skillcheck:close').id,id,'replacement closes old browser widget')
+    stubs.nui('alert_result',{id=lastMessage('alert:open').id,confirmed=false}); stubs.tick(1)
+    id = open('skill_owner')
+    stubs.tick(1001); stubs.nui('ui_ready',{}); stubs.tick(1)
+    eq(outcome,false,'shell reload cancels pending skill check')
+    eq(stubs.nuiFocus.focus,false,'shell reload releases focus')
+end
+
 --------------------------------------------------------------------------------
 -- runner
 --------------------------------------------------------------------------------
 
-local SUITES <const> = { suiteManifest, suiteDiscovery, suiteFocus, suitePatch, suitePaths,
+local SUITES <const> = { suiteSkillCheck, suiteManifest, suiteDiscovery, suiteFocus, suitePatch, suitePaths,
     suiteFeed, suiteRequests, suiteServerForward, suiteHudKeys, suiteHudStats,
     suiteHudFeed, suiteHudFeedConfig, suiteWorldPrompts, suiteWorldPromptsNative,
     suiteWorldPromptsScaleform, suiteWorldPromptsCadence, suiteWorldPromptsEntity }

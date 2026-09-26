@@ -20,6 +20,7 @@ local Log = Core.Log
 local OPS <const> = {
     ['open'] = 'open',
     ['close'] = 'close',
+    ['menu.close'] = 'menu.close',
     ['send'] = 'send',
     ['update'] = 'update',             -- §38.10: shallow merge into the page's props
     ['patch'] = 'patch',               -- §38.10: one deep op (a missing value deletes)

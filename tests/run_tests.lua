@@ -109,6 +109,8 @@ local function suiteImport()
         'Core.Utils comes from the real lib file')
     eq(Core.Utils.formatMoney(1234), '$1,234', 'the in-VM lib function runs locally')
     check(type(rawget(Core.Math, 'offset')) == 'function', 'Core.Math loads from lib/math/shared.lua')
+    local shape = Core.Geometry.normalize({type='sphere', coords=vector3(0,0,0), radius=2})
+    check(shape and Core.Geometry.contains(shape, vector3(1,0,0)), 'Core.Geometry loads shared containment locally')
     eq(#calls, 0, 'a lib call never hops through the export')
 
     -- unknown namespace -> export proxy

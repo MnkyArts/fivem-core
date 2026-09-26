@@ -3964,3 +3964,69 @@ glyphs resolve). Shell: `Built-ins/HUD` and `Built-ins/Stats bars` stories rewri
 unslotted stat still gets a rail bar). Lua: `tests/client_ui_tests.lua` (`hud.set` lets the four new keys through
 and drops wrong types; `stats.set` forwards `slot` / `icon`), `tests/server_tests.lua` (`hud` normalisation).
 README (config keys, HUD paragraph, kit tag list, in-game checklist), `DesignSystem.mdx`, AGENTS §5 counts.
+
+## 40. Reusable gameplay development services
+
+These additive APIs remain dependency-free. No existing progress, lifecycle hook, or menu return contract changes.
+Stateful registrations are proxy services, captured under Registry.getCaller and automatically removed on owner stop;
+mutation/removal is restricted to the owner. Client results are presentation only, never authority for rewards.
+
+- `Core.Controls.acquire({ controls = { controlIds }, groups = { groupIds }? }) -> handle|nil`,
+  `release(handle) -> boolean`, `releaseAll()`: independent reference-counted restrictions; one active-only
+  frame loop and synchronous cleanup. Defaults to input group 0. Restrictions do not restore unrelated controls.
+- `Core.Actions.run(options) -> completed, reason`: managed progress with existing `label`, `duration`,
+  `canCancel`, optional animation (`dict`, `clip`, `flag`) or `scenario`, props (`model`, `bone`, `offset`,
+  `rotation`), `disable` control ids and interruption flags (`allowDead`, `allowFalling`, `allowSwimming`,
+  `allowRagdoll`). Single activity, busy refusal; `cancel()` and `isActive()`. Every exit releases owned
+  assets/props/animation/control handles; ped replacement interrupts. UI.progress remains compatible.
+- `Core.Geometry.normalize(definition)` and `contains(shape, coords)` are pure shared libraries. Shapes:
+  sphere (`coords`, `radius`), box (`coords`, `size`, `rotation` degrees), polygon (`points`, `minZ`, `maxZ`).
+  Finite bounded geometry and edge-inclusive containment work identically on server and client.
+  `Core.Zones.add(definition) -> id|nil`, `remove(id)`, `removeAll()`, `contains(id, coords)` and
+  `Core.Points.add({coords,distance,onEnter,onExit,nearby,interval?})` / remove / removeAll are client-owned
+  services. Callbacks run on an adaptive spatial scan, not exported funcrefs every frame. Debug rendering
+  uses the existing World scheduler. Zone callbacks receive id; point callbacks also receive distance.
+- `Core.Player.context()` returns a snapshot of ped/vehicle/seat/weapon. `onContextChange(key, fn)` and
+  `offContextChange(handle)` subscribe to core's single cache; no polling in plugin VMs. Core's existing
+  pedChanged(ped, previous) observer is unchanged. Context is advisory and refreshed at a bounded interval.
+- Streaming adds request/release pairs for texture dictionaries, Scaleform movies, script audio banks,
+  and weapon assets. All waits are bounded, malformed arguments fail closed, timeout releases assets;
+  Scaleform requests return a handle or nil, other requests return boolean.
+- Lua input fields additionally support textarea/password/slider/searchable select/multi-select/date/time/color.
+  Values are validated against the original schema on return (bounds, types, option membership, required),
+  and cancelled forms still return nil. Menus add checkbox/side-scroll rows, onChange, nested items/back,
+  metadata and progress, preserving ordinary `value|nil` selection results and non-serializable Lua values.
+- `Core.UI.skillCheck({ difficulty = { 'easy'|'medium'|'hard'|{speed,areaSize} }, keys?, canCancel? })`
+  returns boolean; `skillCheck.cancel()` / `skillCheck.isActive()` manage a bounded, owner-tracked modal.
+  Each stage moves an indicator through a target window; configured keys must hit the window. Cleanup on
+  close, pause, timeout, owner stop and core stop releases focus and resolves false. No server authority.
+- `Core.Hooks.register(name, callback, {priority?,filter?,after?}) -> handle`, `remove(handle)`,
+  `run(name, payload) -> allowed, reason` provide owner-scoped synchronous veto pipelines on both sides.
+  Ascending priority then registration order, false or errors fail closed; filters skip nonmatches,
+  after observers cannot change the decision. Existing Core.on/emitHook remain observers. Explicit
+  server `money:beforeTransfer` runs before mutation, rejects reentrant transfers, and never bypasses
+  source/destination/funds validation. Hook callbacks receive snapshots, not mutable transaction state.
+
+Client caches, geometry, UI and action completion never substitute for server permission, distance,
+cooldown or eligibility checks. No replicated state or new raw network transport is introduced. Server
+menu changes use the existing validated callback transport with `core:ui:menuChange(token, change)`:
+the source must have that current server-issued menu token; rows, values and ancestors are checked against
+the server snapshot; changes are throttled to 100 ms and non-overlapping while a callback is suspended.
+Owner stop sends token-matched `menu.close` through the existing `core:client:ui` event. The internal
+`Registry.withCaller(owner, fn, ...)` scopes callbacks per coroutine and restores ownership even after errors
+or yields; it is not available through exports. Ordinary lifecycle observers retain their existing behavior.
+
+Limits: 8192 total client zones/points; geometry coordinates ±1000000, dimensions/radius ≤10000 and
+polygons 3..256 vertices. The hierarchical spatial scan runs at 250 ms (1000 ms when empty); `nearby`
+intervals are 100..60000 ms with scan precision. Debug geometry is drawn within at most 300 m of its centre.
+Player context samples at most every 250 ms while subscribed, with on-demand stale reads otherwise;
+slow subscribers receive a coalesced pending change. Streaming timeouts are finite and capped at 60000 ms.
+Forms are bounded to 32 fields, select lists to 200 options, menus to 200 rows/eight levels. Skill checks
+have 1..20 stages, 1..10 keys, speed 20..200, areaSize 5..80, and a derived watchdog capped at 120000 ms.
+Required checkboxes must be true. Hook payload `money:beforeTransfer` is `{from,to,account,amount,reason}`.
+
+Menu changes are acknowledged, not optimistic: the browser allows one outstanding change and commits its
+display only after the bridge accepts it. Throttled/rejected changes retain the prior display; an unknown
+transport outcome cancels the menu. Final selection waits for the outstanding change, and stale replies
+cannot mutate a replacement menu. Acceptance means schema/state acceptance, not that a gameplay action
+is authorized; notification callback errors are logged without changing the accepted row state.

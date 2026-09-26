@@ -19,6 +19,11 @@
     HasAnimSetLoaded, RemoveAnimSet, RequestNamedPtfxAsset, HasNamedPtfxAssetLoaded,
     RemoveNamedPtfxAsset, RequestCollisionAtCoord, HasCollisionLoadedAroundEntity, PlayerPedId,
     GetGameTimer (client+server), GetHashKey (client+server).
+    Added helpers verified with fxref 2026-09-20 (all client): RequestStreamedTextureDict,
+    HasStreamedTextureDictLoaded, SetStreamedTextureDictAsNoLongerNeeded, RequestScaleformMovie,
+    HasScaleformMovieLoaded, SetScaleformMovieAsNoLongerNeeded, RequestScriptAudioBank,
+    ReleaseNamedScriptAudioBank, RequestWeaponAsset, HasWeaponAssetLoaded, RemoveWeaponAsset,
+    IsWeaponValid.
 ]]
 
 local ns = ...
@@ -27,10 +32,13 @@ local DEFAULT_TIMEOUT_MS <const> = 10000
 
 --- Explicit timeout, else Core.Config.StreamingTimeoutMs (DESIGN §2.0), else the built-in default.
 local function timeoutOf(timeoutMs)
-    if type(timeoutMs) == 'number' and timeoutMs > 0 then return timeoutMs end
+    if type(timeoutMs) == 'number' and timeoutMs == timeoutMs and timeoutMs > 0 and timeoutMs < math.huge then
+        return math.min(timeoutMs, 60000)
+    end
     local cfg = Core.Config
     local configured = type(cfg) == 'table' and cfg.StreamingTimeoutMs or nil
-    return type(configured) == 'number' and configured or DEFAULT_TIMEOUT_MS
+    return type(configured) == 'number' and configured == configured and configured > 0
+        and configured < math.huge and math.min(configured, 60000) or DEFAULT_TIMEOUT_MS
 end
 
 --- Model name or hash -> hash, or nil when the argument is neither.
@@ -122,4 +130,75 @@ function ns.requestCollision(coords, timeoutMs)
         Wait(0) -- per-frame: collision streams in over a few frames, bounded by the deadline
     until GetGameTimer() >= deadline
     return false
+end
+
+-- The additions use explicit failure returns, matching the existing streaming API.
+local function assetName(name)
+    return type(name) == 'string' and #name > 0 and #name <= 256 and not name:find('%z')
+end
+
+local function timeoutValid(ms)
+    return ms == nil or (type(ms) == 'number' and ms == ms and ms > 0 and ms <= 60000)
+end
+
+local function loaded(value) return value == true or value == 1 end
+
+function ns.requestTextureDict(name, timeoutMs)
+    if not assetName(name) or not timeoutValid(timeoutMs) then return false end
+    if loaded(HasStreamedTextureDictLoaded(name)) then return true end
+    RequestStreamedTextureDict(name, false)
+    local ok = waitLoaded(function(asset) return loaded(HasStreamedTextureDictLoaded(asset)) end, name, timeoutMs)
+    if not ok then SetStreamedTextureDictAsNoLongerNeeded(name) end
+    return ok
+end
+
+function ns.releaseTextureDict(name)
+    if assetName(name) then SetStreamedTextureDictAsNoLongerNeeded(name) end
+end
+
+function ns.requestScaleform(name, timeoutMs)
+    if not assetName(name) or not timeoutValid(timeoutMs) then return nil end
+    local handle = RequestScaleformMovie(name)
+    if type(handle) ~= 'number' or handle <= 0 then return nil end
+    if waitLoaded(function(id) return loaded(HasScaleformMovieLoaded(id)) end, handle, timeoutMs) then return handle end
+    SetScaleformMovieAsNoLongerNeeded(handle)
+    return nil
+end
+
+function ns.releaseScaleform(handle)
+    if math.type(handle) == 'integer' and handle > 0 then SetScaleformMovieAsNoLongerNeeded(handle) end
+end
+
+function ns.requestAudioBank(name, timeoutMs)
+    if not assetName(name) or not timeoutValid(timeoutMs) then return false end
+    local ok = waitLoaded(function(bank) return loaded(RequestScriptAudioBank(bank, false, -1)) end, name, timeoutMs)
+    if not ok then ReleaseNamedScriptAudioBank(name) end
+    return ok
+end
+
+function ns.releaseAudioBank(name)
+    if assetName(name) then ReleaseNamedScriptAudioBank(name) end
+end
+
+local function weaponHash(weapon)
+    if type(weapon) == 'string' and not assetName(weapon) then return nil end
+    local hash = toHash(weapon)
+    if hash and hash >= -2147483648 and hash <= 4294967295 and loaded(IsWeaponValid(hash)) then return hash end
+    return nil
+end
+
+function ns.requestWeaponAsset(weapon, timeoutMs)
+    if not timeoutValid(timeoutMs) then return false end
+    local hash = weaponHash(weapon)
+    if not hash then return false end
+    if loaded(HasWeaponAssetLoaded(hash)) then return true end
+    RequestWeaponAsset(hash, 31, 0)
+    local ok = waitLoaded(function(asset) return loaded(HasWeaponAssetLoaded(asset)) end, hash, timeoutMs)
+    if not ok then RemoveWeaponAsset(hash) end
+    return ok
+end
+
+function ns.releaseWeaponAsset(weapon)
+    local hash = weaponHash(weapon)
+    if hash then RemoveWeaponAsset(hash) end
 end

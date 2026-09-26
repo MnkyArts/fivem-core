@@ -28,7 +28,7 @@ local removers = {}
 -- be able to set a caller name or replace a kind's remover) and the seam
 -- client/ui.lua and client/ui_plugins.lua share (DESIGN §38.4: it can send raw
 -- NUI messages and answer held page requests).
-local INTERNAL_NS <const> = { World = true, Registry = true, UIInternal = true }
+local INTERNAL_NS <const> = { World = true, Registry = true, UIInternal = true, UIForms = true }
 
 local Registry = {}
 
@@ -49,6 +49,16 @@ function Registry.getCaller()
     local co = coroutine.running()
     local owner = co and callerByCoroutine[co]
     return owner or caller
+end
+
+-- Internal callback ownership scope: never changes the global fallback across a yield.
+function Registry.withCaller(owner, callback, ...)
+    local co = coroutine.running()
+    local previous = co and callerByCoroutine[co]
+    if co then callerByCoroutine[co] = owner end
+    local result = table.pack(pcall(callback, ...))
+    if co then callerByCoroutine[co] = previous end
+    return table.unpack(result, 1, result.n)
 end
 
 --- Remember that `owner` created `id` of `kind` ('marker', 'label', 'blip', ...).

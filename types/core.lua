@@ -52,7 +52,7 @@
 ---@alias CoreUIPluginState '"registered"' | '"loading"' | '"ready"' | '"failed"' | '"incompatible"'
 ---@alias CoreAutoHideWatcher '"pause"' | '"fade"' | '"switch"' | '"warning"' | '"hud"' | '"cinematic"'
 ---@alias CoreShardStyle '"wasted"' | '"success"' | '"info"'
----@alias CoreInputFieldType '"text"' | '"number"' | '"select"' | '"checkbox"'
+---@alias CoreInputFieldType 'text'|'number'|'select'|'checkbox'|'textarea'|'password'|'slider'|'multiselect'|'multi-select'|'date'|'time'|'color'
 ---@alias CoreMoneyAccount '"cash"' | '"bank"' | string
 ---@alias CorePermScope '"account"' | '"character"'
 ---@alias CoreDBImportMode '"merge"' | '"replace"'
@@ -215,18 +215,31 @@
 ---@field icon? string icon name understood by the shell
 ---@field value any returned by `Core.UI.menu.open` when the row is picked
 ---@field disabled? boolean greyed out and not selectable
+---@field checked? boolean checkbox state; selecting toggles without closing
+---@field values? (string|number|boolean|{label:string,value:any})[] side-scroll choices
+---@field selected? integer 1-based selected side-scroll choice
+---@field items? CoreMenuItem[] nested submenu
+---@field metadata? {label:string,value:string|number|boolean}[] shown for the active row
+---@field progress? number 0..100 progress shown for active row
+---@field onChange? fun(value:any,state:any,index?:integer) checkbox/side-scroll changes
 
 ---@class CoreMenuOptions
 ---@field title string menu heading
----@field items CoreMenuItem[] rows, in display order
+---@field items CoreMenuItem[] rows, in display order (200 total, depth <=8)
+---@field onChange? fun(value:any,state:any,index?:integer) fallback if row has no onChange
 
 ---@class CoreInputField
 ---@field name string key of the value in the returned table
 ---@field label string field label
 ---@field type? CoreInputFieldType default 'text'
----@field options? string[] choices for `type = 'select'`
+---@field options? (string|number|boolean|{label:string,value:string|number|boolean})[] select choices
+---@field searchable? boolean filters select options
+---@field multiple? boolean select alias for multiselect
+---@field step? number positive number/slider increment
+---@field minLength? integer string length lower bound
+---@field maxLength? integer string length upper bound, at most 4096
 ---@field default? any pre-filled value
----@field required? boolean block submit while empty
+---@field required? boolean block empty values; checkboxes must be checked
 ---@field min? number minimum for `type = 'number'`
 ---@field max? number maximum for `type = 'number'`
 ---@field placeholder? string
@@ -1538,6 +1551,7 @@ function CoreUILocale.set(data) end
 ---@field menu Core.UI.menu
 ---@field input Core.UI.input
 ---@field progress Core.UI.progress
+---@field skillCheck Core.UI.skillCheck
 ---@field hud Core.UI.hud
 ---@field keys Core.UI.keys
 ---@field spinner Core.UI.spinner
@@ -3176,3 +3190,205 @@ function Core.Registry.getOwned(owner) end
 ---@param owner string
 ---@return string[]
 function Core.Registry.idsOf(kind, owner) end
+
+--------------------------------------------------------------------------------
+-- Development services (DESIGN §40)
+--------------------------------------------------------------------------------
+
+---@class CoreControlOptions
+---@field controls integer[] input control IDs, 0..360
+---@field groups? integer[] input groups, default {0}
+---@class Core.Controls
+Core.Controls = {}
+---(client) Acquires an owner-scoped restriction handle. Register inside onReady.
+---@param options CoreControlOptions
+---@return string|nil
+function Core.Controls.acquire(options) end
+---(client) Releases only the calling owner's handle.
+---@param handle string
+---@return boolean
+function Core.Controls.release(handle) end
+---(client) Releases all restrictions owned by the caller.
+function Core.Controls.releaseAll() end
+
+---@class CoreActionProp
+---@field model string|integer
+---@field bone? integer ped bone ID
+---@field offset? vector3
+---@field rotation? vector3
+---@class CoreActionOptions: CoreProgressOptions
+---@field animation? {dict:string,clip:string,flag?:integer}
+---@field scenario? string mutually exclusive with animation
+---@field props? CoreActionProp[] cosmetic, local objects
+---@field disable? integer[] restricted controls while running
+---@field allowDead? boolean default false
+---@field allowFalling? boolean default false
+---@field allowSwimming? boolean default false
+---@field allowRagdoll? boolean default false
+---@class Core.Actions
+Core.Actions = {}
+---(client) Runs one managed progress activity; completion is not server authority.
+---@param options CoreActionOptions
+---@return boolean completed
+---@return string reason
+function Core.Actions.run(options) end
+---(client) Cancels the calling owner's active activity.
+---@return boolean
+function Core.Actions.cancel() end
+---(client) Whether any managed activity is running.
+---@return boolean
+function Core.Actions.isActive() end
+
+---@class CoreShapeDefinition
+---@field type 'sphere'|'box'|'polygon'
+---@field coords? vector3
+---@field radius? number sphere radius
+---@field size? vector3 box dimensions
+---@field rotation? number box heading in degrees
+---@field points? vector3[] polygon vertices
+---@field minZ? number polygon floor
+---@field maxZ? number polygon ceiling
+---@class Core.Geometry
+Core.Geometry = {}
+---Pure shared lib: validates and snapshots geometry; no native calls or export hop.
+---@param definition CoreShapeDefinition
+---@return table|nil shape
+---@return string|nil error
+function Core.Geometry.normalize(definition) end
+---Pure shared lib: inclusive boundary containment using normalized geometry.
+---@param shape table
+---@param coords vector3
+---@return boolean
+function Core.Geometry.contains(shape, coords) end
+
+---@class CoreZoneOptions: CoreShapeDefinition
+---@field onEnter? fun(id:string)
+---@field onExit? fun(id:string)
+---@field debug? boolean
+---@class Core.Zones
+Core.Zones = {}
+---(client) Adds owner-scoped geometry with proximity callbacks; register inside onReady.
+---@param options CoreZoneOptions
+---@return string|nil id
+function Core.Zones.add(options) end
+---(client) Removes the calling owner's zone.
+---@param id string
+---@return boolean
+function Core.Zones.remove(id) end
+---(client) Removes all calling-owner zones.
+function Core.Zones.removeAll() end
+---(client) Tests an owner's zone. Server validation uses the shared Geometry lib instead.
+---@param id string
+---@param coords vector3
+---@return boolean
+function Core.Zones.contains(id, coords) end
+
+---@class CorePointOptions
+---@field coords vector3
+---@field distance number
+---@field interval? integer nearby callback period in ms; never per-frame across exports
+---@field onEnter? fun(id:string,distance:number)
+---@field onExit? fun(id:string,distance:number)
+---@field nearby? fun(id:string,distance:number)
+---@class Core.Points
+Core.Points = {}
+---(client) Adds an owner-scoped proximity point; register inside onReady.
+---@param options CorePointOptions
+---@return string|nil id
+function Core.Points.add(options) end
+---(client) Removes the calling owner's point.
+---@param id string
+---@return boolean
+function Core.Points.remove(id) end
+---(client) Removes all calling-owner points.
+function Core.Points.removeAll() end
+
+---@class CorePlayerContext
+---@field ped integer
+---@field vehicle integer 0 on foot
+---@field seat integer|nil -1 driver; nil on foot
+---@field weapon integer
+
+---(client) Proxy: Returns a detached snapshot of the single local context cache.
+---@return CorePlayerContext
+function Core.Player.context() end
+---(client) Proxy: Subscribes to a cached value; register inside onReady. Not server authority.
+---@param key 'ped'|'vehicle'|'seat'|'weapon'
+---@param fn fun(value:any,previous:any)
+---@return string|nil handle
+function Core.Player.onContextChange(key, fn) end
+---(client) Proxy: Removes the caller's context subscription.
+---@param handle string
+---@return boolean
+function Core.Player.offContextChange(handle) end
+
+---(client) Lib: Bounded texture dictionary load; false on invalid input/timeout.
+---@param name string
+---@param timeoutMs? integer
+---@return boolean
+function Core.Streaming.requestTextureDict(name, timeoutMs) end
+---(client) Lib:
+---@param name string
+function Core.Streaming.releaseTextureDict(name) end
+---(client) Lib: Returns the loaded movie handle, nil on failure.
+---@param name string
+---@param timeoutMs? integer
+---@return integer|nil
+function Core.Streaming.requestScaleform(name, timeoutMs) end
+---(client) Lib:
+---@param handle integer
+function Core.Streaming.releaseScaleform(handle) end
+---(client) Lib: Loads a script audio bank; false on failure.
+---@param name string
+---@param timeoutMs? integer
+---@return boolean
+function Core.Streaming.requestAudioBank(name, timeoutMs) end
+---(client) Lib:
+---@param name string
+function Core.Streaming.releaseAudioBank(name) end
+---(client) Lib:
+---@param weapon string|integer
+---@param timeoutMs? integer
+---@return boolean
+function Core.Streaming.requestWeaponAsset(weapon, timeoutMs) end
+---(client) Lib:
+---@param weapon string|integer
+function Core.Streaming.releaseWeaponAsset(weapon) end
+
+---@class CoreHookPipelineOptions
+---@field priority? integer lower values run first
+---@field filter? fun(payload:table):boolean false skips callback
+---@field after? boolean observer runs after decision, receives payload, allowed, reason
+---@class Core.Hooks
+Core.Hooks = {}
+---Registers an owner-scoped synchronous pipeline callback; callbacks must not yield.
+---Return false, reason to veto. Failures fail closed; existing Core.on is unchanged.
+---@param name string
+---@param callback fun(payload:table,allowed?:boolean,reason?:string):boolean?,string?
+---@param options? CoreHookPipelineOptions
+---@return string|nil handle
+function Core.Hooks.register(name, callback, options) end
+---Removes only the caller's registration.
+---@param handle string
+---@return boolean
+function Core.Hooks.remove(handle) end
+---Runs a deterministic pipeline. Each callback receives a detached snapshot.
+---@param name string
+---@param payload table
+---@return boolean allowed
+---@return string|nil reason
+function Core.Hooks.run(name, payload) end
+
+---@class CoreSkillCheckOptions
+---@field difficulty ('easy'|'medium'|'hard'|{speed:number,areaSize:number})[] 1..20 stages; speed20..200 percent/sec, areaSize5..80 percent
+---@field keys? string[] 1..10 single alphanumeric or space keys; default {'e'}; cycled per stage
+---@field canCancel? boolean default true
+---@class Core.UI.skillCheck
+---@overload fun(options:CoreSkillCheckOptions):boolean (client) awaits a presentation-only skill check
+local CoreUISkillCheck = {}
+---(client) Cancels only the caller's active skill check.
+---@return boolean
+function CoreUISkillCheck.cancel() end
+---(client) Reports whether any skill check is currently active.
+---@return boolean
+function CoreUISkillCheck.isActive() end

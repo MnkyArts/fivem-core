@@ -9,6 +9,7 @@
 ]]
 
 local Money = {}
+local transferring = false
 
 local Log = Core.Log
 local Utils = Core.Utils
@@ -91,13 +92,22 @@ function Money.set(src, account, amount, reason)
     return commit(src, money, account, amount, delta, reason or 'set')
 end
 
-function Money.transfer(fromSrc, toSrc, account, amount, reason)
+local function transfer(fromSrc, toSrc, account, amount, reason)
     if fromSrc == toSrc then return false end
     if not isAccount(account) or not isPositiveAmount(amount) then return false end
     local player = Core.Player
     if not player or not player.isLoaded(fromSrc) or not player.isLoaded(toSrc) then return false end
 
     local text = Utils.sanitize(reason or 'transfer', 64)
+    if Money.get(fromSrc, account) < amount
+        or Money.get(toSrc, account) > Config.Money.MaxAmount - amount then return false end
+    local allowed = Core.Hooks.run('money:beforeTransfer', {
+        from = fromSrc, to = toSrc, account = account, amount = amount, reason = text,
+    })
+    if not allowed then return false end
+    -- Callbacks may change sessions or balances through other APIs; validate them again.
+    if not player.isLoaded(fromSrc) or not player.isLoaded(toSrc)
+        or Money.get(toSrc, account) > Config.Money.MaxAmount - amount then return false end
     if not Money.remove(fromSrc, account, amount, text) then return false end
     if not Money.add(toSrc, account, amount, text) then
         -- roll back: the receiver could not take it (cap or a session that just went away)
@@ -105,6 +115,15 @@ function Money.transfer(fromSrc, toSrc, account, amount, reason)
         return false
     end
     return true
+end
+
+function Money.transfer(fromSrc, toSrc, account, amount, reason)
+    if transferring then return false end
+    transferring = true
+    local ok, result = pcall(transfer, fromSrc, toSrc, account, amount, reason)
+    transferring = false
+    if not ok then return false end
+    return result
 end
 
 Core.Money = Money

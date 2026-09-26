@@ -27,6 +27,16 @@ function Registry.getCaller()
     return currentCaller
 end
 
+-- Internal callback ownership scope: never changes the global fallback across a yield.
+function Registry.withCaller(owner, callback, ...)
+    local co = coroutine.running()
+    local previous = co and callerByCoroutine[co]
+    if co then callerByCoroutine[co] = owner end
+    local result = table.pack(pcall(callback, ...))
+    if co then callerByCoroutine[co] = previous end
+    return table.unpack(result, 1, result.n)
+end
+
 local function forget(kind, id)
     local owner = ownerOf[kind] and ownerOf[kind][id]
     if not owner then return nil end
@@ -87,7 +97,7 @@ end
 -- Not reachable through the export: core's own plumbing. A plugin replacing a remover, the DB adapter or
 -- the session/autosave machinery would take the whole server down with it when it stops.
 -- PlayerGrid (§22.1) is core's own spatial index; plugins reach it through Player.getInRange/getClosest.
-local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true,}
+local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true, UIForms = true }
 local INTERNAL_FUNCTIONS <const> = {
     ['DB.setAdapter'] = true,
     ['Player.loadSession'] = true,

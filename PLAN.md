@@ -667,3 +667,58 @@ is the progress bar's and the text UI's, the bottom right the key hints' and the
 turn them on); the unit is fixed px like the rest of the shell, `Config.Hud.Scale` is the knob. In game (open, the
 README's step 37): placement against the real minimap / `sf_minimap`, the mic tile with pma-voice, resmon with the
 100 ms tick, legibility of the 13 px unit at Liam's resolution.
+
+## Run C40 — dependency-free development services (2026-09-20)
+
+Full integrated scope: DESIGN §40. No deployment until root coordinator verifies. No ox_lib dependency.
+
+| Slice | Exact ownership | Purpose / target |
+|---|---|---|
+| scout | scratch native reference report | verify every new native and existing Core API |
+| controls/actions | client/controls.lua, client/actions.lua, tests/client_actions_tests.lua | owner restrictions + managed activities, <=600 lines |
+| geometry/zones | lib/geometry/shared.lua, client/zones.lua, tests/geometry_tests.lua | pure geometry + spatial proximity, <=600 lines |
+| context/streaming | client/context.lua, lib/player/client.lua, lib/streaming/client.lua, tests/context_streaming_tests.lua | cached changes + bounded assets, <=600 lines |
+| hooks | shared/hooks.lua, server/money.lua, tests/hooks_tests.lua | deterministic fail-closed pipelines, <=600 lines |
+| UI bridge | client/ui.lua, import.lua, tests/client_ui_tests.lua | Lua schemas/menu/skill-check compatibility |
+| UI presentation | ui/src/shell/InputDialog.vue, ui/src/shell/Menu.vue, ui/src/shell/SkillCheck.vue, ui/src/store.js | forms/menu/skill-check composition |
+| UI integration | ui/src/App.vue, ui/tests/runtime-regression.js, ui/tests/unit/development-services.test.ts, ui/src/stories/DevelopmentServices.stories.js | regressions and stories |
+| coordinator | DESIGN.md, PLAN.md, README.md, types/core.lua, fxmanifest.lua, scripts/check.sh, tests/run_tests.lua, tests/server_tests.lua, html/** | contract, wiring, public stubs, integrated verification |
+
+Core APIs used: Registry.getCaller/track/untrack/onOwnerStop (internal both), Utils.isCallable (shared lib),
+Streaming.requestModel/requestAnimDict/releaseModel/releaseAnimDict (client lib), UI.progress (client proxy),
+World.add/remove (client internal). Verify via fxref where indexed; internal functions read in source.
+UI page: existing core shell only; no plugin page. New menu-change RPC uses existing callback transport;
+token-matched menu-close uses existing UI event. No new state bags. Config uses existing
+StreamingTimeoutMs; new schedulers have bounded fixed service defaults documented by §40.
+In-game checklist: overlapping restrictions; action success/cancel/death/ped swap/resource stop;
+zone edges/rotation/height/enter-exit/stop/debug; context enter/seat/weapon/ped changes; invalid asset timeout;
+all input controls/menu nesting and callbacks; skill-check pass/fail/escape/pause/stop; veto transfer exactly
+once; restart owner/core releases all handles and UI focus; idle resmon 0.00–0.02 ms.
+
+Final review (2026-09-26): named role agents were unavailable; default agents followed the same skills.
+Root owns targeted menu acknowledgement fixes (`client/ui.lua`, `server/ui.lua`, `ui/src/store.js`,
+`ui/src/shell/Menu.vue`, Lua tests/docs); final reviewer owns form validation and browser regressions
+(`InputDialog.vue`, `runtime-regression.js`). Findings: optimistic menu changes diverged under throttling;
+browser form step validation needed parity with the Lua schema before closing. Existing full browser run
+also exposed submenu Escape navigation and is being rerun after correction. No live deployment yet.
+
+### C40 final verification — 2026-09-26
+
+Root independently ran `scripts/check.sh --full` successfully on the completed tree. Lua: loader 402,
+geometry 190, zones 36, actions 48, context/streaming 122, hooks 94, forms/menus 98, chat 40,
+interiors 999, client UI 575, server 863; zero failed. Node: chat 7 and runtime/SDK 202, zero failed.
+Browser: shell 125/125, kit 228/228, runtime 182/182. Typecheck, generated kit tags and all discovered
+plugin manifests passed. Shell rebuilt into `html/`; Storybook built successfully (upstream advisory
+deprecation/chunk-size warnings only). `fxlint core` and `core_example`: zero errors/warnings.
+Inventory consumer suite: 1970 passed. `git diff --check` clean. Rebuilt the local fxref core API index;
+all added public functions resolve, and root spot-checked native signatures independently of the scout.
+
+Confirmed review fixes: hook veto reasons preserved; native BOOL handling and dense controls validated;
+managed progress uses request-specific cancellation; menu callbacks preserve owner across yields;
+server owner stop closes only its token-matched menu; checkbox false values survive schemas; form validation
+stays editable; menu state waits for acknowledgement and late replies cannot alter replacement menus;
+submenu back navigation is owned by the central keyboard handler. New regression cases cover these paths.
+
+Dev deployment state: existing `core` symlink already points at this checkout. FXServer is stopped;
+no server/config changes, process start, restart, live resmon measurement or in-game claim was made.
+Use README's §40 acceptance checklist after starting the dev server through txAdmin.

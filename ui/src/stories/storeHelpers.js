@@ -32,6 +32,7 @@ export function resetStore () {
   send({ action: 'menu:close' })
   send({ action: 'input:close' })
   send({ action: 'alert:close' })
+  send({ action: 'skillcheck:close' })
   send({ action: 'textui:hide' })
   // `resetExtras()` below puts health / armour / talking / muted / anchor / scale back, so this
   // only has to clear the fields core no longer draws but still hands to `useHud()` (§39.4).

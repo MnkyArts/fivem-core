@@ -1415,3 +1415,147 @@ If you prefer to point at a checkout instead, add its path to `workspace.library
 
 Keep `types/core.lua` in sync by hand when you change a public API — `DESIGN.md` §3–§6 and §15–§26 are
 the contract, the meta file mirrors it.
+
+## Development services (DESIGN §40)
+
+These APIs are part of core, with no additional resource dependencies. Registrations below belong to the
+calling resource and disappear automatically when it stops. Register zones, points, controls, context
+subscriptions and hooks inside `Core.onReady`. Never call proxy services per frame. Nothing here changes
+the server's obligation to validate permissions, distance, cooldowns and eligibility.
+
+### Controls and managed activities (client)
+
+```lua
+Core.onReady(function()
+    local token = Core.Controls.acquire({ controls = { 24, 25, 37 }, groups = { 0 } })
+    -- Other resources may independently restrict the same controls.
+    Core.Controls.release(token) -- releases only this caller's claim
+end)
+
+local completed, reason = Core.Actions.run({
+    label = 'Repairing', duration = 5000, canCancel = true,
+    animation = { dict = 'mini@repair', clip = 'fixing_a_ped', flag = 49 },
+    disable = { 24, 25, 30, 31 },
+    props = { { model = 'prop_tool_wrench', bone = 57005,
+        offset = vector3(0.1, 0.0, 0.0), rotation = vector3(0.0, 0.0, 0.0) } },
+})
+```
+
+`Controls.releaseAll()` removes your restrictions. Control IDs are 0..360, groups 0..2 (default 0).
+`Actions.run` accepts 100..600000 ms and at most 8 cosmetic local props. `scenario` is an alternative to
+`animation`. Death, falling, swimming, ragdoll or a changed ped interrupt by default; `allowDead`,
+`allowFalling`, `allowSwimming`, `allowRagdoll` opt out individually. Busy calls return `false,'busy'`.
+`Actions.cancel()` cancels only your activity; `isActive()` reports the global activity slot. Every exit
+cleans up owned props, animation assets and restrictions. A cancelled asset load finishes its bounded wait
+before another activity can start. `Core.UI.progress` keeps its existing client/server API unchanged.
+A successful activity or skill check is **not** permission to grant an item or transfer money.
+
+### Geometry, zones and proximity points
+
+`Core.Geometry.normalize(definition)` returns a detached shape or `nil,error`; `contains(shape,coords)`
+works on either side without an export or native call. Supported definitions:
+
+- Sphere: `{type='sphere',coords=vector3(...),radius=10}`.
+- Rotated box: `{type='box',coords=vector3(...),size=vector3(10,4,3),rotation=45}` (degrees).
+- Polygon: `{type='polygon',points={vector3(...),...},minZ=0,maxZ=5}`; 3..256 vertices, either winding,
+  concave allowed, no crossing/touching edges, repeated vertices or degenerate height.
+
+All shape boundaries are inclusive. Coordinates are finite within ±1000000, dimensions/radius at most
+10000. `Zones.add(definition)` adds client callbacks `onEnter(id)`, `onExit(id)` and optional `debug=true`.
+`Zones.contains(id,coords)`, `remove(id)` and `removeAll()` address only your registrations. Debug geometry
+uses core's existing world renderer (visible within 300m of the shape centre).
+
+```lua
+Core.onReady(function()
+    Core.Points.add({ coords = vector3(25.7, -1347.3, 29.5), distance = 3,
+        onEnter = function(id, distance) print('entered', id, distance) end,
+        onExit = function(id, distance) print('left', id, distance) end,
+        nearby = function(id, distance) -- bounded periodic work, not drawing
+        end,
+        interval = 500,
+    })
+end)
+```
+
+Points have `remove(id)` / `removeAll()`. One hierarchical spatial scan samples every 250ms, or sleeps
+1000ms with no registrations. `nearby` interval is 100..60000ms (effective precision is the 250ms scan).
+Callbacks run outside that scan; slow callbacks have a bounded queue rather than accumulating threads.
+Client callbacks are advisory; validate authoritative containment using shared Geometry on the server.
+
+### Player context and streaming (client)
+
+`Core.Player.context()` returns a snapshot `{ped,vehicle,seat,weapon}` (`vehicle=0`, `seat=nil` on foot).
+`onContextChange('vehicle', function(value,previous) ... end)` returns a subscription handle;
+`offContextChange(handle)` removes it. Available keys: `ped`, `vehicle`, `seat`, `weapon`. The single cache
+samples at most every 250ms, only polls while subscribed, and coalesces changes for slow listeners. The
+existing `pedChanged(ped,previous)` event and direct player getters are unchanged. Refresh native state
+immediately before an action where freshness matters.
+
+Streaming adds `requestTextureDict/releaseTextureDict`, `requestScaleform/releaseScaleform`,
+`requestAudioBank/releaseAudioBank`, `requestWeaponAsset/releaseWeaponAsset`. Requests take name (weapon
+also accepts a hash) and optional timeout ms; Scaleform returns a handle or nil, other requests boolean.
+Release a Scaleform **handle**, other assets by their original name/hash. Requests are bounded (maximum
+60000ms); new helpers release their request on timeout. Successful loads must be released by the caller.
+
+### Rich forms, menus and skill checks
+
+`UI.input.open` accepts `textarea`, `password`, `slider`, `date`, `time`, `color`, `multiselect` in addition
+to the existing types. Select options can be primitive values or `{label,value}`; `searchable=true` adds
+filtering, `multiple=true` on select aliases multiselect. Numeric controls use `min/max/step`, strings
+use `minLength/maxLength` (default maximum 256, configurable up to 4096). Required checkboxes must be checked.
+Dates return `YYYY-MM-DD`, times `HH:MM`, colors `#RRGGBB`, multiple selections an array of declared values.
+Both client and server validate the original bounded schema; invalid replies return nil, not partial data.
+
+Menus retain `value|nil` results, including false or non-serializable Lua values. Rows additionally accept
+`checked`, `values`, `selected` (1-based), nested `items`, `metadata={{label,value}}`, `progress` (0..100).
+Checkboxes toggle without closing; left/right change a side-scroll choice; Enter selects ordinary rows;
+Escape goes back in a submenu and closes at the root. `item.onChange(value,state,index)` or fallback
+`opts.onChange` handles changes: state is the boolean or original side-scroll value; index is 1-based for
+side-scroll rows. Server menus retain only numeric IDs on the wire and validate each change against the
+server's own rows, player and open token with a 100ms throttle. No server callback is exposed to the browser.
+Menus are bounded to 200 total rows and eight nesting levels.
+Changes wait for an acknowledgement before updating the displayed state; while one is pending, further
+changes/final selection are ignored. Rejected changes keep the prior display. A lost acknowledgement cancels
+the menu rather than leaving uncertain state on screen. Notification callback errors are logged; acceptance
+is a UI state decision, not proof that a gameplay operation succeeded.
+
+```lua
+local passed = Core.UI.skillCheck({
+    difficulty = { 'easy', 'medium', { speed = 60, areaSize = 15 } },
+    keys = { 'e', 'r' }, canCancel = true,
+})
+```
+
+Skill checks are client-only, use the existing modal focus stack, and cancel on pause, owner stop or shell
+reload. Difficulty accepts 1..20 stages (`speed` 20..200 percent/second, `areaSize` 5..80 percent). Keys are
+1..10 single alphanumeric/space characters, cycled per stage; default `{'e'}`. Wrong keys, missed windows,
+Escape when cancellable, or the bounded watchdog return false. `UI.skillCheck.cancel()` cancels only your
+check; `UI.skillCheck.isActive()` reports whether one is open.
+
+### Cancellable pipelines (both sides)
+
+`Core.Hooks.register(name,callback,{priority=0,filter=predicate,after=false})` returns an owned handle;
+`remove(handle)` removes it. `run(name,payload)` returns `allowed,reason`. Lower priority runs first, ties
+use registration order. Returning `false,reason`, throwing or yielding fails closed. Every filter/callback
+gets a bounded detached plain-data snapshot. `after=true` observes `(payload,allowed,reason)` after the
+decision and cannot change it. Existing `Core.on`/`Core.emitHook` remain notification-only.
+
+The server provides `money:beforeTransfer` with `{from,to,account,amount,reason}` before any debit.
+Validation runs before and after hooks, nested transfers are rejected, and a veto performs no balance
+writes. Hooks cannot override insufficient funds, account validity or recipient caps.
+
+### In-game acceptance checklist
+
+1. Overlap two control restrictions; release/restart one owner: the other's controls stay restricted.
+2. Complete/cancel an activity, change ped, die, stop its owner during asset loading: no prop, animation,
+   stuck restriction or unrelated progress cancellation remains.
+3. Cross sphere/rotated-box/concave-polygon edges, teleport out, test height limits and debug drawing;
+   enter/exit fires once. Stop owner: no further callbacks/drawing.
+4. Enter/leave/change vehicle seats and weapons: context callbacks match, stop owner removes listeners.
+5. Load/release each asset family; invalid assets time out without freezing the game.
+6. Submit every form type, nested menus and checkbox/side-scroll changes; test false and disabled values.
+   Stop a local or server menu owner: menu closes, focus releases, unrelated replacement remains intact.
+7. Pass/fail/cancel skill checks, pause, reload shell, stop owner: false on cancellation and no stuck cursor.
+8. Veto a transfer: both balances unchanged; allowed transfer changes each exactly once.
+9. Restart core and ensure dependants again: onReady registrations replay without duplicates. Check
+   resmon idle target 0.00–0.02 ms; these offline tests do not establish in-game performance.

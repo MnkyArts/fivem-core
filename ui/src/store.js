@@ -34,6 +34,7 @@ export const store = reactive({
   notifications: [],
   textui: { visible: false, key: '', text: '', position: 'bottom' },
   progress: { visible: false, id: null, label: '', duration: 0, canCancel: false, startedAt: 0 },
+  skillcheck: { visible: false, id: null, difficulty: [], keys: ['e'], canCancel: true },
   menu: { visible: false, id: null, title: '', items: [] },
   input: { visible: false, id: null, title: '', fields: [], submit: 'OK', cancel: 'Cancel' },
   alert: { visible: false, id: null, title: '', message: '', confirm: 'OK', cancel: 'Cancel' },
@@ -101,6 +102,7 @@ function clearTimer(key) {
 
 /** True while a built-in modal owns the keyboard. Returns its name or null. */
 export function activeModal() {
+  if (store.skillcheck.visible) return 'skillcheck'
   if (store.alert.visible) return 'alert'
   if (store.input.visible) return 'input'
   if (store.menu.visible) return 'menu'
@@ -139,6 +141,29 @@ export function notify(msg) {
 // ---------------------------------------------------------------- result helpers
 // Each clears its state first (optimistic close) and then posts; the matching
 // `*:close` message Lua sends afterwards is a no-op.
+
+let menuBack = null
+export function setMenuBackHandler(handler) {
+  menuBack = handler
+  return () => { if (menuBack === handler) menuBack = null }
+}
+
+export async function menuChange(value, changes) {
+  const id = store.menu.id
+  if (!store.menu.visible || id == null) return false
+  const reply = await post('menu_change', { id, value, ...changes })
+  if (!store.menu.visible || store.menu.id !== id) return false
+  // Unknown delivery may have applied remotely: close instead of displaying an uncertain state.
+  if (typeof reply.ok !== 'boolean') { menuResult(null); return false }
+  return reply.ok === true
+}
+
+export function skillCheckResult(success) {
+  const id = store.skillcheck.id
+  if (!store.skillcheck.visible) return
+  Object.assign(store.skillcheck, { visible: false, id: null, difficulty: [] })
+  if (id != null) post('skillcheck_result', { id, success: success === true })
+}
 
 export function menuResult(value) {
   const id = store.menu.id
@@ -360,6 +385,8 @@ const actions = {
     clearTimer('progress')
     Object.assign(store.progress, { visible: false, id: null, label: '', duration: 0, canCancel: false })
   },
+  'skillcheck:open': (m) => Object.assign(store.skillcheck, { visible: true, id: m.id, difficulty: Array.isArray(m.difficulty) ? m.difficulty.slice(0, 20) : ['easy'], keys: Array.isArray(m.keys) && m.keys.length ? m.keys.slice(0, 10).map(String) : ['e'], canCancel: m.canCancel !== false }),
+  'skillcheck:close': (m) => { if (m.id == null || m.id === store.skillcheck.id) Object.assign(store.skillcheck, { visible: false, id: null, difficulty: [] }) },
   'menu:open': (m) => Object.assign(store.menu, {
     visible: true, id: m.id, title: m.title || '', items: Array.isArray(m.items) ? m.items : [],
   }),
@@ -524,16 +551,22 @@ function isTextTarget(event) {
  *  -> the open page.
  *  x / Backspace -> cancel a cancellable progress bar. */
 export function handleKeydown(event) {
+  if (event.defaultPrevented) return
   if (event.key === 'Escape') {
     const modal = activeModal()
     const target = Layers.escapeTarget(modal, store.openPage)
     if (target === 'builtin') {
-      if (modal === 'alert') alertResult(false)
+      if (modal === 'skillcheck') { if (store.skillcheck.canCancel) skillCheckResult(false) }
+      else if (modal === 'alert') alertResult(false)
       else if (modal === 'input') inputResult(null)
-      else if (modal === 'menu') menuResult(null)
+      else if (modal === 'menu') { if (!menuBack || !menuBack()) menuResult(null) }
     } else if (target === 'modal') closePage(Layers.topModalId())
     else if (target === 'page') closePage()
     else return
+    event.preventDefault()
+    return
+  }
+  if (event.key === 'Backspace' && activeModal() === 'menu' && menuBack && menuBack()) {
     event.preventDefault()
     return
   }

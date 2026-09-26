@@ -57,7 +57,8 @@ function fetchImpl(): TransportImpl {
         // The dev/offline shim: no NUI bridge exists, so the post is only logged. The shell
         // regression suite reads exactly this line — do not reshape it.
         console.log('[core:ui] post', name, body)
-        return Promise.resolve({})
+        // Menu controls wait for an acknowledgement; offline stories accept their simulated changes.
+        return Promise.resolve(name === 'menu_change' ? { ok: true } : {})
       }
       const ctrl = new AbortController()
       const timer = setTimeout(() => ctrl.abort(), timeoutMs)

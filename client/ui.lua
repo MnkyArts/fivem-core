@@ -147,6 +147,7 @@ local function resolvePending(id, value)
     local entry = pending[id]
     if not entry then return false end
     pending[id] = nil
+    Registry.untrack('uimodal', tostring(id))
     if modal and modal.id == id then modal = nil end
     if progressReq == id then progressReq = nil end
     entry.promise:resolve(value)
@@ -155,13 +156,15 @@ end
 
 --- What an unanswered built-in returns: alert/progress are booleans, the rest nil.
 local function cancelValue(kind)
-    return (kind == 'alert' or kind == 'progress') and false or nil
+    if kind == 'alert' or kind == 'progress' or kind == 'skillcheck' then return false end
+    return nil
 end
 
 --- Unblocks everything still waiting on the shell (shell reload, resource stop).
 local function resolveAllPending()
     for id, entry in pairs(pending) do
         pending[id] = nil
+        Registry.untrack('uimodal', tostring(id))
         entry.promise:resolve(cancelValue(entry.kind))
     end
     modal, progressReq, progressCancellable = nil, nil, false
@@ -257,7 +260,7 @@ end
 --- Sends `message` and suspends the calling coroutine until the NUI answers.
 --- Returns `fallback` immediately when the shell is not loaded, so a caller can
 --- never hang on a page that will never reply.
-local function awaitResult(kind, message, fallback, timeoutMs)
+local function awaitResult(kind, message, fallback, timeoutMs, context)
     local id = newRequestId()
     message.id = id
     if not nuiReady then
@@ -265,9 +268,14 @@ local function awaitResult(kind, message, fallback, timeoutMs)
         return fallback
     end
     local p = promise.new()
-    pending[id] = { kind = kind, promise = p }
+    local owner = Registry.getCaller()
+    pending[id] = { kind = kind, promise = p, owner = owner, context = context }
+    Registry.track('uimodal', tostring(id), owner)
     if kind ~= 'progress' then
-        if modal then resolvePending(modal.id, nil) end
+        if modal then
+            send({ action = modal.kind .. ':close', id = modal.id })
+            resolvePending(modal.id, cancelValue(modal.kind))
+        end
         modal = { kind = kind, id = id }
         applyFocus()
     else
@@ -296,7 +304,7 @@ local function closeModal()
     if not modal then return end
     local kind, id = modal.kind, modal.id
     send({ action = kind .. ':close' })
-    resolvePending(id, kind == 'alert' and false or nil)
+    resolvePending(id, cancelValue(kind))
 end
 
 --- Stricter than Validate's 'id': no ':' at all, so a forged page/event pair from
@@ -995,10 +1003,17 @@ function UI.progress(opts)
         canCancel = opts.canCancel == true,
     }
     -- fail closed: a shell that never reports done means the action did NOT complete
-    return awaitResult('progress', message, false, duration + PROGRESS_GRACE_MS) == true
+    return awaitResult('progress', message, false, duration + PROGRESS_GRACE_MS,
+        { actionToken = opts._actionToken }) == true
 end
 
 UI['progress.cancel'] = cancelProgress
+
+function UIInternal.cancelManagedProgress(token)
+    local entry = progressReq and pending[progressReq]
+    if type(token) ~= 'table' or not entry or not entry.context or entry.context.actionToken ~= token then return false end
+    return cancelProgress()
+end
 
 -- The progress bar takes no NUI focus, so the page never sees a key press: core
 -- owns the cancel key itself. Not a restricted command — it only cancels the
@@ -1008,9 +1023,59 @@ RegisterCommand('core_cancel', function()
 end, false)
 RegisterKeyMapping('core_cancel', 'Cancel current action', 'keyboard', uiCfg('CancelKey', 'X'))
 
+-- Skill checks use the same owner-tracked modal promise and focus lifecycle as forms.
+local SKILL_PRESETS <const> = { easy = 35, medium = 50, hard = 70 }
+local function denseLength(value, limit)
+    if type(value) ~= 'table' or #value < 1 or #value > limit then return nil end
+    local length = #value
+    for key in pairs(value) do
+        if math.type(key) ~= 'integer' or key < 1 or key > length then return nil end
+    end
+    for i = 1, length do if value[i] == nil then return nil end end
+    return length
+end
+
+function UI.skillCheck(opts)
+    if type(opts) ~= 'table' then return false end
+    local count = denseLength(opts.difficulty, 20)
+    if not count or (opts.canCancel ~= nil and type(opts.canCancel) ~= 'boolean') then return false end
+    local difficulty, totalMs = {}, 2000
+    for i = 1, count do
+        local stage = opts.difficulty[i]
+        local speed = type(stage) == 'string' and SKILL_PRESETS[stage] or nil
+        if speed then difficulty[i] = stage
+        elseif type(stage) == 'table' and Utils.isNumber(stage.speed) and Utils.isNumber(stage.areaSize)
+            and stage.speed >= 20 and stage.speed <= 200 and stage.areaSize >= 5 and stage.areaSize <= 80 then
+            speed = stage.speed
+            difficulty[i] = { speed = speed, areaSize = stage.areaSize }
+        else return false end
+        totalMs = totalMs + 100000 / speed + 500
+    end
+    local rawKeys = opts.keys or { 'e' }
+    local keyCount = denseLength(rawKeys, 10)
+    if not keyCount then return false end
+    local keys = {}
+    for i = 1, keyCount do
+        local key = rawKeys[i]
+        if type(key) ~= 'string' or not key:match('^[a-zA-Z0-9 ]$') then return false end
+        keys[i] = key:lower()
+    end
+    return awaitResult('skillcheck', { action = 'skillcheck:open', difficulty = difficulty,
+        keys = keys, canCancel = opts.canCancel ~= false }, false, math.ceil(math.min(totalMs, 120000))) == true
+end
+
+UI['skillCheck.isActive'] = function() return modal ~= nil and modal.kind == 'skillcheck' end
+UI['skillCheck.cancel'] = function()
+    local entry = modal and modal.kind == 'skillcheck' and pending[modal.id]
+    if not entry or entry.owner ~= Registry.getCaller() then return false end
+    closeModal()
+    applyFocus()
+    return true
+end
+
 -- ------------------------------------------------- menu / input / alert / hud ----
 
-local FIELD_TYPES <const> = { text = true, number = true, select = true, checkbox = true }
+local Forms = Core.UIForms
 local HUD_KEYS <const> = {
     visible = 'boolean', cash = 'number', bank = 'number', name = 'string', serverId = 'number',
     health = 'number', armour = 'number', speed = 'number', street = 'string', zone = 'string',
@@ -1029,40 +1094,59 @@ local STAT_SLOTS <const> = { health = true, armour = true }
 --- Items are sent with their list index as `value`; the real value never leaves
 --- Lua, so any value type (table, vector3) survives the round trip.
 local function menuOpen(opts)
-    if type(opts) ~= 'table' or type(opts.items) ~= 'table' then
-        Log.error('UI.menu.open: { items = { { label = ..., value = ... } } } is required')
-        return nil
-    end
-    local items, values = {}, {}
-    for i = 1, #opts.items do
-        local item = opts.items[i]
-        if type(item) == 'table' and type(item.label) == 'string' then
-            local index = #items + 1
-            local value = item.value
-            if value == nil then value = item.label end   -- and/or would swallow value = false
-            values[index] = value
-            items[index] = {
-                label = Utils.sanitize(item.label, 128),
-                description = type(item.description) == 'string' and Utils.sanitize(item.description, 256) or nil,
-                icon = type(item.icon) == 'string' and Utils.sanitize(item.icon, 64) or nil,
-                value = index,
-                disabled = item.disabled == true,
-            }
-        end
-    end
-    if #items == 0 then return nil end
-    local message = {
-        action = 'menu:open',
-        title = type(opts.title) == 'string' and Utils.sanitize(opts.title, 96) or '',
-        items = items,
-    }
-    local index = math.tointeger(tonumber(awaitResult('menu', message)) or 0)
-    if index and values[index] ~= nil then return values[index] end   -- value = false is a real answer
-    return nil
+    if type(opts) ~= 'table' then return nil end
+    if opts.onChange ~= nil and not Utils.isCallable(opts.onChange) then return nil end
+    local items, records = Forms.menu(opts.items)
+    if not items then return nil end
+    local message = { action = 'menu:open', items = items,
+        title = type(opts.title) == 'string' and Utils.sanitize(opts.title, 96) or '' }
+    local context = { records = records, onChange = opts.onChange, remote = opts._menuToken, changedAt = -1000 }
+    local index = awaitResult('menu', message, nil, nil, context)
+    return Forms.menuValue(records, index)
 end
 
-local function menuClose()
+RegisterNuiCallback('menu_change', function(data, cb)
+    local id = type(data) == 'table' and type(data.id) == 'number' and data.id or nil
+    local request = id and pending[id]
+    local context = request and request.kind == 'menu' and request.context
+    if not context or context.busy or not modal or modal.id ~= id or GetGameTimer() - context.changedAt < 100 then
+        cb({ ok = false }); return
+    end
+    local row = type(data.value) == 'number' and context.records[data.value]
+    local previousChecked = row and row.row.checked
+    local previousSelected = row and row.row.selected
+    local ok, entry, selected = Forms.menuChange(context.records, data)
+    if not ok then cb({ ok = false }); return end
+    context.changedAt = GetGameTimer()
+    context.busy = true
+    local callback = entry.onChange or context.onChange
+    if callback then
+        local success, err = Registry.withCaller(request.owner, callback, entry.value, selected, entry.row.selected)
+        if not success then Log.error('UI.menu onChange failed: %s', tostring(err)) end
+    end
+    if type(context.remote) == 'number' and pending[id] == request then
+        local accepted = Core.Callback.await('core:ui:menuChange', context.remote,
+            { value = data.value, checked = data.checked, selected = data.selected })
+        if accepted ~= true then
+            entry.row.checked, entry.row.selected = previousChecked, previousSelected
+            context.busy = false
+            -- An unanswered remote change may have committed; discard the uncertain menu.
+            if accepted == nil and pending[id] == request then
+                send({ action = 'menu:close', id = id })
+                resolvePending(id, nil)
+                applyFocus()
+            end
+            cb({ ok = false }); return
+        end
+    end
+    context.busy = false
+    cb({ ok = pending[id] == request })
+end)
+
+local function menuClose(token)
     if not modal or modal.kind ~= 'menu' then return false end
+    local entry = pending[modal.id]
+    if token ~= nil and (not entry or not entry.context or entry.context.remote ~= token) then return false end
     send({ action = 'menu:close' })
     resolvePending(modal.id, nil)
     return true
@@ -1073,58 +1157,14 @@ define('menu', 'close', menuClose)
 
 --- UI.input.open({ title, fields, submit, cancel }) -> values|nil — awaits.
 local function inputOpen(opts)
-    if type(opts) ~= 'table' or type(opts.fields) ~= 'table' then
-        Log.error('UI.input.open: { fields = { { name = ..., label = ... } } } is required')
-        return nil
-    end
-    local fields = {}
-    for i = 1, #opts.fields do
-        local field = opts.fields[i]
-        if type(field) == 'table' and Validate.value('id', field.name) and FIELD_TYPES[field.type or 'text'] then
-            fields[#fields + 1] = {
-                name = field.name,
-                label = type(field.label) == 'string' and Utils.sanitize(field.label, 96) or field.name,
-                type = field.type or 'text',
-                options = type(field.options) == 'table' and field.options or nil,
-                default = field.default,
-                required = field.required == true,
-                min = tonumber(field.min),
-                max = tonumber(field.max),
-                placeholder = type(field.placeholder) == 'string' and Utils.sanitize(field.placeholder, 64) or nil,
-            }
-        end
-    end
-    if #fields == 0 then return nil end
-    local message = {
-        action = 'input:open',
+    if type(opts) ~= 'table' then return nil end
+    local fields = Forms.fields(opts.fields)
+    if not fields then return nil end
+    local raw = awaitResult('input', { action = 'input:open', fields = fields,
         title = type(opts.title) == 'string' and Utils.sanitize(opts.title, 96) or '',
-        fields = fields,
         submit = type(opts.submit) == 'string' and Utils.sanitize(opts.submit, 32) or 'OK',
-        cancel = type(opts.cancel) == 'string' and Utils.sanitize(opts.cancel, 32) or 'Cancel',
-    }
-    local raw = awaitResult('input', message)
-    if type(raw) ~= 'table' then return nil end
-    local out = {}
-    for i = 1, #fields do
-        local field = fields[i]
-        local value = raw[field.name]
-        if field.type == 'checkbox' then
-            out[field.name] = value == true
-        elseif field.type == 'number' then
-            local num = tonumber(value)
-            if num and num == num then
-                if field.min then num = math.max(num, field.min) end
-                if field.max then num = math.min(num, field.max) end
-                out[field.name] = num
-            end
-        elseif field.type == 'select' then
-            if field.options and Utils.contains(field.options, value) then out[field.name] = value end
-        elseif type(value) == 'string' and value ~= '' then
-            out[field.name] = Utils.sanitize(value, 256)
-        end
-        if field.required and out[field.name] == nil then return nil end
-    end
-    return out
+        cancel = type(opts.cancel) == 'string' and Utils.sanitize(opts.cancel, 32) or 'Cancel' })
+    return Forms.answer(fields, raw)
 end
 
 define('input', 'open', inputOpen)
@@ -1900,10 +1940,21 @@ resultCallback('input_result', 'input', function(data) return type(data.values) 
 resultCallback('alert_result', 'alert', function(data) return data.confirmed == true end)
 resultCallback('progress_cancel', 'progress', function() return false end)
 resultCallback('progress_done', 'progress', function() return true end)
+resultCallback('skillcheck_result', 'skillcheck', function(data) return data.success == true end)
 
 -- ------------------------------------------------ owner cleanup / HUD feed ----
 
 -- A plugin that stops takes its pages with it (§2.3): close, then unregister.
+Registry.onOwnerStop('uimodal', function(key)
+    local id = tonumber(key)
+    local entry = id and pending[id]
+    if not entry then return end
+    local action = entry.kind == 'progress' and 'progress:stop' or (entry.kind .. ':close')
+    send({ action = action, id = id })
+    resolvePending(id, cancelValue(entry.kind))
+    applyFocus()
+end)
+
 Registry.onOwnerStop('page', function(id)
     UI.unregisterPage(id)
 end)
