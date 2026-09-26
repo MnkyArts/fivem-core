@@ -26,6 +26,10 @@ export interface AlphaCounters {
   lazyEvals: number
   /** One per `onUpdated` of a bench slot — how many children a patch really re-rendered. */
   slotRenders: number
+  /** §41 page events the page itself heard: `escape` (escape = 'event'), `suspend`, `resume`. */
+  escapes: number
+  suspends: number
+  resumes: number
 }
 
 const bag = ((globalThis as unknown as { __fx?: Record<string, unknown> }).__fx ||= {})
@@ -33,6 +37,7 @@ const bag = ((globalThis as unknown as { __fx?: Record<string, unknown> }).__fx 
 export const counters: AlphaCounters = ((bag as Record<string, unknown>).alpha ||= {
   evals: 0, setups: 0, disposes: 0, hits: 0, ticks: 0, pings: 0,
   opens: 0, closes: 0, updates: 0, changed: [], variant: '', lastPing: null, lazyEvals: 0, slotRenders: 0,
+  escapes: 0, suspends: 0, resumes: 0,
 }) as AlphaCounters
 
 counters.evals++

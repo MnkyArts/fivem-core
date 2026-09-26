@@ -9,7 +9,10 @@
                  permission = 'core.admin',   -- server only, checked via Core.Perms.has(src, perm)
                  allowConsole = false }       -- default true; set false to refuse the server console (src 0)
 
-    Param types: string | integer | number | boolean | player | rest (must be last).
+    Param types: string | integer | number | boolean | player | rest (must be last), and server-only
+    target (exactly one player) | targets (>= 1; param `max`, `allowSelf = true`), resolved through
+    Core.Player.resolveTargets (DESIGN §49: me, ids, c:, r:, #group, %group, f:, *, others, names);
+    callers without Config.Admin.StaffPerm get the basic grammar only (me, ids, c:, names).
     Arguments bind left to right, so OPTIONAL PARAMS MUST COME LAST: a missing optional still consumes
     its slot, which makes `{ a? , b }` unusable — registering that order logs a warning.
     `args` reaches the handler keyed by param name; a bad/missing argument answers `Usage: /name <a> [b]`.
@@ -23,7 +26,40 @@ local IS_SERVER <const> = Core.isServer
 
 local PARAM_TYPES <const> = {
     string = true, integer = true, number = true, boolean = true, player = true, rest = true,
+    target = true, targets = true,
 }
+
+-- §49 selector errors → Config.Texts key + default text (%s = the selector as typed)
+local TARGET_TEXTS <const> = {
+    ambiguous = { 'target_ambiguous', "'%s' matches several players: %s" },
+    too_many = { 'target_too_many', "'%s' matches too many players" },
+    self = { 'target_self', 'You cannot target yourself with this command' },
+    not_found = { 'target_not_found', "No player matches '%s'" },
+    unknown_group = { 'target_unknown_group', "'%s': no such group" },
+    unknown_faction = { 'target_unknown_faction', "'%s': no such faction" },
+    bad_radius = { 'target_bad_radius', "'%s': the radius must be 1 to 500 metres" },
+    no_origin = { 'target_no_origin', "'%s' needs a position (not available from the console)" },
+    bad_selector = { 'target_bad_selector', "'%s' is not a valid target" },
+    not_allowed = { 'target_not_allowed', "'%s': only staff can use that kind of target" },
+    too_fast = { 'target_too_fast', "'%s': too many target lookups, try again in a moment" },
+}
+
+-- R2-7: a selector with a name or set token costs a pass over the players, so a command line holding one is
+-- throttled per src like core:admin:run (§51, cooldownMs 100). Lines whose selectors are only ids / me / ^ / c:
+-- (O(1) lookups) are not; one line may hold several target params.
+local TARGET_COOLDOWN_MS <const> = 100
+local lastTargetAt = {}   -- [src] = GetGameTimer() of the last command line that resolved targets
+
+--- True for a selector word made only of O(1) tokens (ids, $ids, me, ^, c:<charId>, their `!` forms). Anything
+--- else (names, groups, radius, factions, *, others) or a missing word counts as costly.
+local function cheapSelector(word)
+    if type(word) ~= 'string' or word == '' or #word > 256 then return word == nil end
+    for token in word:gmatch('[^,]+') do
+        local t = token:match('^%s*!?%s*(.-)%s*$'):lower()
+        if not (t:find('^%$?%d+$') or t == 'me' or t == '^' or t:find('^c:.')) then return false end
+    end
+    return true
+end
 
 -- words accepted by the `boolean` param type
 local BOOLEAN_WORDS <const> = {
@@ -67,8 +103,54 @@ local function usageOf(entry)
     return ok and message or ('Usage: ' .. signature)
 end
 
---- Converts one raw word into the param's type. Returns ok, value (value may legitimately be false).
-local function parseValue(kind, raw)
+--- The reply for a selector that did not resolve (§49); unknown errors read as "no player matches".
+local function targetMessage(raw, err, detail)
+    local entry = TARGET_TEXTS[err] or TARGET_TEXTS.not_found
+    local names = ''
+    if err == 'ambiguous' and type(detail) == 'table' then
+        local list = {}
+        for i = 1, math.min(#detail, 10) do
+            local c = detail[i]
+            list[i] = type(c) == 'table' and ('%s (%s)'):format(tostring(c.name), tostring(c.src)) or tostring(c)
+        end
+        names = table.concat(list, ', ')
+    end
+    local ok, message = pcall(string.format, text(entry[1], entry[2]), raw, names)
+    return ok and message or entry[2]:gsub('%%s', '?')
+end
+
+--- Staff (Config.Admin.StaffPerm, the console always) get the full §49 grammar; everybody else only
+--- me / ids / c: / names — no groups, radius, factions, `*`, `others` or `!` (they would reveal staff).
+local function isStaff(src)
+    if not src or src == 0 then return true end
+    local admin = type(Core.Config) == 'table' and Core.Config.Admin or nil
+    local perm = type(admin) == 'table' and type(admin.StaffPerm) == 'string' and admin.StaffPerm or 'core.admin'
+    local ok, allowed = pcall(Core.Perms.has, src, perm)
+    return ok and allowed == true
+end
+
+--- `target` / `targets` (server only): Core.Player.resolveTargets is core's getters.lua inside core and
+--- the export proxy in a plugin VM. Returns ok, value | false, nil, message.
+local function parseTarget(param, raw, src)
+    local opts = { max = param.type == 'target' and 1 or param.max, allowSelf = param.allowSelf ~= false,
+        basic = not isStaff(src) }
+    local ok, list, err, detail = pcall(function()
+        return Core.Player.resolveTargets(src or 0, raw, opts)
+    end)
+    if not ok then
+        Core.Log.error('command target %q could not be resolved: %s', raw, tostring(list))
+        return false, nil, targetMessage(raw, 'not_found')
+    end
+    if type(list) ~= 'table' or #list == 0 then return false, nil, targetMessage(raw, err, detail) end
+    if param.type == 'target' then return true, list[1] end
+    return true, list
+end
+
+--- Converts one raw word into the param's type. Returns ok, value (value may legitimately be false),
+--- plus a reply text instead of the usage line for a selector that failed.
+local function parseValue(param, raw, src)
+    local kind = param.type
+    if kind == 'target' or kind == 'targets' then return parseTarget(param, raw, src) end
     if kind == 'string' or kind == 'rest' then
         return true, raw
     elseif kind == 'integer' or kind == 'player' then
@@ -93,9 +175,23 @@ local function parseValue(kind, raw)
     return false
 end
 
---- Maps the raw word list onto the declared params. Returns args table, or nil + failing param index.
-local function parseParams(params, args)
+--- Maps the raw word list onto the declared params. Returns args table, or nil + failing param index
+--- (+ a reply text when a target selector failed).
+local function parseParams(params, args, src)
     local out, index = {}, 1
+    if IS_SERVER and type(src) == 'number' and src > 0 then
+        for i = 1, #params do
+            local word = args[i]
+            if (params[i].type == 'target' or params[i].type == 'targets') and not cheapSelector(word) then
+                local now = GetGameTimer()
+                if now - (lastTargetAt[src] or -TARGET_COOLDOWN_MS) < TARGET_COOLDOWN_MS then
+                    return nil, i, targetMessage(tostring(word), 'too_fast')
+                end
+                lastTargetAt[src] = now
+                break
+            end
+        end
+    end
     for i = 1, #params do
         local p = params[i]
         local raw
@@ -109,8 +205,8 @@ local function parseParams(params, args)
         if raw == nil or raw == '' then
             if not p.optional then return nil, i end
         else
-            local ok, value = parseValue(p.type, raw)
-            if not ok then return nil, i end
+            local ok, value, message = parseValue(p, raw, src)
+            if not ok then return nil, i, message end
             out[p.name] = value
         end
     end
@@ -148,10 +244,10 @@ local function makeWrapper(entry, handler)
             end
         end
 
-        local parsed, failed = parseParams(entry.params, args or {})
+        local parsed, failed, message = parseParams(entry.params, args or {}, src)
         if not parsed then
             Core.Log.debug('command /%s: bad argument #%d (%s)', entry.name, failed, entry.params[failed].name)
-            reply(src, usageOf(entry))
+            reply(src, message or usageOf(entry))
             return
         end
 
@@ -171,7 +267,11 @@ local function normalizeParams(list)
         local kind = p.type or 'string'
         if not PARAM_TYPES[kind] then return nil, i end
         if kind == 'rest' and i ~= #list then return nil, i end
-        out[i] = { name = p.name, type = kind, help = p.help, optional = p.optional == true }
+        -- selectors resolve against the server's sessions: a client command cannot take them
+        if (kind == 'target' or kind == 'targets') and not IS_SERVER then return nil, i end
+        out[i] = { name = p.name, type = kind, help = p.help, optional = p.optional == true,
+            max = math.type(p.max) == 'integer' and p.max > 0 and p.max or nil,
+            allowSelf = p.allowSelf ~= false }
     end
     return out
 end
@@ -281,9 +381,9 @@ function ns.execute(name, src, args, raw)
             if type(args[i]) == 'string' then wordList[#wordList + 1] = args[i] end
         end
     end
-    local parsed, failed = parseParams(entry.params, wordList)
+    local parsed, _, message = parseParams(entry.params, wordList, src)
     if not parsed then
-        reply(src, usageOf(entry))
+        reply(src, message or usageOf(entry))
         return false
     end
     -- the registered handler runs exactly as the engine wrapper would run it (same pcall,
@@ -329,6 +429,10 @@ Core.on('chatSuggestionsRequested', function(src)
 end)
 
 if IS_SERVER then
+    AddEventHandler('playerDropped', function()
+        lastTargetAt[source] = nil
+    end)
+
     -- suggestions are pushed per player once their session exists, never broadcast to -1
     AddEventHandler('core:hook:playerLoaded', function(src)
         if type(src) ~= 'number' or src <= 0 then return end

@@ -140,8 +140,11 @@ parseValue = function(s, i)
     end
     local word = s:match('^[%w%.%+%-eE]+', i)
     if not word then error('json: unexpected character at ' .. i, 0) end
-    local value = (word == 'true' and true) or (word == 'false' and false)
-        or (word == 'null' and nil) or tonumber(word)
+    -- an and/or chain would turn `false` into nil (false is falsy), so branch explicitly
+    local value
+    if word == 'true' then value = true
+    elseif word == 'false' then value = false
+    elseif word ~= 'null' then value = tonumber(word) end
     return value, i + #word
 end
 
@@ -647,9 +650,21 @@ local function installServerNatives(env, rec)
     env.EndFindKvp = function(handle) findHandles[handle] = nil end
 
     -- players
+    -- The engine prefix-matches (`rfind(type, 0)`, first hit wins), so 'license:' finds 'license:…' but not
+    -- 'license2:…'. The stub keys identifiers by bare type; an exact key still wins, then values are prefix-scanned
+    -- in a stable (sorted-key) order.
     env.GetPlayerIdentifierByType = function(src, kind)
         local ids = stubs.identifiers[tonumber(src)]
-        return ids and ids[kind] or nil
+        if not ids or type(kind) ~= 'string' then return nil end
+        if ids[kind] ~= nil then return ids[kind] end
+        local keys = {}
+        for key in pairs(ids) do keys[#keys + 1] = tostring(key) end
+        table.sort(keys)
+        for i = 1, #keys do
+            local value = ids[keys[i]]
+            if type(value) == 'string' and value:sub(1, #kind) == kind then return value end
+        end
+        return nil
     end
     env.GetNumPlayerIndices = function() return #stubs.connected end
     env.GetPlayerFromIndex = function(index)         -- 0-based, like the engine

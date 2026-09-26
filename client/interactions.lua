@@ -25,6 +25,9 @@
      No per-frame loop beyond the projection thread: the scan runs at Config.Interactions.ScanIntervalMs
      (near) or FarScanIntervalMs (far, nothing within Config.Interactions.NearRange); the projection
      thread sleeps 250 ms while its list is empty and Wait(0)s only while dots are visible.
+     §54: while Core.UI.hideHud holds a reason (the `hudHiddenChanged` hook sets one local flag) the
+     projection thread idles exactly like it does under NUI focus — nothing is drawn or sent — the text
+     UI prompt is suppressed by client/ui.lua itself, and `core_interact` does nothing.
 ]]
 
 local Interactions = {}
@@ -112,6 +115,7 @@ local frameBest = nil       -- the looked-at slot of that pass, or nil
 local focusDirty = true     -- the slot list changed under the cached set: project on the next frame
 local lastFocusAt = 0       -- GetGameTimer() of the last projection pass
 local wpFocused = false     -- the last IsNuiFocused() answer (asked on projection frames only)
+local hudHidden = false     -- §54: Core.UI.hideHud holds a reason (the hudHiddenChanged hook sets it)
 local sentCount = 0         -- entries of WP_SENT.items the shell currently holds
 local retryAt = 0           -- GetGameTimer() before which a failed send is not retried
 local lastSendAt = 0        -- GetGameTimer() of the last successful send (position throttle)
@@ -771,7 +775,7 @@ CreateThread(function()
             lastFocusAt, focusDirty = now, false
             wpFocused = IsNuiFocused()
         end
-        if wpFocused then
+        if wpFocused or hudHidden then
             Wait(WP_IDLE_MS)
         else
             if retryAt == 0 or now >= retryAt then project(now, pass) end
@@ -782,6 +786,17 @@ end)
 
 Core.on('uiReady', function()
     forceSend = true               -- a (reloaded) shell forgot every set we sent
+end)
+
+-- §54: a hidden HUD parks the projection thread above (one boolean per iteration, nothing new per
+-- frame). The shell hides its world prompt layer by itself; coming back re-projects on the next
+-- frame and re-sends the whole set ('nui' renderer), so nothing stale is shown.
+Core.on('hudHiddenChanged', function(hidden)
+    hudHidden = hidden == true
+    if not hudHidden then
+        focusDirty = true
+        forceSend = true
+    end
 end)
 
 -- Resolves an entry's current world target. Returns coords, entity (0 for points) or nil when the
@@ -1155,6 +1170,15 @@ end
 -- not use the world prompt. Both paths run the same checks.
 RegisterCommand(INTERACT_CMD, function()
     if IsNuiFocused() then return end
+    -- §54: no prompt is drawn while the HUD is hidden (an editor holds it), so nothing is interacted with
+    if hudHidden then return end
+    -- §51: while a sanctioned staff mode flies the camera (noclip, editor, spectate) the ped is hidden
+    -- elsewhere and E is the camera's "up" key — never interact from there. The modes come from core's private
+    -- staff state (client/adminstate.lua, fed by core:admin:self — never a public state bag); one read per press.
+    local admin = rawget(Core, 'Admin')
+    local mine = admin and type(admin.getSelf) == 'function' and admin.getSelf() or nil
+    local modes = type(mine) == 'table' and mine.modes or nil
+    if type(modes) == 'table' and (modes.noclip or modes.editor or modes.spectate) then return end
     local entry = focusedId and entries[focusedId] or nil
     if not entry and active then
         local activeEntry = entries[active.id]
@@ -1195,7 +1219,7 @@ AddEventHandler('onClientResourceStop', function(resource)
     for i = 1, promptCount do prompts[i] = nil end
     for i = 1, frameCount do frame[i] = nil end
     promptCount, focusedId, forceSend, promptDirty = 0, nil, false, false
-    frameCount, frameBest, focusDirty, wpFocused = 0, nil, true, false
+    frameCount, frameBest, focusDirty, wpFocused, hudHidden = 0, nil, true, false, false
     sentCount = 0
     for i in pairs(WP_SENT.items) do WP_SENT.items[i] = nil end
     releaseHint()                 -- the one Scaleform pool slot goes back, synchronously

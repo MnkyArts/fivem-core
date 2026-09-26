@@ -195,6 +195,8 @@
     // ================================================================= 3. open before the plugin is ready
     m = mark()
     declare('fx_lazy', 'page', 'fx_lazy')
+    // declared before the module exists: the props container starts deep (no definition yet)
+    declare('fx_lazy_shallow', 'overlay', 'fx_lazy')
     const lazyManifest = await register('fx_lazy')
     check('a lazy plugin declares load: lazy', lazyManifest.load === 'lazy')
     await sleep(300)
@@ -207,6 +209,20 @@
     check('opening it replaced the exclusive page layer', !q('.fx-alpha-page'), 'fx_alpha should have been replaced')
     check('closing the exclusive page did not send ui_close (Lua closed it)', count(m, 'ui_close') === 0)
     close('fx_lazy')
+    // §38.10: the definition's `reactivity: 'shallow'` wins even though page:register came first
+    const lazyShallow = () => store.pages.fx_lazy_shallow
+    check('a page declared before its lazy plugin loaded gets the definition\'s shallow props',
+      lazyShallow().reactivity === 'shallow' && window.Vue.isShallow(lazyShallow().props),
+      lazyShallow().reactivity + '/' + window.Vue.isShallow(lazyShallow().props))
+    open('fx_lazy_shallow', { nested: { a: 'first' } })
+    await waitFor(() => q('.fx-lazy-shallow') && q('.fx-lazy-shallow').textContent.trim() === 'first', 2000)
+    const lazyNested = lazyShallow().props.nested
+    send({ action: 'page:patch', id: 'fx_lazy_shallow', ops: [{ p: 'nested.a', v: 'second' }] })
+    check('its nested values are not proxied and a nested patch copies along the path and renders',
+      await waitFor(() => q('.fx-lazy-shallow').textContent.trim() === 'second', 2000)
+        && !window.Vue.isReactive(lazyNested) && lazyShallow().props.nested !== lazyNested,
+      q('.fx-lazy-shallow') && q('.fx-lazy-shallow').textContent)
+    close('fx_lazy_shallow')
     open('fx_alpha', { label: 'one', nested: { a: 1, keep: { deep: true } }, slots: ['s1', 's2'] })
     await waitFor(() => q('.fx-alpha-page'), 2000)
 
@@ -387,6 +403,39 @@
     check('the latest value wins', feed.speed === 999, String(feed.speed))
     stopWatch()
 
+    // ================================================================= 9b. §54 shell:hud — hiding the hud layer
+    // Lua's half (reasons, owners, natives, text UI, ui_ready order) is tests/client_ui_tests.lua `hud hide`;
+    // this is what the SHELL does with `shell:hud { hidden, keep }`: core's HUD widgets and every overlay whose
+    // owner is not in `keep` stop painting (v-show) — nothing is closed, nothing unmounts.
+    m = mark()
+    open('fx_alpha_hud', {})
+    await waitFor(() => q('.fx-alpha-hud'), 3000)
+    send({ action: 'hud:set', visible: true, health: 80, armour: 40 })
+    await waitFor(() => q('.hud'), 1500)
+    const painted = (el) => !!el && el.getClientRects().length > 0   // display: none (here or above) has no boxes
+    const hudParts = () => Array.from(document.querySelectorAll('[data-core-hud]'))
+    const alphaHud = q('.fx-alpha-hud')
+    check('before shell:hud both overlays and the vitals strip paint', painted(alphaHud) && painted(q('.fx-beta-page')) && painted(q('.hud')))
+    send({ action: 'shell:hud', hidden: true, keep: ['fx_beta'] })
+    await frame()
+    check('shell:hud hides the overlay of a resource that holds no reason', !painted(q('.fx-alpha-hud')))
+    check('and keeps the overlay of the resource that holds one', painted(q('.fx-beta-page')))
+    check('core\'s vitals strip steps aside', !painted(q('.hud')))
+    check('so do the world prompts and the stat bars (every data-core-hud wrapper)', hudParts().length === 3 && hudParts().every((el) => css(el, 'display') === 'none'), hudParts().map((el) => el.dataset.coreHud + '=' + css(el, 'display')).join())
+    check('hidden, never unmounted: the same element, still open', q('.fx-alpha-hud') === alphaHud && store.overlays.fx_alpha_hud === true)
+    send({ action: 'feed', c: { fx_alpha: { speed: 77 } } })
+    check('a hidden overlay keeps updating underneath', await waitFor(() => q('.fx-alpha-speed').textContent === '77', 1000), q('.fx-alpha-speed').textContent)
+    send({ action: 'shell:hud', hidden: true, keep: {} })   // Lua encodes an empty list as an object
+    await frame()
+    check('an empty keep (Lua {}) hides every overlay', !painted(q('.fx-beta-page')) && !painted(q('.fx-alpha-hud')))
+    send({ action: 'shell:hud', hidden: false, keep: {} })
+    await frame()
+    check('shell:hud { hidden = false } brings everything back exactly as it was', painted(q('.fx-alpha-hud')) && q('.fx-alpha-hud') === alphaHud && painted(q('.fx-beta-page')) && painted(q('.hud')))
+    check('the wrappers are display: contents again (no layout of their own)', hudParts().every((el) => css(el, 'display') === 'contents'), hudParts().map((el) => css(el, 'display')).join())
+    check('hiding the hud never asked Lua to close anything', count(m, 'ui_close') === 0)
+    close('fx_alpha_hud')
+    send({ action: 'hud:set', visible: false })
+
     // ================================================================= 10. layers, inert, Escape
     declare('fx_alpha_confirm', 'modal', 'fx_alpha')
     declare('fx_alpha_shallow', 'modal', 'fx_alpha')
@@ -434,6 +483,80 @@
     await sleep(60)
     check('then the page', !!find(m, 'ui_close', (b) => b.page === 'fx_alpha') && !q('.fx-alpha-page'), JSON.stringify(since(m).map((p) => p.name + ':' + (p.body && p.body.page))))
     check('a closed page layer leaves no inert attribute behind', !q('.page-layer'))
+    focusStack()
+
+    // ================================================================= 10b. input modes, Escape, suspend (§41)
+    // Lua's half is in tests/client_ui_tests.lua; this is what the SHELL does with the three §41 fields.
+    const alpha = window.__fx.alpha
+    const mode = () => (q('.fx-alpha-mode') || {}).textContent
+    // `page:register` with the §41 fields, exactly as client/ui.lua sends it
+    send({ action: 'page:register', id: 'fx_alpha', type: 'page', owner: 'fx_alpha', input: 'ui', escape: 'event', keepInput: false })
+    open('fx_alpha', { label: 'input' })
+    focusStack(entry('page', 'fx_alpha'))
+    check('§41: the page renders its input mode (PageHandle.input)', await waitFor(() => mode() === 'ui', 3000), mode())
+    check('§41: a ui page layer takes the mouse', css(q('.page-layer'), 'pointerEvents') === 'auto' && q('.page-layer').getAttribute('data-core-input') === 'ui', css(q('.page-layer'), 'pointerEvents'))
+    let escapesBefore = alpha.escapes
+    m = mark()
+    esc()
+    await sleep(60)
+    check('§41: Escape on an escape=event page does not close it', !!q('.fx-alpha-page') && count(m, 'ui_close') === 0, JSON.stringify(since(m).map((p) => p.name)))
+    check('§41: the page heard its own escape event', alpha.escapes === escapesBefore + 1, String(alpha.escapes - escapesBefore))
+    check('§41: Lua hears it as ui_event escape', !!find(m, 'ui_event', (b) => b.page === 'fx_alpha' && b.event === 'escape'))
+
+    // page:input game — the page stays mounted, the layer and every control in it pass clicks through
+    const pageNode = q('.fx-alpha-page')
+    send({ action: 'page:input', id: 'fx_alpha', input: 'game' })
+    focusStack()
+    check('§41: page:input reaches PageHandle.input reactively', await waitFor(() => mode() === 'game', 1000), mode())
+    check('§41: the same instance, not a remount', q('.fx-alpha-page') === pageNode)
+    check('§41: a game layer lets clicks through', css(q('.page-layer'), 'pointerEvents') === 'none' && q('.page-layer').getAttribute('data-core-input') === 'game', css(q('.page-layer'), 'pointerEvents'))
+    check('§41: and so does every kit control inside it', css(q('.fx-alpha-btn'), 'pointerEvents') === 'none', css(q('.fx-alpha-btn'), 'pointerEvents'))
+    const btnBox = q('.fx-alpha-btn').getBoundingClientRect()
+    const hitEl = document.elementFromPoint(btnBox.left + btnBox.width / 2, btnBox.top + btnBox.height / 2)
+    check('§41: hit-testing passes through a game page', !hitEl || !q('.page-layer').contains(hitEl), hitEl ? hitEl.className : 'none')
+    escapesBefore = alpha.escapes
+    m = mark()
+    esc()
+    await sleep(60)
+    check('§41: a game page is never the Escape target', alpha.escapes === escapesBefore && count(m, 'ui_close') === 0 && !!q('.fx-alpha-page'))
+
+    send({ action: 'page:input', id: 'fx_alpha', input: 'ui' })
+    focusStack(entry('page', 'fx_alpha'))
+    check('§41: back to ui, the layer takes the mouse again', await waitFor(() => mode() === 'ui' && css(q('.page-layer'), 'pointerEvents') === 'auto' && css(q('.fx-alpha-btn'), 'pointerEvents') !== 'none', 1000), css(q('.fx-alpha-btn'), 'pointerEvents'))
+
+    // a game MODAL above a ui page: Lua leaves it out of the stack, the shell must not guess it in
+    send({ action: 'page:register', id: 'fx_alpha_confirm', type: 'modal', owner: 'fx_alpha', input: 'game', escape: 'close', keepInput: false })
+    open('fx_alpha_confirm', { question: 'ghost' })
+    await waitFor(() => q('.fx-alpha-confirm'), 3000)
+    focusStack(entry('page', 'fx_alpha'))
+    await frame()
+    check('§41: a game modal does not make the page under it inert', !!q('.fx-alpha-confirm') && !q('.page-layer').hasAttribute('inert'))
+    check('§41: its layer and its controls let clicks through', css(q('.modal-layer'), 'pointerEvents') === 'none' && css(q('.fx-alpha-ok'), 'pointerEvents') === 'none', css(q('.modal-layer'), 'pointerEvents') + '/' + css(q('.fx-alpha-ok'), 'pointerEvents'))
+    escapesBefore = alpha.escapes
+    m = mark()
+    esc()
+    await sleep(60)
+    check('§41: Escape skips the game modal and reaches the page', alpha.escapes === escapesBefore + 1 && !find(m, 'ui_close') && !!q('.fx-alpha-confirm'), JSON.stringify(since(m).map((p) => p.name + ':' + (p.body && p.body.page))))
+    close('fx_alpha_confirm')
+    declare('fx_alpha_confirm', 'modal', 'fx_alpha')
+
+    // onHide = 'suspend': Lua keeps the page open across the hidden transition and tells it so
+    const suspendsBefore = alpha.suspends
+    const resumesBefore = alpha.resumes
+    send({ action: 'page:event', id: 'fx_alpha', event: 'suspend', data: {} })
+    send({ action: 'focus', focused: false, stack: [] })
+    send({ action: 'shell:visible', visible: false, reasons: ['game:pause'] })
+    await frame()
+    check('§41: a suspended page stays mounted while the shell is hidden', q('.fx-alpha-page') === pageNode && alpha.suspends === suspendsBefore + 1, String(alpha.suspends - suspendsBefore))
+    send({ action: 'shell:visible', visible: true, reasons: [] })
+    send({ action: 'page:event', id: 'fx_alpha', event: 'resume', data: {} })
+    focusStack(entry('page', 'fx_alpha'))
+    await frame()
+    check('§41: resume reaches the same instance', q('.fx-alpha-page') === pageNode && alpha.resumes === resumesBefore + 1, String(alpha.resumes - resumesBefore))
+
+    // leave the next sections what they expect: fx_alpha closed and declared plainly
+    close('fx_alpha')
+    declare('fx_alpha', 'page', 'fx_alpha')
     focusStack()
 
     // ================================================================= 11. every failure mode

@@ -22,6 +22,9 @@ function env.CreateThread(fn) threads[#threads + 1] = coroutine.create(fn) end
 function env.Wait(ms) coroutine.yield(ms) end
 function env.AddEventHandler(_, fn) stopHandlers[#stopHandlers + 1] = fn end
 function env.DisableControlAction(group, control) disabled[group .. ':' .. control] = true end
+local allDisabled, enabled, perControl = {}, {}, 0
+function env.DisableAllControlActions(group) allDisabled[group] = true end
+function env.EnableControlAction(group, control, on) eq(on, true, 'enable flag'); enabled[#enabled + 1] = group .. ':' .. control end
 function env.PlayerPedId() return ped end
 function env.GetGameTimer() return time end
 function env.DoesEntityExist(entity) return entity ~= 0 end
@@ -77,6 +80,39 @@ eq(Core.Controls.acquire({ controls = { [1] = 24, [3] = 25 } }), nil, 'sparse co
 eq(Core.Controls.acquire({ controls = { 24, extra = 25 } }), nil, 'controls extra keys')
 eq(Core.Controls.acquire({ controls = { 24 }, groups = { [1] = 0, [3] = 2 } }), nil, 'sparse groups')
 eq(Core.Controls.acquire({ controls = { 24 }, groups = { 3 } }), nil, 'invalid group')
+-- `all = true, except = { … }`: one DisableAllControlActions + one EnableControlAction per exception
+local function frame() disabled, allDisabled, enabled = {}, {}, {}; tick() end
+local cam = Core.Controls.acquire({ all = true, except = { 249, 199, 200 } })
+eq(type(cam), 'string', 'all handle')
+frame()
+eq(allDisabled[0], true, 'whole group disabled')
+eq(next(disabled), nil, 'no per-control disables under all')
+eq(table.concat(enabled, ','), '0:199,0:200,0:249', 'exceptions re-enabled, sorted')
+local list = Core.Controls.acquire({ controls = { 249, 24 } })
+frame()
+eq(table.concat(enabled, ','), '0:199,0:200', 'a list handle keeps its control disabled under all')
+local second = Core.Controls.acquire({ all = true, except = { 200 } })
+frame()
+eq(table.concat(enabled, ','), '0:200', 'exceptions are the intersection of every all handle')
+eq(Core.Controls.release(second), true, 'second all released')
+eq(Core.Controls.release(cam), true, 'first all released')
+frame()
+eq(allDisabled[0], nil, 'no all handle left')
+eq(disabled['0:24'] and disabled['0:249'], true, 'back to the list plan')
+eq(Core.Controls.release(list), true, 'list released')
+local grouped = Core.Controls.acquire({ all = true, groups = { 0, 2 } })
+frame()
+eq(allDisabled[0] and allDisabled[2], true, 'all per group')
+eq(#enabled, 0, 'no exceptions')
+owner = 'beta'; eq(Core.Controls.release(grouped), false, 'foreign all refused'); owner = 'alpha'
+stop('alpha'); frame()
+eq(next(allDisabled), nil, 'owner stop releases all handles')
+eq(Core.Controls.acquire({ all = 'yes' }), nil, 'all must be boolean')
+eq(Core.Controls.acquire({ all = true, controls = { 24 } }), nil, 'all excludes controls')
+eq(Core.Controls.acquire({ all = true, except = { [1] = 24, [3] = 25 } }), nil, 'sparse except')
+eq(Core.Controls.acquire({ all = true, except = { 400 } }), nil, 'invalid except id')
+eq(Core.Controls.acquire({ all = false }), nil, 'all = false still needs controls')
+tick()
 eq(Core.Actions.run({ duration = 0/0 }), false, 'nan duration')
 eq(Core.Actions.run({ duration = 100, props = { { model = 'box', offset = { x = 0/0, y = 0, z = 0 } } } }), false, 'nan offset')
 local completed, reason = Core.Actions.run({ duration = 100, animation = { dict = 'dict', clip = 'clip' }, disable = { 24 }, props = { { model = 'box' } } })

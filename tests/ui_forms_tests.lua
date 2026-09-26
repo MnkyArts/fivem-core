@@ -117,8 +117,8 @@ local function last(action)
     return messages[#messages]
 end
 local returned, changedValue
-core.Registry.setCaller('test_owner')
-env.CreateThread(function()
+env.CreateThread(function()   -- the caller is per coroutine (DESIGN §2.3): set it in the calling thread
+    core.Registry.setCaller('test_owner')
     returned = core.UI.menu.open({ items = { { label = 'Toggle', value = false, checked = false,
         onChange = function(v, state) changedValue = { v, state } end } } })
 end)
@@ -131,8 +131,10 @@ env.CreateThread(function() returned = core.UI.input.open({ fields = { { name = 
 stubs.nui('input_result', { id = last('input:open').id, values = { x = 7 } }); stubs.tick(1)
 check(returned == nil, 'client rejects out-of-bounds rather than clamps')
 local cancelled = 'pending'
-core.Registry.setCaller('stop_owner')
-env.CreateThread(function() cancelled = core.UI.alert({ message = 'test' }) end)
+env.CreateThread(function()
+    core.Registry.setCaller('stop_owner')
+    cancelled = core.UI.alert({ message = 'test' })
+end)
 env.TriggerEvent('onResourceStop', 'stop_owner'); stubs.tick(1)
 check(cancelled == false and not stubs.nuiFocus.focus, 'owner stop cancels modal and releases focus')
 local token = {}
@@ -218,7 +220,8 @@ serverCore.Callback.awaitClientTimeout = function(_, _, _, opts)
     check(not callbacks['core:ui:menuChange'](1, opts._menuToken, { value = 1, checked = false }),
         'busy callback blocks overlap beyond throttle window')
     stubs.tick(101)
-    check(yieldedFinished and returnedOwner == 'unrelated', 'completed callback restores coroutine caller')
+    -- DESIGN §2.3 / M1: the caller is per coroutine; a core thread without its own entry is 'core'
+    check(yieldedFinished and returnedOwner == 'core', 'completed callback restores coroutine caller')
     serverCore.Registry.setCaller('server_owner')
     return 1
 end

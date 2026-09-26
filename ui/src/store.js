@@ -28,6 +28,9 @@ export const store = reactive({
   // (pause menu, screen fade, player switch, warning, cutscene, or a plugin's
   // `Core.UI.hide`). Nothing unmounts — only `.core-root` stops painting.
   shell: { visible: true, reasons: [] },
+  // §54: `Core.UI.hideHud` — while `hidden`, core's HUD widgets and every overlay whose owner is not
+  // in `keep` are hidden (v-show: nothing unmounts). Owned by runtime/layers.ts (attached below).
+  hudHide: { hidden: false, keep: [] },
   // §32: `data-core-blur` panels show the blurred game behind them; src/gameblur.js reads this
   // (and `shell.visible`) itself, so nothing is plumbed through App.vue.
   blur: Object.assign({}, BLUR_DEFAULTS),
@@ -83,6 +86,7 @@ export const store = reactive({
 Pages.attachPageStore(store)
 Plugins.attachPluginStore(store)
 Layers.attachLayerStore(store)
+Layers.attachHudStore(store.hudHide)
 Layers.setModalSource(() => store.modals)
 Errors.setNotify((msg) => notify(msg))
 
@@ -320,10 +324,11 @@ export function setBlur(config) {
   return store.blur
 }
 
-/** Story/test helper: back to a freshly loaded shell for everything §21, §31 and §32 added. */
+/** Story/test helper: back to a freshly loaded shell for everything §21, §31, §32 and §54 added. */
 export function resetExtras() {
   hideShard()
   Object.assign(store.shell, { visible: true, reasons: [] })
+  Layers.applyHudHide({ hidden: false })
   Object.assign(store.blur, BLUR_DEFAULTS)
   Object.assign(store.spinner, { visible: false, text: '' })
   Object.assign(store.keys, { visible: false, items: [] })
@@ -493,6 +498,8 @@ const actions = {
   // owner's plugin. The `script`/`style` URL loader of §7.4 is gone.
   'page:register': (m) => Pages.registerPage(m),
   'page:unregister': (m) => Pages.unregisterPage(m.id),
+  // §41: `Core.UI.setInput` — the page's input mode; `game` makes its layer click-through.
+  'page:input': (m) => Pages.setPageInput(m),
   'page:open': (m) => Pages.openPage(m),
   'page:close': (m) => Pages.closePageAction(m),
   'page:patch': (m) => Pages.applyPatch(m.id, m.ops),
@@ -521,6 +528,10 @@ const actions = {
     visible: m.visible !== false,
     reasons: Array.isArray(m.reasons) ? m.reasons.map(String) : [],
   }),
+  // §54: `Core.UI.hideHud` — hides core's HUD widgets and the overlays of every resource that holds
+  // no hideHud reason (`keep` lists the ones that do). Unlike `shell:visible` this never touches a
+  // page, a modal or a toast, and it never closes anything: an overlay is only not painted.
+  'shell:hud': (m) => Layers.applyHudHide(m),
   // §32.2: `{ action = 'blur:set', enabled, strength, fps, scale }`. src/gameblur.js watches
   // `store.blur`, so a message is all it takes to turn the glass off or re-tune it live.
   'blur:set': (m) => setBlur(m),
@@ -548,7 +559,8 @@ function isTextTarget(event) {
 
 /** Escape -> the §38.9 order: kit escape layers (a capturing listener in kit/use.js already ran and
  *  stopped the event if a popup was open) -> the built-in menu/input/alert -> the top plugin modal
- *  -> the open page.
+ *  -> the open page. §41: a page or modal registered with `escape = 'event'` is not closed — it gets
+ *  the page event `escape` (Pages.escapePage), and a `game` page is never the target.
  *  x / Backspace -> cancel a cancellable progress bar. */
 export function handleKeydown(event) {
   if (event.defaultPrevented) return
@@ -560,8 +572,8 @@ export function handleKeydown(event) {
       else if (modal === 'alert') alertResult(false)
       else if (modal === 'input') inputResult(null)
       else if (modal === 'menu') { if (!menuBack || !menuBack()) menuResult(null) }
-    } else if (target === 'modal') closePage(Layers.topModalId())
-    else if (target === 'page') closePage()
+    } else if (target === 'modal') Pages.escapePage(Layers.topModalId())
+    else if (target === 'page') Pages.escapePage(store.openPage)
     else return
     event.preventDefault()
     return

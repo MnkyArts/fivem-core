@@ -89,6 +89,14 @@ if [ -f tests/client_ui_tests.lua ]; then
 else
     skip 'tests/client_ui_tests.lua does not exist yet'
 fi
+# §41–§53 (admin platform): libs, services and the map runtime, one suite per module.
+for suite in raycast schema settings perms buckets audit bans targets admin_api registry_caller client_registry_caller client_adminstate callback maps maps_store maps_regions client_maps chat_hook; do
+    if [ -f "tests/${suite}_tests.lua" ]; then
+        lua5.4 "tests/${suite}_tests.lua" || fail "tests/${suite}_tests.lua"
+    else
+        skip "tests/${suite}_tests.lua does not exist yet"
+    fi
+done
 
 step '4/9  lua5.4 tests/server_tests.lua'
 if [ -f tests/server_tests.lua ]; then

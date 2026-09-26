@@ -1,12 +1,16 @@
---- core / client/ui.lua — Core.UI: the NUI bridge (DESIGN §6.10, §38).
+--- core / client/ui.lua — Core.UI: the NUI bridge (DESIGN §6.10, §38, §41, §54).
 --- Owns the page registry (one exclusive page + overlays + plugin modals), the
---- focus stack (§38.9), page state (snapshot/patch/feed, §38.10), the NUI↔Lua
+--- focus stack (§38.9) with per-page input modes, Escape and hide policy (§41),
+--- page state (snapshot/patch/feed, §38.10), the NUI↔Lua
 --- request pair (§38.8), the built-ins (notify, textUI, progress, menu, input,
---- alert, hud), every NUI callback and the focus watchdog.
+--- alert, hud), every NUI callback and the focus watchdog. §54 adds the editor
+--- focus pair: HUD hiding (`UI.hideHud/showHud/isHudHidden`) and the stateful half
+--- of key capture (`Core.Keys.capture/release/isCaptured` on the lib namespace).
 --- Natives verified with fxref on 2026-09-12 and 2026-09-18: SetNuiFocus,
 --- SetNuiFocusKeepInput, PlaySoundFrontend, RegisterKeyMapping (client),
 --- RegisterCommand, AddStateBagChangeHandler (shared), GetGameTimer (client+server),
---- GetCurrentResourceName (shared).
+--- GetCurrentResourceName (shared); 2026-09-26 (§54, apiset client, HUD namespace):
+--- DisplayRadar, DisplayHud, IsRadarHidden, IsHudHidden.
 --- Runtime helpers: SendNUIMessage (table form), RegisterNuiCallback, promise,
 --- Citizen.Await, SetTimeout.
 --- Note: `UI.progress` is the function itself, so inside core its canceller is only
@@ -31,6 +35,10 @@ local NOTIFY_TICK_MS <const> = 100
 local HUD_TICK_MS <const> = 100
 local PROGRESS_GRACE_MS <const> = 5000
 local PAGE_TYPES <const> = { page = true, overlay = true, modal = true }
+-- §41: how a page/modal takes input, what Escape does to it, what the §31 hidden transition does
+local INPUT_MODES <const> = { ui = true, mixed = true, look = true, game = true }
+local ESCAPE_MODES <const> = { close = true, event = true }
+local HIDE_MODES <const> = { close = true, suspend = true }
 local MAX_PATCH_OPS <const> = 64          -- more than this costs less as one snapshot (§38.10)
 local MAX_PATH_DEPTH <const> = 8
 local MAX_PATH_LEN <const> = 160
@@ -48,20 +56,33 @@ local SHARD_STYLES <const> = { wasted = true, success = true, info = true }
 local STATE_SKIP <const> = { stats = true, attachments = true }
 local STATE_KEYS <const> = { 'loaded', 'name', 'charId', 'cash', 'bank', 'faction', 'group', 'dead' }
 
-local pages = {}                    -- id -> { owner, type, keepInput, registered, props }
+local pages = {}                    -- id -> { owner, type, input, escape, onHide, registered, props }
 local overlays = {}                 -- id -> true (visible overlays)
 local openPage = nil                -- id of the exclusive page, or nil
+local suspendedPage = nil           -- §41: the open page the §31 hidden transition suspended, or nil
+local shellVisible = true           -- §31: the last visible state the shell was told about
 local modals = {}                   -- open plugin modals (type = 'modal'), top last (§38.9)
 local pending = {}                  -- requestId -> { kind, promise }
 local modal = nil                   -- { kind = 'menu'|'input'|'alert', id = requestId }
 local progressReq = nil             -- requestId of the running progress bar
 local progressCancellable = false   -- whether that bar may be cancelled by the key bind
-local textUI = nil                  -- { key, text, position }
+local textUI = nil                  -- { key, text, position, owner, resource }
+local textUISent = false            -- §54: the shell shows `textUI` right now (false while suppressed)
 local hud = { visible = false }     -- last HUD snapshot (re-sent on ui_ready)
 local hudPending = {}               -- HUD fields waiting for the next 100 ms flush
 local hudTimer = false
 local hudSentAt = -HUD_TICK_MS
 local keyHints = nil                -- items of the visible key hint bar, or nil
+local keyHintsResource = 'core'     -- §54: the resource that showed them
+local keyHintsSent = false          -- §54: the shell shows `keyHints` right now
+-- §54 HUD hiding (editor focus). Declared up here because the text UI, the key hints and the §31
+-- `hud` watcher below all read it; the API itself lives in the §54 section further down.
+local hudReasons = {}               -- reason key -> owner resource
+local hudHolders = {}               -- owner resource -> how many reasons it holds (the keep list)
+local hudHideCount = 0
+local hudHidden = false             -- the state the shell, the natives and the hook were last told
+local hudKeepSig = ''               -- the keep list last sent, joined
+local hudNatives = { radar = false, hud = false }   -- what §54 switched OFF (only that is restored)
 local spinnerText = nil             -- text of the running spinner, or nil
 local statsPending = {}             -- stat name -> { value, min, max } awaiting the 250 ms flush
 local statsTimer = false
@@ -170,24 +191,46 @@ local function resolveAllPending()
     modal, progressReq, progressCancellable = nil, nil, false
 end
 
+--- Does the open page/modal `id` contribute a focus entry (§41)? A `game` page stays
+--- open and rendered but holds nothing; a page the §31 hidden transition suspended
+--- holds nothing until the shell is shown again. No allocation: the watchdog calls it.
+local function holdsFocus(id)
+    local page = pages[id]
+    if page and page.input == 'game' then return false end
+    return suspendedPage ~= id
+end
+
+--- Is anything above the chat layer holding focus (page, plugin modal, built-in)?
+local function focusAboveChat()
+    if modal then return true end
+    if openPage and holdsFocus(openPage) then return true end
+    for i = 1, #modals do
+        if holdsFocus(modals[i]) then return true end
+    end
+    return false
+end
+
 --- The focus stack, top last (DESIGN §38.9): chat (1) < page (2) < modal (3) <
 --- system (4). Derived on every change instead of stored, so no path can leave a
---- stale entry behind — removing a page removes its entry by construction.
+--- stale entry behind — removing a page removes its entry by construction. §41:
+--- `game` and suspended entries are skipped, the rest of the stack decides.
 local function focusStack()
     local stack = {}
     if chatTyping then
         stack[#stack + 1] = { key = 'chat', layer = 'chat', owner = 'core' }
     end
-    if openPage then
+    if openPage and holdsFocus(openPage) then
         local page = pages[openPage]
         stack[#stack + 1] = { key = 'page:' .. openPage, layer = 'page', id = openPage,
             owner = page and page.owner or 'core' }
     end
     for i = 1, #modals do
         local id = modals[i]
-        local page = pages[id]
-        stack[#stack + 1] = { key = 'modal:' .. id, layer = 'modal', id = id,
-            owner = page and page.owner or 'core' }
+        if holdsFocus(id) then
+            local page = pages[id]
+            stack[#stack + 1] = { key = 'modal:' .. id, layer = 'modal', id = id,
+                owner = page and page.owner or 'core' }
+        end
     end
     if modal then
         stack[#stack + 1] = { key = 'system:' .. modal.kind, layer = 'system', owner = 'core' }
@@ -203,13 +246,15 @@ local function stackSignature(stack)
 end
 
 --- The top entry alone decides focus: SetNuiFocus(true, cursor) +
---- SetNuiFocusKeepInput(keepInput), an empty stack releases both (§38.9). The
---- natives are called only when that triple changes; the `focus` message also goes
---- out when only the stack moved, because the shell mirrors it for z-order and
---- `inert`. The CEF chat input never takes a cursor and loses the keyboard the
---- moment anything above it appears (§23).
+--- SetNuiFocusKeepInput(keepInput), an empty stack releases both (§38.9). A page or
+--- modal derives both from its input mode (§41): `ui` cursor, `mixed` cursor + keep,
+--- `look` keep without a cursor (`game` never reaches the stack). The natives are
+--- called only when that triple changes; the `focus` message also goes out when only
+--- the stack moved, because the shell mirrors it for z-order and `inert`. The CEF chat
+--- input never takes a cursor and loses the keyboard the moment anything above it
+--- holds focus (§23) — a `game` page does not, so chat still works in a fly mode.
 local function applyFocus()
-    if chatTyping and (openPage ~= nil or modal ~= nil or #modals > 0) then
+    if chatTyping and focusAboveChat() then
         chatTyping = false
         send({ action = 'chat:open', open = false })
     end
@@ -220,7 +265,9 @@ local function applyFocus()
     local keep = false
     if want and (top.layer == 'page' or top.layer == 'modal') then
         local page = pages[top.id]
-        keep = page ~= nil and page.keepInput == true
+        local mode = page and page.input or 'ui'
+        cursor = mode ~= 'look'
+        keep = mode == 'mixed' or mode == 'look'
     end
     local signature = stackSignature(stack)
     local sameTriple = want == focusOwned and keep == focusKeepInput and cursor == focusCursor
@@ -450,37 +497,77 @@ end
 -- ---------------------------------------------------------------- pages ----
 
 --- Hides one page/overlay/modal without touching focus. Returns whether it was shown.
-local function closeOne(id)
+--- `reason` / `by` go to the page's Lua owner as `core:ui:<id>:closed { reason, by? }` (§41 notes, 2026-09-26):
+--- 'close' (UI.close), 'replaced' (another exclusive page took the layer; `by` = its id), 'closeAll', 'hidden'
+--- (the shell hid a page that is not onHide = 'suspend'), 'unregister'. Without it an owner whose page another
+--- resource replaced keeps running as if its page were on screen (the admin editor soft-locked under F10).
+local function closeOne(id, reason, by)
     if overlays[id] then
         overlays[id] = nil
     elseif openPage == id then
         openPage = nil
+        if suspendedPage == id then suspendedPage = nil end   -- closed while hidden: no `resume`
     else
         local index = modalIndex(id)
         if not index then return false end
         table.remove(modals, index)
     end
     sendFor(id, { action = 'page:close', id = id })
+    TriggerEvent(('core:ui:%s:closed'):format(id), { reason = reason or 'close', by = by })
     return true
 end
 
+--- §41 lifecycle event of a page (`suspend` / `resume`), to both listeners a page
+--- event has: the shell (SDK `page.on(event)`) and Lua (`Core.UI.on(id, event, fn)`,
+--- i.e. 'core:ui:<id>:<event>' — the name a `ui_event` from the page triggers).
+local function pageLifecycle(id, event)
+    sendFor(id, { action = 'page:event', id = id, event = event, data = {} })
+    TriggerEvent(('core:ui:%s:%s'):format(id, event), {})
+end
+
 --- Closes every open plugin modal, top first, without touching focus.
-local function closeModals()
+local function closeModals(reason, by)
     for i = #modals, 1, -1 do
         local id = modals[i]
         modals[i] = nil
         sendFor(id, { action = 'page:close', id = id })
+        TriggerEvent(('core:ui:%s:closed'):format(id), { reason = reason or 'close', by = by })
     end
 end
 
---- UI.registerPage(id, { type = 'page'|'overlay'|'modal', keepInput? })
+--- `page:register` for a record — the one shape both registerPage and the ui_ready
+--- replay send. `keepInput` stays on the wire for older readers: it is what the
+--- input mode implies (the game receives input in `mixed` and `look`).
+local function registerMessage(id, page)
+    return {
+        action = 'page:register', id = id, type = page.type, owner = page.owner,
+        input = page.input, escape = page.escape,
+        keepInput = page.input == 'mixed' or page.input == 'look',
+    }
+end
+
+--- One §41 option: nil gives the default, anything outside `allowed` is an error.
+local function pageOption(id, opts, key, allowed, default)
+    local value = opts[key]
+    if value == nil then return default end
+    if type(value) == 'string' and allowed[value] then return value end
+    Log.error("UI.registerPage('%s'): invalid %s (%s)", id, key, tostring(value))
+    return nil
+end
+
+--- UI.registerPage(id, { type = 'page'|'overlay'|'modal', keepInput?, input?, escape?, onHide? })
 --- The component comes from the owning resource's UI plugin (§38): Lua declares
 --- the id, its type and who owns it, the shell resolves it. `modal` pages stack
---- above the exclusive page, any number of them (§38.9).
+--- above the exclusive page, any number of them (§38.9). §41: `input` = 'ui' |
+--- 'mixed' | 'look' | 'game' (`keepInput = true` without it is 'mixed'; overlays
+--- ignore it), `escape` = 'close' | 'event', `onHide` = 'close' | 'suspend' (only an
+--- exclusive page is ever suspended — modals are always cancelled on hide).
 function UI.registerPage(id, opts)
     local owner = Registry.getCaller()
-    if not Validate.value('id', id) then
-        Log.error('UI.registerPage: invalid page id (%s)', tostring(id))
+    -- a PLAIN id (no ':'): ui_event drops anything else, so such a page could never
+    -- answer, and the id doubles as the 'core:ui:<id>:<event>' event name prefix
+    if not isPlainId(id) then
+        Log.error("UI.registerPage: invalid page id (%s) — use 1..64 of [A-Za-z0-9_-], no ':'", tostring(id))
         return false
     end
     if type(opts) ~= 'table' then
@@ -497,25 +584,62 @@ function UI.registerPage(id, opts)
             .. "from its own resource's UI plugin (core_ui '<dir>' + ui/dist, DESIGN §38)", id)
         return false
     end
+    local input = pageOption(id, opts, 'input', INPUT_MODES, opts.keepInput == true and 'mixed' or 'ui')
+    local escape = pageOption(id, opts, 'escape', ESCAPE_MODES, 'close')
+    local onHide = pageOption(id, opts, 'onHide', HIDE_MODES, 'close')
+    if not input or not escape or not onHide then return false end
     local entry = {
         owner = owner,
         type = PAGE_TYPES[opts.type] and opts.type or 'page',
-        keepInput = opts.keepInput == true,
+        input = input,
+        escape = escape,
+        onHide = onHide,
         registered = true,
     }
     pages[id] = entry
     Registry.track('page', id, owner)
-    send({
-        action = 'page:register', id = id, type = entry.type,
-        keepInput = entry.keepInput, owner = owner,
-    })
+    send(registerMessage(id, entry))
+    -- the owner may have changed the input mode of a page that is showing
+    if UI.isOpen(id) then applyFocus() end
     return true
+end
+
+--- UI.setInput(id, mode) — switches a page between cursor, mixed, look and game input
+--- without closing it (§41). Only the resource that registered the page may call it;
+--- works whether the page is open or not. The shell hears `page:input` on every change
+--- and the focus natives are written only when the derived triple changes.
+function UI.setInput(id, mode)
+    local page = type(id) == 'string' and pages[id] or nil
+    if not page then
+        Log.error("UI.setInput: page '%s' is not registered", tostring(id))
+        return false
+    end
+    if type(mode) ~= 'string' or not INPUT_MODES[mode] then
+        Log.error("UI.setInput('%s'): invalid mode (%s)", id, tostring(mode))
+        return false
+    end
+    local caller = Registry.getCaller()
+    if caller ~= page.owner then
+        Log.error("UI.setInput('%s'): only '%s' may change its input (caller '%s')", id, page.owner, tostring(caller))
+        return false
+    end
+    if page.input == mode then return true end
+    page.input = mode
+    sendFor(id, { action = 'page:input', id = id, input = mode })
+    if UI.isOpen(id) then applyFocus() end
+    return true
+end
+
+--- UI.getInput(id) -> 'ui'|'mixed'|'look'|'game'|nil (nil: no such page).
+function UI.getInput(id)
+    local page = type(id) == 'string' and pages[id] or nil
+    return page and page.input or nil
 end
 
 function UI.unregisterPage(id)
     local page = pages[id]
     if not page then return false end
-    closeOne(id)
+    closeOne(id, 'unregister')
     pages[id] = nil
     patchQueue[id] = nil            -- nothing queued can outlive its page
     Registry.untrack('page', id)
@@ -541,14 +665,20 @@ function UI.open(id, props)
         if not modalIndex(id) then modals[#modals + 1] = id end   -- re-open = props only
     elseif openPage ~= id then
         -- a different exclusive page replaces the whole layer, modals included
-        closeModals()
-        if openPage then closeOne(openPage) end
+        closeModals('replaced', id)
+        if openPage then closeOne(openPage, 'replaced', id) end
         openPage = id
     end
     page.props = props or {}            -- kept so ui_ready can restore the page after a shell reload
     -- a snapshot supersedes whatever was queued: the ops are already in props
     patchQueue[id] = nil
     send({ action = 'page:open', id = id, props = page.props })
+    -- §41: an `onHide = 'suspend'` page opened while the shell is hidden starts suspended,
+    -- so its `resume` on show pairs with a `suspend` like every other one
+    if openPage == id and not shellVisible and page.onHide == 'suspend' and suspendedPage ~= id then
+        suspendedPage = id
+        pageLifecycle(id, 'suspend')
+    end
     applyFocus()
     return true
 end
@@ -570,8 +700,8 @@ end
 
 --- Closes every page, overlay, plugin modal and built-in, then releases focus.
 function UI.closeAll()
-    closeModals()
-    if openPage then closeOne(openPage) end
+    closeModals('closeAll')
+    if openPage then closeOne(openPage, 'closeAll') end
     for id in pairs(overlays) do
         overlays[id] = nil
         sendFor(id, { action = 'page:close', id = id })
@@ -938,8 +1068,30 @@ function UI.notify(data, notifyType)
     return true
 end
 
+--- §54: may a HUD-level element shown by `resource` paint right now? Always, unless the HUD is
+--- hidden — then only when that resource holds a hideHud reason itself (the editor's own prompt).
+local function hudAllows(resource)
+    return hudHideCount == 0 or hudHolders[resource or 'core'] ~= nil
+end
+
+--- §54: puts the shell's text UI in line with `textUI` and the HUD hiding — shows the current
+--- one when it may paint, hides what the shell still shows when it may not. `force` re-sends a
+--- show even when the shell already has one (new text, or a reloaded shell).
+local function syncTextUI(force)
+    if textUI and hudAllows(textUI.resource) then
+        if force or not textUISent then
+            send({ action = 'textui:show', key = textUI.key, text = textUI.text, position = textUI.position })
+        end
+        textUISent = true
+    elseif textUISent then
+        send({ action = 'textui:hide' })
+        textUISent = false
+    end
+end
+
 --- UI.textUI.show(key, text, { position, owner }) — `owner` scopes hide/isShown so
---- two producers (interactions, doors) cannot clear each other's prompt.
+--- two producers (interactions, doors) cannot clear each other's prompt. §54: the calling
+--- resource is remembered too, so a hidden HUD keeps the prompt of the resource that hid it.
 local function textUIShow(key, text, opts)
     if not Validate.value('id', key) then return false end
     if type(text) ~= 'string' or text == '' then return false end
@@ -949,8 +1101,9 @@ local function textUIShow(key, text, opts)
     end
     local owner = type(opts) == 'table' and type(opts.owner) == 'string' and opts.owner ~= ''
         and opts.owner or 'default'
-    textUI = { key = key, text = Utils.sanitize(text, 256), position = position, owner = owner }
-    send({ action = 'textui:show', key = key, text = textUI.text, position = position })
+    textUI = { key = key, text = Utils.sanitize(text, 256), position = position, owner = owner,
+        resource = Registry.getCaller() }
+    syncTextUI(true)
     return true
 end
 
@@ -959,7 +1112,7 @@ local function textUIHide(owner)
     if not textUI then return false end
     if owner ~= nil and owner ~= textUI.owner then return false end
     textUI = nil
-    send({ action = 'textui:hide' })
+    syncTextUI()
     return true
 end
 
@@ -1261,6 +1414,18 @@ define('hud', 'isVisible', hudIsVisible)
 
 -- ----------------------------------- keys / shard / spinner / stats / state ----
 
+--- §54: the key hint twin of syncTextUI — the bar of a resource that does not hold a hideHud
+--- reason is taken off the screen while the HUD is hidden and comes back afterwards.
+local function syncKeyHints(force)
+    if keyHints and hudAllows(keyHintsResource) then
+        if force or not keyHintsSent then send({ action = 'keys:show', items = keyHints }) end
+        keyHintsSent = true
+    elseif keyHintsSent then
+        send({ action = 'keys:hide' })
+        keyHintsSent = false
+    end
+end
+
 --- UI.keys.show({ { key = 'E', label = 'Interact' }, ... }) — instructional buttons.
 local function keysShow(items)
     if type(items) ~= 'table' then return false end
@@ -1277,14 +1442,15 @@ local function keysShow(items)
         return false
     end
     keyHints = out
-    send({ action = 'keys:show', items = out })
+    keyHintsResource = Registry.getCaller()
+    syncKeyHints(true)
     return true
 end
 
 local function keysHide()
     if not keyHints then return false end
     keyHints = nil
-    send({ action = 'keys:hide' })
+    syncKeyHints()
     return true
 end
 
@@ -1470,17 +1636,18 @@ local WATCHERS <const> = {
         read = function() return IsPlayerSwitchInProgress() end },
     { name = 'warning', cfg = 'Warning', default = true, reason = 'game:warning',
         read = function() return IsWarningMessageActive() end },
-    -- off by default: IsHudHidden's exact semantics are undocumented and a wrong
-    -- reading would hide the shell for good
+    -- off by default: a wrong reading would hide the shell for good. IsHudHidden() is exactly
+    -- `not CScriptHud::bDisplayHud` (the DISPLAY_HUD flag), so while §54 itself switched the
+    -- native HUD off (UI.hideHud) the answer is ours and must not hide the whole shell
     { name = 'hud', cfg = 'HudHidden', default = false, reason = 'game:hud',
-        read = function() return IsHudHidden() end },
+        read = function() return IsHudHidden() and not hudNatives.hud end },
     { name = 'cinematic', cfg = 'Cinematic', default = true, reason = 'game:cinematic',
         read = function() return IsCinematicCamRendering() end },
 }
 
 local hiddenReasons = {}        -- reason key -> true
 local hiddenCount = 0
-local shellVisible = true       -- the last state the shell was told about
+-- `shellVisible` (the last state the shell was told about) is declared with the page state above
 local autoHide = {}             -- watcher name -> enabled (Config at load, setAutoHide at runtime)
 local watcherByName = {}
 
@@ -1515,19 +1682,36 @@ end
 --- Applies a change of the reason set. One message and one hook per hidden<->visible
 --- flip, never per reason change (§31.4). Hiding first closes whatever holds the
 --- cursor — the open built-in modal (its await gets the same value as on ESC) and
---- the focused page — so nobody is stuck behind an invisible element.
+--- the focused page — so nobody is stuck behind an invisible element. §41: a page
+--- registered with `onHide = 'suspend'` stays open and mounted instead; its focus
+--- entry is skipped while hidden and comes back (with `resume`) on show. Modals are
+--- cancelled either way.
 local function applyVisibility()
     local visible = hiddenCount == 0
     if visible == shellVisible then return end
     shellVisible = visible
     if not visible then
         closeModal()
-        closeModals()                                 -- §38.9: plugin modals go with the page
-        if openPage then closeOne(openPage) end
+        closeModals('hidden')                         -- §38.9: plugin modals go with the page
+        local page = openPage and pages[openPage]
+        if page and page.onHide == 'suspend' then
+            if suspendedPage ~= openPage then
+                suspendedPage = openPage
+                pageLifecycle(openPage, 'suspend')
+            end
+        elseif openPage then
+            closeOne(openPage, 'hidden')
+        end
         if chatTyping then setChatTyping(false) end   -- §23: a hidden shell cannot keep the keyboard
         applyFocus()
     end
     sendVisible()
+    if visible and suspendedPage then
+        local id = suspendedPage
+        suspendedPage = nil
+        if openPage == id then pageLifecycle(id, 'resume') end
+        applyFocus()                                  -- the page's own input mode again
+    end
     Core.emitHook('uiVisibility', visible, reasonList())
 end
 
@@ -1556,16 +1740,18 @@ end
 --- The key the CURRENT caller may touch, plus that caller. Core (and everything it
 --- dispatches, including the §21 server pushes) uses the reason verbatim; a plugin
 --- is confined to its own '<resource>:' space and can never clear a foreign reason.
+--- `fn` is the full API name for the log line ('UI.hide', 'Keys.capture', …); §54 reuses this
+--- for the hideHud reasons and the key captures, which follow exactly the same namespacing.
 local function reasonKeyFor(fn, reason)
     if reason == nil then reason = 'default' end
     if type(reason) ~= 'string' or not reason:find(REASON_PATTERN) then
-        Log.error('UI.%s: invalid reason (%s)', fn, tostring(reason))
+        Log.error('%s: invalid reason (%s)', fn, tostring(reason))
         return nil
     end
     local owner = Registry.getCaller()
     local key = owner == 'core' and reason or (owner .. ':' .. reason)
     if #key > MAX_REASON_KEY then
-        Log.error("UI.%s: reason '%s' is longer than %d characters", fn, key, MAX_REASON_KEY)
+        Log.error("%s: reason '%s' is longer than %d characters", fn, key, MAX_REASON_KEY)
         return nil
     end
     return key, owner
@@ -1573,7 +1759,7 @@ end
 
 --- UI.hide(reason?) — hides the whole shell until every reason is gone.
 function UI.hide(reason)
-    local key, owner = reasonKeyFor('hide', reason)
+    local key, owner = reasonKeyFor('UI.hide', reason)
     if not key then return false end
     addReason(key, owner)
     return true
@@ -1581,7 +1767,7 @@ end
 
 --- UI.show(reason?) — drops this caller's reason; true when it removed one.
 function UI.show(reason)
-    local key, owner = reasonKeyFor('show', reason)
+    local key, owner = reasonKeyFor('UI.show', reason)
     if not key then return false end
     return removeReason(key, owner)
 end
@@ -1649,6 +1835,173 @@ CreateThread(function()
         local sleep = active and watcherInterval() or IDLE_INTERVAL_MS
         Wait(sleep)
     end
+end)
+
+-- ------------------------------------------- editor focus (DESIGN §54) ----
+-- Two owner-tracked reason sets with the §31 namespacing (`reasonKeyFor`): a plugin's reason is
+-- '<resource>:<reason>', core's is verbatim, and a plugin can only clear its own.
+--
+-- HUD hiding: while at least one reason is held the shell hides core's HUD widgets (vitals strip,
+-- stat bars, world prompts) and every OVERLAY page whose owner holds no reason — the holder's own
+-- overlays, toasts, pages, modals and prompts stay — through ONE message, `shell:hud { hidden,
+-- keep }` (keep = the owner resources holding a reason, sorted); the text UI and the key hints of
+-- a resource that holds no reason are taken off the screen here; the GTA radar and native HUD are
+-- switched off ONCE (only what was on, and only that is restored); the hook `hudHiddenChanged`
+-- fires on the flip. Nothing runs per frame: every step is driven by a hideHud/showHud call.
+--
+-- Key capture: the stateful half of `Core.Keys.capture/release/isCaptured`. The lib in each VM
+-- (lib/keys/client.lua) asks `Core.Keys.isCaptured()` at PRESS time only — through the import.lua
+-- proxy, i.e. one export hop per key press — and swallows the press when a capture is held by
+-- another resource, unless the binding says `whileCaptured = true`.
+
+--- The owner resources holding a hideHud reason, sorted (the shell's keep list).
+local function hudKeepList()
+    local list = {}
+    for owner in pairs(hudHolders) do list[#list + 1] = owner end
+    table.sort(list)
+    return list
+end
+
+--- Tells the shell the current HUD state (on change, and on ui_ready while hidden).
+local function sendHud(keep)
+    send({ action = 'shell:hud', hidden = hudHideCount > 0, keep = keep or hudKeepList() })
+end
+
+--- The radar and the native HUD back to what they were before §54 switched them off. Only a flag
+--- WE flipped is touched: a radar another script had hidden stays hidden.
+local function restoreHudNatives()
+    if hudNatives.radar then
+        hudNatives.radar = false
+        DisplayRadar(true)
+    end
+    if hudNatives.hud then
+        hudNatives.hud = false
+        DisplayHud(true)
+    end
+end
+
+--- Applies a change of the hideHud reason set: one `shell:hud` per change of the hidden state or
+--- of the keep list, the natives and the hook only on the hidden<->visible flip.
+local function applyHud()
+    local hidden = hudHideCount > 0
+    local keep = hudKeepList()
+    local signature = table.concat(keep, ',')
+    local flipped = hidden ~= hudHidden
+    if not flipped and signature == hudKeepSig then return end
+    hudHidden, hudKeepSig = hidden, signature
+    if flipped then
+        if hidden then
+            -- IsRadarHidden/IsHudHidden read the DISPLAY_RADAR/DISPLAY_HUD flags back (BOOL:
+            -- truthiness only, AGENTS §8) — so this switches off only what is on right now
+            if not IsRadarHidden() then
+                DisplayRadar(false)
+                hudNatives.radar = true
+            end
+            if not IsHudHidden() then
+                DisplayHud(false)
+                hudNatives.hud = true
+            end
+        else
+            restoreHudNatives()
+        end
+    end
+    sendHud(keep)
+    syncTextUI()
+    syncKeyHints()
+    if flipped then Core.emitHook('hudHiddenChanged', hidden) end
+end
+
+--- Drops one already-namespaced hideHud key (the owner's count with it).
+local function dropHudReason(key)
+    local owner = hudReasons[key]
+    if not owner then return false end
+    hudReasons[key] = nil
+    local count = (hudHolders[owner] or 1) - 1
+    hudHolders[owner] = count > 0 and count or nil
+    hudHideCount = hudHideCount - 1
+    applyHud()
+    return true
+end
+
+--- UI.hideHud(reason?) — hides the HUD (not the shell) until every reason is gone. True when the
+--- reason is held afterwards (also when it already was), false for an invalid reason.
+function UI.hideHud(reason)
+    local key, owner = reasonKeyFor('UI.hideHud', reason)
+    if not key then return false end
+    if hudReasons[key] then return true end
+    hudReasons[key] = owner
+    hudHolders[owner] = (hudHolders[owner] or 0) + 1
+    hudHideCount = hudHideCount + 1
+    if owner ~= 'core' then Registry.track('uihud', key, owner) end
+    applyHud()
+    return true
+end
+
+--- UI.showHud(reason?) — drops this caller's reason; true when it removed one.
+function UI.showHud(reason)
+    local key, owner = reasonKeyFor('UI.showHud', reason)
+    if not key or not hudReasons[key] then return false end
+    if owner ~= 'core' then Registry.untrack('uihud', key) end
+    return dropHudReason(key)
+end
+
+--- UI.isHudHidden() — true while any hideHud reason is held.
+function UI.isHudHidden()
+    return hudHideCount > 0
+end
+
+-- A plugin that stops cannot leave the HUD, the radar or the native HUD hidden behind it.
+Registry.onOwnerStop('uihud', function(id)
+    dropHudReason(id)
+end)
+
+-- Key capture (the lib namespace from lib/keys/client.lua — extended, never replaced).
+local Keys = Core.Keys
+local keyCaptures = {}                 -- reason key -> owner resource
+local keyHolders = {}                  -- owner resource -> how many captures it holds
+local keyCaptureCount = 0
+
+--- Drops one already-namespaced capture key.
+local function dropCapture(key)
+    local owner = keyCaptures[key]
+    if not owner then return false end
+    keyCaptures[key] = nil
+    local count = (keyHolders[owner] or 1) - 1
+    keyHolders[owner] = count > 0 and count or nil
+    keyCaptureCount = keyCaptureCount - 1
+    return true
+end
+
+--- Core.Keys.capture(reason?) — while held, every Core.Keys binding of ANOTHER resource swallows
+--- its press (releases still arrive), unless it was registered with `whileCaptured = true`.
+--- True when the capture is held afterwards, false for an invalid reason.
+function Keys.capture(reason)
+    local key, owner = reasonKeyFor('Keys.capture', reason)
+    if not key then return false end
+    if keyCaptures[key] then return true end
+    keyCaptures[key] = owner
+    keyHolders[owner] = (keyHolders[owner] or 0) + 1
+    keyCaptureCount = keyCaptureCount + 1
+    if owner ~= 'core' then Registry.track('keycapture', key, owner) end
+    return true
+end
+
+--- Core.Keys.release(reason?) — drops this caller's capture; true when it removed one.
+function Keys.release(reason)
+    local key, owner = reasonKeyFor('Keys.release', reason)
+    if not key or not keyCaptures[key] then return false end
+    if owner ~= 'core' then Registry.untrack('keycapture', key) end
+    return dropCapture(key)
+end
+
+--- Core.Keys.isCaptured() -> captured, byCaller: whether any capture is held, and whether the
+--- CALLING resource holds one itself (the lib's press-time question: "swallow unless it is mine").
+function Keys.isCaptured()
+    return keyCaptureCount > 0, keyHolders[Registry.getCaller()] ~= nil
+end
+
+Registry.onOwnerStop('keycapture', function(id)
+    dropCapture(id)
 end)
 
 -- ----------------------------------------------------------- game blur ----
@@ -1751,19 +2104,18 @@ RegisterNuiCallback('ui_ready', function(_, cb)
     -- is declared, so a `page:register` is never orphaned (§38.4).
     if type(UIInternal.replayPlugins) == 'function' then UIInternal.replayPlugins() end
     for id, page in pairs(pages) do
-        send({
-            action = 'page:register', id = id, type = page.type,
-            keepInput = page.keepInput, owner = page.owner,
-        })
+        send(registerMessage(id, page))
     end
     local snapshot = { action = 'hud:set' }
     for key, value in pairs(hud) do snapshot[key] = value end
     send(snapshot)
     sendBlur()                          -- the reloaded shell forgot the blur config too (§32.3)
-    if textUI then
-        send({ action = 'textui:show', key = textUI.key, text = textUI.text, position = textUI.position })
-    end
-    if keyHints then send({ action = 'keys:show', items = keyHints }) end
+    -- §54: the reloaded shell shows no HUD state at all: the hide first (before the overlays are
+    -- re-opened below, so a hidden one never flashes), then the text UI and key hints it may show
+    if hudHideCount > 0 then sendHud() end
+    textUISent, keyHintsSent = false, false
+    syncTextUI()
+    syncKeyHints()
     if spinnerText then send({ action = 'spinner:show', text = spinnerText }) end
     pushPlayerState()
     pushLocale()
@@ -1773,6 +2125,10 @@ RegisterNuiCallback('ui_ready', function(_, cb)
     local current = openPage and pages[openPage]
     if current then
         send({ action = 'page:open', id = openPage, props = current.props or {} })
+        -- §41: the fresh instance must know it is suspended (Lua listeners heard it already)
+        if suspendedPage == openPage then
+            send({ action = 'page:event', id = openPage, event = 'suspend', data = {} })
+        end
     end
     for i = 1, #modals do                       -- plugin modals in stack order, bottom first
         local page = pages[modals[i]]
@@ -2018,7 +2374,8 @@ CreateThread(function()
         Wait(500)
         -- only ever release focus core itself took: NUI focus is global client
         -- state, so touching it while another resource holds it steals the cursor
-        if focusOwned and not openPage and not modal and #modals == 0 and not chatTyping then
+        -- §41: a `game` or suspended page holds no focus, so it does not count here
+        if focusOwned and not chatTyping and not focusAboveChat() then
             applyFocus()
         end
     end
@@ -2035,7 +2392,8 @@ AddEventHandler('onResourceStop', function(resource)
     SetNuiFocusKeepInput(false)
     SetNuiFocus(false, false)
     focusOwned, focusKeepInput = false, false
-    openPage, textUI, chatTyping = nil, nil, false
+    restoreHudNatives()                 -- §54: the radar and the native HUD outlive core
+    openPage, textUI, chatTyping, suspendedPage = nil, nil, false, nil
     for i = #modals, 1, -1 do modals[i] = nil end
     for rid in pairs(uiRequests) do resolveUiRequest(rid, false, 'shell_reloaded') end
     for key, entry in pairs(heldRequests) do

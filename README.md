@@ -34,12 +34,14 @@ add_ace group.admin core.admin allow              # /car /tp /setcash /setgroup 
 add_ace group.admin core.mod allow                # /kick /announce /revive /heal, staff chat
 set sv_stateBagStrictMode true                    # only the server may write state bags; core relies on it
 # set core_webhook_audit "https://discord.com/api/webhooks/..."   # optional Discord mirror of the audit hook
+# set core_webhook_audit_denied "https://discord.com/api/webhooks/..."   # optional: only the denied audit rows (§46)
 ```
 
 `core` calls `exports.spawnmanager:setAutoSpawn(false)` on start and spawns the player itself from the character
 document, so leaving `basic-gamemode` on means two spawns fighting. `spawnmanager` itself stays loaded.
-`Core.Perms.has` checks `IsPlayerAceAllowed` first and falls back to the group stored on the account, so
-`/setgroup <player> admin` also works without an ACE line (`Config.Perms.Groups`: `user`, `mod`, `admin`).
+`Core.Perms.has` checks `IsPlayerAceAllowed` first and falls back to the account/character grants and the
+player's group (collection `perm_groups`, seeded once from `Config.Perms.Groups/Weights/Inherits`: `user`, `helper`,
+`mod`, `admin`, `senior`, `owner`), so `/setgroup <player> admin` also works without an ACE line.
 Every bag key core uses is written server-side and only read on the client (§8), so strict mode costs nothing
 and stops a client forging `cash`, `faction` or a vehicle's `locked`.
 
@@ -73,10 +75,25 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 | `Config.Hud.ShowSpeed` · `.ShowStreet` | `false` | core draws neither any more — turn one on only for a plugin that reads `useHud().speed` / `.street` / `.zone`, because the feed then pays for those natives |
 | `Config.Stats.Defs.<name>.hud` | `'health'` / `'armour'` | `'health'` / `'armour'` cut the stat's bar out of that vitals plate (where `hunger` and `thirst` sit), `true` puts it on the top-right stat rail instead, `false` draws nothing; `.icon` is the kit glyph under a slotted bar |
 
+The admin-platform keys (§41–§53, 2026-09-26):
+
+| key | default | why you would change it |
+|---|---|---|
+| `Config.Perms.Groups` · `.Weights` · `.Inherits` | six groups, weights `user 0` `helper 100` `mod 200` `admin 300` `senior 400` `owner 1000`, each inheriting the one below | only the **seed** of the `perm_groups` collection (§44): read into an empty collection on the first start; afterwards edit groups with `Core.Perms.saveGroup` (the admin panel), not here |
+| `Config.Admin.RequireDuty` | `true` | admin actions, pages and tabs need the actor on duty (`Core.Admin.setDuty`); an action may override it with `duty = false` |
+| `Config.Admin.Scope` | `{ helper = 1, mod = 5, admin = 50, senior = 200, owner = 2000 }` | the most players one admin action may target, per group (1 for unlisted groups; the console has no cap) |
+| `Config.Admin.StaffPerm` | `'core.admin.staff'` | who counts as staff (may go on duty, gets echoes and the admin snapshot, uses the full §49 selector grammar) |
+| `Config.Admin.LegacyCommands` | `true` | core's own staff commands (`/tp /bring /kick /ban /setcash …`, see "Commands"); `false` registers none of them — for servers running the admin plugin |
+| `Config.Chat.JoinLeave` | `'staff'` | join/leave chat lines: `'staff'` (on the staff set only), `'all'` (one broadcast per connect/drop — small servers), `'off'` |
+| `Config.Buckets.Range` | `{ 10000, 60000 }` | the routing buckets `Core.Buckets.allocate` hands out (editor drafts, events); keep it clear of buckets other resources pick by hand |
+| `Config.Maps.RegionSize` … `MaxMarkers` | `512` m regions, `LatentBps 250000`, `MaxLocalObjects 1500`, … (DESIGN §52.5) | the map runtime's streaming budget; the per-map element limits are **settings** (`maps.limits.*`), not config |
+| `Config.Maps.PackBudgetBytes` · `.PackBudgetWindowMs` | `2000000` · `10000` | per-player region-pack byte budget (2 MB burst, 200 kB/s sustained) — raise only for very dense maps |
+
 Discord logging is a convar, never a config value, so the URL never lands in git:
 
 ```cfg
-set core_webhook_audit "https://discord.com/api/webhooks/..."   # mirrors the `audit` hook
+set core_webhook_audit "https://discord.com/api/webhooks/..."   # mirrors the `audit` hook and every Core.Audit ok/denied row
+set core_webhook_audit_denied "https://discord.com/api/webhooks/..."   # optional: denied Core.Audit rows only
 ```
 
 Any `core_webhook_<name>` convar makes `Core.Webhook.send('<name>', …)` work; an unset one is a silent no-op.
@@ -116,7 +133,8 @@ TS 7, which `vue-tsc` 3.3.x cannot load. `npm run typecheck` in `core/ui` (or in
 
 ### Where data lives
 
-Collections (`accounts`, `characters`, `factions`, `vehicles`, `bans`) live in `Core.DB` — an in-memory document store backed by the server's KVP file, flushed every 5 s and on stop, so no database is needed to run.
+Collections (`accounts`, `characters`, `factions`, `vehicles`, `bans`, `audit`, `settings`, `perm_groups`, `maps`,
+`map_elements`, `map_versions`, `map_journal`) live in `Core.DB` — an in-memory document store backed by the server's KVP file, flushed every 5 s and on stop, so no database is needed to run.
 `Core.DB.setAdapter({ loadAll, put, remove, flush })` is the seam for MySQL/Redis; nothing else changes (§4.1).
 
 #### Postgres
@@ -319,20 +337,29 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 |---|---|
 | `Log.info(fmt, …)` `warn` `error` `debug` | `string.format` style; `debug` is a no-op unless `Config.Debug` |
 | `Log.audit(category, src, fmt, …)` | server only; also fires the `audit` hook for a logging plugin |
-| `Callback.register(name, fn)` | server: `fn(src, …)`; client: `fn(…)` |
-| `Callback.await(name, …)` | client → server, awaits; `nil` on timeout/error |
+| `Callback.register(name, schema?, fn, opts?)` | server: `fn(src, …)`; client: `fn(…)`; server `opts = { permission?, cooldownMs? }` (§44) refuse with `nil` |
+| `Callback.await(name, …)` | client → server, awaits; the results, or `nil, err` (`rate_limit` `schema` `cooldown` `permission` `timeout` `error`) |
 | `Callback.awaitClient(src, name, …)` | server → one client, awaits; `nil` on timeout/error |
 | `Net.on(name, schema, handler, opts?)` | validated handler; server `opts`: `cooldown`, `requireLoaded`, `permission`, `distance`, `onReject` |
 | `Net.emit(src, name, …)` / `Net.emit(name, …)` | server → one client / client → server |
 | `Net.emitMany(targets, name, …)` | server → a list of srcs; the payload is packed once. Scoped delivery ("the players near X") |
 | `Net.broadcast(name, …)` | server → everyone; never from a loop, never for something only nearby players need (one reliable packet per connected client) |
-| `Commands.register(name, opts, handler)` | `opts`: `description`, `params`, `permission`, `allowConsole`; auto usage text + chat suggestions |
+| `Commands.register(name, opts, handler)` | `opts`: `description`, `params`, `permission`, `allowConsole`; auto usage text + chat suggestions. Param types `string` `integer` `number` `boolean` `player` `rest`, and server-only `target` (one src) / `targets` (src array; `max`, `allowSelf`) — a §49 selector word |
+
+**`Core.Schema`** (§43) — one typed field vocabulary for settings, admin action args and map element fields
+
+| function | purpose |
+|---|---|
+| `Schema.field(def)` `fields(list)` | normalise one definition / a list of 1..64 named fields → `field\|nil, err` |
+| `Schema.check(field, value)` `checkAll(fields, values, { partial? })` | `ok, value\|err` / `ok, out\|errs`; never coerces; errors are machine strings (`'required'`, `'min'`, `'custom:<text>'`, nested `'<name>.<err>'`) |
+| `Schema.default(field)` `public(fields)` | deep-copied default · JSON-safe copies for the UI (`<CoreSchemaForm>`), no functions, no secret defaults |
 
 **Client-only libs** (§3.8–§3.12)
 
 | function | purpose |
 |---|---|
-| `Keys.register({ name, key, description, mapper?, onPress, onRelease?, debounce? })` | rebindable keybind, zero per-frame cost |
+| `Keys.register({ name, key, description, mapper?, onPress, onRelease?, debounce?, whileFocused?, whileCaptured? })` | rebindable keybind, zero per-frame cost; `whileCaptured = true` keeps it firing while another resource captures the keys (§54) |
+| `Keys.capture(reason?)` `Keys.release(reason?)` `Keys.isCaptured()` → `captured, byCaller` | §54, stateful in core (one proxy hop): while a capture is held, a PRESS of every other resource's `Core.Keys` binding is swallowed (releases still arrive); owner-tracked |
 | `Streaming.requestModel/requestAnimDict/requestAnimSet/requestPtfx/requestCollision` (+ `release*`) | load with a timeout, then release |
 | `Anim.play(ped, dict, clip, opts)` `Anim.stop(ped, dict?, clip?)` `Anim.isPlaying(ped, dict, clip)` | animations, dict handled for you |
 | `Player.isLoaded()` `get(key)` `getServerId()` `getPed()` `getCoords()` `getHeading()` `getFaction()` `isDead()` | state-bag reads, no hop |
@@ -345,10 +372,11 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 |---|---|
 | `Core.DB` §4.1 | `create(coll, doc)` `get` `set` `update(coll, id, partial)` `delete` `find(coll, match)` `findOne` `all` `count` `flush()` `setAdapter(a)` |
 | `Core.Player` §4.2 | `isLoaded(src)` `getInfo` `getData(src, path)` `setData(src, path, v)` `save` `saveAll` `getPlayers` `forEach` `count` |
-| | `getSrcByCharId` `getName` `getLicense` `getPed` `getCoords` `setCoords` `setModel` `setBucket` `getBucket` |
-| | `kick(src, reason)` `ban(src, reason, seconds?, by?)` `notify` `respawn(src, coords?, heading?)` |
+| | `getSrcByCharId` `getName` `getLicense` `getPed` `getCoords` `setCoords(src, coords, heading?, { withVehicle?, fade?, bucket?, moveRiders? })` `setModel` `setBucket` `getBucket` |
+| | `getAccount(src)` `getAccountById(id)` — read-only account view (§48) · `getGroup(src)` · `findAccountsByIdentifier(identifier)` (the §47 index) · `getStates(src)` — sticky frozen/invincible/visible/controls · `resolveTargets(actor, selector, opts?)` (§49) |
+| | `kick(src, reason)` `ban(src, reason, seconds?, by?)` (via `Core.Bans`, §47) `notify` `respawn(src, coords?, heading?)` |
 | `Core.Money` §4.3 | `get(src, account)` `add` `remove` `set` `canAfford` `transfer(from, to, account, amount, reason?)` — integers only |
-| `Core.Perms` §4.4 | `has(src, perm)` `getGroup(src)` `setGroup(src, group)` `isAdmin(src)` |
+| `Core.Perms` §4.4 | `has(src, perm)` `getGroup(src)` `setGroup(src, group)` `isAdmin(src)` — v2 (§44): see "Admin platform APIs" |
 | `Core.Factions` §4.5 | `create(src, name, tag, opts?)` `disband` `get(id)` `list()` `getPlayerFaction(src)` `getMembers(id)` `hasPerm(src, perm)` |
 | | `invite` `acceptInvite` `declineInvite` `leave` `kick(src, charId)` `setRank` `setRankDef` `addRank` `removeRank` `setOwner` `update` |
 | | `deposit(src, amount)` `withdraw` `getBank(id)` `setMeta(id, k, v)` `getMeta(id, k)` |
@@ -356,6 +384,12 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 | | `giveKeys(netId, charId)` `removeKeys` `hasKeys(src, netId)` `setOwner` `getOwner` `getPlayerVehicles(src)` — `keyMode = 'virtual'` is default; `'item'` leaves virtual keys empty for a domain plugin's physical-key check |
 | | `persist(netId)` `getRecords(charId)` `getRecord(vehId)` `spawnRecord` `restoreRecord` `adopt(netId, opts)` `store(netId)` `saveProps` `deleteRecord` |
 | `Core.Notify` §4.7 | `send(src, message, type?, duration?)` `broadcast(message, type?)` — types `info` `success` `error` `warning` |
+| `Core.Settings` §45 | `define(section)` `get(key)` `set(key, value, actorSrc?, reason?)` `reset` `inspect(key)` `list(viewerSrc?)` `onChange(prefix, fn)` `offChange(handle)` |
+| `Core.Audit` §46 | `record(row) -> id` `query(filter) -> { rows, next }` `get(id)` `prune()` |
+| `Core.Bans` §47 | `add(opts) -> ban, err` `remove(banId, by, reason)` `get(id)` `list(opts)` `check(identifiers, tokens)` `forAccount(accountId)` `sweep()` |
+| `Core.Buckets` §50 | `allocate({ label?, population?, lockdown? })` `release(b)` `info(b)` `list()` |
+| `Core.Admin` §51 | `category/action/page/playerTab(def)` `run(actor, id, opts)` `snapshot(src)` `setDuty/isOnDuty` `setMode/getModes` `staff(onDutyOnly?)` `echo(text, opts?)` — hook `staffModeChanged (src, modes)` |
+| `Core.Maps` §52 | `defineType` `types` `setModelValidator` · `create` `get` `list` `update` `delete` `setActive` `elements` · `apply` `invert` `clear` `journal` · `openDraft` `closeDraft` `publish` `versions` `rollback` · `respawn` `on` `off` `records` |
 
 Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `Core.Player(src).money:add('cash', 10)`.
 
@@ -363,9 +397,9 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 
 | namespace | functions |
 |---|---|
-| `Core.Spawn` §6.1 | `spawnPlayer(opts)` `applyAppearance(ped, appearance)` `teleport(coords, heading?)` `setModel(model, appearance?)` |
+| `Core.Spawn` §6.1 | `spawnPlayer(opts)` `applyAppearance(ped, appearance)` `teleport(coords, heading?, { withVehicle?, fade? }?)` `setModel(model, appearance?)` — teleports wait for map content (`Core.Maps.waitAreaReady`, ≤ 3 s) and keep a sticky freeze (§48) |
 | | `appearance` (§34, every group optional, applied in this order): `headBlend` `components` `props` `faceFeatures` `headOverlays` `hairColor` `eyeColor` |
-| `Core.Player` §6.2 | `getData(key)` `refresh()` (on top of the lib reads above) |
+| `Core.Player` §6.2 | `getData(key)` `refresh()` (on top of the lib reads above) · `getStates()` `reapplyStates(ped?)` — the §48 sticky states |
 | `Core.Markers` §6.4 | `add(opts)` `update(id, partial)` `remove(id)` `removeAll()` |
 | `Core.TextLabels` §6.5 | `add(opts)` `setText(id, text)` `update(id, partial)` `remove(id)` `removeAll()` |
 | `Core.Blips` §6.6 | `add(opts)` `update` `setLabel` `setCoords` `setRoute` `getHandle` `remove` `removeAll` `setWaypoint(coords)` `getWaypoint()` |
@@ -374,13 +408,19 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 | `Core.Vehicles` §6.8 | `getClosest(coords?, radius?)` `getCurrent()` `isDriver()` `getSeat()` `getNetId(veh)` `fromNetId(netId, timeout?)` |
 | | `getProps(veh)` `setProps` `getPlate` `getDisplayName` `hasKeys(veh)` `isLocked` `toggleLock(veh?)` `setEngine` `repair` `saveProps` |
 | `Core.Raycast` §6.9 | `fromCamera(distance?, flags?, ignoreEntity?)` `between(from, to, …)` `getEntityInFront(distance?)` |
+| | §42, the RENDERED camera (scripted cameras too): `screenToWorld(fx, fy) -> origin, direction` `worldToScreen(coords) -> onScreen, fx, fy` `fromScreen(fx, fy, distance?, flags?, ignore?)` `fromRenderedCamera(distance?, flags?, ignore?)` → `hit, coords, normal, entity`; fx/fy in 0..1, distance ≤ 5000 |
 | `Core.Interiors` §36 | `request(ipl)` `remove(ipl)` `isActive(ipl)` — owner-tracked IPLs; `activateSet(coords, set)` `deactivateSet` `isSetActive` `refreshAt(coords)` — interior entity sets; `listGroups()` |
 | `Core.UI` §6.10 | `registerPage(id, opts?)` `unregisterPage` `open(id, props?)` `close(id?)` `closeAll()` `isOpen(id)` `getOpenPage()` `isFocused()` `send(id, event, data)` |
+| | §41 input modes: `registerPage(id, { type, input = 'ui'\|'mixed'\|'look'\|'game', escape = 'close'\|'event', onHide = 'close'\|'suspend' })` `setInput(id, mode)` (owner only, open or not) `getInput(id)`; page events `escape` / `suspend` / `resume` / `closed { reason = 'close'\|'replaced'\|'closeAll'\|'hidden'\|'unregister', by? }` via `UI.on(id, event, fn)` |
 | | `notify` · `textUI.show/hide/isShown` · `progress` + `progress.cancel` · `menu.open/close` · `input.open` · `alert` · `hud.set/setVisible` |
 | | §38 state: `update(id, partial)` `patch(id, path, value)` `feed([channel,] values)` `isFeedActive(channel?)` |
 | | §38 requests: `onRequest(name, fn)` `offRequest(name)` `request(target, name, data?, timeoutMs?)` |
 | | §38 plugins: `plugins()` `isPluginReady(resource?)`; hooks `uiPluginReady (id)` / `uiPluginFailed (id, error)` |
 | | §31 `hide(reason?)` `show(reason?)` `isHidden()` `hiddenReasons()` `setAutoHide(name, bool)` — auto-hide over the pause menu, fades and cutscenes; hook `uiVisibility (visible, reasons)` |
+| | §54 `hideHud(reason?)` `showHud(reason?)` `isHudHidden()` — hide the HUD LAYER only (vitals, stat bars, world prompts, other resources' overlays / text UI / key hints, GTA radar + HUD); your own page, overlays and toasts stay; owner-tracked; hook `hudHiddenChanged (hidden)` |
+| `Core.Settings` §45 | `get(key)` — `replicate = true` keys only; hook `settingChanged (key, new, old)` |
+| `Core.Admin` §51 | `getSelf()` → `{ duty, modes }` · `getStaffStates()` → `{ [src] = state }` (empty unless on duty) — display only; hooks `staffSelfChanged (state)` / `staffStateChanged (src, state\|nil)` |
+| `Core.Maps` §52.4 | `isAreaReady(coords, radius?)` `waitAreaReady(coords, timeoutMs?)` `handleOf(uid)` `uidOf(entity)` `hold(uid)` `release(uid)` — owner-tracked holds (the runtime leaves a dragged element alone); `setEditorView(on)` (owner-tracked previews of data kinds within 150 m) `stats()` |
 
 Also on `Core` itself: `Core.name` `isServer` `isClient` `isCore` `version` `Config` (core's config, read-only),
 `Core.on(hook, fn)` `Core.emitHook(hook, …)` `Core.isReady()` `Core.onReady(fn)` `Core.onPlayerLoaded(fn)` (§2.4).
@@ -447,6 +487,35 @@ with exactly what ESC gives them) and the focused page (`page:close`, its `close
 **Hiding with a modal open equals cancelling it** — that is documented behaviour, not a bug. Overlay pages,
 the text UI, key hints, the spinner, the shard and the progress bar are only hidden, never cancelled.
 Server reasons are fire-and-forget: they follow the session and are gone when the NUI reloads.
+
+### HUD hiding and key capture (editor focus, §54)
+
+`Core.UI.hide` is the wrong tool for a full-screen tool of your own (a map editor, a photo mode): it hides the
+whole shell and closes your page. `Core.UI.hideHud` hides only the **HUD layer**, and `Core.Keys.capture` gives
+your key bindings to you alone — both owner-tracked reason sets with the same `<resource>:<reason>` namespacing,
+both released automatically when your resource stops.
+
+```lua
+-- client, in the tool's resource
+Core.UI.hideHud('editor')     -- true; vitals strip, stat bars, world prompts, the overlays / text UI / key
+                              -- hints of every resource that holds no reason, the GTA radar and native HUD
+Core.Keys.capture('editor')   -- true; other resources' Core.Keys presses are swallowed (their releases still arrive)
+-- ... your page, your overlays, your own text UI and your own Core.Keys bindings all keep working ...
+Core.Keys.release('editor')   -- true when it removed yours
+Core.UI.showHud('editor')     -- everything comes back as it was; the radar only if core hid it
+Core.UI.isHudHidden()         -- true while anybody holds a reason
+Core.Keys.isCaptured()        -- captured, byCaller
+Core.on('hudHiddenChanged', function(hidden) end)   -- on the flip only
+
+Core.Keys.register({ name = 'radio', key = 'F9', whileCaptured = true, onPress = fn })   -- keeps firing
+```
+
+Nothing is closed: a hidden overlay (the inventory hotbar) is only not painted and comes back with its state;
+toasts, the progress bar, pages and modals are not the HUD and stay. core switches the radar and the native HUD off
+once (`DisplayRadar(false)` / `DisplayHud(false)`) and back on only if they were on before. The key check runs at
+press time — one export hop per key press from a plugin, nothing per frame — and a key never goes dead with core
+(core stopped = not captured). core's chat key is `whileCaptured`; raw key mappings that are not `Core.Keys`
+bindings are not affected (`core_interact` does nothing while the HUD is hidden).
 
 ### UI plugins
 
@@ -554,6 +623,14 @@ const { pong } = await nui.invoke('ping')         // request/response; rejects w
 `defineUIPlugin` and `definePage` are pure and run at module evaluation; every other export resolves the host
 lazily and throws a clear error outside the shell. Generics stay one level deep — a props interface, an event
 map, an rpc map; nothing is inferred across the Lua boundary.
+
+Input modes (§41): the page's handle carries `input` (`'ui' | 'mixed' | 'look' | 'game'`, readonly and
+reactive — Lua switches it with `Core.UI.setInput(id, mode)` while the page stays open), and
+`on('escape' | 'suspend' | 'resume', fn)` needs no entry in the page's `In` map: `escape` arrives when the page
+was registered `escape = 'event'` (Escape then keeps it open), `suspend` / `resume` with `onHide = 'suspend'`.
+A `game` page is drawn but click-through (the shell forces `pointer-events: none` on it), and the chat still
+works above it. Page ids must be **plain** (`[A-Za-z0-9_-]`, no `:` or `.`): `registerPage` refuses anything else,
+because the NUI bridge drops events, requests and feeds of such ids.
 
 #### Lua side (unchanged signatures)
 
@@ -739,7 +816,7 @@ so nothing drifts apart. The look is Liam's four mockups: blue-black translucent
 |---|---|---|
 | tokens | the `@theme static` blocks of `ui/sdk/theme.css` (imported by `ui/src/styles.css`, referenced by every plugin build) | every colour, font, radius, shadow, size — each one also a Tailwind utility (`bg-panel`, `text-fg-dim`, `rounded-ui`, `font-display`, `text-display-lg`) |
 | classes | `ui/src/kit/css/*.css` | the `.core-*` vocabulary (`core-btn`, `core-panel`, `core-slot`, …); plain HTML may wear them |
-| components | `ui/src/kit/components/Core*.vue` | 64 tags registered **globally** on the shell's one Vue app — `<CoreButton>` works in any page with no import |
+| components | `ui/src/kit/components/Core*.vue` | 71 tags registered **globally** on the shell's one Vue app — `<CoreButton>` works in any page with no import |
 
 #### The tags
 
@@ -750,11 +827,11 @@ Grouped as in DESIGN §37.5, which is the full API (props · slots · emits · c
 | foundation | **CoreIcon** a registry glyph (`kit/icons.js`, 191 names, 24 × 24, `currentColor`) — the `hud-*` six (`hud-mic`, `hud-mic-off`, `hud-heart`, `hud-shield`, `hud-food`, `hud-drink`) are hand-made for the §39 HUD and survive a regeneration of the file |
 | actions | **CoreButton** every button (`primary` `secondary` `ghost` `danger` `success`, `fade`, `kbd`, `loading`, `block`) · **CoreIconButton** square icon-only · **CoreKey** a key cap or mouse glyph · **CoreKeyHint** cap + caption · **CoreKeyHints** the hint bar of a footer · **CorePrompt** `[F] ENTER VEHICLE` · **CorePromptGroup** stacked prompts |
 | surfaces | **CorePanel** the bordered panel (title/subtitle/eyebrow, `actions` + `footer` slots, `blur`) · **CoreScreen** full-page scaffold (header · body · footer) · **CoreBackground** the scrim over the game · **CoreCard** media + text card · **CoreHeading** title block with the `//` marker · **CoreDivider** hairline · **CoreDash** the short accent bar · **CoreTagline** stacked wide-tracked lines · **CoreBrand** logo lockup |
-| navigation | **CoreTabs** top row with the glowing underline · **CoreMenu** vertical rows (main menu, sidebar) · **CoreChips** filter chips / segmented control · **CoreStepper** `‹ value ›` cycler |
-| forms — text | **CoreField** label + control + hint/error (`inline` = settings row) · **CoreInput** text field · **CoreTextarea** with counter · **CoreNumberInput** `[−] 12 [+]` · **CoreSelect** dropdown (`box` or the inline `SORT: RECENT ⌄`) |
-| forms — choice | **CoreCheckbox** · **CoreRadioGroup** / **CoreRadio** (`radio` or `card`) · **CoreSwitch** · **CoreSlider** · **CoreSwatches** colour picker |
+| navigation | **CoreTabs** top row with the glowing underline · **CoreMenu** vertical rows (main menu, sidebar) · **CoreChips** filter chips / segmented control · **CoreStepper** `‹ value ›` cycler · **CorePagination** page / cursor controls (`1–25 of 312`, size select) |
+| forms — text | **CoreField** label + control + hint/error (`inline` = settings row) · **CoreInput** text field · **CoreTextarea** with counter · **CoreNumberInput** `[−] 12 [+]` · **CoreSelect** dropdown (`box` or the inline `SORT: RECENT ⌄`) · **CoreCombobox** filterable select (async `search`, `multiple`, `creatable`, virtualised past 100) · **CoreVectorInput** `{ x, y, z }` with axis caps and copy / paste |
+| forms — choice | **CoreCheckbox** · **CoreRadioGroup** / **CoreRadio** (`radio` or `card`) · **CoreSwitch** · **CoreSlider** · **CoreSwatches** colour picker · **CoreColorPicker** hex + swatches + RGB(A) sliders (inline or `popover`) · **CoreSchemaForm** a whole form from `Core.Schema.public` (resolvers, groups, `visibleWhen`, server errors) |
 | data — meters | **CoreProgress** linear bar (`inline`, `segments`, threshold tones) · **CoreRing** radial · **CoreVital** the §39 HUD plate — a slanted white plate over a dark track, with the food / drink bar cut out of its bottom · **CoreStatBar** HUD vital row · **CoreStatRow** detail stat between hairlines · **CoreSpinner** · **CoreSkeleton** |
-| data — display | **CoreBadge** count pip · **CoreTag** small chip (tones + rarities) · **CoreAvatar** · **CorePlayerChip** avatar · name · level · XP · **CoreTable** · **CoreKeyValue** ruled label/value rows · **CoreEmpty** empty state |
+| data — display | **CoreBadge** count pip · **CoreTag** small chip (tones + rarities) · **CoreAvatar** · **CorePlayerChip** avatar · name · level · XP · **CoreTable** (sortable headers, `loading`) · **CoreVirtualList** fixed-height virtualised rows · **CoreTree** nested rows, expand / select, virtualised · **CoreKeyValue** ruled label/value rows · **CoreEmpty** empty state |
 | game | **CoreSlot** item slot · **CoreSlotGrid** the inventory grid · **CoreHotbar** · **CoreList** / **CoreListItem** rich rows · **CoreObjective** · **CoreTracker** HUD quest card · **CoreHudTile** the slanted dark tile that opens the vitals strip (`active` = transmitting, `dimmed` = muted) · **CoreCompass** heading strip · **CoreInteractionDot** world interaction dot → key prompt |
 | feedback | **CoreAlert** inline banner · **CoreToast** notification card · **CoreDialog** modal (focus trap, escape layers) · **CoreDrawer** side sheet · **CorePopover** anchored panel · **CoreContextMenu** right-click menu · **CoreTooltip** · **CoreShard** centre-screen banner |
 
@@ -917,11 +994,11 @@ manifests that do not validate.
 
 Three browser suites guard the shell — run them together with `node ui/tests/run-browser-suites.mjs`, which
 builds the fixture plugins, starts one HTTP origin per fixture resource with FiveM's exact headers and drives
-all three through agent-browser: `shell-regression.js` for the built-ins and the protocol (101 checks),
-`kit-regression.js` for the kit (195 — every catalogue name mounts without a Vue warning, the interactive
-contracts hold, the fonts resolve, no rule in the built CSS uses a Chromium-103-unsafe feature), and
-`runtime-regression.js` for the platform itself (152 — cross-origin load, hot deploy, restart with a new
-build, lazy load, every failure mode, modal layering, feeds).
+all three through agent-browser: `shell-regression.js` for the built-ins and the protocol (125 checks),
+`kit-regression.js` for the kit (312 on the built page — every catalogue name mounts without a Vue warning, the
+interactive contracts hold, the fonts resolve, no rule in the built CSS uses a Chromium-103-unsafe feature), and
+`runtime-regression.js` for the platform itself (201 — cross-origin load, hot deploy, restart with a new
+build, lazy load, every failure mode, modal layering, feeds, §41 input modes).
 
 ### Game blur (glass panels)
 
@@ -984,16 +1061,28 @@ Hooks are local events on the same side: `Core.on('playerLoaded', fn)` / `Core.e
 | server | `factionChanged` / `factionUpdated` | `src, summary\|nil` / `factionId` |
 | server | `vehicleSpawned` / `vehicleDeleted` | `netId, info` / `netId` |
 | server | `audit` | `category, src, message` |
+| server | `permsChanged` | `src\|nil, what, detail` — §44: `grant` `revoke` `group` `grants` `saveGroup` `deleteGroup` `define` `expired` `load` (src nil = a whole group changed; `group`/`grants` also from `Player.setGroup`/`setAccountData`) |
+| server | `adminAction` | `{ id, actor, targets, args, reason, source, result, message }` — §51, after every executed admin action (never for refusals) |
 | client | `ready` / `playerLoaded` / `playerDied` / `playerRespawned` / `uiReady` | — |
 | client | `pedChanged` | `ped, previous` — the player's ped entity changed (model swap, spawn); re-apply ped-bound state (config flags, attachments) here. Not replayed for a resource that starts later |
+| client | `settingChanged` | `key, new, old` — §45, a `replicate = true` setting changed (`new = nil` when it stopped replicating) |
+| client | `hudHiddenChanged` | `hidden` — §54, the first `Core.UI.hideHud` reason arrived / the last one went |
+| server | `staffModeChanged` | `src, modes` — §51, the `{ [name] = true }` map on every staff-mode change or clear (`{}` on drop) |
+| client | `staffSelfChanged` / `staffStateChanged` | `state` / `src, state\|nil` — §51, this player's own `{ duty, modes }` · an on-duty member's (only while on duty; nil = left duty/dropped) |
+
+Veto pipelines (`Core.Hooks.register(name, fn, { priority?, filter?, after? })`, §40) core runs itself:
+`money:beforeTransfer` `{ from, to, account, amount, reason }`, `chat:beforeMessage` `{ src, channel, text }` (§23),
+`admin:before` `{ id, actor, targets, args }` (§51; filter by `id`) and `maps:beforeApply` `{ mapId, mode, actor,
+source, count, ops }` (§52). Return `false, reason` to veto; a hook that errors fails closed.
 
 State bags are server-written, client-read. Read them with `Core.Player.get(key)` or `Entity(veh).state.x`.
 
 | bag | keys |
 |---|---|
-| `player:<src>` | `loaded` `name` `charId` `group` `cash` `bank` `faction` (summary or `false`) `dead` |
+| `player:<src>` | `loaded` `name` `charId` `group` `cash` `bank` `faction` (summary or `false`) `dead` — `duty` / `staffModes` are reserved names but never written: staff state goes by event (§51, `Core.Admin.getSelf()`) |
 | `entity:<netId>` (core vehicles) | `coreVeh` `locked` `owner` `keys` `keyMode` `plate` `vehId` `coreProps` (optional persisted props) |
-| `GlobalState` | `core:ready`, `faction:<id>` = `{ name, tag, color, memberCount }` or `false` |
+| `entity:<netId>` (map entities, §52) | `mapEl` = `'<mapId>:<elementId>'` · `mapCfg` = peds `{ invincible, frozen, scenario? }`, vehicles `{ locked }`, physics props `{ rot }` |
+| `GlobalState` | `core:ready`, `faction:<id>` = `{ name, tag, color, memberCount }` or `false` · `cs:<key>` + `cs:keys` — replicated settings (§45) |
 
 ## Commands
 
@@ -1003,10 +1092,17 @@ State bags are server-written, client-read. Read them with `Core.Player.get(key)
 | `/car <model> [plate]` · `/dv` | `core.admin` | spawn a vehicle and warp in · delete the one you are in or the nearest within 5 m |
 | `/tp <x> <y> <z>` · `/tpm` · `/tpto <player>` · `/bring <player>` | `core.admin` | teleport to coords · to your waypoint · to a player · a player to you |
 | `/setcash` `/setbank` `/givecash` `/givebank` `<player> <amount>` | `core.admin` | set or add money |
-| `/setgroup <player> <group>` | `core.admin` (console always) | `user` / `mod` / `admin` |
+| `/setgroup <player> <group>` | `core.admin` (console always) | any group in `perm_groups` (seed: `user` `helper` `mod` `admin` `senior` `owner`) |
 | `/kick <player> [reason…]` · `/ban <player> <hours> [reason…]` | `core.mod` / `core.admin` | `0` hours = permanent |
 | `/announce <message…>` · `/revive [player]` · `/heal [player]` | `core.mod` | broadcast · respawn where they stand · health + armour |
 | `/faction <action> …` | — | chat front-end over `Core.Factions` |
+
+The staff commands above (and `/weapon`, `/weapons`, the `/tpm` handler) follow the admin platform's rules since
+2026-09-26: under `Config.Admin.RequireDuty` a player must be on duty (`Core.Admin.setDuty`), every executed command
+writes an audit row `core.cmd.<name>` and echoes to on-duty staff, and they check ranks (`/kick`, `/ban`, `/bring`,
+the money commands, `/setgroup`, `/weapons clear`, `/dv` occupants; `/tpto` only refuses a vanished or spectating
+higher-ranked target). `Config.Admin.LegacyCommands = false` registers none of them; `/id`, `/players` and `/faction`
+always stay.
 
 `/faction create <name> <tag>` · `invite <player id>` · `accept` · `leave` · `kick <charId>` ·
 `rank <charId> <rank>` · `info` · `list`. Disband and the rest of the API are the §5.2 callbacks, for a faction UI plugin.
@@ -1157,7 +1253,7 @@ them to a plugin to render.
 | `Core.Vehicles.getInRange(coords, range)` `getDriver` `getPassengers` `getClosestToPlayer(src, maxDist = 20.0)` `setData(netId\|vehId, key, value)` / `getData` | core vehicles only; `setData` writes record meta |
 | `Core.Globals.get(key, default?)` `set(key, value, mirror?)` `increment(key, delta = 1)` `unset(key)` | persisted server-wide; `mirror = true` also writes `GlobalState['g:<key>']` |
 | `Core.Services.register(name, impl)` `get(name)` `has(name)` `unregister(name)` · `Core.Api.register(name, table)` / `Api.get(name)` | swappable interfaces · plugin-to-plugin tables |
-| `Core.Perms.grant(src, perm, scope = 'account'\|'character')` `revoke(src, perm, scope)` `list(src)` | on top of ACE and the config group |
+| `Core.Perms.grant(src, perm, scope = 'account'\|'character', { expiresAt? })` `revoke(src, perm, scope)` `list(src)` | on top of ACE and the group chain; temporary grants expire by themselves (§44) |
 
 Core registers `notification`, `currency`, `death`, `time` and `weather` itself; `items` stays empty until
 an inventory plugin fills it — write against `Core.Services.get('items')` and any inventory works.
@@ -1205,10 +1301,15 @@ to appear with typed hints; the engine still executes them normally. No guessed 
 | `Core.Chat.send(src, message, opts?)` | `opts = { color = {r,g,b}, prefix = 'SYSTEM', channel? }` — one CEF line |
 | `Core.Chat.broadcast(message, opts?)` · `sendNear(coords, range?, message, opts?)` | announcements / proximity (each recipient gets their own opacity) |
 | `Core.Chat.registerChannel(name, { command, permission?, format, global?, staffOnly?, faction?, color?, range?, description? })` | adds the `/command` for you |
-| `Core.Chat.setFilter(fn(src, channel, msg) -> bool)` | returning `false` vetoes the message |
+| `Core.Chat.setFilter(fn(src, channel, msg) -> bool)` | returning `false` vetoes the message (one filter, not owner-tracked) |
+| `Core.Hooks.register('chat:beforeMessage', function(p) return not muted(p.src), 'You are muted.' end)` | owner-tracked veto of a player's line (`p = { src, channel, text }`); runs after the filter on every player path (local, ooc, channels, `/s`, `/pm`); the sender reads the reason |
 | `Core.Chat.clear(src)` | wipes one player's feed |
 | `Core.Chat.suggestions(src)` | permitted channel commands with descriptions and message-argument metadata |
 | `Core.Commands.get(name)` · `execute(name, src, args, raw)` (server) · `suggestions(src)` | the command seam the CEF input uses (§30.2) |
+
+Order per player line: channel permission → cooldown → `setFilter` → `chat:beforeMessage` hooks → the `chatMessage`
+observer → delivery. Global and faction lines go out packed once (`Core.Net.emitMany`), staff channels reach the cached
+staff set, and join/leave lines follow `Config.Chat.JoinLeave` (`'staff'` by default).
 
 Built-in channels: plain text → **local** (proximity, fades with distance), `/ooc` (global), `/fc`
 (faction members only — the chip only appears for faction members), `/s` scream (doubled range, always
@@ -1227,7 +1328,9 @@ never as console). Core also sends join/leave system lines and owns console `say
 | `Core.Http.setToken(name, convarName)` · `getToken(name)` · `Core.Webhook.send(name, { title, description, color, fields })` | secrets come from convars only; the embed goes to convar `core_webhook_<name>` |
 
 Webhook posts are batched (at most one request per 2 s per webhook, up to 10 embeds), and core mirrors
-the `audit` hook into `core_webhook_audit` automatically when that convar is set.
+the `audit` hook into `core_webhook_audit` automatically when that convar is set. `Core.Audit` rows with
+`result = 'ok'|'denied'` are posted there too (one embed per row, never twice: a `Log.audit` line is posted
+by the hook only), and denied rows additionally go to `core_webhook_audit_denied` when that convar is set.
 
 ### Security (§25)
 
@@ -1236,6 +1339,8 @@ the `audit` hook into `core_webhook_audit` automatically when that convar is set
 `explosionEvent`, always using the server-provided `sender`, never a player id from the payload.
 `Core.Security.setDamageFilter(fn(sender, data) -> bool)` vetoes a damage event before the built-in
 checks. Hooks: `weaponDamage (sender, data)`, `explosion (sender, data)`, `cheatDetected (src, kind, details)`.
+`Core.Security.isStaffExempt(src, what)` — staff in a sanctioned `Core.Admin` mode (noclip, vanish, spectate, god,
+editor) are exempt from invisibility/collision/teleport/god/speed detections; `report` consults it for every kind.
 
 ### Locale (§26)
 
@@ -1264,7 +1369,7 @@ untested. Verify the export names against the version you deploy, and take a `/d
 
 | command | perm | what it does |
 |---|---|---|
-| `/weapon <player> <WEAPON_NAME> [ammo]` · `/weapons clear <player>` | `core.admin` | give a weapon (persisted in the loadout) · wipe a loadout |
+| `/weapon <player> <WEAPON_NAME> [ammo]` · `/weapons clear <player>` | `core.admin` | give a weapon (persisted in the loadout) · wipe a loadout — staff commands (duty, audit, ranks; registered by `server/admin.lua`) |
 | `/dbexport` · `/dbimport <file> [replace]` | console only | writes `data/export-<timestamp>.json` · reads one back; `replace` wipes each collection first |
 | `/uiplugins` · `/uidev <res> <origin\|off>` · `/uiinspect` | client; the last two need `Config.UI.Dev.Enabled` | the UI platform's diagnostics — see "Knowing whether a plugin is up" |
 
@@ -1279,8 +1384,8 @@ npm run check:ui                          # at the resources folder: validate ev
 `new-plugin.sh` validates the name (`^[a-z][a-z0-9_]*$`), refuses to overwrite an existing resource,
 rewrites every placeholder and prints the next steps. `check.sh` stops at the first failure, in nine steps:
 `luac5.4 -p` over every `.lua`; `fxlint` on core and `core_example` (skipped with a notice when it is not on
-`PATH`); the Lua suites (`run_tests`, `client_chat_tests`, `client_interiors_tests`, `client_ui_tests`,
-`server_tests`); `node --test` over the chat model, `ui/tests/unit` and `ui/sdk/tests`;
+`PATH`); the Lua suites (`run_tests`, the §40 service suites, `client_chat_tests`, `client_interiors_tests`,
+`client_ui_tests`, the eighteen §41–§53 suites from `raycast` to `chat_hook`, `server_tests`); `node --test` over the chat model, `ui/tests/unit` and `ui/sdk/tests`;
 `vue-tsc --noEmit -p ui/tsconfig.json`; `gen-kit-types --check` and `check-plugins.mjs`; the shell build; and
 with `--full` the three browser suites (`ui/tests/run-browser-suites.mjs`) plus the Storybook build.
 
@@ -1354,6 +1459,18 @@ The vitals HUD (§39). This one is all eyes — the offline suites can prove the
 
 37. **The vitals strip:** after the spawn it sits at the bottom left, 24 px from both edges (`Config.Hud.Anchor = 'bottom-left'`, the default — no minimap maths involved) — mic tile, then the HEALTH plate, then ARMOR, same size, same 20° lean, equal gaps. Take damage → the white HEALTH fill drops at once along that same slanted edge and the span it left stays **red** for about half a second, shrinking into the fill's edge (the label splits two-tone across the edge and is hidden under the chunk); `/revive <id>` → a **green** chunk shoots ahead to the new value and the white fill catches up with it. `Core.Player.setArmour(<id>, 50)` → the ARMOR plate is half drained. `Core.Stats.set(<id>, 'hunger', 20)` → the food bar under HEALTH turns amber; `… 5` → red with a pulsing burger glyph; `thirst` does the same under ARMOR with the cup. Talk on push-to-talk → the mic tile rings and glows for as long as you transmit; stop the voice resource (or lose Mumble) → the tile keeps the crossed-out mic at 40 %. Set `Config.Hud.Anchor = 'minimap'` and `Config.Hud.Scale = 1.4`, `restart core` → the strip anchors to the computed minimap rect and grows, still one piece; set both back. Finally `resmon 1` standing still and silent: `core` stays at the idle `0.00–0.01 ms` — the 100 ms feed only sends what changed.
 
+Editor focus (§54). Run it with the admin map editor (it holds both), or from a throwaway client command.
+
+38. **The HUD steps aside, the tool does not:** with the inventory hotbar up, a toast on screen and the minimap
+    visible, open the admin map editor → the vitals strip, the stat bars, the hotbar, the world prompt dots, the
+    radar (and `sf_minimap` with it) and the GTA HUD are gone, the toast and the editor's own chrome stay. Close the
+    editor → everything is back exactly as it was (the hotbar shows the same slots). With the radar hidden BEFORE
+    (`DisplayRadar(false)` from another script), it stays hidden after the editor closes.
+39. **The keys are the editor's:** in fly mode press `1`–`5` → the editor's quick slots act and the inventory
+    hotbar does NOT use an item; `T` still opens the chat; `E` near a world prompt interaction does nothing. Close the
+    editor → `1`–`5` use hotbar items again. Hold `1` while opening the editor, release it after → nothing sticks.
+40. **Nothing survives a stop:** open the editor, then `restart admin` → HUD, radar, hotbar and keys all come back.
+
 ## Troubleshooting
 
 Read the server side with `fxserver logs --errors --resource <name>`, the client side with `F8`.
@@ -1392,7 +1509,8 @@ anything.
 per namespace (Utils, Math, Validate, Log, Callback, Net, Commands, Keys, Streaming, Anim, Audio,
 Locale, Player, UI, Markers, TextLabels, Blips, Interactions, Vehicles, Raycast, Spawn, World, Screen,
 Cron, DB, Money, Perms, Factions, Notify, Doors, Stats, Weapons, Native, Attachments, Waypoint,
-Screenshot, Globals, Services, Api, Chat, Http, Webhook, Security, Registry), typed option tables
+Screenshot, Globals, Services, Api, Chat, Http, Webhook, Security, Registry, and since §40–§53 Controls, Actions,
+Geometry, Zones, Points, Hooks, Schema, Settings, Audit, Bans, Buckets, Admin, Maps, MapRegions), typed option tables
 (`CoreMarkerOptions`, `CoreInteractionOptions`, `CoreVehicleProps`, `CoreMenuOptions`, …) and aliases
 for the enums (`CoreHook`, `CoreNotifyType`, `CorePageType`, `CoreWeather`, …). It is documentation
 only: it is **not** in `fxmanifest.lua`, is never loaded at runtime and never shipped to a client.
@@ -1413,8 +1531,9 @@ addon (the `@citizenfx` typings), which adds the native definitions as a LuaLS l
 per side; combined with `core/types` you get completion for both `Core.*` and `GetEntityCoords(...)`.
 If you prefer to point at a checkout instead, add its path to `workspace.library` next to `core/types`.
 
-Keep `types/core.lua` in sync by hand when you change a public API — `DESIGN.md` §3–§6 and §15–§26 are
-the contract, the meta file mirrors it.
+Keep `types/core.lua` in sync by hand when you change a public API — `DESIGN.md` §3–§6, §15–§26 and §40–§53
+are the contract, the meta file mirrors it. After changing it, rebuild the dev kit's index
+(`fivem-dev-kit/bin/fxref core build`) so `fxlint`'s K013 check knows the new functions.
 
 ## Development services (DESIGN §40)
 
@@ -1442,6 +1561,9 @@ local completed, reason = Core.Actions.run({
 ```
 
 `Controls.releaseAll()` removes your restrictions. Control IDs are 0..360, groups 0..2 (default 0).
+`Core.Controls.acquire({ all = true, except = { 199, 200, 245, 246, 249 } })` disables a whole group except a few
+controls (a fly camera: ~6 natives per frame instead of one per control); with several handles on one group `all`
+wins and a control stays enabled only when every `all` handle excepts it.
 `Actions.run` accepts 100..600000 ms and at most 8 cosmetic local props. `scenario` is an alternative to
 `animation`. Death, falling, swimming, ragdoll or a changed ped interrupt by default; `allowDead`,
 `allowFalling`, `allowSwimming`, `allowRagdoll` opt out individually. Busy calls return `false,'busy'`.
@@ -1559,3 +1681,289 @@ writes. Hooks cannot override insufficient funds, account validity or recipient 
 8. Veto a transfer: both balances unchanged; allowed transfer changes each exactly once.
 9. Restart core and ensure dependants again: onReady registrations replay without duplicates. Check
    resmon idle target 0.00–0.02 ms; these offline tests do not establish in-game performance.
+
+## Admin platform APIs (DESIGN §41–§53)
+
+The framework half of the admin system (2026-09-26). The `admin` resource (`resources/admin`, its own
+`DESIGN.md`) is only the frontend and the built-in actions — every piece below is a plain core API that any plugin
+uses without `dependency 'admin'`. Registrations are owner-tracked and disappear when their resource stops;
+server entry points validate in the usual order. Signatures: `types/core.lua` (last section).
+
+### Input modes, Escape and hide policy (§41, client)
+
+```lua
+Core.UI.registerPage('myres_editor', { type = 'page', input = 'game', escape = 'event', onHide = 'suspend' })
+Core.UI.setInput('myres_editor', 'ui')        -- cursor over the page; 'game' = page stays, click-through, no focus
+Core.UI.on('myres_editor', 'escape', function() Core.UI.setInput('myres_editor', 'game') end)
+```
+
+| mode | cursor | game input | use |
+|---|---|---|---|
+| `ui` (default) | yes | no | a normal page |
+| `mixed` | yes | yes | the old `keepInput = true` |
+| `look` | no | yes (page still gets keys) | experimental — hold-to-look |
+| `game` | — | — | the page stays drawn but takes no focus and no clicks (fly mode); chat keeps working |
+
+`setInput` is owner-only and works whether the page is open or not; `getInput(id)` reads it. An unknown
+`input` / `escape` / `onHide` value makes `registerPage` return `false`. `escape = 'event'` keeps the page open on
+Escape and fires its page event `escape`; `onHide = 'suspend'` keeps an exclusive page mounted over the pause menu
+and fires `suspend` / `resume` (modals are still cancelled). Page ids must be plain (`[A-Za-z0-9_-]`) — others are
+refused.
+
+### Raycasts from the rendered camera (§42, client)
+
+`Core.Raycast.fromRenderedCamera(distance?, flags?, ignore?)` and `fromScreen(fx, fy, …)` probe from whatever camera
+is rendering (a scripted editor camera included) — `fromCamera` stays on the gameplay camera.
+`screenToWorld(fx, fy) -> origin, direction` and `worldToScreen(coords) -> onScreen, fx, fy` convert between the
+viewport (0..1) and the world. They are proxy calls for occasional queries: a per-frame tool calls the natives in
+its own VM.
+
+### Field schemas (§43)
+
+`Core.Schema` is a pure lib in every VM: one vocabulary (`boolean integer number string text password reason enum
+array object color duration vector3 heading rotation model player ref faction item`) for settings, admin action
+arguments and map element fields — and `<CoreSchemaForm :fields="Core.Schema.public(fields)">` renders any of them.
+
+```lua
+local fields = Core.Schema.fields({
+    { name = 'amount', type = 'integer', min = 1, max = 100000, required = true },
+    { name = 'length', type = 'duration', allowPermanent = true, presets = { 3600, 86400, 0 } },
+})
+local ok, out = Core.Schema.checkAll(fields, payload)   -- out = the normalised values, or { [name] = errCode }
+```
+
+Errors are machine strings (`'required' 'type' 'min' 'max' 'step' 'pattern' 'option' 'length' 'items' 'unknown'
+'custom:<text>'`, nested ones with a path: `'2.reason.length'`). `validate = fn(value, all)` is server-side only
+and never leaves the VM; `icon`, `rows`, `presets`, `templates` are UI-only keys.
+
+### Settings (§45)
+
+```lua
+Core.Settings.define({ id = 'shop', title = 'Shop', icon = 'store', properties = {
+    ['shop.taxRate'] = { type = 'number', default = 0.05, min = 0, max = 0.5, label = 'Tax rate', replicate = true },
+    ['shop.apiKey']  = { type = 'password', default = '', secret = true, edit = 'core.owner' },
+} })
+local tax = Core.Settings.get('shop.taxRate')                   -- override > config > default
+Core.Settings.onChange('shop.', function(key, new, old) end)    -- after persist, in a new thread
+```
+
+`set(key, value, actorSrc?, reason?)` / `reset(key, actorSrc?, reason?)` validate with the schema (never coerce);
+with an actor the property's `edit` permission (default `core.admin`) is required, and every change is audited
+(`settings.set`). `list(viewerSrc?)` is what the admin panel's Settings page shows (filtered by `view`, default
+`core.settings.view`; secrets masked). `replicate = true` keys reach clients: `Core.Settings.get(key)` there, and
+the client hook `settingChanged (key, new, old)`. Overrides live in the `settings` collection and survive the owner
+stopping. Core defines `maps.limits.*` + `maps.journalMax` + `maps.journalMaxOps`, `audit.retentionDays` +
+`audit.maxRows` + `audit.logMaxRows` and `bans.tokenMatches` + `bans.enrichTokens` + `bans.enrichIdentifiers` +
+`bans.failClosed` itself.
+
+### Permissions v2 (§44)
+
+| function | purpose |
+|---|---|
+| `Core.Perms.grant(src, perm, scope?, { expiresAt? })` `revoke` `list` `effective(src)` `explain(src, perm)` | grants on top of ACE and the group chain; temporary grants expire by themselves; `explain` says why `has` answered |
+| `Core.Perms.define(perm, { label, description?, category?, default? })` `catalogue()` | plugin permissions; the `default` group gets it once (never again after an owner removed it) |
+| `Core.Perms.groups()` `saveGroup(name, patch, actorSrc?)` `deleteGroup(name, actorSrc?)` `groupExists(name)` | ranked groups in `perm_groups`; an actor needs `core.perms.manage`, edits only groups strictly below its own weight, never sets a weight ≥ its own and only adds perms it holds itself (`rank`, `not_held`) |
+| `Core.Perms.getWeight(src)` `canTarget(actor, target)` | rank: act only on strictly lower weights (console and self always) |
+| `Core.Callback.register(name, schema?, fn, { permission?, cooldownMs? })` | the same gate for RPCs, before the handler; the caller's `await` gets `nil, 'permission'` / `'cooldown'` / … |
+
+Hook `permsChanged (src|nil, what, detail)` — one change can fire it twice (`grants` from player.lua, `grant` from
+perms.lua), so keep listeners idempotent. Core defines `core.perms.manage` (owner), `core.settings.view`,
+`core.audit.view` (admin) and `core.admin.staff` (helper).
+
+### Audit trail (§46)
+
+```lua
+Core.Audit.record({ actor = src, action = 'shop.refund', source = 'api', targets = { targetSrc },
+    changes = { { key = 'bank', old = 100, new = 600 } }, reason = 'double charge' })
+local page = Core.Audit.query({ actionPrefix = 'ban.', limit = 50 })   -- { rows, next }; pass next as `before`
+```
+
+Append-only, newest first (collection `audit`, a lean in-memory index — no scan per query). `record` never yields
+and never throws; `actor` is a src, `0` (console) or `'system'`, a bare number in `targets` is a player src. Filters:
+`action`, `actionPrefix`, `actorAccount`, `target = { type, id }` (a player's rows are also found by `{ type =
+'account', id }`), `resource`, `result`, `from`/`to`, `text`, `limit` (≤ 200), `before`. A filter key that is present
+but unusable matches nothing. Every `Core.Log.audit` line also lands here as `core.<category>`. Retention: settings
+`audit.retentionDays` (90) and `audit.maxRows` (50000; `ban.*`/`sanction.*` rows are exempt and live 4× longer),
+pruned daily at 04:30. Gameplay `Log.audit` categories (money, faction, security, …) live in their own pool,
+`audit.logMaxRows` (20000), capped at 20 rows per category per second, so a busy economy never evicts the admin trail.
+The view permission `core.audit.view` is the consumer's check.
+
+### Bans (§47)
+
+`Core.Bans.add({ target = src | { accountId?, identifiers?, tokens?, name? }, reason, duration = seconds (0 =
+permanent), by = src|0, evidence?, source? }) -> ban, err` collects the online player's identifiers AND hardware
+tokens, flags the account, audits `ban.add` and kicks — the target and every other online player the ban would
+refuse. A player `by` must outrank every account holding a banned identifier and every such online player (else
+`nil, 'rank'`). `remove(banId, by, reason)` revokes (the document stays),
+`get`, `list({ active?, text?, accountId?, limit?, before? })`, `check(identifiers, tokens)`, `forAccount(id)`,
+`sweep()`. `Core.Player.ban` delegates to it. Ban ids are `B<n>`; the reject text reads "You are banned until …
+Reason: … (ban B12)".
+
+An identifier (license, discord, fivem, steam, …) matches a ban on a single overlap. Hardware tokens match on their
+own only when at least `bans.tokenMatches` (default 2, 0 = never) distinct tokens of the connecting player are in the
+same ban. On a refused connection the player's unseen tokens join the ban unless `bans.enrichTokens` is off; unseen
+identifiers join only after an identifier match or ≥ 2 matching tokens (`bans.enrichIdentifiers`), so one shared
+token never spreads a ban to a stranger's license. Raise `tokenMatches` (or set 0) and switch token enrichment off if
+players share hardware (internet cafés, cloud gaming); `hits` / `lastHitAt` on a ban show a spread. While the bans
+cannot be read, connections are refused ("Ban service unavailable") unless `bans.failClosed` is false.
+
+### Sticky states, teleports, accounts (§48)
+
+`Core.Player.setFrozen/setInvincible/setVisible/setControls(src, bool)` are **sticky** for the session: the client
+re-applies them after a new ped, a respawn and every teleport (`getStates(src)` reads them). `setCoords(src, coords,
+heading?, { withVehicle?, fade?, bucket? })` — `withVehicle` takes the car the player drives (riders included),
+`fade = false` skips the black screen, `bucket` switches the routing bucket first (the car follows; its other riders
+only with `moveRiders = true` — after your own rank checks on them); teleports wait up to 3 s for map content at the
+destination. `getAccount(src)` / `getAccountById(id)` return a read-only account view (offline too).
+`setBucket` also tells the client (`core:client:bucketChanged`).
+
+### Target selectors (§49)
+
+`Core.Player.resolveTargets(actorSrc, selector, { max?, allowSelf? }) -> srcs | nil, err, detail` and the
+server-only command param types `target` / `targets` understand:
+
+| selector | means |
+|---|---|
+| `me` `^` | the actor |
+| `12` `$12` · `c:<charId>` | a server id · a character |
+| `r:50` | loaded players within 50 m of the actor's server-side position (≤ 500) |
+| `#admin` · `%mod` | exactly that group · that group's weight or higher |
+| `f:<faction>` | a faction by id, tag or name |
+| `*` · `others` | every loaded player · all but the actor |
+| anything else | a partial name (one exact match wins; several → `ambiguous` with ≤ 10 candidates) |
+
+`,` is a union, `!token` removes (`*,!me`). At most 4 set tokens (`*` `others` `r:` `f:` `#` `%`) and 8 names per
+selector; the union stops at `max` (`too_many`). `{ basic = true }` allows only `me`, `^`, ids, `c:` and names — the
+command params use it for non-staff callers (the rest is `not_allowed`), and a command line with a name or set token
+is throttled to one per 100 ms. Errors: `bad_actor` `bad_selector` `not_allowed` `not_found` `ambiguous` `no_self`
+`no_origin` `bad_radius` `unknown_group` `unknown_faction` `self` `no_match` `too_many`. `@` (the crosshair
+target) is resolved by the admin client and sent as an id. Permission checks on multi-target selectors are the
+caller's job (`Core.Admin` caps them per group).
+
+### Routing buckets (§50)
+
+`Core.Buckets.allocate({ label?, population = false, lockdown = 'strict' })` hands the calling resource a bucket
+from `Config.Buckets.Range` (round robin); `release(b)` (owner only) moves players still inside to bucket 0; `info`,
+`list`. A stopped owner's buckets are released.
+
+### Admin contributions (§51)
+
+Any plugin adds categories, actions, pages and player tabs to the admin system — data plus a server handler, no
+`dependency 'admin'` (without the admin resource they are simply not shown). Core owns the registry, the rights
+snapshot and the ONE dispatch path, so every action gets the same checks, audit row and staff echo.
+
+```lua
+Core.Admin.category({ id = 'shop', label = 'Shop', icon = 'store' })
+Core.Admin.action({
+    id = 'shop.refund', category = 'shop', label = 'Refund', target = 'player', default = 'mod',
+    args = { { name = 'amount', type = 'integer', min = 1, max = 100000, required = true } },
+    reason = 'required', danger = 'confirm', command = 'refund',
+    handler = function(ctx)
+        local target, amount = ctx.targets[1], ctx.args.amount
+        if not Core.Money.add(target, 'bank', amount, 'refund') then return false, 'refund failed' end
+        return true, 'refunded', { changes = { { key = 'bank', old = nil, new = amount } } }
+    end,
+})
+Core.Admin.playerTab({ id = 'shop.orders', label = 'Orders', provider = function(ctx)
+    return { { kind = 'table', columns = { { key = 'id', label = 'Order' } }, rows = ordersOf(ctx.target) } }
+end })
+```
+
+`Admin.run(actor, id, { targets?, args?, reason?, source?, confirm? })` is the only way an action runs: action →
+actor loaded → permission (default `'admin.' .. id`, granted once to `default` = `'admin'`) → duty → cooldown → args
+(Core.Schema) → reason → targets (selector string, id array, `{ netId }`, vector3; self, scope cap
+`Config.Admin.Scope[group]`, hierarchy) → confirm → `admin:before` pipeline → handler → audit → echo → `adminAction`
+hook. Every refusal but the cooldown is audited (`denied`). `command = 'name'` also registers `/name <target> <args…>
+<reason…>`; typing it is its own confirmation. Pages are either the plugin's own UI page (`page = '<plain id>'`,
+opened as a modal) or `provider` blocks (`keyvalue`, `table`, `text`, `stats`, `actions`, `form`); a player tab's
+viewer must be able to target the player unless the tab sets `hierarchy = false`. Duty (`setDuty/isOnDuty`) and staff
+modes (`setMode/getModes`) are session state, **never a state bag**: the player and the on-duty staff are told by
+event (`core:admin:self`, `core:admin:staffState(s)`), the client reads `Core.Admin.getSelf()` /
+`Core.Admin.getStaffStates()` and the hooks `staffSelfChanged` / `staffStateChanged`, the server hook
+`staffModeChanged (src, modes)`. Going off duty turns every mode off. Transport: callbacks `core:admin:snapshot` /
+`run` / `page` / `playerTab` (all staff-only — an action meant for everyone is reached through its chat command or the
+owning plugin's own RPC calling `Admin.run`), client events `core:admin:echo` and `core:admin:snapshotChanged`
+(refetch the snapshot).
+
+### Maps (§52)
+
+Admin-placed world content, permanent or live for events. `Core.Maps` is a trusted server API — the caller (the
+admin plugin's editor) checks its users' permissions.
+
+- Types: `Core.Maps.defineType{ id = 'garage:spot', kind = 'point', fields = { … }, preview = { … } }` (owner-tracked;
+  built-ins `core:prop|physprop|vehicle|ped|marker|hide|point|zone`), `Core.Maps.types()`,
+  `Core.Maps.setModelValidator(fn(kind, model) -> ok, info)` (the admin plugin installs the catalogue gate).
+- Maps: `create({ name, mode = 'draft'|'live', targetBucket?, meta?, expiresAt?, limits? }, actor)`, `get`, `list`,
+  `update`, `delete`, `setActive(id, on, actor)`, `elements(id)`.
+- Editing: `apply(id, ops, actor, { source?, expect? })` → `true, applied` | `nil, err, detail` (all-or-nothing, ops
+  `create` / `update` / `delete`, plus the `restore` ops undo uses), `invert(applied)` → `ops, expect` (undo; rebase
+  the next step's expects on the undo's own `applied`), `clear(id, actor)`, `journal(id, { limit?, before?, author? })`.
+  Deleting an element another one still references fails `referenced`.
+- Drafts: `openDraft(id, actor)` → an editor bucket where the draft is live, `closeDraft(id)`,
+  `publish(id, actor, note?)`, `versions(id)`, `rollback(id, version, actor)`. The world sees the published version
+  while the map is active; live maps change the world immediately in `targetBucket`; `expiresAt` deactivates them.
+- Gameplay: `Core.Maps.on('garage:spot', fn(event, record, mapId))` + `Core.Maps.records('garage:spot')` (seed with
+  `records`, events are not replayed); `Core.Hooks.register('maps:beforeApply', fn(payload) -> false, reason)` vetoes
+  an apply.
+- Limits: settings `maps.limits.*` (elements 3000, perModel 300, uniqueModels 200, networked 20, networkedTotal 200,
+  opsPerApply 200), `maps.journalMax` (5000 rows) and `maps.journalMaxOps` (20000 stored operations) per map; per map
+  via `update(id, { limits })`. A `targetBucket` inside `Config.Buckets.Range` is refused.
+- Vehicles, peds and physics props are server entities (state bags `mapEl`, `mapCfg`); a move, rotation or field
+  change updates them in place (same entity and net id; the pose is applied by the client that owns the entity),
+  and a vehicle without a `color` gets a paint picked from its id, so it looks the same after every re-creation.
+  A model change, a destroyed entity or nobody near re-creates it; `respawn(id)` re-creates destroyed ones. Everything else streams to clients per region. Client side: `isAreaReady(coords, radius?)`,
+  `waitAreaReady(coords, timeoutMs?)`, `handleOf(uid)`, `uidOf(entity)`, `hold(uid)` / `release(uid)` (the runtime
+  leaves a dragged element alone), `setEditorView(on)`, `stats()`.
+- Errors: `unavailable`, `not_found`, `input`, `name`, `mode`, `targetBucket`, `meta`, `expiresAt`, `limits`,
+  `active`, `ops`, `too_many_ops`, `op`, `source`, `expect`, `conflict`, `type`, `position`, `bounds`, `rotation`,
+  `fields`, `layer`, `model`, `no_validator`, `id`, `exists`, `restore`, `migrate`, `ref`, `referenced`, `parents`,
+  `limit`, `validate`, `hook`, `db`, `bucket`, `note`, `version`.
+
+**Map content streams by region, not by broadcast (§52.3).** Published and live content is cut into
+`Config.Maps.RegionSize` (512 m) regions per routing bucket. A client asks for the 3×3 block around its camera
+through `core:maps:window` (≈ one small callback per 512 m of travel, 250 ms cooldown) and gets only the regions
+whose version it does not hold, as bandwidth-limited latent events (`Config.Maps.LatentBps`); each region is
+JSON-encoded once per version however many clients fetch it. Each player also has a pack budget
+(`PackBudgetBytes`, 2 MB, refilled over `PackBudgetWindowMs`, 10 s): a pack that does not fit is withheld and
+fetched again a moment later, so no client can make the server stream unbounded bytes. An edit reaches only the
+players holding that region: changes are coalesced per server tick into one delta (≤ `PushOpsMax` ops) or one
+"stale" notice per region, sent with `Core.Net.emitMany`. The bucket is always the one the server reads. Data kinds
+and editor helpers (points, zones, placeholders) reach editors only — Admin mode `editor` or an open draft's bucket —
+and losing that role downgrades a subscriber at once. Nothing
+loops over players and nothing runs while nobody edits. `Core.MapRegions` and `Core.MapsRuntime` are internal
+(blocked in the export). Map content missing on a client? `Core.Maps.stats()` there: `regions` / `bucket` (did the
+window answer?), `failed` (models that are not in the game files or did not load in 10 s are logged once),
+`capped` (`MaxLocalObjects` reached).
+
+### In-game checklist (admin platform — not run yet)
+
+1. **Input modes:** a page registered `input = 'game'` stays drawn with no cursor, the player moves and looks, `T`
+   chat works; `setInput(id, 'ui')` brings the cursor, `'game'` gives the game back. `'mixed'`: cursor + WASD.
+   `'look'` (experimental): note what happens. A `ui` modal over a `game` page takes the cursor and gives it back.
+2. **Escape / hide:** `escape = 'event'` → Esc does not close the page and `Core.UI.on(id, 'escape')` fires (a kit
+   popover inside still closes first). `onHide = 'suspend'` → the pause menu hides the page and frees the cursor;
+   leaving it restores page and mode, `suspend` / `resume` fire once each.
+3. **Raycasts:** under a scripted camera `fromRenderedCamera(50)` hits what the camera sees; `fromScreen(0.5, 0.5)`
+   hits the centre; `worldToScreen` of the centred ped ≈ 0.5 / 0.5.
+4. **Settings:** `Core.Settings.set` of a `replicate = true` key from the console updates `Core.Settings.get` on a
+   client within ~1 s and fires `settingChanged` once; `restart core` keeps the override.
+5. **Bans:** `Core.Player.ban(src, 'test', 60)` → kicked with "You are banned until … (ban B<n>)"; reconnecting shows
+   the same text and `hits` counts up; after 60 s the player gets in and `accounts.banned` is false again. A second
+   Rockstar account on the banned PC is refused and the ban now lists its license; `Core.Bans.remove('B<n>', 0,
+   'appeal')` lets it in. `bans.tokenMatches = 0` lets a new license on the same hardware in. A mod banning an
+   admin's alt (shared identifier) is refused `rank`.
+6. **Audit:** `Core.Audit.query({ actionPrefix = 'ban.' })` lists `ban.add` / `ban.remove`; a `Core.Log.audit` line
+   from any resource shows up as `core.<category>`; with `core_webhook_audit` set, one embed per line, no duplicates.
+7. **Sticky states and teleports:** `setFrozen(src, true)` survives a respawn and a teleport; `setVisible(false)`
+   survives a model change; `setCoords(src, c, h, { withVehicle = true })` as a driver with a passenger moves both;
+   `{ fade = false }` shows no black screen; `{ bucket = N }` switches the bucket.
+8. **Admin dispatch:** an action with `command` runs from chat with a selector (`/refund bob 100 double charge`); a
+   refused run writes a `denied` audit row; staff on duty get the echo; noclip/editor/spectate ignore `E`. A second
+   player's client never learns who is on duty or vanished (no `duty`/`staffModes` state bag); an on-duty admin's
+   panel lists the on-duty staff.
+10. **Legacy commands:** off duty, `/kick` answers "You must be on duty…"; on duty it works, writes `core.cmd.kick`
+   and echoes; with `Config.Admin.LegacyCommands = false` (and `restart core`) `/kick` does not exist.
+9. **Maps:** a live map's prop appears for everyone in its bucket while an admin places it; a hide over a world bench
+   hides it and deleting the hide brings it back; a teleport onto an event platform lands on it (the 3 s wait);
+   resmon while flying through ≥ 1000 props stays within budget; a ped placed before a client joined gets its
+   `mapCfg` (scenario, invincible) once that client controls it.

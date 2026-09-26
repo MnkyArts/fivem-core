@@ -103,14 +103,35 @@ export interface NuiHandle<Rpc extends object = RpcMap, Out extends object = Eve
   handle(name: string, fn: (data: unknown) => unknown | Promise<unknown>): Off
 }
 
+/**
+ * How a page takes input (DESIGN §41) — set by Lua (`registerPage({ input })`, `Core.UI.setInput`):
+ *   'ui'     cursor over the page, the game gets nothing (the default)
+ *   'mixed'  cursor over the page AND the game receives input (`keepInput = true`)
+ *   'look'   no cursor, the game receives input, the page still gets keyboard events
+ *   'game'   the page holds no focus at all: it stays open and rendered, clicks pass through it
+ */
+export type PageInputMode = 'ui' | 'mixed' | 'look' | 'game'
+
+/**
+ * Page events the framework itself sends (DESIGN §41), on top of a page's own `In` map:
+ *   'escape'   Escape reached a page registered with `escape = 'event'` — it was NOT closed
+ *   'suspend'  the shell was hidden (§31) and the page, registered with `onHide = 'suspend'`, stays mounted
+ *   'resume'   the shell is visible again and the page holds its focus again
+ */
+export type PageSystemEvent = 'escape' | 'suspend' | 'resume'
+
 /** One page of this plugin: its props, its open state and its own event channel. */
 export interface PageHandle<Props extends object = Record<string, unknown>, Out extends object = EventMap, In extends object = EventMap> {
   readonly id: string
   /** Stable reactive object for the life of the shell (DESIGN §7.4) — never replaced, only mutated. */
   readonly props: Props
   readonly isOpen: boolean
+  /** §41: the page's current input mode. Reactive, read-only — Lua decides it. */
+  readonly input: PageInputMode
   emit<K extends keyof Out & string>(event: K, data?: Out[K]): void
   on<K extends keyof In & string>(event: K, fn: (data: In[K]) => void): Off
+  /** §41: `escape` / `suspend` / `resume`, whatever the page's own `In` map says. */
+  on(event: PageSystemEvent, fn: (data: Record<string, never>) => void): Off
   close(): void
 }
 

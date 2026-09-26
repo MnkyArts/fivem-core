@@ -13,6 +13,9 @@
         Chat.registerChannel(name, { command, permission?, format?, global?, staffOnly?, color?,
                                      range?, description?, proximity?, fade? })
         Chat.setFilter(fn(src, channel, msg) -> bool)   -- return false to veto a message
+        Core.Hooks 'chat:beforeMessage' ({ src, channel, text })  -- any resource may veto a player's
+                                                   message (`return false, reason`; the sender is told the
+                                                   reason); runs after the filter, on every player path
         Chat.clear(src)                            -- wipe one player's CEF feed
         Chat.suggestions(src)                      -- table for the TAB completer (pushed on playerLoaded)
 
@@ -27,7 +30,10 @@
     Every proximity route (sendNear, the dispatch proximity branch, /s) asks Core.PlayerGrid
     (§22.1) for the candidates around the sender and then tests the exact distance with live
     coordinates on those only — at 2,000 players a full loop per chat line was ~6,000 natives (§9).
-    The global, staff and faction routes are unchanged: they genuinely concern a whole set.
+    The global, staff and faction routes genuinely concern a whole set: each packs its line ONCE
+    (Core.Net.emitMany) — a player-triggered line is never a -1 broadcast — and the staff route reads
+    Core.Admin's cached staff set (§51) instead of asking Perms.has for every player. Join/leave lines
+    follow Config.Chat.JoinLeave: 'staff' (default), 'all' (a -1 broadcast per connect/drop) or 'off'.
 
     Slash input uses CLIENT ExecuteCommand (without the slash), preserving the player's
     identity and the server command wrapper's checks. Never execute as server console.
@@ -293,18 +299,34 @@ function Chat.sendNear(coords, range, message, opts)
     return sent
 end
 
---- Everyone holding `perm` (staff channels). Returns how many were reached.
-local function sendToPerm(perm, line)
-    local players = Core.Player.getPlayers()
-    local sent = 0
-    for i = 1, #players do
-        local target = players[i]
-        if Core.Perms.has(target, perm) then
-            sendLine(target, line)
-            sent = sent + 1
-        end
+--- One line to many recipients, packed once (Core.Net.emitMany) — global, staff and faction routes.
+local function sendMany(targets, line)
+    return Core.Net.emitMany(targets, EVENT, { action = 'add', line = line })
+end
+
+--- The staff that hold `perm` (every staff member when nil): Core.Admin's cached staff set (§51, the holders of
+--- Config.Admin.StaffPerm), so a staff line never walks every player. Only a VM without core's admin API (an
+--- offline suite that did not load server/adminapi.lua) falls back to the loaded players, then with a required perm.
+local function staffWith(perm, except)
+    local admin = rawget(Core, 'Admin')
+    local list
+    if type(admin) == 'table' and type(admin.staff) == 'function' then
+        list = admin.staff() or {}
+    else
+        list = Core.Player.getPlayers()
+        perm = perm or STAFF_PERM
     end
-    return sent
+    local out = {}
+    for i = 1, #list do
+        local target = list[i]
+        if target ~= except and (not perm or Core.Perms.has(target, perm)) then out[#out + 1] = target end
+    end
+    return out
+end
+
+--- Everyone of the staff holding `perm` (staff channels). Returns how many were reached.
+local function sendToPerm(perm, line)
+    return sendMany(staffWith(perm), line)
 end
 
 --- Faction channel: every ONLINE member of the sender's faction, sender included.
@@ -315,15 +337,18 @@ local function sendToFaction(src, line)
     local id = summary and summary.id or nil
     if type(id) ~= 'string' or id == '' or type(factions.getMembers) ~= 'function' then return false end
     local members = factions.getMembers(id)
+    local targets = {}
     for i = 1, #members do
         local target = members[i] and members[i].online or nil
-        if target then sendLine(target, line) end
+        if target then targets[#targets + 1] = target end
     end
+    sendMany(targets, line)
     return true
 end
 
 --------------------------------------------------------------------------------
--- Pipeline: cooldown -> sanitize -> filter veto -> hook -> format -> route
+-- Pipeline: sanitize -> channel permission -> cooldown -> filter veto -> chat:beforeMessage hooks
+--           -> chatMessage observer hook -> format -> route
 --------------------------------------------------------------------------------
 
 --- Per-src throttle (Config.Chat.CooldownMs). Cleared in playerDropped; a rejected message never
@@ -338,16 +363,38 @@ local function onCooldown(src)
     return false
 end
 
---- The Core.Chat.setFilter veto. A filter is plugin code: its error must not take the message pipeline
---- (and with it the whole chat) down, so it runs in pcall and a failing filter never blocks a message.
-local function vetoed(src, channel, text)
-    if not filter then return false end
-    local ok, allowed = pcall(filter, src, channel, text)
-    if not ok then
-        Core.Log.warn('chat: filter failed (%s)', tostring(allowed))
-        return false
+-- Core.Hooks' own refusal codes (shared/hooks.lua): never shown to a player as they are.
+local HOOK_CODES <const> = { veto = true, reentrant = true, invalid_name = true, invalid_payload = true }
+
+--- What the sender reads when `chat:beforeMessage` refused the message: the veto's reason (e.g. the
+--- admin plugin's "You are muted …"), or a generic line for a bare veto or a failing hook.
+local function refusalText(reason)
+    if type(reason) ~= 'string' or reason == '' or HOOK_CODES[reason]
+        or reason:find('^callback_') or reason:find('^filter_') then
+        return 'Your message was not sent.'
     end
-    return allowed == false
+    return reason
+end
+
+--- The Core.Chat.setFilter veto, then the `chat:beforeMessage` hook pipeline (Core.Hooks, §40). A filter
+--- is plugin code: its error must not take the message pipeline (and with it the whole chat) down, so it
+--- runs in pcall and a failing filter never blocks a message. Hooks fail closed (their contract); a
+--- refusal tells the sender why.
+local function vetoed(src, channel, text)
+    if filter then
+        local ok, allowed = pcall(filter, src, channel, text)
+        if not ok then
+            Core.Log.warn('chat: filter failed (%s)', tostring(allowed))
+        elseif allowed == false then
+            return true
+        end
+    end
+    local hooks = rawget(Core, 'Hooks')
+    if type(hooks) ~= 'table' or type(hooks.run) ~= 'function' then return false end
+    local allowed, reason = hooks.run('chat:beforeMessage', { src = src, channel = channel, text = text })
+    if allowed then return false end
+    Chat.send(src, refusalText(reason), { color = SYSTEM_COLOR, kind = 'system' })
+    return true
 end
 
 --- Channel permission check: staffOnly channels need `permission` (default core.mod);
@@ -369,9 +416,10 @@ end
 local function dispatch(src, channel, message, def)
     local text = cleanText(message, maxLength())
     if not text then return false end
+    -- permission first (AGENTS §3): a refused channel never reaches the cooldown, filters or veto hooks
+    if not mayUse(src, def) then return false end
     if onCooldown(src) then return false end
     if vetoed(src, channel, text) then return false end
-    if not mayUse(src, def) then return false end
     Core.emitHook('chatMessage', src, channel, text)
 
     local coords = Core.Player.getCoords(src)
@@ -391,9 +439,9 @@ local function dispatch(src, channel, message, def)
     elseif def.faction then
         sendToFaction(src, line)
     elseif def.global then
+        -- a player-triggered line is never a -1 broadcast (AGENTS §3 Scale): the loaded players, packed once
         line.opacity = 1.0
-        local players = Core.Player.getPlayers()
-        for i = 1, #players do sendLine(players[i], line) end
+        sendMany(Core.Player.getPlayers(), line)
     else
         if not coords then return false end
         -- proximity: EVERY recipient gets their own opacity (§23). Delivery reaches out to
@@ -765,21 +813,33 @@ Core.Commands.register('say', {
     end
 end)
 
+local JOIN_LEAVE <const> = { staff = true, all = true, off = true }
+
+--- Join/leave lines (the stock chat broadcast them; core owns them now). Config.Chat.JoinLeave: 'staff' (default —
+--- the staff set only, packed once), 'all' (one -1 broadcast per connect and drop: small servers only), 'off'.
+local function joinLeave(src, format, color)
+    local mode = setting('JoinLeave', 'staff')
+    if not JOIN_LEAVE[mode] then mode = 'staff' end
+    if mode == 'off' then return end
+    local name = GetPlayerName(src)
+    if type(name) ~= 'string' or name == '' then return end
+    local text = format:format(Utils.sanitize(name, MAX_NAME))
+    if mode == 'all' then
+        Chat.broadcast(text, { color = color })
+        return
+    end
+    local line = buildLine(cleanText(text, MAX_OUTPUT), { color = color, channel = 'system', kind = 'system', opacity = 1.0 })
+    if line then sendMany(staffWith(nil, src), line) end
+end
+
 AddEventHandler('playerDropped', function()
     local src = source
     if src == nil then return end
     lastMessage[src] = nil
-    local name = GetPlayerName(src)
-    if type(name) == 'string' and name ~= '' then
-        Chat.broadcast(('* %s left'):format(Utils.sanitize(name, MAX_NAME)), { color = { 200, 170, 140 } })
-    end
+    joinLeave(src, '* %s left', { 200, 170, 140 })
 end)
 
---- Join lines (the stock chat sent these; core owns them now).
 AddEventHandler('playerJoining', function()
     local src = source
-    local name = GetPlayerName(src)
-    if type(name) == 'string' and name ~= '' then
-        Chat.broadcast(('* %s joined'):format(Utils.sanitize(name, MAX_NAME)), { color = { 150, 220, 150 } })
-    end
+    joinLeave(src, '* %s joined', { 150, 220, 150 })
 end)

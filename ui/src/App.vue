@@ -16,8 +16,11 @@ import Menu from './shell/Menu.vue'
 import InputDialog from './shell/InputDialog.vue'
 import AlertDialog from './shell/AlertDialog.vue'
 import SkillCheck from './shell/SkillCheck.vue'
-import { defineAsyncComponent } from 'vue'
+import { computed, defineAsyncComponent } from 'vue'
 import { store } from './store.js'
+
+// §54: `shell:hud` — core's own HUD widgets step aside while a hideHud reason is held.
+const hudHidden = computed(() => store.hudHide.hidden)
 
 // §38.14: the inspector is a lazy chunk. The `import()` is only issued the first time
 // `store.dev.inspector` becomes true (`/uiinspect` -> `inspector:toggle`), so a production shell
@@ -34,19 +37,29 @@ const Inspector = defineAsyncComponent(() => import('./shell/Inspector.vue'))
     :class="{ 'is-hidden': !store.shell.visible }"
     :aria-hidden="store.shell.visible ? null : 'true'"
   >
+    <!-- §54: `Core.UI.hideHud` (an editor, a photo mode) hides core's HUD widgets — the world
+         prompts, the vitals strip and the stat bars — and nothing else: toasts, the text UI of
+         the holder, pages and modals stay. `display: contents` wrappers, so the layout of what
+         they hold is untouched; `v-show`, so nothing unmounts and every value keeps updating. -->
     <!-- world layer: the §6.7 interaction dots (z 20 — under the HUD rail, prompts and hints) -->
-    <WorldPrompts />
+    <div v-show="!hudHidden" class="contents" data-core-hud="worldprompts">
+      <WorldPrompts />
+    </div>
 
     <!-- §39.4: the vitals HUD is no longer a rail plate. It is a strip of its own, placed
          against the minimap (or a screen corner) by `hud.anchor` and sized by
          `--core-hud-unit`, so it carries its own `position: fixed` and sits under the rail's
          z 40 — a toast that grows down must never end up behind it. -->
-    <Hud />
+    <div v-show="!hudHidden" class="contents" data-core-hud="vitals">
+      <Hud />
+    </div>
 
     <!-- top-right rail: the stat bars that did NOT claim a vital slot, then the notification
          stack (z 40). With the two defs core ships the plate renders nothing. -->
     <div class="rail-tr pointer-events-none absolute top-4 right-4 z-40 flex flex-col items-end gap-2.5">
-      <StatsBars />
+      <div v-show="!hudHidden" class="contents" data-core-hud="stats">
+        <StatsBars />
+      </div>
       <Notifications />
     </div>
 

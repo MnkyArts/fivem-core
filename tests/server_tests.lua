@@ -48,6 +48,23 @@ local function eq(actual, expected, label)
         ('expected %s, got %s'):format(show(expected), show(actual)))
 end
 
+--- Array equality, order included.
+local function same(actual, expected, label)
+    local ok = type(actual) == 'table' and #actual == #expected
+    if ok then
+        for i = 1, #expected do
+            if actual[i] ~= expected[i] then ok = false end
+        end
+    end
+    local function list(t)
+        if type(t) ~= 'table' then return tostring(t) end
+        local parts = {}
+        for i = 1, #t do parts[i] = show(t[i]) end
+        return '{' .. table.concat(parts, ',') .. '}'
+    end
+    return check(ok, label, ('expected %s, got %s'):format(list(expected), list(actual)))
+end
+
 --- The error of a `pcall`ed API that returns `value, err` — second return value only.
 local function errOf(...)
     return (select(2, ...))
@@ -504,6 +521,9 @@ local function suitePlayer()
 
     stubs.dropped = {}
     stubs.osTime = 1000000
+    -- this block is the pre-§47 fallback path (no Core.Bans); suitePlayerAdmin covers the delegation
+    local realBans = rawget(Core, 'Bans')
+    Core.Bans = nil
     eq(P.ban(44, 'x'), false, 'ban refuses an unconnected src')
     eq(P.ban(3, 'cheating', 3600, 'admin'), true, 'ban writes the record and drops')
     local ban = DB.findOne('bans', { license = 'license:ghost' })
@@ -519,6 +539,7 @@ local function suitePlayer()
     check((stubs.dropped[2].reason or ''):find('permanently banned') ~= nil, 'the drop message says permanent')
     eq(P.ban(5, 'again', -5), true, 'a negative duration falls back to permanent')
     stubs.osTime = nil
+    Core.Bans = realBans
 
     -- 9. the rest of the per-session API
     eq(P.getBucket(3), 0, 'a session starts in bucket 0')
@@ -544,6 +565,632 @@ local function suitePlayer()
     eq(#seen, 2, 'forEach visits every session')
     eq(#P.getPlayers(), 2, 'getPlayers lists the loaded sessions')
     eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
+end
+
+--- Runs the playerConnecting deferral for `src` to its end; returns { done, reason, updates }.
+local function connecting(env, src, license)
+    stubs.identifiers[src] = license and { license = license } or {}
+    local result = { updates = 0 }
+    local deferrals = {
+        defer = function() end,
+        update = function() result.updates = result.updates + 1 end,
+        done = function(reason) result.done, result.reason = true, reason end,
+    }
+    env.CreateThread(function()
+        stubs.triggerOn(env, 'playerConnecting', src, 'Name', function() end, deferrals)
+    end)
+    stubs.tick(10)
+    return result
+end
+
+--- DESIGN §47 (connect path, Player.ban delegation) and §48 (sticky states, setCoords opts, the
+--- account reader, bucketChanged) — the server/player.lua half of the admin additions.
+local function suitePlayerAdmin()
+    suite('player admin')
+    stubs.resetServer()
+    local env, Core = newServer()
+    local P, DB = Core.Player, Core.DB
+    local realBans = rawget(Core, 'Bans')
+    Core.Bans = nil
+
+    -- 1. connect path without Core.Bans: the license lookup reads both ban shapes
+    stubs.osTime = 2000000
+    local oldId = DB.create('bans', { license = 'license:old', reason = 'old shape', ['until'] = 0 })
+    DB.create('bans', { identifiers = { 'discord:1', 'license:new' }, reason = 'new shape',
+        expiresAt = 2000000 + 600, createdAt = 1 })
+    DB.create('bans', { identifiers = { 'license:revoked' }, reason = 'r', expiresAt = 0,
+        revoked = { by = { name = 'x' }, at = 5, reason = 'appeal' } })
+    DB.create('bans', { license = 'license:expired', reason = 'e', ['until'] = 1999999 })
+    local res = connecting(env, 30, 'license:old')
+    eq(res.done, true, 'the deferral finishes')
+    check((res.reason or ''):find('permanently banned', 1, true) ~= nil, 'a legacy permanent ban rejects')
+    check((res.reason or ''):find('old shape', 1, true) ~= nil, 'the reject text carries the reason')
+    check((res.reason or ''):find('(ban ' .. oldId .. ')', 1, true) ~= nil, '... and the ban id')
+    res = connecting(env, 31, 'license:new')
+    check((res.reason or ''):find('banned until', 1, true) ~= nil, 'a §47-shape ban on the license rejects with its expiry')
+    eq(connecting(env, 32, 'license:revoked').reason, nil, 'a revoked ban lets the player in')
+    eq(connecting(env, 33, 'license:expired').reason, nil, 'an expired ban lets the player in')
+    res = connecting(env, 34, 'license:clean')
+    eq(res.done, true, 'a clean license passes')
+    eq(res.reason, nil, '... with done() and no reason')
+    check((connecting(env, 35, nil).reason or ''):find('No license', 1, true) ~= nil, 'no license identifier is refused first')
+
+    -- 2. connect path with Core.Bans.checkConnecting (§47)
+    local asked = {}
+    Core.Bans = { checkConnecting = function(src)
+        asked[#asked + 1] = src
+        if src == 40 then return { id = 'b40', reason = 'aimbot', expiresAt = 0 }, 'custom text (ban b40)' end
+        if src == 41 then return { id = 'b41', reason = 'wallhack', expiresAt = 0 } end
+        if src == 42 then error('index exploded') end
+        return nil
+    end }
+    eq(connecting(env, 40, 'license:a').reason, 'custom text (ban b40)', "Bans' reject text is used verbatim")
+    eq(asked[1], 40, 'checkConnecting got the connecting src')
+    res = connecting(env, 41, 'license:b')
+    check((res.reason or ''):find('wallhack', 1, true) and (res.reason or ''):find('(ban b41)', 1, true),
+        'a ban without text gets reason + id from player.lua')
+    eq(connecting(env, 43, 'license:old').reason, nil, 'with Core.Bans the old license lookup is not consulted')
+    res = connecting(env, 42, 'license:old')
+    check((res.reason or ''):find('old shape', 1, true) ~= nil, 'a failing checkConnecting falls back to the license check')
+    check(printed('using the license check') ~= nil, '... and says so')
+
+    -- M4: Bans answering `nil, 'unavailable'`, and a ban list that cannot be read at all
+    Core.Bans = { checkConnecting = function() return nil, 'unavailable' end }
+    check((connecting(env, 44, 'license:old').reason or ''):find('old shape', 1, true) ~= nil,
+        "'unavailable' falls back to the license lookup")
+    eq(connecting(env, 45, 'license:clean2').reason, nil, '... which admits a clean license while bans is readable')
+    local realDegraded = DB.isDegraded
+    DB.isDegraded = function(collection) return collection == 'bans' end
+    eq(connecting(env, 46, 'license:clean3').reason, 'Ban service unavailable, please try again in a minute.',
+        'an unreadable ban list refuses the connection (bans.failClosed defaults to true)')
+    local realSettings = rawget(Core, 'Settings')
+    Core.Settings = { get = function(key) if key == 'bans.failClosed' then return false end end }
+    eq(connecting(env, 47, 'license:clean4').reason, nil, 'bans.failClosed = false admits instead')
+    Core.Settings = realSettings
+    DB.isDegraded = realDegraded
+    local realFindOne = DB.findOne
+    DB.findOne = function() error('adapter down') end
+    eq(connecting(env, 48, 'license:clean5').reason, 'Ban service unavailable, please try again in a minute.',
+        'a lookup that throws fails closed too')
+    DB.findOne = realFindOne
+    clearFailures()
+    stubs.osTime = nil
+
+    -- §47: the engine PREFIX-matches the identifier type — ask 'license:', never take 'license2:'
+    local realById = env.GetPlayerIdentifierByType
+    env.GetPlayerIdentifierByType = function(src, kind)
+        local ordered = { 'license2:second', 'license:real', 'fivem:9' }
+        if tonumber(src) ~= 49 then return realById(src, kind) end
+        for i = 1, #ordered do
+            if ordered[i]:sub(1, #kind) == kind then return ordered[i] end
+        end
+        return nil
+    end
+    stubs.connectPlayer(env, 49, { license = 'license:ignored', name = 'Prefix' })
+    eq(P.getLicense(49), 'license:real', "the session license is the 'license:' one, not license2")
+    eq(P.getAccount(49).identifiers.fivem, 'fivem:9', 'the other identifier types are asked with the colon too')
+    env.GetPlayerIdentifierByType = realById
+    stubs.dropPlayer(env, 49)
+
+    -- 3. Player.ban delegates to Core.Bans.add (§47)
+    stubs.connectPlayer(env, 1, { license = 'license:p1', name = 'Ada', coords = vector3(10.0, 0.0, 0.0) })
+    local added = {}
+    Core.Bans = { add = function(opts)
+        added[#added + 1] = opts
+        if opts.reason == 'refuse' then return nil, 'nope' end
+        return { id = 'ban' .. #added }
+    end }
+    stubs.dropped = {}
+    eq(P.ban(1, 'cheating', 3600, 7), true, 'ban delegates and reports success')
+    eq(added[1].target, 1, 'Bans.add gets the online src as target')
+    eq(added[1].reason, 'cheating', '... the reason')
+    eq(added[1].duration, 3600, '... the duration in seconds')
+    eq(added[1].by, 7, '... and who issued it')
+    eq(#stubs.dropped, 0, 'player.lua leaves the kick to Bans.add')
+    eq(DB.count('bans'), 4, 'no legacy ban document was written')
+    P.ban(1, 'forever')
+    eq(added[2].duration, 0, 'no seconds = permanent (duration 0)')
+    P.ban(1, 'neg', -5)
+    eq(added[3].duration, 0, 'a negative duration is permanent too')
+    eq(P.ban(1, 'refuse'), false, 'a refused Bans.add reports false')
+    check(printed('Bans.add refused') ~= nil, '... and is logged')
+    eq(P.ban(99, 'x'), false, 'an unconnected src never reaches Bans.add')
+    eq(#added, 4, 'the refused call was the last one')
+    Core.Bans = realBans
+
+    -- 4. sticky states live in the session and reach the client (§48)
+    local states = P.getStates(1)
+    eq(states.frozen, false, 'a new session is not frozen')
+    eq(states.visible, true, '... is visible')
+    eq(states.controls, true, '... has controls')
+    eq(states.invincible, false, '... and is not invincible')
+    stubs.clear()
+    eq(P.setFrozen(1, true), true, 'setFrozen')
+    eq(P.getStates(1).frozen, true, 'getStates reads the sticky value back')
+    local sent = lastSent('core:client:playerState')
+    eq(sent and sent.target, 1, 'the state goes to that client alone')
+    eq(sent and sent.args[1].frozen, true, '... carrying only the changed key')
+    eq(sent and sent.args[1].visible, nil, '... and nothing else')
+    eq(P.setVisible(1, false), true, 'setVisible')
+    eq(P.setInvincible(1, true), true, 'setInvincible')
+    eq(P.setControls(1, false), true, 'setControls')
+    states = P.getStates(1)
+    eq(states.visible == false and states.invincible and states.controls == false, true, 'all four are stored')
+    states.frozen = false
+    eq(P.getStates(1).frozen, true, 'getStates hands out a copy')
+    eq(P.setFrozen(1, 'yes'), false, 'a non-boolean state is refused')
+    eq(P.getStates(1).frozen, true, '... and changes nothing')
+    eq(P.setFrozen(99, true), false, 'no session, no state')
+    eq(P.getStates(99), nil, 'getStates without a session is nil')
+    stubs.clear()
+    env.CreateThread(function() stubs.triggerOn(env, 'core:server:requestLoad', 1) end)
+    local payload = lastSent('core:client:loaded').args[1]
+    eq(payload.states and payload.states.frozen, true, 'the loaded payload carries the sticky states')
+    eq(payload.states and payload.states.visible, false, '... every one of them')
+    stubs.tick(1100)
+    P.setFrozen(1, false)
+    stubs.clear()
+    env.CreateThread(function() stubs.triggerOn(env, 'core:server:requestLoad', 1) end)
+    eq(lastSent('core:client:loaded').args[1].states.frozen, false, 'a state change invalidates the cached payload')
+
+    -- 5. setBucket tells the client (§48, for the §52 map runtime)
+    stubs.clear()
+    eq(P.setBucket(1, 12), true, 'setBucket')
+    sent = lastSent('core:client:bucketChanged')
+    eq(sent and sent.target, 1, 'core:client:bucketChanged goes to that player')
+    eq(sent and sent.args[1], 12, '... with the new bucket')
+    P.setBucket(1, 0)
+
+    -- 6. setCoords opts (§48)
+    stubs.loadFile(env, 'server/getters.lua')   -- Player.getInVehicle, for the riders of a bucket move
+    stubs.clear()
+    eq(P.setCoords(1, vector3(1.0, 2.0, 3.0), 90.0), true, 'setCoords without opts')
+    sent = lastSent('core:client:teleport')
+    eq(sent.args[3], nil, 'a plain faded teleport sends no opts table')
+    eq(P.setCoords(1, vector3(1.0, 2.0, 3.0), 90.0, { fade = false }), true, 'fade = false')
+    sent = lastSent('core:client:teleport')
+    eq(sent.args[3] and sent.args[3].fade, false, 'the client is told to skip the fade')
+    eq(sent.args[3] and sent.args[3].withVehicle, false, '... and not to take a car')
+    stubs.clear()
+    eq(P.setCoords(1, vector3(1.0, 2.0, 3.0), nil, { withVehicle = true }), true, 'withVehicle while on foot')
+    eq(lastSent('core:client:teleport').args[3], nil, 'on foot there is no car to take along')
+    eq(P.setCoords(1, vector3(1.0, 2.0, 3.0), nil, 'x'), false, 'opts must be a table')
+    eq(P.setCoords(1, vector3(1.0, 2.0, 3.0), nil, { bucket = -3 }), false, 'a bad bucket refuses the teleport')
+    eq(P.setCoords(1, vector3(1.0, 2.0, 3.0), nil, { bucket = 1.5 }), false, 'so does a fractional one')
+    eq(lastSent('core:client:bucketChanged'), nil, '... before anything moved')
+
+    -- the driver of a car with a second player in it
+    stubs.connectPlayer(env, 2, { license = 'license:p2', name = 'Bo' })
+    local car = stubs.newEntity(2, {})
+    local ped1, ped2 = stubs.peds[1], stubs.peds[2]
+    stubs.pedVehicle[ped1], stubs.pedVehicle[ped2] = car, car
+    stubs.vehicleSeats[car] = { [-1] = ped1, [0] = ped2 }
+    stubs.clear()
+    eq(P.setCoords(1, vector3(50.0, 60.0, 70.0), 180.0, { withVehicle = true, bucket = 44 }), true,
+        'a driver teleports with the car into another bucket')
+    sent = lastSent('core:client:teleport')
+    eq(sent.args[3] and sent.args[3].withVehicle, true, 'the driver is told to move the car')
+    eq(sent.args[3] and sent.args[3].fade, true, '... faded')
+    eq(stubs.buckets[1], 44, 'the driver changed bucket')
+    eq(stubs.entities[car].bucket, 44, 'the car went along')
+    eq(stubs.buckets[2], nil, 'the passenger stays unless the caller asks (moveRiders, R2-13)')
+    eq(P.setCoords(1, vector3(50.0, 60.0, 70.0), 180.0, { withVehicle = true, bucket = 45, moveRiders = true }), true,
+        'moveRiders = true')
+    eq(stubs.buckets[2], 45, '... takes the passenger along')
+    eq(stubs.buckets[1], 45, '... and the driver')
+    eq(P.getData(1, 'position').x, 50.0, 'the stored position followed')
+    local order = {}
+    for i = 1, #stubs.sent do order[#order + 1] = stubs.sent[i].target .. ':' .. stubs.sent[i].name end
+    local joined = table.concat(order, ' ')
+    check(joined:find('1:core:client:bucketChanged', 1, true) < joined:find('1:core:client:teleport', 1, true),
+        'the bucket changes before the teleport', joined)
+    stubs.clear()
+    P.setCoords(2, vector3(0.0, 0.0, 0.0), nil, { withVehicle = true })
+    eq(lastSent('core:client:teleport').args[3], nil, 'a passenger never takes the car')
+    stubs.pedVehicle[ped1], stubs.pedVehicle[ped2] = nil, nil
+
+    -- 7. the account reader (§48)
+    Core.Perms.grant(1, 'core.test', 'account')
+    local acc = P.getAccount(1)
+    eq(acc.name, 'Ada', 'getAccount carries the name')
+    eq(acc.group, 'user', '... the group')
+    eq(acc.identifiers.license, 'license:p1', '... the identifiers')
+    eq(type(acc.firstSeen), 'number', '... firstSeen')
+    eq(acc.banned, false, '... banned')
+    eq(acc.permissions, nil, '... and never the permissions list')
+    eq(acc.license, nil, 'only the documented fields are copied')
+    acc.identifiers.license = 'tampered'
+    eq(P.getAccount(1).identifiers.license, 'license:p1', 'getAccount hands out a copy')
+    eq(P.getAccount(99), nil, 'no session, no account')
+    local accountId = P.getInfo(1).accountId
+    DB.update('accounts', accountId, { name = 'Stale' })
+    eq(P.getAccountById(accountId).name, 'Ada', 'getAccountById prefers the live document while online')
+    stubs.dropPlayer(env, 1)
+    DB.update('accounts', accountId, { name = 'Offline' })
+    eq(P.getAccountById(accountId).name, 'Offline', 'offline it reads the stored document')
+    eq(P.getAccountById(accountId).id, accountId, '... id included')
+    eq(P.getAccountById('nope'), nil, 'an unknown id is nil')
+    eq(P.getAccountById({}), nil, 'a table is not an id')
+
+    -- 8. setGroup asks Perms.groupExists when perms v2 provides it (§44)
+    local realExists = rawget(Core.Perms, 'groupExists')
+    Core.Perms.groupExists = function(name) return name == 'eventstaff' end
+    eq(P.setGroup(2, 'eventstaff'), true, 'a group that only exists in perm_groups is accepted')
+    eq(P.getInfo(2).group, 'eventstaff', '... and stored')
+    eq(P.setGroup(2, 'admin'), false, 'groupExists is the authority, not the config seed')
+    Core.Perms.groupExists = realExists
+    eq(P.setGroup(2, 'admin'), true, 'the restored lookup accepts a seeded group')
+    eq(P.setGroup(2, 'eventstaff'), false, '... and knows no eventstaff')
+
+    -- 9. L2: group and grant writes announce permsChanged (perms caches, staff sets)
+    local changes = {}
+    Core.on('permsChanged', function(src, what) changes[#changes + 1] = tostring(src) .. ':' .. tostring(what) end)
+    P.setGroup(2, 'mod')
+    check(table.concat(changes, ' '):find('2:group', 1, true) ~= nil, 'setGroup emits permsChanged (src, group)')
+    changes = {}
+    P.setAccountData(2, 'group', 'admin')
+    check(table.concat(changes, ' '):find('2:group', 1, true) ~= nil, "setAccountData('group') too")
+    changes = {}
+    P.setAccountData(2, 'permissions', { 'x.y' })
+    eq(changes[1], '2:grants', "setAccountData('permissions') emits (src, grants)")
+    changes = {}
+    P.setAccountData(2, 'tempPermissions', {})
+    eq(changes[1], '2:grants', "... and so does 'tempPermissions'")
+    changes = {}
+    P.setAccountData(2, 'note', 'hello')
+    eq(#changes, 0, 'any other account field is silent')
+    eq(P.setAccountData(2, 'identifiers', { license = 'license:forged' }), false,
+        'the engine-sourced identifiers cannot be overwritten')
+
+    -- 10. Player.findAccountsByIdentifier (§47 offline bans): lazy index, joins, shared ids, stale entries
+    local F = P.findAccountsByIdentifier
+    check(type(F) == 'function', 'getters.lua installed findAccountsByIdentifier')
+    local realIsDegraded = DB.isDegraded
+    DB.isDegraded = function(collection) return collection == 'accounts' end
+    local none, why = F('license:p1')
+    eq(none, nil, 'R2-11: an unreadable accounts collection answers nil ...')
+    eq(why, 'unavailable', "... 'unavailable' (never 'nobody holds it')")
+    DB.isDegraded = realIsDegraded
+    local offlineId = accountId                              -- Ada's account, player 1 dropped above
+    local p2Account = P.getInfo(2).accountId
+    same(F('license:p1'), { offlineId }, 'an offline account is found by its license (index built on first use)')
+    same(F('license:p2'), { p2Account }, 'an online one too')
+    same(F('fivem:2'), { p2Account }, 'any identifier type works')
+    stubs.connectPlayer(env, 6, { name = 'Dee', identifiers = { license = 'license:p6', discord = 'discord:shared' } })
+    stubs.connectPlayer(env, 7, { name = 'Eve', identifiers = { license = 'license:p7', discord = 'discord:shared' } })
+    local six, seven = P.getInfo(6).accountId, P.getInfo(7).accountId
+    local expected = { six, seven }
+    table.sort(expected)
+    same(F('discord:shared'), expected, 'a join after the build is indexed; a shared identifier lists both')
+    stubs.dropPlayer(env, 7)
+    stubs.connectPlayer(env, 8, { name = 'Eve', identifiers = { license = 'license:p7', discord = 'discord:new' } })
+    same(F('discord:shared'), { six }, 'an identifier the account no longer carries is not reported')
+    same(F('discord:new'), { seven }, 'its new one is')
+    same(F('discord:nobody'), {}, 'an unknown identifier: empty')
+    same(F('nocolon'), {}, 'not type:value: empty')
+    same(F(42), {}, 'not a string: empty')
+    same(F('ip:127.0.0.1'), {}, 'ip: is never indexed')
+
+    -- R2-3: every identifier type the engine lists is stored and indexed (license2, xbl, live …), never ip:
+    local list = { 'license:p9', 'license2:p9b', 'xbl:p9x', 'live:p9l', 'discord:p9d', 'ip:10.0.0.9' }
+    env.GetNumPlayerIdentifiers = function(src) return tonumber(src) == 9 and #list or 0 end
+    env.GetPlayerIdentifier = function(src, i) return tonumber(src) == 9 and list[i + 1] or nil end
+    stubs.connectPlayer(env, 9, { name = 'Nine', identifiers = { license = 'license:p9' } })
+    env.GetNumPlayerIdentifiers, env.GetPlayerIdentifier = nil, nil
+    local nine = P.getAccount(9)
+    eq(nine.identifiers.license2, 'license2:p9b', 'license2 is stored')
+    eq(nine.identifiers.xbl, 'xbl:p9x', 'xbl is stored')
+    eq(nine.identifiers.live, 'live:p9l', 'live is stored')
+    eq(nine.identifiers.ip, nil, 'ip is not')
+    same(F('license2:p9b'), { nine.id }, 'license2 finds the account')
+    same(F('live:p9l'), { nine.id }, 'live finds the account')
+    local imported = DB.create('accounts', { license = 'license:imp', name = 'Imp', group = 'user',
+        identifiers = { license = 'license:imp', discord = 'discord:imp' } })
+    same(F('discord:imp'), { imported }, 'an account written without a join (/dbimport) is found: a miss rebuilds')
+    DB.update('accounts', imported, { identifiers = { license = 'license:imp', discord = 'discord:changed' } })
+    same(F('discord:changed'), {}, 'an in-place identifier edit is not seen while the index is fresh')
+    stubs.tick(300001)
+    same(F('discord:changed'), { imported }, '... and is picked up by the rebuild of a stale index on a miss')
+    eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
+end
+
+--- The last core:client:notify message sent to `src`, or nil.
+local function lastNoticeTo(src)
+    for i = #stubs.sent, 1, -1 do
+        local packet = stubs.sent[i]
+        if packet.name == 'core:client:notify' and packet.target == src then return packet.args[1].message end
+    end
+    return nil
+end
+
+--- The legacy commands of server/admin.lua (§4.8) under the §44 ranks: a player may act only on somebody it
+--- strictly outranks; /setgroup also refuses self and any group at or above the actor's weight; the console
+--- is exempt. Cast: 1 mod (200), 2 admin (300), 3 senior (400), 4 admin (300).
+local function suiteAdminRanks()
+    suite('admin ranks')
+    stubs.resetServer()
+    local env, Core = newServer()
+    stubs.loadFile(env, 'server/getters.lua')
+    stubs.loadFile(env, 'server/admin.lua')
+    local Perms, Money = Core.Perms, Core.Money
+    local function run(name, src, ...)
+        stubs.clear()
+        local words = { ... }
+        env.__vm.commands[name].fn(src, words, '/' .. name .. ' ' .. table.concat(words, ' '))
+    end
+    for src, spec in ipairs({ { 'license:mod', 'Mo', 'mod' }, { 'license:adm', 'Al', 'admin' },
+        { 'license:sen', 'Se', 'senior' }, { 'license:ad2', 'Ann', 'admin' } }) do
+        stubs.connectPlayer(env, src, { license = spec[1], name = spec[2] })
+        Perms.setGroup(src, spec[3])
+    end
+    local RANK = 'You cannot do that to a player of equal or higher rank.'
+    -- everybody on duty here; suiteLegacyCommands covers duty, audit rows and echo (R2-15)
+    Core.Admin = { isOnDuty = function() return true end, echo = function() return 0 end,
+        getModes = function() return {} end }
+    local realBans = rawget(Core, 'Bans')
+    local banned, bannedBy = {}, {}
+    Core.Bans = { add = function(opts)
+        banned[#banned + 1], bannedBy[#bannedBy + 1] = opts.target, opts.by
+        return { id = 'b' .. #banned }
+    end }
+
+    -- /kick (core.mod)
+    stubs.dropped = {}
+    run('kick', 1, '2')
+    eq(#stubs.dropped, 0, 'kick: mod -> admin is refused')
+    eq(lastNoticeTo(1), RANK, '... with the rank text')
+    run('kick', 2, '1')
+    eq(stubs.dropped[1] and stubs.dropped[1].src, 1, 'kick: admin -> mod is allowed')
+    run('kick', 2, '4')
+    eq(#stubs.dropped, 1, 'kick: admin -> admin (equal) is refused')
+    run('kick', 2, '2')
+    eq(#stubs.dropped, 1, 'kick: nobody kicks themselves')
+    run('kick', 0, '3')
+    eq(stubs.dropped[2] and stubs.dropped[2].src, 3, 'kick: the console kicks anybody')
+
+    -- /ban (core.admin)
+    run('ban', 1, '2', '1')
+    eq(#banned, 0, 'ban: a mod lacks the permission (mod -> admin refused)')
+    run('ban', 2, '3', '1')
+    eq(#banned, 0, 'ban: admin -> senior is refused')
+    eq(lastNoticeTo(2), RANK, '... with the rank text')
+    run('ban', 2, '4', '1')
+    eq(#banned, 0, 'ban: admin -> admin (equal) is refused')
+    run('ban', 3, '3', '1')
+    eq(#banned, 0, 'ban: nobody bans themselves')
+    run('ban', 3, '2', '1')
+    eq(banned[1], 2, 'ban: senior -> admin is allowed')
+    eq(bannedBy[1], 3, 'ban: Core.Bans gets the actor SRC as `by` (R2-1), never a player-chosen name')
+    run('ban', 0, '3', '0')
+    eq(banned[2], 3, 'ban: the console bans anybody')
+    Core.Bans = realBans
+
+    -- /bring (core.admin)
+    run('bring', 2, '3')
+    eq(lastSent('core:client:teleport'), nil, 'bring: admin -> senior is refused')
+    eq(lastNoticeTo(2), RANK, '... with the rank text')
+    run('bring', 2, '4')
+    eq(lastSent('core:client:teleport'), nil, 'bring: admin -> admin (equal) is refused')
+    run('bring', 3, '2')
+    eq(lastSent('core:client:teleport') and lastSent('core:client:teleport').target, 2, 'bring: senior -> admin is allowed')
+    run('bring', 2, '2')
+    eq(lastSent('core:client:teleport') and lastSent('core:client:teleport').target, 2, 'bring: self passes (a no-op move)')
+    run('bring', 0, '2')
+    eq(lastSent('core:client:teleport'), nil, 'bring: the console has no position to bring to')
+    run('bring', 1, '4')
+    eq(lastSent('core:client:teleport'), nil, 'bring: a mod lacks the permission')
+
+    -- money: /givecash /givebank /setcash /setbank (core.admin)
+    local cash3, bank4 = Money.get(3, 'cash'), Money.get(4, 'bank')
+    run('givecash', 2, '3', '100')
+    eq(Money.get(3, 'cash'), cash3, 'givecash: admin -> senior is refused')
+    eq(lastNoticeTo(2), RANK, '... with the rank text')
+    run('givebank', 2, '4', '100')
+    eq(Money.get(4, 'bank'), bank4, 'givebank: admin -> admin (equal) is refused')
+    run('setcash', 2, '3', '1')
+    eq(Money.get(3, 'cash'), cash3, 'setcash: admin -> senior is refused')
+    run('setbank', 2, '4', '1')
+    eq(Money.get(4, 'bank'), bank4, 'setbank: admin -> admin (equal) is refused')
+    local cash2 = Money.get(2, 'cash')
+    run('givecash', 3, '2', '100')
+    eq(Money.get(2, 'cash'), cash2 + 100, 'givecash: senior -> admin is allowed')
+    run('setbank', 2, '1', '7')
+    eq(Money.get(1, 'bank'), 7, 'setbank: admin -> mod is allowed')
+    run('givecash', 2, '2', '5')
+    eq(Money.get(2, 'cash'), cash2 + 105, 'money: self passes')
+    run('setcash', 0, '3', '9')
+    eq(Money.get(3, 'cash'), 9, 'setcash: the console sets anybody')
+    run('givecash', 1, '1', '5')
+    eq(Money.get(1, 'cash'), 5000, 'money: a mod lacks the permission')
+
+    -- /setgroup (core.admin): outrank the target, never self, only groups below the actor
+    run('setgroup', 2, '1', 'helper')
+    eq(Perms.getGroup(1), 'helper', 'setgroup: admin moves a mod to a lighter group')
+    run('setgroup', 2, '1', 'admin')
+    eq(Perms.getGroup(1), 'helper', 'setgroup: admin cannot hand out its own weight')
+    eq(lastNoticeTo(2), 'You can only assign groups below your own rank.', '... and is told so')
+    run('setgroup', 2, '1', 'senior')
+    eq(Perms.getGroup(1), 'helper', 'setgroup: ... nor a heavier group')
+    run('setgroup', 2, '2', 'mod')
+    eq(Perms.getGroup(2), 'admin', 'setgroup: nobody changes their own group')
+    eq(lastNoticeTo(2), 'You cannot change the group of this player.', '... with the refusal text')
+    run('setgroup', 2, '3', 'user')
+    eq(Perms.getGroup(3), 'senior', 'setgroup: admin -> senior is refused')
+    run('setgroup', 2, '4', 'user')
+    eq(Perms.getGroup(4), 'admin', 'setgroup: admin -> admin (equal) is refused')
+    run('setgroup', 3, '2', 'mod')
+    eq(Perms.getGroup(2), 'mod', 'setgroup: senior demotes an admin')
+    run('setgroup', 1, '4', 'user')
+    eq(Perms.getGroup(4), 'admin', 'setgroup: a helper lacks the permission')
+    run('setgroup', 0, '3', 'owner')
+    eq(Perms.getGroup(3), 'owner', 'setgroup: the console sets any group')
+    eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
+end
+
+--- R2-15 / R2-1 / R2-2: the legacy staff commands as an admin path — duty, an audit row WITH the actor per executed
+--- command, the staff echo, /ban's actor src, the rank checks of /dv /tpto /weapon /weapons, and
+--- Config.Admin.LegacyCommands = false. Cast: 1 admin (on duty), 2 admin (off duty), 3 senior (on duty), 4 user.
+local function suiteLegacyCommands()
+    suite('legacy commands')
+    stubs.resetServer()
+    local env, Core = newServer()
+    stubs.loadFile(env, 'server/getters.lua')
+    stubs.loadFile(env, 'server/weapons.lua')
+    stubs.loadFile(env, 'server/admin.lua')
+    local P, Perms = Core.Player, Core.Perms
+    for src, spec in ipairs({ { 'license:l1', 'Al', 'admin' }, { 'license:l2', 'Off', 'admin' },
+        { 'license:l3', 'Se', 'senior' }, { 'license:l4', 'Us', 'user' } }) do
+        stubs.connectPlayer(env, src, { license = spec[1], name = spec[2], coords = vector3(src * 1.0, 0.0, 0.0) })
+        Perms.setGroup(src, spec[3])
+    end
+    local duty, echoes, rows, modes = { [1] = true, [3] = true }, {}, {}, {}
+    Core.Admin = {
+        isOnDuty = function(src) return src == 0 or duty[src] == true end,
+        echo = function(text, opts) echoes[#echoes + 1] = { text = text, exclude = opts and opts.exclude } return 1 end,
+        getModes = function(src) return modes[src] or {} end,
+    }
+    Core.Audit = { record = function(row) rows[#rows + 1] = row return #rows end }
+    local banOpts
+    Core.Bans = { add = function(opts) banOpts = opts return opts.reason ~= 'refuse' and { id = 'B1' } or nil end }
+    env.NetworkGetEntityOwner = function(entity)
+        for src, ped in pairs(stubs.peds) do if ped == entity then return src end end
+        return -1
+    end
+    local function run(name, src, ...)
+        stubs.clear()
+        local words = { ... }
+        env.CreateThread(function()
+            env.__vm.commands[name].fn(src, words, '/' .. name .. ' ' .. table.concat(words, ' '))
+        end)
+        stubs.tick(50)
+    end
+    local function lastRow(action)
+        for i = #rows, 1, -1 do if rows[i].action == action then return rows[i] end end
+        return nil
+    end
+    local RANK = 'You cannot do that to a player of equal or higher rank.'
+    local DUTY = 'You must be on duty to use staff commands.'
+
+    -- 1. duty (Config.Admin.RequireDuty): players only, the console is exempt, no Core.Admin = refused
+    run('heal', 2, '4')
+    eq(lastSent('core:client:heal'), nil, 'an off-duty admin is refused')
+    eq(lastNoticeTo(2), DUTY, '... with the duty text')
+    eq(lastRow('core.cmd.heal'), nil, '... and nothing is audited')
+    run('heal', 1, '4')
+    eq(lastSent('core:client:heal') and lastSent('core:client:heal').target, 4, 'an on-duty admin heals')
+    run('heal', 0, '4')
+    eq(lastSent('core:client:heal') and lastSent('core:client:heal').target, 4, 'the console needs no duty')
+    Core.Config.Admin.RequireDuty = false
+    run('heal', 2, '4')
+    eq(lastSent('core:client:heal') and lastSent('core:client:heal').target, 4, 'RequireDuty = false lifts the gate')
+    Core.Config.Admin.RequireDuty = true
+    local admin = Core.Admin
+    Core.Admin = nil
+    run('heal', 1, '4')
+    eq(lastSent('core:client:heal'), nil, 'without Core.Admin the duty is unknown: refused')
+    Core.Admin = admin
+
+    -- 2. every executed command: one audit row with the actor, and an echo to the other staff
+    rows, echoes = {}, {}
+    run('givecash', 1, '4', '50')
+    local row = lastRow('core.cmd.givecash')
+    check(row ~= nil, 'givecash writes core.cmd.givecash')
+    eq(row and row.actor, 1, '... with the actor src')
+    eq(row and row.source, 'chat', "... source 'chat'")
+    eq(row and row.targets and row.targets[1].id, 4, '... the target player')
+    eq(row and row.message, 'add cash 50', '... and the summary')
+    check(#echoes == 1 and echoes[1].text:find('/givecash', 1, true) ~= nil, 'the on-duty staff get an echo')
+    eq(echoes[1] and echoes[1].exclude, 1, '... without the actor')
+    run('heal', 0, '4')
+    eq(lastRow('core.cmd.heal').actor, 0, 'the console is the actor of its own rows')
+    eq(lastRow('core.cmd.heal').source, 'console', "... source 'console'")
+    run('kick', 1, '4', 'spamming', 'chat')
+    eq(lastRow('core.cmd.kick') and lastRow('core.cmd.kick').reason, 'spamming chat', 'kick records the reason')
+    local each = {
+        { 'tp', 1, '10', '20', '30' }, { 'tpto', 1, '4' }, { 'bring', 1, '4' }, { 'setbank', 1, '4', '5' },
+        { 'givebank', 1, '4', '5' }, { 'setcash', 1, '4', '5' }, { 'setgroup', 1, '4', 'helper' },
+        { 'announce', 1, 'hello', 'all' }, { 'revive', 1, '4' }, { 'heal', 1, '4' },
+        { 'weapon', 1, '4', 'WEAPON_PISTOL', '10' }, { 'weapons', 1, 'clear', '4' }, { 'ban', 1, '4', '1', 'x' },
+        { 'car', 1 },
+    }
+    for _, spec in ipairs(each) do
+        rows = {}
+        run(table.unpack(spec))
+        local got = lastRow('core.cmd.' .. spec[1])
+        check(got ~= nil and got.actor == 1, ('/%s is audited with its actor'):format(spec[1]))
+    end
+    rows = {}
+    stubs.clear()
+    stubs.triggerOn(env, 'core:server:teleportToWaypoint', 1, vector3(100.0, 200.0, 30.0))
+    eq(lastRow('core.cmd.tpm') and lastRow('core.cmd.tpm').actor, 1, 'the /tpm event is audited too')
+    stubs.tick(1100)
+    duty[1] = false
+    stubs.triggerOn(env, 'core:server:teleportToWaypoint', 1, vector3(1.0, 2.0, 3.0))
+    eq(P.getData(1, 'position').x, 100.0, '... and refused off duty')
+    duty[1] = true
+
+    -- 3. /ban hands Core.Bans the actor SRC (R2-1); a refused ban says so
+    run('ban', 1, '4', '2', 'cheats')
+    eq(banOpts and banOpts.by, 1, 'by = the actor src')
+    eq(banOpts and banOpts.duration, 7200, 'the duration in seconds')
+    run('ban', 1, '4', '0', 'refuse')
+    eq(lastNoticeTo(1), 'Could not ban Us', 'a refused Bans.add is reported, not claimed')
+
+    -- 4. /dv: never out from under a player of equal or higher rank (R2-2)
+    local car = stubs.newEntity(2, {})
+    local ped1, ped3 = stubs.peds[1], stubs.peds[3]
+    stubs.pedVehicle[ped1], stubs.pedVehicle[ped3] = car, car
+    stubs.vehicleSeats[car] = { [-1] = ped3, [0] = ped1 }
+    run('dv', 1)
+    eq(stubs.entities[car].exists, true, 'dv: an admin cannot delete the car a senior drives')
+    eq(lastNoticeTo(1), RANK, '... rank text')
+    run('dv', 3)
+    eq(stubs.entities[car].exists, false, 'dv: the senior deletes it with the admin inside')
+    eq(lastRow('core.cmd.dv') and lastRow('core.cmd.dv').targets[1].type, 'vehicle', 'dv audits the vehicle')
+    stubs.pedVehicle[ped1], stubs.pedVehicle[ped3] = nil, nil
+
+    -- 5. /tpto: anybody may be visited, except hidden staff one does not outrank (R2-2)
+    run('tpto', 1, '3')
+    eq(lastSent('core:client:teleport') and lastSent('core:client:teleport').target, 1, 'tpto a visible senior: allowed')
+    modes[3] = { vanish = true }
+    run('tpto', 1, '3')
+    eq(lastSent('core:client:teleport'), nil, 'tpto a vanished senior: refused')
+    eq(lastNoticeTo(1), RANK, '... rank text')
+    modes[3], modes[4] = nil, { spectate = true }
+    run('tpto', 1, '4')
+    eq(lastSent('core:client:teleport') and lastSent('core:client:teleport').target, 1,
+        'tpto a spectating player one outranks: allowed')
+
+    -- 6. /weapon and /weapons clear (R2-2)
+    run('weapon', 1, '3', 'WEAPON_PISTOL')
+    eq(Core.Weapons.has(3, 'WEAPON_PISTOL'), false, 'weapon: admin -> senior is refused')
+    eq(lastNoticeTo(1), RANK, '... rank text')
+    run('weapon', 1, '1', 'WEAPON_PISTOL', '5')
+    eq(Core.Weapons.has(1, 'WEAPON_PISTOL'), true, 'weapon: self is fine')
+    run('weapon', 1, '4', 'NOPE')
+    eq(lastNoticeTo(1), 'Unknown weapon NOPE', 'weapon: an unknown name')
+    run('weapon', 3, '1', 'WEAPON_SMG', '1')
+    eq(Core.Weapons.has(1, 'WEAPON_SMG'), true, 'weapon: senior -> admin is allowed')
+    run('weapons', 1, 'clear', '3')
+    eq(lastNoticeTo(1), RANK, 'weapons clear: admin -> senior is refused')
+    run('weapons', 3, 'clear', '1')
+    eq(Core.Weapons.has(1, 'WEAPON_SMG'), false, 'weapons clear: senior -> admin is allowed')
+    eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
+
+    -- 7. Config.Admin.LegacyCommands = false: none of the staff commands exist, the player ones stay
+    stubs.resetServer()
+    local off = newServer()
+    off.Config.Admin.LegacyCommands = false
+    stubs.loadFile(off, 'server/getters.lua')
+    stubs.loadFile(off, 'server/weapons.lua')
+    stubs.loadFile(off, 'server/admin.lua')
+    local cmds = off.__vm.commands
+    for _, name in ipairs({ 'tp', 'tpto', 'bring', 'car', 'dv', 'setcash', 'setbank', 'givecash', 'givebank',
+        'setgroup', 'kick', 'ban', 'announce', 'revive', 'heal', 'weapon', 'weapons' }) do
+        eq(cmds[name], nil, ('LegacyCommands = false: no /%s'):format(name))
+    end
+    eq(off.__vm.netEvents['core:server:teleportToWaypoint'], nil, '... and no /tpm handler')
+    check(cmds.id ~= nil and cmds.players ~= nil and cmds.faction ~= nil, 'the player commands stay')
 end
 
 --- Core.Money (DESIGN §4.3): add/remove/set, the transfer rollback and the moneyChanged hook.
@@ -2003,6 +2650,9 @@ local suites = {
     { 'chat', suiteChat },
     { 'perms', suitePerms },
     { 'player', suitePlayer },
+    { 'player admin', suitePlayerAdmin },
+    { 'admin ranks', suiteAdminRanks },
+    { 'legacy commands', suiteLegacyCommands },
     { 'money', suiteMoney },
     { 'factions', suiteFactions },
     { 'vehicles', suiteVehicles },

@@ -1,6 +1,6 @@
 /* core UI kit — Data — display (DESIGN §37.5).
-   CoreBadge, CoreTag, CoreAvatar, CorePlayerChip, CoreTable, CoreKeyValue,
-   CoreEmpty.
+   CoreBadge, CoreTag, CoreAvatar, CorePlayerChip, CoreTable (sorting + loading, §53),
+   CoreVirtualList, CoreTree (§53), CoreKeyValue, CoreEmpty.
    Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
    following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
 
@@ -431,12 +431,225 @@
   color: var(--color-fg-faint);
 }
 
+/* Sorting (§53). A sortable header is a real button carrying the label voice of the <th>; the
+   arrow is faint until its column is the sorted one, then it turns accent and the label goes fg.
+   The table never reorders rows — the caller does, on `update:sort`. */
+.core-table__sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: color 0.12s var(--ease-ui);
+}
+.core-table__sort:hover { color: var(--color-fg-dim); }
+.core-table__sort:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+  border-radius: var(--radius-ui-xs);
+}
+.core-table__sort-icon {
+  flex: none;
+  opacity: 0.55;
+  transition: opacity 0.12s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-table__th.is-sorted { color: var(--color-fg); }
+.core-table__th.is-sorted .core-table__sort-icon {
+  opacity: 1;
+  color: var(--color-accent);
+}
+
+/* Loading (§53): a 2 px sweep on the top edge that sticks while the wrapper scrolls (it takes no
+   room: the negative margin gives its height back), rows dimmed under it. With no rows yet the
+   body draws skeleton rows instead of the empty line. */
+.core-table__progress {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  height: 2px;
+  margin-bottom: -2px;
+  overflow: hidden;
+}
+.core-table__progress-fill {
+  display: block;
+  width: 30%;
+  height: 100%;
+  background: var(--core-grad-accent);
+  animation: core-indeterminate 1.15s ease-in-out infinite;
+}
+.core-table.is-loading .core-table__row:not(.core-table__row--skeleton) {
+  opacity: 0.55;
+  transition: opacity 0.16s var(--ease-ui), background-color 0.12s var(--ease-ui);
+}
+.core-table__row--skeleton { cursor: default; }
+.core-table__row--skeleton .core-table__cell--right .core-skeleton,
+.core-table__row--skeleton .core-table__cell--center .core-skeleton { margin-left: auto; }
+.core-table__row--skeleton .core-table__cell--center .core-skeleton { margin-right: auto; }
+
 /* A cell that pairs a thumbnail with a name — the faction roster of the gallery. */
 .core-table__media {
   display: flex;
   align-items: center;
   gap: 12px;
   min-width: 0;
+}
+
+/* ---- CoreVirtualList (§53) ----------------------------------------------------------------------
+   The root is the scroll box; a spacer as tall as every row keeps the scrollbar true, and the few
+   rendered rows ride ONE transform on the window. Rows are a fixed height (the component sets it
+   inline) and clip whatever overflows, so a long cell can never push the rows below it. */
+
+.core-virtuallist {
+  position: relative;
+  min-height: 0;
+  overflow-y: auto;
+  pointer-events: auto;
+}
+.core-virtuallist__spacer {
+  position: relative;
+  width: 100%;
+}
+.core-virtuallist__window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+.core-virtuallist__row {
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.core-virtuallist__empty > p {
+  margin: 0;
+  padding: 28px 16px;
+  text-align: center;
+  font-size: var(--text-ui-sm);
+  color: var(--color-fg-faint);
+}
+
+/* ---- CoreTree (§53) -----------------------------------------------------------------------------
+   Rows of the outliner / a category tree. The root is the tab stop and a column, so a caller's
+   max-height lands on it and the inner CoreVirtualList scrolls. Selection is the select list's
+   language (accent 16 % + a 2 px inset bar); the keyboard cursor is a hairline ring shown only
+   while the tree has focus. The chevron turns by `transform: rotate()` only. */
+
+.core-tree {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-radius: var(--radius-ui-sm);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  color: var(--color-fg-dim);
+  outline: none;
+  pointer-events: auto;
+}
+.core-tree:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+.core-tree__list { flex: 1 1 auto; }
+
+.core-tree__row {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding-right: 8px;
+  border-radius: var(--radius-ui-xs);
+  color: var(--color-fg-dim);
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-tree__row:hover { background: rgba(255, 255, 255, 0.04); color: var(--color-fg); }
+.core-tree:focus .core-tree__row.is-active { box-shadow: inset 0 0 0 1px rgb(var(--core-accent-rgb) / 0.55); }
+.core-tree__row.is-selected {
+  background: rgb(var(--core-accent-rgb) / 0.16);
+  box-shadow: inset 2px 0 0 var(--color-accent);
+  color: var(--color-fg);
+}
+.core-tree:focus .core-tree__row.is-selected.is-active {
+  box-shadow: inset 2px 0 0 var(--color-accent), inset 0 0 0 1px rgb(var(--core-accent-rgb) / 0.55);
+}
+.core-tree__row.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: none;
+}
+
+.core-tree__twisty {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-ui-xs);
+  color: var(--color-fg-faint);
+  transition: transform 0.16s var(--ease-ui), color 0.12s var(--ease-ui), background-color 0.12s var(--ease-ui);
+}
+.core-tree__twisty:hover { background: rgba(255, 255, 255, 0.08); color: var(--color-fg); }
+.core-tree__row.is-open .core-tree__twisty { transform: rotate(90deg); }
+.core-tree__twisty.is-hidden { visibility: hidden; }
+
+.core-tree__icon {
+  flex: none;
+  display: flex;
+  color: var(--color-fg-faint);
+}
+.core-tree__row.is-selected .core-tree__icon { color: var(--color-accent); }
+
+.core-tree__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.core-tree__badge {
+  flex: none;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: var(--radius-ui-xs);
+  background: rgba(255, 255, 255, 0.06);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--color-fg-dim);
+}
+.core-tree__trailing {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.core-tree--dense { font-size: 13px; }
+.core-tree.is-disabled { opacity: 0.45; cursor: not-allowed; }
+.core-tree.is-disabled .core-tree__row { pointer-events: none; }
+
+.core-tree__empty {
+  margin: 0;
+  padding: 20px 12px;
+  text-align: center;
+  font-size: var(--text-ui-sm);
+  color: var(--color-fg-faint);
 }
 
 /* ---- CoreKeyValue ----------------------------------------------------------------------------

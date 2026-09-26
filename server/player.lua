@@ -12,6 +12,10 @@
 
     Core owns the §8 player state-bag keys (CORE_STATE_KEYS below); plugin keys go through
     Player.setReplicated. Server side only: every native used here is apiset server or client+server.
+
+    §47/§48: bans through Core.Bans (license fallback without it), sticky session.states, setCoords opts.
+    Natives (fxref 2026-09-26, CFX server): GetVehiclePedIsIn(ped, lastVehicle), GetPedInVehicleSeat(vehicle,
+    seatIndex), SetEntityRoutingBucket(entity, bucket), SetPlayerRoutingBucket, GetPlayerRoutingBucket.
 ]]
 
 -- runtime Player(src) state-bag accessor, captured before the module table shadows the global
@@ -25,13 +29,14 @@ local Net = Core.Net
 
 local sessions = {}      -- [src] = session table (see DESIGN §4.2)
 local byCharId = {}      -- [charId] = src
+local byAccountId = {}   -- [accountId] = src (Player.getAccountById prefers the live document)
 local loadCooldown = {}  -- [src] = GetGameTimer() of the last requestLoad
 local autosaveRunning = false
 
 local MAX_BUCKET <const> = 65535
 local LOAD_WAIT_MS <const> = 10000
 local LOAD_POLL_MS <const> = 250
-local ID_TYPES <const> = { 'license', 'discord', 'fivem', 'steam' }
+local ID_TYPES <const> = { 'license', 'license2', 'discord', 'fivem', 'steam', 'xbl', 'live' }   -- fallback list
 
 -- character keys that mirror into the player state bag (§8)
 local REPLICATED <const> = { name = true, money = true, faction = true }
@@ -40,20 +45,42 @@ local REPLICATED <const> = { name = true, money = true, faction = true }
 local CORE_STATE_KEYS <const> = {
     loaded = true, name = true, charId = true, group = true, cash = true, bank = true,
     faction = true, dead = true, stats = true, attachments = true,
+    -- §51: server-written staff state (Core.Admin duty + sanctioned modes); a plugin must never overwrite it
+    duty = true, staffModes = true,
 }
+
+-- sticky player states (§48): the client re-applies every value that differs from these
+local STATE_DEFAULTS <const> = { frozen = false, invincible = false, visible = true, controls = true }
+
+-- the read-only account view of Player.getAccount / getAccountById (§48): no permissions list
+local ACCOUNT_FIELDS <const> = { 'id', 'name', 'group', 'identifiers', 'firstSeen', 'lastSeen', 'playtime', 'banned' }
 
 --- Sanitized display name for a connected player.
 local function playerName(src)
     return Utils.sanitize(GetPlayerName(src) or 'Unknown', Config.Player.MaxNameLength)
 end
 
+--- One identifier of a kind. The engine PREFIX-matches, so 'license' may answer 'license2:…': ask with the
+--- colon (§47) and accept only a value that carries it.
+local function identifierOf(src, kind)
+    local prefix = kind .. ':'
+    local value = GetPlayerIdentifierByType(src, prefix)
+    return type(value) == 'string' and value:sub(1, #prefix) == prefix and value or nil
+end
+
 --- Collects the identifier set stored on the account document.
+--- R2-3: EVERY identifier type except ip: (the §47 index and ban holders must see license2/xbl/live too).
 local function collectIdentifiers(src)
     local out = {}
-    for i = 1, #ID_TYPES do
-        local kind = ID_TYPES[i]
-        local value = GetPlayerIdentifierByType(src, kind)
-        if type(value) == 'string' and value ~= '' then out[kind] = value end
+    local count = GetNumPlayerIdentifiers ~= nil and tonumber(GetNumPlayerIdentifiers(src)) or nil
+    if not count then
+        for i = 1, #ID_TYPES do out[ID_TYPES[i]] = identifierOf(src, ID_TYPES[i]) end
+        return out
+    end
+    for i = 0, count - 1 do
+        local id = GetPlayerIdentifier(src, i)
+        local kind = type(id) == 'string' and #id <= 128 and id:match('^(%w+):.') or nil
+        if kind and kind ~= 'ip' and out[kind] == nil then out[kind] = id end
     end
     return out
 end
@@ -181,15 +208,14 @@ local function newCharacterDoc(account)
     }
 end
 
---- Finds or creates the account + character documents and builds the in-memory session.
---- fresh = true for a real join (the client should spawn), false when core restarted under a
---- player who is already in the world.
+--- Finds or creates the account + character documents and builds the in-memory session. fresh = true for
+--- a real join (the client should spawn), false when core restarted under a player already in the world.
 local function loadSession(src, fresh)
     local existing = sessions[src]
     if existing then return existing end
 
-    local license = GetPlayerIdentifierByType(src, 'license')
-    if type(license) ~= 'string' or license == '' then
+    local license = identifierOf(src, 'license')
+    if not license then
         DropPlayer(src, 'No license identifier.')
         return nil
     end
@@ -226,10 +252,8 @@ local function loadSession(src, fresh)
         return nil
     end
 
-    -- Unclean disconnect + reconnect before the server noticed the drop: the character is still
-    -- bound to an older src. That ghost session holds the newest state, so persist it, release it
-    -- and re-read both documents -- otherwise its next save would overwrite this one with stale
-    -- data and its playerDropped would clear byCharId for the live src.
+    -- Unclean reconnect before the drop was noticed: the ghost session on the older src holds the newest
+    -- state, so save it, release it and re-read both documents (its next save / drop would clobber this one).
     local ghostSrc = byCharId[character.id]
     local ghost = ghostSrc and ghostSrc ~= src and sessions[ghostSrc] or nil
     if ghost then
@@ -238,6 +262,7 @@ local function loadSession(src, fresh)
         sessions[ghostSrc] = nil
         loadCooldown[ghostSrc] = nil
         byCharId[ghost.charId] = nil
+        if byAccountId[ghost.accountId] == ghostSrc then byAccountId[ghost.accountId] = nil end
         character = db.get('characters', character.id) or character
         account = stampAccount(db.get('accounts', account.id) or account)
     end
@@ -248,12 +273,68 @@ local function loadSession(src, fresh)
         name = character.name or name, account = account, data = character,
         dirty = true, loadedAt = now, playtimeAt = now, deadSince = nil,
         fresh = fresh and true or false, answered = false,
+        states = Utils.deepCopy(STATE_DEFAULTS),
     }
     sessions[src] = session
     byCharId[character.id] = src
+    byAccountId[account.id] = src
     replicate(src)
     Log.info('session ready for [%d] %s (character %s)', src, session.name, character.id)
     return session
+end
+
+--- Reject text for a ban of either shape (§47 `expiresAt` or the pre-§47 `until`): reason, expiry, id.
+local function banNotice(ban)
+    local expiry = tonumber(ban.expiresAt or ban['until']) or 0
+    local head = expiry == 0 and 'You are permanently banned.'
+        or ('You are banned until %s.'):format(os.date('%Y-%m-%d %H:%M', math.floor(expiry)))
+    return ('%s Reason: %s%s'):format(head, Utils.sanitize(ban.reason or 'No reason given', 128),
+        ban.id ~= nil and (' (ban %s)'):format(tostring(ban.id)) or '')
+end
+
+--- Fallback while Core.Bans is unavailable: an active, unrevoked ban on this license, either shape.
+local function legacyBan(license)
+    local now = os.time()
+    return Core.DB.findOne('bans', function(doc)
+        local expiry = tonumber(doc.expiresAt or doc['until']) or 0
+        if doc.revoked or (expiry ~= 0 and expiry <= now) then return false end
+        if doc.license == license then return true end
+        local ids = type(doc.identifiers) == 'table' and doc.identifiers or {}
+        for i = 1, #ids do if ids[i] == license then return true end end
+        return false
+    end)
+end
+
+--- Setting `bans.failClosed` (§47, defined by server/bans.lua): default true = refuse while unreadable.
+local function failClosed()
+    local settings = Core.Settings
+    if type(settings) ~= 'table' or not Utils.isCallable(settings.get) then return true end
+    local ok, value = pcall(settings.get, 'bans.failClosed')
+    return not (ok and value == false)
+end
+
+--- The ban blocking this connection and its reject text, or nil (§47). Core.Bans collects, checks and enriches;
+--- when it is missing, throws or answers `nil, 'unavailable'` the license is looked up here, and when `bans`
+--- cannot be read at all (degraded reads empty, it does not throw) bans.failClosed refuses the connection.
+local function connectingBan(src, license)
+    local bans = Core.Bans
+    if type(bans) == 'table' and Utils.isCallable(bans.checkConnecting) then
+        local ok, ban, notice = pcall(bans.checkConnecting, src)
+        if ok and ban then
+            if type(notice) == 'string' then return ban, notice end
+            return ban, type(ban) == 'table' and banNotice(ban) or 'You are banned from this server.'
+        end
+        if ok and notice ~= 'unavailable' then return nil end
+        Log.error('Core.Bans %s for [%d], using the license check', ok and 'unavailable' or tostring(ban), src)
+    end
+    local ok, ban = pcall(legacyBan, license)
+    if ok and ban then return ban, banNotice(ban) end
+    local isDegraded = Core.DB.isDegraded
+    if (not ok or (Utils.isCallable(isDegraded) and isDegraded('bans'))) and failClosed() then
+        Log.error('the ban list cannot be read: refusing [%d] (bans.failClosed)', src)
+        return true, 'Ban service unavailable, please try again in a minute.'
+    end
+    return nil
 end
 
 AddEventHandler('playerConnecting', function(_, _, deferrals)
@@ -262,26 +343,13 @@ AddEventHandler('playerConnecting', function(_, _, deferrals)
     Wait(0) -- required: at least one tick between defer() and update()/done()
     deferrals.update(Config.Texts.loading or 'Checking your account...')
 
-    local license = GetPlayerIdentifierByType(src, 'license')
-    if type(license) ~= 'string' or license == '' then
+    local license = identifierOf(src, 'license')
+    if not license then
         return deferrals.done('No license identifier — restart FiveM and reconnect.')
     end
 
-    local now = os.time()
-    local ban = Core.DB.findOne('bans', function(doc)
-        local expiry = doc['until'] or 0
-        return doc.license == license and (expiry == 0 or expiry > now)
-    end)
-    if ban then
-        local expiry = ban['until'] or 0
-        local reason = Utils.sanitize(ban.reason or 'No reason given', 128)
-        if expiry == 0 then
-            return deferrals.done(('You are permanently banned. Reason: %s'):format(reason))
-        end
-        return deferrals.done(('You are banned until %s. Reason: %s')
-            :format(os.date('%Y-%m-%d %H:%M', expiry), reason))
-    end
-
+    local ban, notice = connectingBan(src, license)
+    if ban then return deferrals.done(notice) end
     deferrals.done()
 end)
 
@@ -301,12 +369,11 @@ AddEventHandler('playerDropped', function()
     Player.save(src)
     -- only when this src still owns the character: a fast reconnect may have re-bound it already
     if byCharId[session.charId] == src then byCharId[session.charId] = nil end
+    if byAccountId[session.accountId] == src then byAccountId[session.accountId] = nil end
     sessions[src] = nil
 end)
 
--- ---------------------------------------------------------------------------
--- API (DESIGN §4.2) — every function returns nil/false without a loaded session
--- ---------------------------------------------------------------------------
+-- == API (DESIGN §4.2) — every function returns nil/false without a loaded session ==========================
 
 function Player.isLoaded(src)
     return sessions[src] ~= nil
@@ -328,8 +395,7 @@ function Player.getData(src, path)
     local node, key = resolvePath(session.data, path, false)
     if not node or key == nil then return nil end
     local value = node[key]
-    if type(value) == 'table' then return Utils.deepCopy(value) end
-    return value
+    return type(value) == 'table' and Utils.deepCopy(value) or value
 end
 
 function Player.setData(src, path, value)
@@ -353,9 +419,8 @@ function Player.save(src)
     local session = sessions[src]
     if not session then return false end
     addPlaytime(session)
-    local db = Core.DB
-    db.set('characters', session.charId, session.data)
-    db.set('accounts', session.accountId, session.account)
+    Core.DB.set('characters', session.charId, session.data)
+    Core.DB.set('accounts', session.accountId, session.account)
     session.dirty = false
     Core.emitHook('playerSaved', src)
     return true
@@ -363,9 +428,7 @@ end
 
 function Player.saveAll()
     local count = 0
-    for src in pairs(sessions) do
-        if Player.save(src) then count = count + 1 end
-    end
+    for src in pairs(sessions) do if Player.save(src) then count = count + 1 end end
     return count
 end
 
@@ -391,20 +454,9 @@ function Player.getSrcByCharId(charId)
     return src and sessions[src] and src or nil
 end
 
-function Player.getName(src)
-    local session = sessions[src]
-    return session and session.name or nil
-end
-
-function Player.getLicense(src)
-    local session = sessions[src]
-    return session and session.license or nil
-end
-
-function Player.getPed(src)
-    if not sessions[src] then return 0 end
-    return GetPlayerPed(src) or 0
-end
+function Player.getName(src) return sessions[src] and sessions[src].name or nil end
+function Player.getLicense(src) return sessions[src] and sessions[src].license or nil end
+function Player.getPed(src) return sessions[src] and (GetPlayerPed(src) or 0) or 0 end
 
 function Player.getCoords(src)
     local session = sessions[src]
@@ -425,16 +477,50 @@ local function toVector3(value)
     return nil
 end
 
-function Player.setCoords(src, coords, heading)
+local function isBucket(bucket)
+    return math.type(bucket) == 'integer' and bucket >= 0 and bucket <= MAX_BUCKET
+end
+
+--- The vehicle `src` sits in as its DRIVER, or 0 (a passenger never takes the car along).
+local function drivenVehicle(src)
+    local ped = GetPlayerPed(src)
+    if ped == 0 then return 0 end
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    if vehicle == 0 or GetPedInVehicleSeat(vehicle, -1) ~= ped then return 0 end
+    return vehicle
+end
+
+--- §48 opts = { withVehicle = false, fade = true, bucket?, moveRiders = false }: the bucket changes first.
+function Player.setCoords(src, coords, heading, opts)
     local session = sessions[src]
     if not session then return false end
     local target = toVector3(coords)
     if not target then return false end
+    if opts ~= nil and type(opts) ~= 'table' then return false end
+    opts = opts or {}
+    local bucket = opts.bucket
+    if bucket ~= nil and not isBucket(bucket) then return false end
+    local vehicle = opts.withVehicle == true and drivenVehicle(src) or 0
+    if bucket ~= nil then
+        if vehicle ~= 0 then SetEntityRoutingBucket(vehicle, bucket) end
+        -- other players ride along only on request: the CALLER vouches for its rank checks (R2-13)
+        if vehicle ~= 0 and opts.moveRiders == true and Utils.isCallable(Player.getInVehicle) then
+            local riders = Player.getInVehicle(NetworkGetNetworkIdFromEntity(vehicle))
+            for i = 1, #riders do
+                if riders[i] ~= src then Player.setBucket(riders[i], bucket) end
+            end
+        end
+        Player.setBucket(src, bucket)
+    end
     local stored = session.data.position or {}
     local dir = Utils.isNumber(heading) and heading + 0.0 or (stored.heading or 0.0) + 0.0
     session.data.position = { x = target.x, y = target.y, z = target.z, heading = dir }
     touch(session)
-    TriggerClientEvent('core:client:teleport', src, target, dir)
+    local flags = nil   -- only sent when something differs from the plain faded teleport
+    if vehicle ~= 0 or opts.fade == false then
+        flags = { withVehicle = vehicle ~= 0, fade = opts.fade ~= false }
+    end
+    TriggerClientEvent('core:client:teleport', src, target, dir, flags)
     return true
 end
 
@@ -446,8 +532,7 @@ function Player.setModel(src, model, appearance)
     if type(appearance) == 'table' then session.data.appearance = Utils.jsonSafe(appearance) end
     touch(session)
     TriggerClientEvent('core:client:setModel', src, model, session.data.appearance or {})
-    -- Same hook `setData` emits (§22), so a plugin that mirrors the look (the inventory's clothing slots)
-    -- learns about a creator save without the creator knowing it exists (2026-09-13, for `inventory`).
+    -- the hook setData emits (§22): a plugin mirroring the look (inventory clothing) learns of a creator save
     Core.emitHook('playerDataChanged', src, 'model', model)
     if type(appearance) == 'table' then
         Core.emitHook('playerDataChanged', src, 'appearance', Utils.deepCopy(session.data.appearance))
@@ -456,9 +541,9 @@ function Player.setModel(src, model, appearance)
 end
 
 function Player.setBucket(src, bucket)
-    if not sessions[src] then return false end
-    if math.type(bucket) ~= 'integer' or bucket < 0 or bucket > MAX_BUCKET then return false end
+    if not sessions[src] or not isBucket(bucket) then return false end
     SetPlayerRoutingBucket(src, bucket)
+    TriggerClientEvent('core:client:bucketChanged', src, bucket)   -- §48: the map runtime (§52) listens
     return true
 end
 
@@ -467,12 +552,17 @@ function Player.getBucket(src)
     return GetPlayerRoutingBucket(src) or 0
 end
 
---- Changes the account group. Core.Perms.setGroup routes through this so the live session, the
---- account document and the state bag never disagree.
+--- Changes the account group (Core.Perms.setGroup routes through this: session, document and bag agree).
 function Player.setGroup(src, group)
     local session = sessions[src]
-    if not session then return false end
-    if type(group) ~= 'string' or Config.Perms.Groups[group] == nil then return false end
+    if not session or type(group) ~= 'string' then return false end
+    -- §44: any group in perm_groups; the config seed decides while perms v2 is not loaded
+    local perms = Core.Perms
+    if type(perms) == 'table' and Utils.isCallable(perms.groupExists) then
+        if perms.groupExists(group) ~= true then return false end
+    elseif Config.Perms.Groups[group] == nil then
+        return false
+    end
     session.account.group = group
     touch(session)
     if not Core.DB.update('accounts', session.accountId, { group = group }) then
@@ -480,7 +570,14 @@ function Player.setGroup(src, group)
     end
     replicate(src, 'group')
     Log.audit('player', src, 'group set to %s', group)
+    Core.emitHook('permsChanged', src, 'group')   -- staff sets and rights caches refresh on it (§44, §51)
     return true
+end
+
+--- The raw account group (no allocation), nil without a session; Perms.getGroup reads unknown ones as 'user'.
+function Player.getGroup(src)
+    local session = sessions[src]
+    return session and session.account.group or nil
 end
 
 --- Writes a plugin-owned key to the player state bag (§20). Core keys are refused.
@@ -498,20 +595,21 @@ function Player.setReplicated(src, key, value)
     return true
 end
 
---- Writes one field on the live account document and persists it (§22; perms.lua stores
---- account.permissions through this). 'group' is routed through setGroup so the bag stays in sync.
+--- Writes one field of the live account document and persists it (§22); 'group' goes through setGroup.
 function Player.setAccountData(src, key, value)
     local session = sessions[src]
     if not session then return false end
     if not Utils.isString(key, 64) then return false end
     if key == 'group' then return Player.setGroup(src, value) end
-    if key == 'id' or key == 'license' then return false end
+    -- engine-sourced (loadSession stamps them; getters.lua indexes them for findAccountsByIdentifier)
+    if key == 'id' or key == 'license' or key == 'identifiers' then return false end
     if type(value) == 'table' then value = Utils.jsonSafe(value) end
     session.account[key] = value
     touch(session)
     if not Core.DB.update('accounts', session.accountId, { [key] = value }) then
         Log.warn('could not persist the account field %s for [%d]', key, src)
     end
+    if key == 'permissions' or key == 'tempPermissions' then Core.emitHook('permsChanged', src, 'grants') end
     return true
 end
 
@@ -522,24 +620,49 @@ local function sendPlayerState(src, partial)
     return true
 end
 
-function Player.setControls(src, enabled)
-    if type(enabled) ~= 'boolean' then return false end
-    return sendPlayerState(src, { controls = enabled })
+--- §48 sticky state: session.states for the session's lifetime; the client re-applies it (new ped, spawn, teleport).
+local function setSticky(src, key, value)
+    local session = sessions[src]
+    if not session or type(value) ~= 'boolean' then return false end
+    session.states[key] = value
+    session.loadPayload = nil   -- the core:client:loaded payload carries the states
+    return sendPlayerState(src, { [key] = value })
 end
 
-function Player.setFrozen(src, frozen)
-    if type(frozen) ~= 'boolean' then return false end
-    return sendPlayerState(src, { frozen = frozen })
+function Player.setControls(src, enabled) return setSticky(src, 'controls', enabled) end
+function Player.setFrozen(src, frozen) return setSticky(src, 'frozen', frozen) end
+function Player.setInvincible(src, invincible) return setSticky(src, 'invincible', invincible) end
+function Player.setVisible(src, visible) return setSticky(src, 'visible', visible) end
+
+--- Player.getStates(src) -> { frozen, invincible, visible, controls } (a copy) | nil without a session.
+function Player.getStates(src)
+    local session = sessions[src]
+    return session and Utils.deepCopy(session.states) or nil
 end
 
-function Player.setInvincible(src, invincible)
-    if type(invincible) ~= 'boolean' then return false end
-    return sendPlayerState(src, { invincible = invincible })
+--- Read-only copy of an account document's public fields (§48).
+local function accountView(doc)
+    local out = {}
+    for _, key in ipairs(ACCOUNT_FIELDS) do
+        out[key] = type(doc[key]) == 'table' and Utils.deepCopy(doc[key]) or doc[key]
+    end
+    out.group, out.banned = out.group or 'user', out.banned == true
+    return out
 end
 
-function Player.setVisible(src, visible)
-    if type(visible) ~= 'boolean' then return false end
-    return sendPlayerState(src, { visible = visible })
+--- Player.getAccount(src) -> { id, name, group, identifiers, firstSeen, lastSeen, playtime, banned } | nil
+function Player.getAccount(src)
+    local session = sessions[src]
+    return session and accountView(session.account) or nil
+end
+
+--- The same view by account id: the live document while its player is online, else the stored one.
+function Player.getAccountById(accountId)
+    if not (Utils.isString(accountId, 64) or math.type(accountId) == 'integer') then return nil end
+    local session = byAccountId[accountId] and sessions[byAccountId[accountId]]
+    if session then return accountView(session.account) end
+    local doc = Core.DB.get('accounts', accountId)
+    return type(doc) == 'table' and accountView(doc) or nil
 end
 
 function Player.setHealth(src, hp)
@@ -550,18 +673,6 @@ end
 function Player.setArmour(src, ap)
     if math.type(ap) ~= 'integer' or ap < 0 or ap > 100 then return false end
     return sendPlayerState(src, { armour = ap })
-end
-
-function Player.getHealth(src)
-    local ped = Player.getPed(src)
-    if ped == 0 then return 0 end
-    return GetEntityHealth(ped) or 0
-end
-
-function Player.getArmour(src)
-    local ped = Player.getPed(src)
-    if ped == 0 then return 0 end
-    return GetPedArmour(ped) or 0
 end
 
 --- True for a src that is connected right now (DropPlayer must never take a stale id).
@@ -580,30 +691,28 @@ end
 
 function Player.ban(src, reason, seconds, by)
     if not isConnected(src) then return false end
-    local license = Player.getLicense(src) or GetPlayerIdentifierByType(src, 'license')
-    if type(license) ~= 'string' or license == '' then return false end
     local text = Utils.sanitize(reason or 'Banned', 128)
-    local expiry = 0
-    if math.type(seconds) == 'integer' and seconds > 0 then expiry = os.time() + seconds end
-    Core.DB.create('bans', {
+    local duration = (math.type(seconds) == 'integer' and seconds > 0) and seconds or 0
+    local bans = Core.Bans
+    if type(bans) == 'table' and Utils.isCallable(bans.add) then
+        -- §47: Bans.add collects identifiers + tokens, flags the account, audits and drops the player
+        local ok, ban, err = pcall(bans.add, { target = src, reason = text, duration = duration, by = by })
+        if ok and ban then return true end
+        Log.warn('Player.ban: Bans.add refused [%d]: %s', src, tostring(ok and err or ban))
+        return false
+    end
+    -- pre-§47 fallback (no server/bans.lua): the license-only record the connect path reads back
+    local license = Player.getLicense(src) or identifierOf(src, 'license')
+    if not license then return false end
+    local expiry = duration > 0 and os.time() + duration or 0
+    if type(by) == 'number' then by = by == 0 and 'console' or Player.getName(by) or tostring(by) end
+    local id = Core.DB.create('bans', {
         license = license, reason = text, by = Utils.sanitize(by or 'console', 64), ['until'] = expiry,
     })
     local session = sessions[src]
-    if session then
-        session.account.banned = true
-        touch(session)
-        Player.save(src)
-    end
-    local notice
-    if expiry == 0 then
-        Log.audit('player', src, 'banned permanently: %s', text)
-        notice = ('You are permanently banned. Reason: %s'):format(text)
-    else
-        Log.audit('player', src, 'banned for %d s: %s', seconds, text)
-        notice = ('You are banned until %s. Reason: %s')
-            :format(os.date('%Y-%m-%d %H:%M', expiry), text)
-    end
-    DropPlayer(src, notice)
+    if session then session.account.banned = true; touch(session); Player.save(src) end
+    Log.audit('player', src, 'banned %s: %s', expiry == 0 and 'permanently' or ('for %d s'):format(duration), text)
+    DropPlayer(src, banNotice({ id = id, reason = text, ['until'] = expiry }))
     return true
 end
 
@@ -645,9 +754,7 @@ function Player.loadAllConnected()
     end
 end
 
--- ---------------------------------------------------------------------------
--- Net events (DESIGN §5) and the autosave loop
--- ---------------------------------------------------------------------------
+-- == Net events (DESIGN §5) and the autosave loop ============================================================
 
 -- raw by design (§5): it must answer before the session exists, so it cannot use requireLoaded
 RegisterNetEvent('core:server:requestLoad', function()
@@ -668,20 +775,16 @@ RegisterNetEvent('core:server:requestLoad', function()
         return
     end
 
-    -- built once per session, invalidated by touch()/replicate(); the client re-requests after a
-    -- core restart, so repeat requests are answered from the cache
+    -- built once, invalidated by touch()/replicate(); repeat requests (core restart) come from the cache
     local payload = session.loadPayload
     if not payload then
         local data = session.data
         payload = {
-            charId = session.charId,
-            name = session.name,
-            model = data.model or Config.Player.DefaultModel,
-            appearance = Utils.deepCopy(data.appearance or {}),
-            position = Utils.deepCopy(data.position or {}),
-            money = Utils.deepCopy(data.money or {}),
-            faction = factionSummary(src),
+            charId = session.charId, name = session.name, model = data.model or Config.Player.DefaultModel,
+            appearance = Utils.deepCopy(data.appearance or {}), position = Utils.deepCopy(data.position or {}),
+            money = Utils.deepCopy(data.money or {}), faction = factionSummary(src),
             group = session.account.group or 'user',
+            states = Player.getStates(src),   -- §48: the client keeps re-applying the sticky ones
         }
         session.loadPayload = payload
     end
@@ -734,22 +837,16 @@ Net.on('core:server:respawn', {}, function(src)
     Player.respawn(src, point and point.coords, point and point.heading)
 end, { cooldown = 1000, requireLoaded = true })
 
---- An autosave pass is cut into chunks (DESIGN §9 "Scale"): per session it is three natives for the position
---- and, when dirty, a document write. 2,000 of those in one server tick every five minutes is a hitch and a
---- burst on the database; AUTOSAVE_CHUNK sessions, then AUTOSAVE_CHUNK_MS of air, spreads a full server over
---- about twenty seconds. With fewer sessions than one chunk the pass is a single tick, exactly as before.
+--- Autosave in chunks (DESIGN §9 "Scale"): AUTOSAVE_CHUNK sessions, then AUTOSAVE_CHUNK_MS of air, so a
+--- full server is spread over ~20 s instead of one tick; below one chunk the pass is a single tick.
 local AUTOSAVE_CHUNK <const> = 25
 local AUTOSAVE_CHUNK_MS <const> = 250
 
---- One autosave pass: refresh position + playtime, then persist the dirty sessions. Called from the
---- autosave thread (it may yield between two chunks), so the srcs are snapshotted first — `sessions`
---- changes while we sleep — and a session that left in between is skipped (playerDropped saved it).
+--- One autosave pass (position + playtime, then the dirty sessions). It yields between chunks, so the srcs are
+--- snapshotted first and a session that left meanwhile is skipped (playerDropped saved it).
 local function autosaveTick()
     local order, count = {}, 0
-    for src in pairs(sessions) do
-        count = count + 1
-        order[count] = src
-    end
+    for src in pairs(sessions) do count = count + 1; order[count] = src end
     for i = 1, count do
         if i > 1 and (i - 1) % AUTOSAVE_CHUNK == 0 then
             Wait(AUTOSAVE_CHUNK_MS)
@@ -795,20 +892,4 @@ AddEventHandler('onResourceStop', function(resource)
 end)
 
 Core.Player = Player
-
--- DESIGN §5.2: the player's own info + money. The license stays server-side on purpose, so this
--- projects getInfo() instead of forwarding it.
-Core.Callback.register('core:player:getInfo', function(src)
-    local info = Player.getInfo(src)
-    if not info then return nil end
-    local money = Player.getData(src, 'money')
-    if type(money) ~= 'table' then money = {} end
-    return {
-        src = info.src,
-        charId = info.charId,
-        accountId = info.accountId,
-        name = info.name,
-        group = info.group,
-        money = { cash = money.cash or 0, bank = money.bank or 0 },
-    }
-end)
+-- Player.getHealth/getArmour and the §5.2 'core:player:getInfo' callback live in server/getters.lua.

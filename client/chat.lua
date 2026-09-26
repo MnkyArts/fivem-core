@@ -133,6 +133,7 @@ end)
 
 Core.Keys.register({
     name = 'chat', description = 'Open chat', key = 'T',
+    whileCaptured = true,   -- §54: an editor's key capture never takes the chat away
     onPress = function()
         if not setTyping(true) then return end
         SendNUIMessage({ action = 'chat:open', open = true })

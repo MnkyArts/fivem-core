@@ -16,6 +16,7 @@ import { installGameBlur } from '../src/gameblur.js'
 import { installKit } from '../src/kit/index.js'
 import { resetStore } from '../src/stories/storeHelpers.js'
 import { luaChannel, withoutLog } from '../src/stories/luaBridge.js'
+import { MIXES, PRESETS, applyLab, installLab, resolveRoles } from '../src/lab/palette.js'
 
 installCoreUI()
 
@@ -89,8 +90,43 @@ export const parameters = {
   },
 }
 
+// The palette lab (src/lab/palette.js, dev only): two toolbar menus re-tone every story with a
+// candidate second colour next to the coral. `off` is the kit as it ships. A story that runs its
+// own lab (Kit/Foundations/Palette Lab) opts out with `parameters: { paletteLab: false }`.
+export const globalTypes = {
+  palette: {
+    description: 'Palette lab: a second colour next to the coral',
+    toolbar: {
+      title: 'Palette',
+      icon: 'paintbrush',
+      dynamicTitle: true,
+      items: [{ value: 'off', title: 'Palette: coral only' }]
+        .concat(PRESETS.map((p) => ({ value: p.id, title: 'Palette: ' + p.name, right: p.base }))),
+    },
+  },
+  paletteRoles: {
+    description: 'Palette lab: how much the second colour takes over',
+    toolbar: {
+      title: 'Roles',
+      icon: 'contrast',
+      dynamicTitle: true,
+      items: MIXES.map((m) => ({ value: m.id, title: 'Roles: ' + m.name, right: m.roles.length + ' roles' })),
+    },
+  },
+}
+
 export const initialGlobals = {
   backgrounds: { value: 'game' },
+  palette: 'off',
+  paletteRoles: 'split',
+}
+
+installLab()
+
+function withPaletteLab (storyFn, context) {
+  const off = context.parameters.paletteLab === false
+  applyLab(document.documentElement, off ? 'off' : context.globals.palette, resolveRoles(context.globals.paletteRoles))
+  return storyFn()
 }
 
 // Every story gets an autodocs page (title + description + Controls + the Lua snippet).
@@ -101,6 +137,7 @@ export const tags = ['autodocs']
 // return `storyFn()` untouched, so the vue3 renderer short-circuits the wrappers entirely
 // (decorateStory: decorated === story).
 export const decorators = [
+  withPaletteLab,
   luaChannel,
   (storyFn) => {
     withoutLog(resetStore)

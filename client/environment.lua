@@ -21,6 +21,7 @@ local Log = Core.Log
 
 local TICK_MS <const> = 1000
 local MAX_ARMOUR <const> = 100
+local STICKY_KEYS <const> = { 'controls', 'frozen', 'invincible', 'visible' }   -- §48, see client/player.lua
 local BOOT_TRIES <const> = 20       -- 20 x 500 ms: GlobalState lands shortly after the join
 local BOOT_WAIT_MS <const> = 500
 
@@ -232,15 +233,14 @@ end)
 --------------------------------------------------------------------------------
 
 Net.on('core:client:playerState', { 'table' }, function(payload)
+    -- §48: controls / frozen / invincible / visible are sticky — client/player.lua stores them, applies
+    -- them now and re-applies them after pedChanged, every (re)spawn and every teleport
+    local sticky = {}
+    for _, key in ipairs(STICKY_KEYS) do
+        if payload[key] ~= nil then sticky[key] = payload[key] == true end
+    end
+    if next(sticky) then Core.Player.setStates(sticky) end
     local ped = PlayerPedId()
-    if payload.controls ~= nil then
-        SetPlayerControl(PlayerId(), payload.controls == true, 0)   -- flags 0: no extra ped handling
-    end
-    if payload.frozen ~= nil then FreezeEntityPosition(ped, payload.frozen == true) end
-    if payload.invincible ~= nil then
-        SetEntityInvincible(ped, payload.invincible == true, false) -- dontResetOnCleanup = false
-    end
-    if payload.visible ~= nil then SetEntityVisible(ped, payload.visible == true, false) end
     if type(payload.health) == 'number' and payload.health == payload.health then
         local max = GetEntityMaxHealth(ped)
         SetEntityHealth(ped, math.floor(math.min(math.max(payload.health, 0), max)), 0, 0)

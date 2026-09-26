@@ -10,10 +10,18 @@
 //
 // Every instance is keyed `<id>:<epoch>`: `epoch` is bumped by the `page:open` that follows a crash,
 // which is what makes "the next page:open remounts it" (§38.12) true for an overlay too.
+//
+// §41: a page or modal in `game` input mode holds no focus, so its layer lets every click through —
+// the layer itself (inline style) and everything inside it, kit buttons included (an important
+// descendant utility beats the kit's components layer and a plugin's own rules).
+//
+// §54: while `Core.UI.hideHud` holds a reason, an overlay whose owner holds none is hidden with
+// `v-show` on a `display: contents` wrapper — never closed, never unmounted, so the hotbar of the
+// inventory comes back exactly as it was when the editor that hid it lets go.
 import { computed, ref, watch } from 'vue'
 import PluginBoundary from './PluginBoundary.vue'
 import { store } from '../store.js'
-import { isInert, topModalId } from '../runtime/layers.ts'
+import { isInert, overlayHidden, topModalId } from '../runtime/layers.ts'
 import { keepAliveEpoch } from '../runtime/pages.ts'
 
 const openPage = computed(() => (store.openPage ? store.pages[store.openPage] : null) || null)
@@ -67,21 +75,40 @@ const modals = computed(() => {
 // `inert` (Chromium 102+) is what stops Tab from walking out of a modal into the page behind it.
 const pageInert = computed(() => (topModalId() ? true : null))
 const modalInert = (id) => (isInert('modal', id) ? true : null)
+
+// §41: `data-core-input` names the mode for tests and the inspector; only `game` changes anything.
+const GAME_LAYER = '[&_*]:pointer-events-none!'
+const isGame = (page) => !!page && page.input === 'game'
+const inputClass = (page) => (isGame(page) ? GAME_LAYER : null)
+const inputStyle = (page) => (isGame(page) ? { pointerEvents: 'none' } : null)
+const modalStyle = (m, i) => (isGame(m) ? { zIndex: 30 + i, pointerEvents: 'none' } : { zIndex: 30 + i })
 </script>
 
 <template>
   <div class="page-host pointer-events-none fixed inset-0">
-    <!-- overlays: click-through layer under the open page (z 10) -->
+    <!-- overlays: click-through layer under the open page (z 10); §54 hides the ones whose owner
+         holds no hideHud reason (`display: contents`, so an overlay's own layout is untouched) -->
     <div class="overlay-layer pointer-events-none absolute inset-0 z-10">
-      <PluginBoundary v-for="o in overlays" :key="keyOf(o)" :plugin="o.owner" :page="o.id">
-        <component :is="o.component" :props="o.props" />
-      </PluginBoundary>
+      <div
+        v-for="o in overlays"
+        v-show="!overlayHidden(o.owner)"
+        :key="keyOf(o)"
+        class="contents"
+        :data-core-overlay="o.id"
+      >
+        <PluginBoundary :plugin="o.owner" :page="o.id">
+          <component :is="o.component" :props="o.props" />
+        </PluginBoundary>
+      </div>
     </div>
 
     <!-- the open page: the shell layer that takes the mouse (z 20) -->
     <div
       v-if="livePage"
       class="page-layer pointer-events-auto absolute inset-0 z-20 overflow-hidden"
+      :class="inputClass(livePage)"
+      :style="inputStyle(livePage)"
+      :data-core-input="livePage.input"
       :inert="pageInert"
     >
       <PluginBoundary :key="keyOf(livePage)" :plugin="livePage.owner" :page="livePage.id" focus-holder>
@@ -95,6 +122,9 @@ const modalInert = (id) => (isInert('modal', id) ? true : null)
       v-if="cacheArmed"
       v-show="cachedPage"
       class="page-layer pointer-events-auto absolute inset-0 z-20 overflow-hidden"
+      :class="inputClass(cachedHeld)"
+      :style="inputStyle(cachedHeld)"
+      :data-core-input="cachedHeld.input"
       :inert="pageInert"
     >
       <KeepAlive :max="3">
@@ -115,7 +145,9 @@ const modalInert = (id) => (isInert('modal', id) ? true : null)
       v-for="(m, i) in modals"
       :key="keyOf(m)"
       class="modal-layer pointer-events-auto absolute inset-0 overflow-hidden"
-      :style="{ zIndex: 30 + i }"
+      :class="inputClass(m)"
+      :style="modalStyle(m, i)"
+      :data-core-input="m.input"
       :inert="modalInert(m.id)"
     >
       <PluginBoundary :plugin="m.owner" :page="m.id" focus-holder>

@@ -5,15 +5,21 @@
 // them apart and never lets one wait on a guess: a `page:open` for a plugin that is still loading
 // waits on THAT plugin's promise, not on a fixed delay.
 //
-// The props object of an id is stable for the LIFE OF THE SHELL (§7.4). A plugin restart replaces
-// the record and re-imports the module; a page store that captured `usePage(id).props` once must
-// keep receiving every later open. Two shell-regression checks pin exactly that.
+// The props DATA of an id is stable for the LIFE OF THE SHELL (§7.4): one raw object per id. A
+// plugin restart replaces the record and re-imports the module; a page store that captured
+// `usePage(id).props` once must keep receiving every later open. Two shell-regression checks pin
+// exactly that. The reactive WRAPPER follows the page definition's `reactivity` (§38.10): a page
+// declared before its plugin loaded (a lazy plugin always is) gets a deep wrapper first and the
+// definition's flavour the moment the definition is known — before the component mounts. Both
+// wrappers sit on the same raw object, and Vue keys its dependencies by that raw object, so a proxy
+// captured early still sees (and triggers on) every later write.
 
 import { markRaw, reactive, ref, shallowReactive } from 'vue'
 import type { Component } from 'vue'
-import type { Off, PageDefinition, PageHandle } from '../../sdk/src/contract.ts'
-import type { MsgPageOpen, MsgPageRegister, PageType, PatchOp } from './protocol.ts'
+import type { Off, PageDefinition, PageHandle, PageInputMode } from '../../sdk/src/contract.ts'
+import type { MsgPageInput, MsgPageOpen, MsgPageRegister, PageEscapeMode, PageType, PatchOp } from './protocol.ts'
 import { post } from './transport.ts'
+import { setInputSource } from './layers.ts'
 import { bindRelease, createScope, withScope } from './scope.ts'
 import type { OwnedScope } from './scope.ts'
 import { guard, notify, report } from './errors.ts'
@@ -23,7 +29,12 @@ export interface PageRecord {
   id: string
   type: PageType
   owner: string | null
+  /** Derived from `input` (§41): true for `mixed` and `look`. Kept for readers of the old field. */
   keepInput: boolean
+  /** §41: how the page takes input. Lua decides; the shell only draws it (`game` = click-through). */
+  input: PageInputMode
+  /** §41: what Escape does to it. */
+  escape: PageEscapeMode
   component: Component | null
   registered: boolean
   props: Record<string, unknown>
@@ -59,7 +70,8 @@ export function pageState(): PageStoreSlice {
   return state
 }
 
-const propsById = new Map<string, Record<string, unknown>>()
+/** id -> the raw props object (never replaced) and the wrapper currently handed out. */
+const propsById = new Map<string, { raw: Record<string, unknown>; mode: 'deep' | 'shallow'; proxy: Record<string, unknown> }>()
 const legacyComponents = new Map<string, Component>()
 const definitions = new Map<string, PageDefinition>()
 const scopes = new Map<string, OwnedScope>()
@@ -76,14 +88,33 @@ export const keepAliveEpoch = ref(0)
 
 // ---------------------------------------------------------------- props (stable identity)
 
-/** The one props object of an id. Deep-reactive unless the definition asked for `shallow`. */
+function wrap(raw: Record<string, unknown>, mode: 'deep' | 'shallow'): Record<string, unknown> {
+  return mode === 'shallow' ? shallowReactive(raw) : reactive(raw)
+}
+
+/**
+ * The props object of an id: `mode` omitted = whatever it is now (deep when new); `mode` given = the
+ * page definition's flavour, which RE-WRAPS the same raw object when it differs. Vue caches one proxy
+ * per raw object and flavour, so switching back and forth never duplicates anything.
+ */
 export function propsFor(id: string, mode?: 'deep' | 'shallow'): Record<string, unknown> {
-  let props = propsById.get(id)
-  if (!props) {
-    props = mode === 'shallow' ? shallowReactive({} as Record<string, unknown>) : reactive({} as Record<string, unknown>)
-    propsById.set(id, props)
+  let entry = propsById.get(id)
+  if (!entry) {
+    const raw: Record<string, unknown> = {}
+    const flavour = mode === 'shallow' ? 'shallow' : 'deep'
+    entry = { raw, mode: flavour, proxy: wrap(raw, flavour) }
+    propsById.set(id, entry)
+  } else if (mode && mode !== entry.mode) {
+    entry.mode = mode
+    entry.proxy = wrap(entry.raw, mode)
   }
-  return props
+  return entry.proxy
+}
+
+/** Which wrapper an id's props currently have (inspector, tests). */
+export function propsMode(id: string): 'deep' | 'shallow' | null {
+  const entry = propsById.get(id)
+  return entry ? entry.mode : null
 }
 
 function setProps(rec: PageRecord, next: unknown): string[] {
@@ -104,10 +135,10 @@ function setProps(rec: PageRecord, next: unknown): string[] {
 // ---------------------------------------------------------------- records
 
 function newRecord(id: string, extra?: Partial<PageRecord>): PageRecord {
-  // Lua replays `plugin:register` BEFORE `page:register` (§38.4), so the owner's definition —
-  // and with it `reactivity` — is normally known the first time the props object is created. A
-  // page that is touched even earlier (an `ensurePage` from `CoreUI.usePage`) gets the deep
-  // default and keeps it: props IDENTITY outranks the proxy flavour (§7.4).
+  // Lua replays `plugin:register` BEFORE `page:register` (§38.4), but a LAZY plugin (or one still
+  // loading) has no definition yet: the props then keep whatever wrapper they have (deep when new)
+  // and `resolveComponent` re-wraps them in the definition's flavour once it is known. An unknown
+  // definition never forces `deep` back onto a container that is already shallow.
   const owner = (extra && extra.owner) || null
   const known = owner ? Plugins.pageDefinition(owner, id) : null
   const rec: PageRecord = {
@@ -115,9 +146,11 @@ function newRecord(id: string, extra?: Partial<PageRecord>): PageRecord {
     type: 'page',
     owner: null,
     keepInput: false,
+    input: 'ui',
+    escape: 'close',
     component: legacyComponents.get(id) || null,
     registered: legacyComponents.has(id),
-    props: propsFor(id, known && known.reactivity === 'shallow' ? 'shallow' : 'deep'),
+    props: propsFor(id, known ? (known.reactivity === 'shallow' ? 'shallow' : 'deep') : undefined),
     keepAlive: false,
     reactivity: 'deep',
     loading: false,
@@ -139,22 +172,52 @@ export function ensurePage(id: string): PageRecord {
   return rec
 }
 
-/** `page:register` — Lua is the authority for id, type, keepInput and OWNER (§38.3). */
+const INPUT_MODES: readonly string[] = ['ui', 'mixed', 'look', 'game']
+
+function isInputMode(value: unknown): value is PageInputMode {
+  return typeof value === 'string' && INPUT_MODES.indexOf(value) !== -1
+}
+
+/** §41: the game receives input in `mixed` and `look` — what `keepInput` used to say. */
+function keepsInput(mode: PageInputMode): boolean {
+  return mode === 'mixed' || mode === 'look'
+}
+
+/** `page:register` — Lua is the authority for id, type, input, escape and OWNER (§38.3, §41). */
 export function registerPage(msg: MsgPageRegister): PageRecord {
   const id = String(msg.id)
   const owner = msg.owner ? String(msg.owner) : null
   const prev = state.pages[id]
   const type: PageType = msg.type === 'overlay' || msg.type === 'modal' ? msg.type : 'page'
+  // An older sender only has `keepInput`: `true` meant what `mixed` means now.
+  const input: PageInputMode = isInputMode(msg.input) ? msg.input : msg.keepInput ? 'mixed' : 'ui'
+  const escape: PageEscapeMode = msg.escape === 'event' ? 'event' : 'close'
   if (prev) {
     prev.type = type
-    prev.keepInput = !!msg.keepInput
+    prev.input = input
+    prev.keepInput = keepsInput(input)
+    prev.escape = escape
     prev.owner = owner
   } else {
-    state.pages[id] = newRecord(id, { type, keepInput: !!msg.keepInput, owner })
+    state.pages[id] = newRecord(id, { type, input, keepInput: keepsInput(input), escape, owner })
   }
   const rec = state.pages[id]
   resolveComponent(rec)
   return rec
+}
+
+/** `page:input` (§41) — a mode change from `Core.UI.setInput`. Unknown pages and modes are ignored. */
+export function setPageInput(msg: MsgPageInput): void {
+  const rec = state.pages[String(msg && msg.id)]
+  if (!rec || !isInputMode(msg.input)) return
+  rec.input = msg.input
+  rec.keepInput = keepsInput(msg.input)
+}
+
+/** The input mode of a page id; an unknown id is a plain `ui` page. */
+export function inputOf(id: string): PageInputMode {
+  const rec = state.pages[id]
+  return rec ? rec.input : 'ui'
 }
 
 /** `page:unregister` — the declaration is gone; the props object is not (§7.4). */
@@ -212,6 +275,8 @@ export function resolveComponent(rec: PageRecord): Component | null {
   definitions.set(rec.id, def)
   rec.keepAlive = def.keepAlive === true
   rec.reactivity = def.reactivity === 'shallow' ? 'shallow' : 'deep'
+  // The definition is known now: the props wrapper follows it (same raw data, see the header).
+  if (propsMode(rec.id) !== rec.reactivity) rec.props = propsFor(rec.id, rec.reactivity)
   const component = def.component
   if (typeof component === 'function') {
     rec.loading = true
@@ -351,6 +416,9 @@ export function pageHandle(id: string): PageHandle {
     get isOpen() {
       return isPageOpen(id)
     },
+    get input() {
+      return inputOf(id)
+    },
     emit(event: string, data?: unknown) {
       post('ui_event', { page: id, event, data: data === undefined ? {} : data })
     },
@@ -479,6 +547,24 @@ export function closePage(id?: string | null): void {
     delete state.overlays[page]
   }
   post('ui_close', { page })
+}
+
+/**
+ * Escape reached a page or modal (store.handleKeydown, after the kit layers and the built-ins).
+ * `escape = 'event'` (§41) keeps it open and hands the key to the page — its own `on('escape')` —
+ * and to Lua (`Core.UI.on(id, 'escape')`, through `ui_event`); every other page closes as before.
+ */
+export function escapePage(id?: string | null): 'close' | 'event' | null {
+  const page = id || state.openPage
+  if (!page) return null
+  const rec = state.pages[page]
+  if (rec && rec.escape === 'event') {
+    emitPageEvent(page, 'escape', {})
+    post('ui_event', { page, event: 'escape', data: {} })
+    return 'event'
+  }
+  closePage(page)
+  return 'close'
 }
 
 /** A page whose component cannot be produced: tell Lua, toast, and never hold the cursor (§38.6). */
@@ -720,6 +806,8 @@ function pluginSettled(plugin: { id: string; state: string; error: string | null
 }
 
 Plugins.setPageSink({ disposePagesOf, pluginSettled })
+// §41: the layer mirror skips `game` pages for Escape and `inert` — it asks this file, never Lua.
+setInputSource(inputOf)
 
 // ---------------------------------------------------------------- views + test helpers
 

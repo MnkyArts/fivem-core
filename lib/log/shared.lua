@@ -10,6 +10,10 @@
     `audit` is server-only: it is guarded by `IsDuplicityVersion()` at call time
     (this chunk is shared, so it loads in client VMs too) and additionally emits
     the local hook `core:hook:audit (category, src, message)` for logging plugins.
+    It also records the line in the persisted trail (DESIGN §46) through
+    `Core.Audit.recordLog` — directly inside core, through the export proxy in a
+    plugin VM — guarded, so a core without Core.Audit (or one that is not running)
+    never turns a log line into an error.
     Never log identifiers beyond `src` and the player name.
 
     Natives: IsDuplicityVersion (shared).
@@ -61,7 +65,23 @@ function ns.debug(fmt, ...)
     return emit('debug', nil, fmt, ...)
 end
 
---- Server-only audit line + `core:hook:audit` for a logging plugin.
+--- Core.Audit.recordLog(category, src, message) without ever throwing: core's own table inside
+--- core (rawget: a missing module stays nil), the export proxy in a plugin VM (pcall: core may be
+--- stopped or older than DESIGN §46).
+local function recordAudit(cat, src, message)
+    if not Core then return end
+    local audit
+    if Core.isCore then
+        audit = rawget(Core, 'Audit')
+        if type(audit) ~= 'table' or type(audit.recordLog) ~= 'function' then return end
+    else
+        audit = Core.Audit
+        if type(audit) ~= 'table' then return end
+    end
+    pcall(function() audit.recordLog(cat, src, message) end)
+end
+
+--- Server-only audit line + `core:hook:audit` for a logging plugin + a row in Core.Audit.
 --- @return boolean written
 function ns.audit(category, src, fmt, ...)
     if not IsDuplicityVersion() then return false end
@@ -73,5 +93,6 @@ function ns.audit(category, src, fmt, ...)
     else
         TriggerEvent('core:hook:audit', cat, src, message)
     end
+    recordAudit(cat, src, message)
     return true
 end

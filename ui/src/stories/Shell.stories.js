@@ -67,6 +67,26 @@ function visibilityScene (args) {
   send({ action: 'shell:visible', visible: !args.hidden, reasons: args.hidden ? [args.reason] : [] })
 }
 
+/** §54: the HUD layer stepping aside for an editor. Exactly what client/ui.lua sends for
+ *  `Core.UI.hideHud('editor')` called by the `admin` resource: one `shell:hud`, then the text UI
+ *  of a resource that holds no reason goes (core's interaction prompt here); the toast stays. */
+function hudHideScene (args) {
+  hud(args)
+  if (!store.notifications.length) {
+    send({
+      action: 'notify',
+      id: rid('n'),
+      type: 'info',
+      title: 'Editor',
+      message: 'Toasts, pages and modals stay while an editor hides the HUD.',
+      duration: HOLD_MS,
+    })
+  }
+  send({ action: 'shell:hud', hidden: !!args.hudHidden, keep: args.hudHidden ? [args.holder] : [] })
+  if (args.hudHidden) send({ action: 'textui:hide' })
+  else send({ action: 'textui:show', key: args.promptKey, text: args.prompt, position: 'bottom' })
+}
+
 /** A modal over the live rail. */
 function menuScene (args) {
   hud(args)
@@ -288,5 +308,73 @@ export const Visibility = {
     await waitFor(() => expect(vis()).toBe('visible'))
     expect(root().getAttribute('aria-hidden')).toBeNull()
     visibilityScene(args) // back to whatever the control says, so the story stays pokeable
+  },
+}
+
+export const HudHidden = {
+  name: 'HUD hidden (editor focus)',
+  args: {
+    prompt: 'Open the door',
+    hudHidden: false,
+    holder: 'admin',
+  },
+  argTypes: {
+    hudHidden: {
+      control: 'boolean',
+      description: 'Sends `shell:hud`. On means some resource holds a `Core.UI.hideHud` reason.',
+      table: { category: 'shell:hud' },
+    },
+    holder: {
+      control: 'text',
+      description: '`keep[1]` — the resource holding the reason; ITS overlays stay, everybody else\'s hide.',
+      table: { category: 'shell:hud' },
+    },
+  },
+  parameters: {
+    lua: {
+      message: 'shell:hud (+ textui:hide for a prompt of another resource)',
+      call: "-- client, from the editor's resource (reached through the proxy, owner-tracked)\n"
+        + "Core.UI.hideHud('editor')     -- vitals, stat bars, world prompts, other overlays, radar + GTA HUD\n"
+        + "Core.Keys.capture('editor')   -- other resources' Core.Keys presses are swallowed\n"
+        + "-- ... the editor runs ...\n"
+        + "Core.Keys.release('editor')\n"
+        + "Core.UI.showHud('editor')     -- everything comes back as it was; the radar only if §54 hid it\n"
+        + "Core.UI.isHudHidden()         -- true while any reason is held\n"
+        + "\n"
+        + "-- client hook, on the hidden <-> visible flip only\n"
+        + "Core.on('hudHiddenChanged', function(hidden) end)",
+      note: 'Fire and forget, re-sent on `ui_ready` while hidden (before the overlays re-open). Unlike '
+        + '`shell:visible` nothing is closed or cancelled: pages, modals and toasts are not the HUD.',
+    },
+    docs: {
+      description: {
+        story: 'An editor wants the screen to itself without hiding its own page. `Core.UI.hideHud` hides '
+          + "the HUD layer only: core's vitals strip, the stat bars and the world prompts, plus every "
+          + '**overlay** page whose owner holds no reason (the inventory hotbar goes, the admin HUD of the '
+          + 'holder stays). The GTA radar and native HUD are switched off in Lua. Flip **hudHidden**: the '
+          + 'toast stays, the strip and the prompt go, and nothing unmounts.',
+      },
+    },
+  },
+  render: liveScene(hudHideScene, view),
+  play: async ({ canvasElement, args }) => {
+    const canvas = within(canvasElement)
+    const part = (name) => canvasElement.querySelector('[data-core-hud="' + name + '"]')
+    const display = (name) => getComputedStyle(part(name)).display
+    await waitFor(() => expect(canvas.getByText(args.prompt)).toBeInTheDocument())
+    expect(display('vitals')).toBe('contents')
+
+    send({ action: 'shell:hud', hidden: true, keep: ['admin'] })
+    send({ action: 'textui:hide' })
+    await waitFor(() => expect(display('vitals')).toBe('none'))
+    expect(display('stats')).toBe('none')
+    expect(display('worldprompts')).toBe('none')
+    // the toast is not the HUD
+    expect(canvas.getByText('Editor')).toBeInTheDocument()
+    expect(getComputedStyle(canvasElement.querySelector('.core-root')).visibility).toBe('visible')
+
+    send({ action: 'shell:hud', hidden: false, keep: [] })
+    await waitFor(() => expect(display('vitals')).toBe('contents'))
+    hudHideScene(args) // back to whatever the controls say
   },
 }

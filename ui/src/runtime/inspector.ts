@@ -23,7 +23,8 @@ export interface InspectorSnapshot {
   dt: number
   plugins: Array<{ id: string; state: string; generation: number; build: string; ms: number | null; url: string; pages: string[]; error: string | null; dev: string | null; load: string }>
   modules: Array<{ url: string; state: string }>
-  pages: Array<{ id: string; owner: string | null; type: string; open: boolean; mounted: boolean; keepAlive: boolean; reactivity: string; crashed: boolean; error: string | null }>
+  /** `input` / `escape`: the §41 modes Lua declared (`game` pages hold no focus entry). */
+  pages: Array<{ id: string; owner: string | null; type: string; open: boolean; mounted: boolean; keepAlive: boolean; reactivity: string; crashed: boolean; error: string | null; input: string; escape: string }>
   focus: FocusEntry[]
   scopes: Array<{ label: string; listeners: number; timers: number; rafs: number; hooks: number }>
   channels: Array<{ channel: string; handlers: number; pending: number }>
@@ -101,6 +102,7 @@ export function snapshot(now?: number): InspectorSnapshot {
       id, owner: rec.owner, type: rec.type, open,
       mounted: open && !!rec.component && !rec.crashed,
       keepAlive: rec.keepAlive, reactivity: rec.reactivity, crashed: rec.crashed, error: rec.error,
+      input: rec.input, escape: rec.escape,
     })
     const scope = Pages.pageScope(id)
     if (scope) scopes.push(Object.assign({ label: scope.label }, scope.counts()))

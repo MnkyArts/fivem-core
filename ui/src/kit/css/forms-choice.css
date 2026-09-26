@@ -1,6 +1,6 @@
 /* core UI kit — Forms — choice (DESIGN §37.5).
    CoreCheckbox, CoreRadioGroup, CoreRadio, CoreSwitch, CoreSlider,
-   CoreSwatches.
+   CoreSwatches, CoreColorPicker and CoreSchemaForm (§53).
    Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
    following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
 
@@ -543,4 +543,302 @@ input[type='range'].core-slider:hover::-webkit-slider-thumb {
 .core-swatches.is-disabled .core-swatch {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* ---- CoreColorPicker (§53) ------------------------------------------------------------------
+   No native colour input (its picker is an OS popup the off-screen CEF never shows): a preview
+   chip + the hex field, CoreSwatches, then one range per channel whose TRACK is the live gradient
+   of that channel (`--core-cp-track`, set inline). Alpha is drawn over a checkerboard, and so is
+   every chip, so a translucent colour reads as translucent. `popover` puts the panel behind a
+   box-look trigger (its box rules live with the others in forms-text.css). */
+
+.core-colorpicker {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  pointer-events: auto;
+}
+.core-colorpicker--inline {
+  width: auto;
+  max-width: 100%;
+}
+.core-colorpicker__anchor {
+  display: flex;
+  width: 100%;
+}
+
+.core-colorpicker__trigger {
+  height: var(--core-box-h);
+  padding: 0 8px 0 6px;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+.core-colorpicker__trigger:disabled { cursor: not-allowed; }
+
+.core-colorpicker__chip,
+.core-colorpicker__preview {
+  position: relative;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-ui-xs);
+  overflow: hidden;
+  background: repeating-conic-gradient(rgba(255, 255, 255, 0.22) 0% 25%, rgba(255, 255, 255, 0.06) 0% 50%) 50% / 8px 8px;
+}
+.core-colorpicker__preview {
+  width: 44px;
+  height: var(--core-h-sm);
+}
+.core-colorpicker__chip-fill {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
+
+.core-colorpicker__value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg);
+}
+.core-colorpicker__value.is-placeholder {
+  font-family: var(--font-sans);
+  letter-spacing: 0;
+  color: var(--color-fg-faint);
+}
+.core-colorpicker__chevron {
+  flex: none;
+  color: var(--color-fg-dim);
+  transition: transform 0.16s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-colorpicker.is-open .core-colorpicker__chevron {
+  transform: rotate(180deg);
+  color: var(--color-accent);
+}
+
+.core-colorpicker__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 296px;
+  max-width: 100%;
+}
+.core-colorpicker__top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.core-colorpicker__channels {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.core-colorpicker__channel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.core-colorpicker__channel-label {
+  flex: none;
+  width: 12px;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--color-fg-dim);
+}
+.core-colorpicker__channel-value {
+  flex: none;
+  width: 30px;
+  text-align: right;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg-dim);
+}
+
+.core-colorpicker__range {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 12px;
+  margin: 0;
+  border-radius: var(--radius-ui-xs);
+  background: var(--core-cp-track);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  outline: none;
+}
+.core-colorpicker__range--alpha {
+  background-image: var(--core-cp-track), repeating-conic-gradient(rgba(255, 255, 255, 0.22) 0% 25%, rgba(255, 255, 255, 0.06) 0% 50%);
+  background-size: auto, 8px 8px;
+}
+.core-colorpicker__range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 20px;
+  border-radius: 2px;
+  background: var(--color-key);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.40);
+  transition: box-shadow 0.12s var(--ease-ui);
+}
+.core-colorpicker__range:hover::-webkit-slider-thumb,
+.core-colorpicker__range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), 0 0 0 5px rgb(var(--core-accent-rgb) / 0.25);
+}
+/* Inline + disabled: every part dims itself (the hex field and the swatches already do), so the
+   root never adds a second 0.45 on top — only the popover trigger dims as one box. */
+.core-colorpicker__range:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.core-colorpicker--inline.is-disabled .core-colorpicker__preview,
+.core-colorpicker--inline.is-disabled .core-colorpicker__channel { opacity: 0.45; }
+.core-colorpicker--inline.is-disabled .core-colorpicker__range:disabled { opacity: 1; }
+
+/* ---- CoreSchemaForm (§53) -------------------------------------------------------------------
+   A §43 schema drawn with kit controls. Groups get the eyebrow voice over a hairline; an `object`
+   field is a quiet framed box (white 2 %) with its own label-voice legend; an `array` is numbered
+   rows with a remove button each and an Add under them. Everything else is a CoreField, so the
+   label, hint and error voices are exactly the stacked / inline field of forms-text.css. */
+
+.core-schemaform {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  width: 100%;
+  min-width: 0;
+  pointer-events: auto;
+}
+
+.core-schemaform__group {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.core-schemaform__group-title {
+  margin: 0 0 14px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--color-border);
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 13px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  color: var(--color-fg-dim);
+}
+
+.core-schemaform__object {
+  min-width: 0;
+  margin: 0 0 12px;
+  padding: 12px 14px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-ui-sm);
+  background: rgba(255, 255, 255, 0.02);
+}
+.core-schemaform__object:last-child { margin-bottom: 0; }
+.core-schemaform__object.is-bare { margin: 0; padding: 10px 12px 12px; }
+.core-schemaform__object.is-invalid { border-color: rgb(var(--core-error-rgb) / 0.5); }
+.core-schemaform__legend {
+  margin-left: -6px;
+  padding: 0 6px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-fg);
+}
+.core-schemaform__desc {
+  margin: 0 0 12px;
+  font-size: var(--text-ui-sm);
+  color: var(--color-fg-faint);
+}
+.core-schemaform__error {
+  margin: 6px 0 0;
+  font-size: var(--text-ui-sm);
+  color: var(--color-error);
+}
+
+.core-schemaform__reason,
+.core-schemaform__duration,
+.core-schemaform__array {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+.core-schemaform__templates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.core-schemaform__duration > .core-inputbox { max-width: 240px; }
+
+.core-schemaform__array-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+.core-schemaform__array-index {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: var(--core-h-md);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg-faint);
+}
+.core-schemaform__array-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.core-schemaform__array-row > .core-iconbtn {
+  flex: none;
+  margin-top: 5px;
+}
+.core-schemaform__array-empty {
+  margin: 0;
+  font-size: var(--text-ui-sm);
+  font-style: italic;
+  color: var(--color-fg-faint);
+}
+.core-schemaform__array-add { align-self: flex-start; }
+.core-schemaform__bare { min-width: 0; }
+
+.core-schemaform__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 4px;
+}
+.core-schemaform__empty {
+  margin: 0;
+  padding: 20px 0;
+  text-align: center;
+  font-size: var(--text-ui-sm);
+  color: var(--color-fg-faint);
 }

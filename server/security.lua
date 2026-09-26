@@ -15,6 +15,11 @@
     Both game events fire per bullet / per blast, so audits, hooks and kicks are throttled per src and
     per kind (AUDIT_COOLDOWN_MS); the cancel itself is never throttled.
 
+    Staff modes (DESIGN §51): `Security.isStaffExempt(src, what)` answers whether a staff member is in a
+    sanctioned Core.Admin mode that explains the anomaly `what` ('invisible', 'collision', 'teleport',
+    'god', 'speed'). `report` consults it for every kind, so a future detection of those anomalies only
+    has to report with that kind; it should also skip its own cancel/correction when the check is true.
+
     Natives: SetRoutingBucketEntityLockdownMode (server), CancelEvent (shared), GetGameTimer (shared).
 ]]
 
@@ -114,9 +119,35 @@ local function allowReport(src, kind)
     return true
 end
 
+-- Anomaly -> the Core.Admin modes that sanction it (noclip hides, ghosts and moves the ped; spectate
+-- hides it under the target; the editor flies a hidden ped around; god is invincibility).
+local STAFF_EXEMPT <const> = {
+    invisible = { vanish = true, noclip = true, spectate = true, editor = true },
+    collision = { noclip = true, spectate = true, editor = true },
+    teleport = { noclip = true, spectate = true, editor = true },
+    god = { god = true, noclip = true, spectate = true, editor = true },
+    speed = { noclip = true, editor = true },
+}
+
+--- True when `src` is in a Core.Admin mode (session state, DESIGN §51) that sanctions the anomaly `what`.
+--- Unknown anomalies and players without modes are never exempt.
+--- @return boolean
+function Security.isStaffExempt(src, what)
+    local sanctioned = STAFF_EXEMPT[what]
+    local admin = rawget(Core, 'Admin')
+    if not sanctioned or type(admin) ~= 'table' or type(admin.getModes) ~= 'function' then return false end
+    local ok, modes = pcall(admin.getModes, src)
+    if not ok or type(modes) ~= 'table' then return false end
+    for mode in pairs(modes) do
+        if sanctioned[mode] then return true end
+    end
+    return false
+end
+
 --- Audit + `cheatDetected` + the optional kick, throttled as above. The caller has already cancelled
---- the event; this only reports it.
+--- the event; this only reports it. Staff in a mode that sanctions `kind` are never reported.
 local function report(src, kind, details, fmt, ...)
+    if Security.isStaffExempt(src, kind) then return end
     if not allowReport(src, kind) then return end
     Log.audit('security', src, fmt, ...)
     Core.emitHook('cheatDetected', src, kind, details)

@@ -9,7 +9,7 @@ on `core`. This file is the working agreement for anyone (human or agent) changi
 
 | file | role |
 |---|---|
-| `DESIGN.md` | **The binding contract.** ~3,400 lines, sections §0–§38. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes; **§37 is the design system** (tokens, classes, the component catalogue — it replaces the old §7.2 look); **§38 is the runtime UI platform** and supersedes §7.1, §7.4, §6.10's focus paragraph and §9's message budget; **§39 is the vitals HUD** (the bottom-left strip: mic tile, HEALTH / ARMOR plates, food / drink bars) and supersedes the HUD of §7.2 / §21 and the `Hud` / `StatsBars` rows of §37.6. Read the section you touch before editing code, and update it *with* the code — never after, never not. |
+| `DESIGN.md` | **The binding contract.** ~5,200 lines, sections §0–§53. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes; **§37 is the design system** (tokens, classes, the component catalogue — it replaces the old §7.2 look); **§38 is the runtime UI platform** and supersedes §7.1, §7.4, §6.10's focus paragraph and §9's message budget; **§39 is the vitals HUD** (the bottom-left strip: mic tile, HEALTH / ARMOR plates, food / drink bars) and supersedes the HUD of §7.2 / §21 and the `Hud` / `StatsBars` rows of §37.6; **§41–§53 are the admin platform** (each section ends in "Implementation notes (2026-09-26)" — the deviations are stated there). Read the section you touch before editing code, and update it *with* the code — never after, never not. |
 | `ui/sdk/src/contract.ts` | **The TypeScript half of the contract** (§38.6): `API_VERSION`, `CoreUIHost` and every type the shell and a plugin share. Both sides import it, so the compiler proves the shell implements what the SDK calls. Change it and DESIGN §38 in the same commit; a breaking change bumps `API_VERSION`. |
 | `README.md` | Integrator guide: install, config keys, API cheat sheet, plugin how-to, in-game checklist, troubleshooting. Update it whenever an API, config key or command changes. |
 | `PLAN.md` | History of the build runs (who owned which file). Append a run table for multi-agent work. |
@@ -20,6 +20,13 @@ DESIGN §40 adds dependency-free geometry/zones/points, controls/actions, player
 rich forms/menus, skill checks and cancellable hook pipelines. Keep client results advisory and preserve
 owner cleanup and coroutine-scoped callback ownership.
 
+DESIGN §41–§53 add the admin platform that every plugin can use: page input modes / Escape / hide policy (§41),
+rendered-camera raycasts (§42), `Core.Schema` (§43), permissions v2 with ranked groups in `perm_groups` (§44),
+`Core.Settings` (§45), `Core.Audit` (§46), `Core.Bans` (§47), sticky player states + teleport options + account
+reader (§48), target selectors (§49), `Core.Buckets` (§50), `Core.Admin` contributions and the one dispatch path
+(§51), `Core.Maps` with region streaming (§52) and seven kit components (§53). The admin plugin itself — panel,
+editor, sanctions, reports — is `resources/admin` with its own `DESIGN.md`; core never depends on it.
+
 ## 2. Layout
 
 ```
@@ -28,9 +35,24 @@ shared/config.lua       every tunable (Config.*); plugins read core's copy as Co
 shared/ui_manifest.lua  UIManifest.API_VERSION / dirOk / validate — the plugin manifest rules, both VMs (§38.4)
 lib/<module>/{shared,client,server}.lua   pure libs compiled INTO each plugin VM (no export hop)
 server/*.lua            stateful modules (api, db, db_pg, player, playergrid, money, factions, vehicles, doors, ui, …)
+server/audit.lua        Core.Audit (§46): append-only trail + lean in-memory index, three retention pools; server/bans.lua
+                        = Core.Bans (§47: identifier + token index; Bans.checkConnecting is internal, block-listed)
+server/bans_identity.lua internal Core.BanIdentity (§47): identity reads, online holder index, rank check — loads RIGHT
+                        before bans.lua (which errors otherwise); block-listed in api.lua
+server/buckets.lua      Core.Buckets (§50); server/settings.lua = Core.Settings (§45) + core's maps/audit sections
+server/adminapi.lua     Core.Admin (§51): registry, snapshot, duty/modes/staff/echo; adminapi_dispatch.lua = Admin.run,
+                        core:admin:run, chat commands — the two MUST stay adjacent in the manifest (private hand-off)
+server/maps_*.lua       Core.Maps (§52): maps_types → maps_runtime → maps → maps_apply (order required; they share the
+                        internal Core.MapsRuntime); maps_regions.lua = Core.MapRegions (§52.3, internal: regions/packs)
 server/ui_plugins.lua   start-up validation of every resource's ui/dist, printed to the SERVER console
 client/*.lua            world scan, interactions, markers, doors, ui shell bridge, blur, visibility, …
 client/ui_plugins.lua   discovery (core_ui metadata → manifest.json), plugin:register/unregister, /uiplugins /uidev /uiinspect
+client/settings.lua     the replicated read side of Core.Settings (GlobalState cs:<key>, hook settingChanged)
+client/adminstate.lua   the private staff state (§51): core:admin:self/staffState(s) → Core.Admin.getSelf/getStaffStates,
+                        hooks staffSelfChanged/staffStateChanged; loads right after shared/hooks.lua (before its readers)
+client/maps*.lua        the map runtime (§52.4): maps_spawn (engine) → maps_view (draw loop, hides, editor view) → maps
+                        (wire, regions, window, API); one-shot global hand-off, nothing internal on Core
+lib/schema/shared.lua   Core.Schema (§43): the field vocabulary of settings, admin args and map elements; pure, every VM
 server/pg/index.js      Node source of the Postgres bridge → bundled into server/db_pg.js (committed)
 ui/                     Vite 7 + Vue 3.5 + Tailwind v4 shell, Storybook 10, the SDK, the browser suites
 ui/sdk/                 npm workspace package `@core/ui` (§38.7): src/contract.ts, src/index.ts (the facade),
@@ -49,7 +71,11 @@ ui/tests/               unit/ (node --test over the runtime, type stripping; ui/
 html/                   the built SHELL (COMMITTED); a plugin's own frontend is its committed <plugin>/ui/dist
 templates/plugin/       scaffold used by scripts/new-plugin.sh <name>, ui/ included
 tests/                  offline suites: run_tests.lua (libs/loader), server_tests.lua, client_ui_tests.lua
-                        (focus stack, discovery, requests, patches, feeds), client_chat_tests.lua, pg_smoke.js
+                        (focus stack, discovery, requests, patches, feeds), client_chat_tests.lua, pg_smoke.js;
+                        §41–§53: raycast, schema, settings, perms, buckets, audit, bans, targets, admin_api,
+                        registry_caller, client_registry_caller, client_adminstate, callback, maps, maps_store,
+                        maps_regions, client_maps, chat_hook (<name>_tests.lua, each on its own); admin_harness.lua and
+                        maps_harness.lua are shared harnesses, not suites
 scripts/                check.sh (offline gate), new-plugin.sh, pg-import.js, build-font-gfx.sh + font-to-gfx.java
                         (Barlow -> stream/barlow_condensed.gfx), build-hint-gfx.sh + hint-to-gfx.java + hint.as
                         (the world-prompt key hint -> stream/core_hint.gfx); FFDec is build-time only, never shipped
@@ -172,20 +198,21 @@ interaction, door, cron, locale, a compiled page).
 | what | command | expect |
 |---|---|---|
 | the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
-| libs and loader | `lua5.4 tests/run_tests.lua` | `402 passed, 0 failed` |
-| development services | `lua5.4 tests/{geometry,client_zones,client_actions,context_streaming,hooks,ui_forms}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 190, 36, 48, 122, 94, 98 passed; 0 failed |
-| server modules | `lua5.4 tests/server_tests.lua` | `863 passed, 0 failed` |
-| client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 575 passed, 0 failed` |
+| libs and loader | `lua5.4 tests/run_tests.lua` | `417 passed, 0 failed` |
+| development services | `lua5.4 tests/{geometry,client_zones,client_actions,context_streaming,hooks,ui_forms}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 190, 36, 74, 122, 94, 98 passed; 0 failed |
+| admin platform (§41–§53) | `lua5.4 tests/{raycast,schema,settings,perms,buckets,audit,bans,targets,admin_api,registry_caller,client_registry_caller,client_adminstate,callback,maps,maps_store,maps_regions,client_maps,chat_hook}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 100, 338, 149, 241, 48, 140, 193, 154, 349, 26, 31, 34, 34, 385, 72, 272, 250, 52 passed; 0 failed |
+| server modules | `lua5.4 tests/server_tests.lua` | `1108 passed, 0 failed` |
+| client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed, §41 input modes + hide policy + plain ids, §54 HUD hiding + key capture) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 786 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
-| runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 202`, `# fail 0` |
+| runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 216`, `# fail 0` |
 | types | `npx vue-tsc --noEmit -p ui/tsconfig.json` | no output, exit 0 |
-| generated kit tags | `node ui/scripts/gen-kit-types.mjs --check` | `up to date (64 kit components)` |
+| generated kit tags | `node ui/scripts/gen-kit-types.mjs --check` | `up to date (71 kit components)` |
 | every plugin's dist | `node ui/scripts/check-plugins.mjs` | `0 error(s), 0 warning(s)` for every discovered plugin |
 | rulebook lint | `fxlint resources/core` (and the plugin) | `0 error(s), 0 warning(s)` |
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
 | a plugin's bundle | `npm run build -w <resource>-ui` (from `resources/`) | writes `<plugin>/ui/dist`, ~1 s |
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
-| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 228/228`, `PASS 182/182` |
+| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 312/312`, `PASS 212/212` (shell, kit, runtime) |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
 | benchmarks | `node ui/tests/bench.mjs` | rewrites `ui/tests/BENCH.md` (never hand-edit it) |
@@ -227,6 +254,9 @@ never manual edits of live rows.
 
 ## 8. Gotchas we already paid for
 
+- `files {}` / script globs only wildcard the LAST path segment (`ResourceMetaDataComponent.cpp`: the part before the
+  last `/` must exist literally): `data/*/meta.json` matches nothing and the server warns "could not find file". Use
+  `data/3751/*.json`, `**`, or explicit paths (admin's catalogue lists its build folder).
 - FXServer caches manifests: `refresh` before `ensure` or a new file "does not exist". A NEW file under an
   existing `files {}` glob needs only `restart <res>`; a NEW manifest entry or resource folder needs `refresh`.
 - The NUI render hook (game blur) binds unreliably on the first try; the shell re-issues the sequence on a
@@ -265,3 +295,44 @@ never manual edits of live rows.
   `use_experimental_fxv2_oal`); a BOOL OUT-value is the integer `0`/`1` on the default route and `0` is truthy in
   Lua. Read returns by truthiness, out-values as `v == true or v == 1` — never `== true` / bare `not v` (DESIGN
   §30.4). A stub that answers `true` hides this: `Raycast.between` reported every miss as a hit for that reason.
+- Page ids and feed channels must be PLAIN (`^[%w_%-]+$`, ≤ 64): the NUI → Lua `ui_event` bridge (page events,
+  `escape`, `Core.UI.on`), requests and `UI.feed` channels/keys refuse anything else. `registerPage` used to accept
+  `:` (a page `admin:panel` registered and then never heard an event); it refuses such ids now, and so does
+  `Core.Admin`'s `page` field (DESIGN §41 notes).
+- `<CoreSchemaForm :errors>` takes `Core.Schema.checkAll`'s map AS IS: `{ name = code }` with nested paths PREFIXED to
+  the code (`{ list = '2.pos.min' }`, array rows 1-based) — not `{ ['list.2.pos'] = 'min' }` (flat path keys work
+  too). The form's own check is advisory; the server's errors always win.
+- `Core.DB` document ids are `[%w_%-:]` ≤ 64 — a dot is refused. Keys with dots map to `:` (settings
+  `inventory.maxWeight` → document `inventory:maxWeight`); compound ids use `:` (`<mapId>:<elementId>`). Core.DB also
+  overwrites a document's top-level `updatedAt` with seconds, so a millisecond stamp needs another field (`rev`).
+- A private hand-off between server files (Core.Admin → adminapi_dispatch.lua, bans_identity.lua → bans.lua, the four
+  `server/maps*.lua` files, client/adminstate.lua before its readers) makes their manifest ORDER load-bearing: a
+  file that asserts its predecessor errors at start when moved.
+- `tests/stubs.lua`'s JSON decoder used to read `false` back as nil (fixed 2026-09-26): a suite that round-trips a
+  boolean through the KVP stub must test `false` explicitly.
+- The Registry caller is PER COROUTINE (DESIGN §2.3 note): inside a coroutine `getCaller()` is that coroutine's own
+  entry or `'core'` — a thread started from a plugin's export call does NOT inherit the plugin. A test that simulates
+  a plugin must set the caller inside the calling thread (`withCaller`), not on the main thread before it.
+- `Core.Callback.await*` answers `nil, err` on a refusal (`rate_limit|schema|cooldown|permission|timeout|error`); a
+  consumer that forwards results to a page must pass `err` on, or the UI cannot tell a refusal from an empty answer.
+- Staff state (duty, modes) is never a state bag — every client could read who is vanished. It goes by event to the
+  player and the on-duty staff (`client/adminstate.lua`); `duty`/`staffModes` stay reserved in `CORE_STATE_KEYS`.
+- `SetEntityDrawOutline` on a PED (NPC or player) crashes the client: FiveM's outline pass calls the ped's draw handler
+  outside the scene and the render thread resolves a null draw-list address (`GTA5+16CE6CD`, citizenfx/fivem#1425; the
+  admin inspector did it on 2026-09-26). Objects, vehicles and buildings are fine. Check `GetEntityType(e) ~= 1` before
+  every outline; the native's own docs call it SDK-only.
+- Only ONE exclusive page (`type = 'page'`) is open at a time: `UI.open` of another one closes the first. Its owner
+  hears `closed { reason = 'replaced', by }` (DESIGN §41 notes) — a page that runs a camera or holds controls must
+  handle it (the admin editor parks and re-opens when the page on top closes) or the player soft-locks.
+- `GetEntityArchetypeName` throws ("exception at address extra-natives-five.dll") for an entity without an archetype
+  — FiveM reads `entity->GetArchetype()->hash` with no null check. Call it through `pcall` wherever the entity comes
+  from a ray / pick / pool (the admin editor's LMB binding died on it).
+- A Lua table sent as JSON whose keys are digit strings becomes a LIST in the browser; key such maps with a prefix
+  (the admin editor keys elements `'e' .. id`).
+- A STATEFUL function on a LIB namespace (`Core.Keys.capture`, DESIGN §54) must never be defined by the lib file: the lib
+  runs in every VM and the import.lua proxy only fills in what the lib table LACKS. core defines it on its own copy
+  (client/ui.lua), plugins reach it through the proxy. The proxy caches each closure with `rawset`, so `rawget` on a
+  plugin's lib table cannot tell a lib function from a proxied one — test `capture`, not a name a press already used.
+- `IsHudHidden()` / `IsRadarHidden()` are pure read-backs of the `DISPLAY_HUD` / `DISPLAY_RADAR` flags (GTA
+  `commands_hud.cpp`), so core's own `DisplayHud(false)` (§54 `Core.UI.hideHud`) reads as "the game hid the HUD": the §31
+  `hud` watcher excludes it, or `Config.UI.AutoHide.HudHidden = true` would hide the whole shell and close the editor.

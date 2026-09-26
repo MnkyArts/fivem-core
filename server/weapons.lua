@@ -18,7 +18,6 @@ local Weapons = {}
 
 local Log = Core.Log
 local Net = Core.Net
-local Commands = Core.Commands
 local Utils = Core.Utils
 
 local MAX_AMMO <const> = 9999
@@ -30,7 +29,6 @@ local SNAPSHOT_COOLDOWN_MS <const> = 30000
 local DEATH_COOLDOWN_MS <const> = 2000  -- the death snapshot needs its own bucket, see below
 local WEAPON_PATTERN <const> = '^WEAPON_%u[%u_%d]*$'
 local COMPONENT_PATTERN <const> = '^COMPONENT_%u[%u_%d]*$'
-local PERM_ADMIN <const> = 'core.admin'
 local UINT_MASK <const> = 0xFFFFFFFF
 
 local hashes = {}                       -- [WEAPON_NAME] = unsigned hash, computed once
@@ -309,67 +307,13 @@ Core.on('playerRespawned', function(src)
     Weapons.apply(src)
 end)
 
--- ---------------------------------------------------------------------------
--- Admin commands (DESIGN §4.8 shape, permission core.admin)
--- ---------------------------------------------------------------------------
+-- The /weapon and /weapons staff commands live in server/admin.lua with the other legacy staff commands (duty,
+-- audit with the actor, echo, ranks, Config.Admin.LegacyCommands — review R2-15).
 
---- Answers the caller: notification in game, plain print on the console (src 0).
-local function reply(src, message, kind)
-    if src == 0 then
-        print(('[core] %s'):format(message))
-        return
-    end
-    Core.Notify.send(src, message, kind or 'info')
+--- True for a weapon name the loadout accepts (Config.Weapons.Allowed, else any WEAPON_ name).
+function Weapons.isAllowed(weapon)
+    return isAllowedName(weapon)
 end
-
-Commands.register('weapon', {
-    description = 'Give a player a weapon',
-    permission = PERM_ADMIN,
-    allowConsole = true,
-    params = {
-        { name = 'target', type = 'player', help = 'server id' },
-        { name = 'weapon', type = 'string', help = 'WEAPON_PISTOL' },
-        { name = 'ammo', type = 'integer', help = 'rounds', optional = true },
-    },
-}, function(src, args)
-    local weapon = args.weapon:upper()
-    local ammo = args.ammo or 0
-    if not isAllowedName(weapon) then
-        reply(src, ('Unknown weapon %s'):format(Utils.sanitize(weapon, MAX_NAME)), 'error')
-        return
-    end
-    if ammo < 0 or ammo > MAX_AMMO then
-        reply(src, ('Ammo must be 0..%d'):format(MAX_AMMO), 'error')
-        return
-    end
-    if not Weapons.give(args.target, weapon, ammo) then
-        reply(src, 'Could not give that weapon (no loaded character or loadout full)', 'error')
-        return
-    end
-    Log.audit('weapons', src, 'gave %s (%d ammo) to src %d', weapon, ammo, args.target)
-    reply(src, ('Gave %s (%d ammo) to [%d]'):format(weapon, ammo, args.target), 'success')
-end)
-
-Commands.register('weapons', {
-    description = 'Weapon loadout admin: /weapons clear <player>',
-    permission = PERM_ADMIN,
-    allowConsole = true,
-    params = {
-        { name = 'action', type = 'string', help = 'clear' },
-        { name = 'target', type = 'player', help = 'server id' },
-    },
-}, function(src, args)
-    if args.action:lower() ~= 'clear' then
-        reply(src, 'Usage: /weapons clear <player>', 'error')
-        return
-    end
-    if not Weapons.clear(args.target) then
-        reply(src, 'Could not clear that loadout (no loaded character)', 'error')
-        return
-    end
-    Log.audit('weapons', src, 'cleared the loadout of src %d', args.target)
-    reply(src, ('Cleared the loadout of [%d]'):format(args.target), 'success')
-end)
 
 Core.Weapons = Weapons
 

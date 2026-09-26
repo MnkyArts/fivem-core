@@ -5,11 +5,13 @@
 // Lua -> NUI is a `SendNUIMessage` payload discriminated by `action`, NUI -> Lua is a
 // `RegisterNuiCallback` body discriminated by the callback NAME (the URL path, not a field).
 
-import type { NuiErrorShape, PluginManifest } from '../../sdk/src/contract.ts'
+import type { NuiErrorShape, PageInputMode, PluginManifest } from '../../sdk/src/contract.ts'
 
 // ---------------------------------------------------------------- shared shapes
 
 export type PageType = 'page' | 'overlay' | 'modal'
+/** §41: what Escape does to a page — close it (default) or hand it the page event `escape`. */
+export type PageEscapeMode = 'close' | 'event'
 /** §38.9: rank order. `hud` never enters the stack — overlays take no focus. */
 export type FocusLayer = 'chat' | 'page' | 'modal' | 'system'
 
@@ -47,11 +49,18 @@ export interface MsgPageRegister {
   action: 'page:register'
   id: string
   type?: PageType
+  /** Implied by `input` since §41 (`mixed`/`look`); still read when `input` is absent. */
   keepInput?: boolean
   /** NEW in §38: the resource that owns the page. Absent = legacy/core-owned. */
   owner?: string | null
+  /** §41: absent = `keepInput ? 'mixed' : 'ui'`. */
+  input?: PageInputMode
+  /** §41: absent = 'close'. */
+  escape?: PageEscapeMode
 }
 export interface MsgPageUnregister { action: 'page:unregister'; id: string }
+/** §41: `Core.UI.setInput` — sent on every change, whether the page is open or not. */
+export interface MsgPageInput { action: 'page:input'; id: string; input: PageInputMode }
 export interface MsgPageOpen { action: 'page:open'; id: string; props?: Record<string, unknown> | null }
 export interface MsgPageClose { action: 'page:close'; id?: string | null }
 export interface MsgPagePatch { action: 'page:patch'; id: string; ops: PatchOp[] }
@@ -68,13 +77,20 @@ export interface MsgDevSet {
   loadTimeoutMs?: number
 }
 export interface MsgInspectorToggle { action: 'inspector:toggle' }
+/**
+ * §54: `Core.UI.hideHud` — sent on every change of `hidden` or of `keep`, and on `ui_ready` while
+ * hidden. While `hidden`, core's HUD widgets and every OVERLAY page whose owner is not in `keep`
+ * are hidden (never closed: their state survives). `keep` = the resources holding a reason; Lua
+ * encodes an empty list as `{}`, so anything that is not an array means "nobody".
+ */
+export interface MsgShellHud { action: 'shell:hud'; hidden?: boolean; keep?: string[] | Record<string, never> }
 
-/** Everything §38 adds. The built-in widget actions keep their §6.10 shapes (see store.js). */
+/** Everything §38 adds (and §54's `shell:hud`). The built-in widget actions keep their §6.10 shapes (see store.js). */
 export type LuaToNui =
   | MsgPluginRegister | MsgPluginUnregister
-  | MsgPageRegister | MsgPageUnregister | MsgPageOpen | MsgPageClose
+  | MsgPageRegister | MsgPageUnregister | MsgPageInput | MsgPageOpen | MsgPageClose
   | MsgPagePatch | MsgPageEvent | MsgPageRequest
-  | MsgFeed | MsgFocus | MsgDevSet | MsgInspectorToggle
+  | MsgFeed | MsgFocus | MsgDevSet | MsgInspectorToggle | MsgShellHud
 
 export type LuaToNuiAction = LuaToNui['action']
 

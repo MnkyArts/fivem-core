@@ -15,6 +15,7 @@
 ]]
 
 local here = (arg and arg[0] or 'tests/client_ui_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
+-- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test stubs
 local stubs = dofile(here .. '/stubs.lua')
 
 local passed, failed, suiteName = 0, 0, '?'
@@ -447,6 +448,274 @@ local function suiteFocus()
     eq(stubs.nuiFocus.focus, false, 'and releases focus')
     eq(UI.isOpen('shop'), false, 'the page is gone')
     eq(UI.registerPage('shop', { type = 'page' }), true, 'its id is free again')
+end
+
+--- §41: input modes, the focus triple per mode, the owner check of UI.setInput.
+local function suiteInputModes()
+    suite('ui input modes')
+    local env, Core = newClient()
+    local UI = Core.UI
+    stubs.nui('ui_ready', {})
+
+    asPlugin(Core, 'editor', function()
+        eq(UI.registerPage('ed_ui', { type = 'page' }), true, "input defaults to 'ui'")
+        eq(UI.registerPage('ed_mixed', { type = 'page', input = 'mixed' }), true, "'mixed' registers")
+        eq(UI.registerPage('ed_look', { type = 'page', input = 'look' }), true, "'look' registers")
+        eq(UI.registerPage('ed_game', { type = 'page', input = 'game', escape = 'event', onHide = 'suspend' }),
+            true, "'game' registers with escape and onHide")
+        eq(UI.registerPage('ed_legacy', { type = 'page', keepInput = true }), true, 'keepInput alone still registers')
+        eq(UI.registerPage('ed_modal', { type = 'modal' }), true, 'a ui modal registers')
+        eq(UI.registerPage('ed_gmodal', { type = 'modal', input = 'game' }), true, 'a game modal registers')
+        eq(UI.registerPage('ed_bad', { type = 'page', input = 'Game' }), false, 'an unknown input mode is refused')
+        eq(UI.registerPage('ed_bad', { type = 'page', escape = 'ignore' }), false, 'an unknown escape mode is refused')
+        eq(UI.registerPage('ed_bad', { type = 'page', onHide = 'keep' }), false, 'an unknown onHide is refused')
+        eq(UI.registerPage('ed_bad', { type = 'page', input = 7 }), false, 'a non-string input is refused')
+        -- a page id must be plain: ui_event drops ids with ':' (the page could never answer)
+        eq(UI.registerPage('admin:panel', { type = 'page' }), false, "an id with ':' is refused")
+        eq(UI.registerPage('admin panel', { type = 'page' }), false, 'an id with a space is refused')
+        eq(UI.registerPage(string.rep('a', 65), { type = 'page' }), false, 'an id over 64 characters is refused')
+        eq(UI.registerPage('', { type = 'page' }), false, 'an empty id is refused')
+        eq(UI.registerPage(42, { type = 'page' }), false, 'a non-string id is refused')
+        eq(UI.registerPage(string.rep('a', 64), { type = 'page' }), true, 'a 64-character plain id is accepted')
+        eq(UI.registerPage('admin_panel-2', { type = 'page' }), true, 'letters, digits, _ and - are accepted')
+    end)
+    eq(UI.getInput('ed_bad'), nil, 'a refused page does not exist')
+    eq(UI.getInput('admin:panel'), nil, "the ':' id was never registered")
+    check(printed("invalid page id (admin:panel)") ~= nil, 'the refusal names the id')
+    check(printed('invalid onHide') ~= nil, 'the refusal names the option')
+    eq(UI.getInput('ed_ui'), 'ui', 'getInput reads the default')
+    eq(UI.getInput('ed_legacy'), 'mixed', "keepInput = true without input is 'mixed'")
+    eq(UI.getInput('nope'), nil, 'getInput of an unknown page is nil')
+    eq(UI.getInput(42), nil, 'getInput of a non-string is nil')
+
+    local function regOf(id)
+        local list = stubs.nuiOf('page:register')
+        for i = #list, 1, -1 do
+            if list[i].id == id then return list[i] end
+        end
+        return {}
+    end
+    eq(regOf('ed_game').input, 'game', 'page:register carries the input mode')
+    eq(regOf('ed_game').escape, 'event', 'and the escape mode')
+    eq(regOf('ed_ui').escape, 'close', "escape defaults to 'close'")
+    eq(regOf('ed_legacy').input, 'mixed', 'the legacy flag reaches the shell as mixed')
+    eq(regOf('ed_legacy').keepInput, true, 'keepInput stays on the wire for mixed')
+    eq(regOf('ed_look').keepInput, true, 'and for look')
+    eq(regOf('ed_ui').keepInput, false, 'but not for ui')
+    eq(regOf('ed_game').onHide, nil, 'onHide stays in Lua')
+
+    -- the focus triple per mode (§41 table): focus / cursor / keepInput
+    local function triple()
+        local f = stubs.nuiFocus
+        return ('%s/%s/%s'):format(tostring(f.focus), tostring(f.cursor), tostring(f.keepInput))
+    end
+    UI.open('ed_ui')
+    eq(triple(), 'true/true/false', "'ui': focus + cursor, the game gets nothing")
+    UI.open('ed_mixed')
+    eq(triple(), 'true/true/true', "'mixed': focus + cursor + game input")
+    UI.open('ed_look')
+    eq(triple(), 'true/false/true', "'look': focus, no cursor, game input")
+    UI.open('ed_legacy')
+    eq(triple(), 'true/true/true', 'keepInput = true behaves exactly like before')
+    UI.open('ed_game')
+    eq(stackKeys(), '', "'game' contributes no focus entry")
+    eq(triple(), 'false/false/false', 'so focus is released')
+    eq(UI.isOpen('ed_game'), true, 'while the page stays open')
+    eq(UI.getOpenPage(), 'ed_game', 'as the exclusive page')
+
+    -- a game modal adds nothing; a ui modal above a game page decides alone
+    UI.open('ed_gmodal')
+    eq(stackKeys(), '', 'a game modal adds no entry either')
+    UI.open('ed_modal')
+    eq(stackKeys(), 'modal:ed_modal', 'a ui modal above a game page is the whole stack')
+    eq(triple(), 'true/true/false', 'and takes the cursor')
+    UI.close('ed_modal')
+    eq(triple(), 'false/false/false', 'closing it hands focus back to nobody')
+    UI.close('ed_gmodal')
+
+    -- the chat input keeps the keyboard under a game page: only real focus holders drop it
+    UI['chat.setTyping'](true)
+    eq(stackKeys(), 'chat', 'chat typing works while a game page is open')
+    eq(UI['chat.isTyping'](), true, 'and survives the next applyFocus')
+    eq(triple(), 'true/false/false', 'keyboard only, as always')
+    UI['chat.setTyping'](false)
+
+    -- the watchdog does not count a game page as a focus holder
+    local calls = #stubs.nuiFocus.calls
+    stubs.tick(600)
+    eq(#stubs.nuiFocus.calls, calls, 'the watchdog is quiet over a game page')
+
+    -- mode change while open: owner only, natives and messages only on change
+    local messages = #stubs.nuiMessages
+    asPlugin(Core, 'editor', function()
+        eq(UI.setInput('ed_game', 'game'), true, 'setting the same mode succeeds')
+    end)
+    eq(#stubs.nuiMessages, messages, 'and sends nothing')
+    eq(#stubs.nuiFocus.calls, calls, 'and writes no native')
+    asPlugin(Core, 'editor', function()
+        eq(UI.setInput('ed_game', 'ui'), true, 'the owner switches game -> ui')
+    end)
+    eq(lastMessage('page:input').id, 'ed_game', 'page:input names the page')
+    eq(lastMessage('page:input').input, 'ui', 'and the new mode')
+    eq(stackKeys(), 'page:ed_game', 'the page is back in the stack')
+    eq(triple(), 'true/true/false', 'with the ui triple')
+    asPlugin(Core, 'editor', function() UI.setInput('ed_game', 'look') end)
+    eq(triple(), 'true/false/true', 'ui -> look drops the cursor and keeps the game input')
+    asPlugin(Core, 'editor', function() UI.setInput('ed_game', 'mixed') end)
+    eq(triple(), 'true/true/true', 'look -> mixed brings the cursor back')
+    calls = #stubs.nuiFocus.calls
+    asPlugin(Core, 'editor', function() UI.setInput('ed_legacy', 'mixed') end)
+    eq(#stubs.nuiFocus.calls, calls, 'switching a CLOSED page writes no native')
+    asPlugin(Core, 'editor', function() UI.setInput('ed_game', 'game') end)
+    eq(triple(), 'false/false/false', 'mixed -> game releases focus')
+    eq(UI.isOpen('ed_game'), true, 'and the page stays open')
+
+    asPlugin(Core, 'intruder', function()
+        eq(UI.setInput('ed_game', 'ui'), false, 'another resource may not switch it')
+    end)
+    eq(UI.getInput('ed_game'), 'game', 'the mode is unchanged')
+    check(printed("only 'editor' may change") ~= nil, 'the refusal names the owner')
+    eq(UI.setInput('ed_game', 'ui'), false, 'core is not the owner either')
+    asPlugin(Core, 'editor', function()
+        eq(UI.setInput('ed_game', 'fly'), false, 'an unknown mode is refused')
+        eq(UI.setInput('ed_game', nil), false, 'a missing mode is refused')
+        eq(UI.setInput('nope', 'ui'), false, 'an unknown page is refused')
+    end)
+
+    -- setInput works while closed; the next open uses it
+    UI.close('ed_game')
+    asPlugin(Core, 'editor', function()
+        eq(UI.setInput('ed_ui', 'mixed'), true, 'setInput works on a closed page')
+    end)
+    eq(lastMessage('page:input').id, 'ed_ui', 'and still tells the shell')
+    eq(triple(), 'false/false/false', 'without taking focus')
+    UI.open('ed_ui')
+    eq(triple(), 'true/true/true', 'the next open uses the new mode')
+    UI.close('ed_ui')
+
+    -- re-registering an OPEN page with another mode applies it at once
+    asPlugin(Core, 'editor', function() UI.registerPage('ed_re', { type = 'page' }) end)
+    UI.open('ed_re')
+    eq(stackKeys(), 'page:ed_re', 'a ui page holds focus')
+    asPlugin(Core, 'editor', function() UI.registerPage('ed_re', { type = 'page', input = 'game' }) end)
+    eq(stackKeys(), '', 're-registered as game, it lets go at once')
+    UI.close('ed_re')
+end
+
+--- §41 over §31.4: onHide = 'suspend' across hide/show, shell reloads and owner stops;
+--- the Lua half of Escape = 'event'.
+local function suiteHidePolicy()
+    suite('ui hide policy')
+    local env, Core = newClient()
+    local UI = Core.UI
+    stubs.nui('ui_ready', {})
+
+    --- The first message of `action` (for `id`) sent at or after index `from`.
+    local function sentSince(from, action, id)
+        for i = from, #stubs.nuiMessages do
+            local message = stubs.nuiMessages[i]
+            if message.action == action and (id == nil or message.id == id) then return message, i end
+        end
+        return nil
+    end
+    local function triple()
+        local f = stubs.nuiFocus
+        return ('%s/%s/%s'):format(tostring(f.focus), tostring(f.cursor), tostring(f.keepInput))
+    end
+
+    asPlugin(Core, 'editor', function()
+        UI.registerPage('ed', { type = 'page', escape = 'event', onHide = 'suspend' })
+        UI.registerPage('ed_plain', { type = 'page' })
+        UI.registerPage('ed_modal', { type = 'modal', onHide = 'suspend' })
+    end)
+    local heard = {}
+    UI.on('ed', 'suspend', function() heard[#heard + 1] = 'suspend' end)
+    UI.on('ed', 'resume', function() heard[#heard + 1] = 'resume' end)
+
+    UI.open('ed')
+    UI.open('ed_modal')
+    eq(stackKeys(), 'page:ed|modal:ed_modal', 'page + modal hold focus')
+    local from = #stubs.nuiMessages + 1
+    UI.hide('test')
+    eq(UI.isOpen('ed'), true, 'hiding keeps a suspend page open')
+    eq(UI.isOpen('ed_modal'), false, 'but a modal is still cancelled, whatever its onHide')
+    eq(sentSince(from, 'page:close', 'ed'), nil, 'no page:close for the page')
+    local event, at = sentSince(from, 'page:event', 'ed')
+    eq(event and event.event, 'suspend', 'the page hears suspend')
+    local _, visibleAt = sentSince(from, 'shell:visible')
+    check(at ~= nil and visibleAt ~= nil and at < visibleAt, 'suspend reaches the shell before shell:visible')
+    eq(heard[1], 'suspend', 'and Lua hears it through Core.UI.on')
+    eq(stackKeys(), '', 'its focus entry is skipped while hidden')
+    eq(triple(), 'false/false/false', 'so focus is released')
+    local calls = #stubs.nuiFocus.calls
+    stubs.tick(600)
+    eq(#stubs.nuiFocus.calls, calls, 'the watchdog does not count a suspended page')
+
+    from = #stubs.nuiMessages + 1
+    UI.show('test')
+    event = sentSince(from, 'page:event', 'ed')
+    eq(event and event.event, 'resume', 'showing again resumes it')
+    eq(heard[2], 'resume', 'Lua hears resume')
+    eq(sentSince(from, 'page:open', 'ed'), nil, 'without a re-open')
+    eq(stackKeys(), 'page:ed', 'its focus entry is back')
+    eq(triple(), 'true/true/false', 'with its own input mode')
+
+    -- a second hide/show cycle pairs again; a page closed while hidden gets no resume
+    UI.hide('test')
+    UI.close('ed')
+    from = #stubs.nuiMessages + 1
+    UI.show('test')
+    eq(sentSince(from, 'page:event', 'ed'), nil, 'a page closed while hidden gets no resume')
+    eq(#heard, 3, 'Lua heard suspend, resume, suspend')
+
+    -- the default still closes
+    UI.open('ed_plain')
+    UI.hide('test')
+    eq(UI.isOpen('ed_plain'), false, "onHide = 'close' (the default) still closes the page")
+    UI.show('test')
+
+    -- opened while hidden: starts suspended, so resume pairs with a suspend
+    UI.hide('test')
+    from = #stubs.nuiMessages + 1
+    UI.open('ed')
+    event = sentSince(from, 'page:event', 'ed')
+    eq(event and event.event, 'suspend', 'a suspend page opened while hidden starts suspended')
+    eq(stackKeys(), '', 'and holds no focus yet')
+
+    -- a shell reload while suspended: the fresh instance is told again, after its open
+    stubs.tick(1001)
+    from = #stubs.nuiMessages + 1
+    stubs.nui('ui_ready', {})
+    local reg = sentSince(from, 'page:register', 'ed')
+    eq(reg and reg.escape, 'event', 'the replayed page:register carries escape')
+    eq(reg and reg.input, 'ui', 'and the input mode')
+    local _, openAt = sentSince(from, 'page:open', 'ed')
+    local replayed, replayAt = sentSince(from, 'page:event', 'ed')
+    eq(replayed and replayed.event, 'suspend', 'the reloaded shell hears suspend again')
+    check(openAt ~= nil and replayAt ~= nil and openAt < replayAt, 'after the page:open that remounts it')
+    eq(#heard, 4, 'Lua is not told twice about the same suspension')
+    eq(stackKeys(), '', 'the replayed focus stack skips it too')
+    from = #stubs.nuiMessages + 1
+    UI.show('test')
+    event = sentSince(from, 'page:event', 'ed')
+    eq(event and event.event, 'resume', 'and resume follows on show')
+    eq(stackKeys(), 'page:ed', 'focus is re-applied')
+
+    -- Escape = 'event': the shell's ui_event reaches Core.UI.on(id, 'escape')
+    local escaped = 0
+    UI.on('ed', 'escape', function() escaped = escaped + 1 end)
+    stubs.nui('ui_event', { page = 'ed', event = 'escape', data = {} })
+    eq(escaped, 1, "the shell's escape event reaches Core.UI.on(id, 'escape')")
+    eq(UI.isOpen('ed'), true, 'and Lua keeps the page open')
+
+    -- the owner stops while its page is suspended: nothing is resumed later
+    UI.hide('test')
+    stubs.triggerOn(env, 'onResourceStop', 0, 'editor')
+    eq(UI.isOpen('ed'), false, 'the registry sweep closes the suspended page')
+    from = #stubs.nuiMessages + 1
+    UI.show('test')
+    eq(sentSince(from, 'page:event'), nil, 'and no resume goes to a page that is gone')
+    eq(triple(), 'false/false/false', 'focus stays released')
 end
 
 --- UI.update / UI.patch: the queue, the ordering rule and the replay copy (§38.10).
@@ -1968,9 +2237,11 @@ local function suiteSkillCheck()
     end
     local outcome = 'pending'
     local function open(owner, options)
-        Core.Registry.setCaller(owner)
-        env.CreateThread(function() outcome = UI.skillCheck(options or {difficulty={'easy','medium'},keys={'E','r'}}) end)
-        Core.Registry.setCaller(nil)
+        -- the caller is per coroutine (DESIGN §2.3): the thread that makes the call carries the owner
+        env.CreateThread(function()
+            Core.Registry.setCaller(owner)
+            outcome = UI.skillCheck(options or {difficulty={'easy','medium'},keys={'E','r'}})
+        end)
         return lastMessage('skillcheck:open').id
     end
     local id = open('skill_owner')
@@ -2024,13 +2295,406 @@ local function suiteSkillCheck()
 end
 
 --------------------------------------------------------------------------------
+-- §54 editor focus: HUD hiding and key capture
+--------------------------------------------------------------------------------
+
+--- Installs the four §54 natives on a client VM. The two readbacks answer like the engine's
+--- DEFAULT invoke route — `false` or the INTEGER 1 (AGENTS §8) — and read the flags the two
+--- setters write, which is exactly what IS_RADAR_HIDDEN / IS_HUD_HIDDEN do in the game
+--- (`!CScriptHud::bDisplayRadar` / `!bDisplayHud`). Returns the live flag table.
+local function hudNatives(env)
+    local game = { radar = true, hud = true, calls = {} }
+    env.DisplayRadar = function(on)
+        game.radar = on == true
+        game.calls[#game.calls + 1] = 'radar:' .. tostring(on)
+    end
+    env.DisplayHud = function(on)
+        game.hud = on == true
+        game.calls[#game.calls + 1] = 'hud:' .. tostring(on)
+    end
+    env.IsRadarHidden = function() return (not game.radar) and 1 or false end
+    env.IsHudHidden = function() return (not game.hud) and 1 or false end
+    return game
+end
+
+--- Core.UI.hideHud / showHud / isHudHidden (DESIGN §54): reasons, owners, the keep list, the
+--- natives, the hook, the text UI + key hints, the §31 hud watcher, ui_ready and owner stop.
+local function suiteHudHide()
+    suite('hud hide')
+    local env, Core = newClient()
+    local UI = Core.UI
+    local game = hudNatives(env)
+    stubs.nui('ui_ready', {})
+    local hooks = {}
+    Core.on('hudHiddenChanged', function(hidden) hooks[#hooks + 1] = hidden end)
+    local function hudMessages() return #stubs.nuiOf('shell:hud') end
+    local function keepOf(message)
+        if not message or type(message.keep) ~= 'table' then return '?' end
+        return table.concat(message.keep, ',')
+    end
+
+    -- the text UI of core's interaction scan and a plugin's key hints are up before the editor
+    UI.textUI.show('E', 'Open the door', { owner = 'interactions' })
+    asPlugin(Core, 'core_example', function() UI.keys.show({ { key = 'F', label = 'Enter' } }) end)
+    eq(UI.isHudHidden(), false, 'the HUD starts visible')
+
+    local from = #stubs.nuiMessages + 1
+    local ok
+    asPlugin(Core, 'admin', function() ok = UI.hideHud('editor') end)
+    eq(ok, true, 'hideHud answers true')
+    eq(UI.isHudHidden(), true, 'isHudHidden while a reason is held')
+    local message = lastMessage('shell:hud')
+    eq(message and message.hidden, true, 'one shell:hud { hidden = true }')
+    eq(keepOf(message), 'admin', 'keep lists the resource that holds the reason')
+    eq(table.concat(game.calls, '|'), 'radar:false|hud:false', 'the radar and the native HUD go off once')
+    eq(#hooks, 1, 'hudHiddenChanged fired once')
+    eq(hooks[1], true, 'with hidden = true')
+    check(actionsSince(from):find('textui:hide', 1, true) ~= nil, "core's text UI is taken off the screen")
+    check(actionsSince(from):find('keys:hide', 1, true) ~= nil, "another resource's key hints too")
+    eq(UI.textUI.isShown('interactions'), true, 'the prompt is only suppressed, never dropped')
+
+    -- the same reason again: nothing new at all
+    local count, calls = hudMessages(), #game.calls
+    asPlugin(Core, 'admin', function() ok = UI.hideHud('editor') end)
+    eq(ok, true, 'a reason already held still answers true')
+    eq(hudMessages(), count, 'and sends nothing')
+    eq(#game.calls, calls, 'and touches no native')
+    eq(#hooks, 1, 'and fires no hook')
+
+    -- a second holder changes the keep list, not the hidden state
+    asPlugin(Core, 'inventory', function() UI.hideHud('photo') end)
+    eq(hudMessages(), count + 1, 'a new holder sends one shell:hud')
+    eq(keepOf(lastMessage('shell:hud')), 'admin,inventory', 'keep is the sorted list of holders')
+    eq(#game.calls, calls, 'no native for a second reason')
+    eq(#hooks, 1, 'no hook for a second reason')
+
+    -- a plugin can only clear its OWN reason
+    asPlugin(Core, 'inventory', function() ok = UI.showHud('editor') end)
+    eq(ok, false, "inventory cannot clear admin's reason")
+    asPlugin(Core, 'inventory', function() ok = UI.showHud('photo') end)
+    eq(ok, true, 'showHud answers true for its own reason')
+    eq(keepOf(lastMessage('shell:hud')), 'admin', 'the keep list shrinks with it')
+    eq(UI.isHudHidden(), true, "admin's reason still hides the HUD")
+
+    -- the holder's own prompt and key hints stay; another resource's show is held back
+    from = #stubs.nuiMessages + 1
+    asPlugin(Core, 'admin', function() UI.textUI.show('G', 'Grab', { owner = 'editor' }) end)
+    eq(lastMessage('textui:show') and lastMessage('textui:show').text, 'Grab', "the holder's own text UI shows")
+    UI.textUI.show('E', 'Open the door', { owner = 'interactions' })
+    eq(actionsSince(from), 'textui:show|textui:hide', "core's prompt replaces it without being painted")
+    asPlugin(Core, 'admin', function() UI.keys.show({ { key = 'G', label = 'Grab' } }) end)
+    eq(lastMessage('keys:show') and lastMessage('keys:show').items[1].key, 'G', "the holder's key hints show")
+    asPlugin(Core, 'core_example', function() UI.keys.show({ { key = 'F', label = 'Enter' } }) end)
+    eq(lastMessage().action, 'keys:hide', "another resource's key hints are held back")
+
+    -- invalid reasons
+    eq(UI.hideHud(42), false, 'a non-string reason is refused')
+    eq(UI.hideHud('bad reason'), false, 'a reason with a space is refused')
+    check(printed('UI.hideHud: invalid reason') ~= nil, 'and logged with the API name')
+
+    -- §31: the `hud` watcher reads IsHudHidden(), which OUR DisplayHud(false) turned true
+    UI.setAutoHide('hud', true)
+    stubs.tick(250)
+    eq(UI.isHidden(), false, 'the §31 hud watcher ignores the native HUD §54 switched off')
+
+    -- ui_ready: the reloaded shell gets the hide BEFORE the overlays re-open
+    asPlugin(Core, 'inventory', function()
+        UI.registerPage('inventory_hotbar', { type = 'overlay' })
+        UI.open('inventory_hotbar')
+    end)
+    stubs.tick(1001)
+    from = #stubs.nuiMessages + 1
+    stubs.nui('ui_ready', {})
+    local hudAt, overlayAt
+    for i = from, #stubs.nuiMessages do
+        local m = stubs.nuiMessages[i]
+        if m.action == 'shell:hud' and not hudAt then hudAt = i end
+        if m.action == 'page:open' and m.id == 'inventory_hotbar' and not overlayAt then overlayAt = i end
+    end
+    check(hudAt ~= nil, 'ui_ready re-sends shell:hud while hidden')
+    check(hudAt and overlayAt and hudAt < overlayAt, 'before the overlay page:open, so it never flashes')
+    eq(stubs.nuiMessages[hudAt or from].hidden, true, 'the re-sent message says hidden')
+    eq(UI.isOpen('inventory_hotbar'), true, 'hiding the HUD never closes an overlay')
+
+    -- the last reason goes: everything back, natives restored, hook false
+    from = #stubs.nuiMessages + 1
+    asPlugin(Core, 'admin', function() ok = UI.showHud('editor') end)
+    eq(ok, true, 'showHud drops the last reason')
+    eq(UI.isHudHidden(), false, 'the HUD is visible again')
+    message = lastMessage('shell:hud')
+    eq(message and message.hidden, false, 'shell:hud { hidden = false }')
+    eq(table.concat(game.calls, '|'), 'radar:false|hud:false|radar:true|hud:true', 'what went off comes back on')
+    eq(hooks[#hooks], false, 'hudHiddenChanged fired with false')
+    eq(#hooks, 2, 'exactly one hook per flip')
+    check(actionsSince(from):find('keys:show', 1, true) ~= nil, 'the held-back key hints come back')
+    check(actionsSince(from):find('textui:show', 1, true) ~= nil, 'and the held-back prompt')
+    eq(lastMessage('textui:show').text, 'Open the door', 'with its current text')
+
+    -- the §31 hud watcher works again for a HUD somebody else hides
+    env.DisplayHud(false)
+    stubs.tick(250)
+    eq(UI.isHidden(), true, 'a foreign DisplayHud(false) is the §31 watcher\'s again')
+    env.DisplayHud(true)
+    stubs.tick(250)
+    UI.setAutoHide('hud', false)
+    eq(UI.isHidden(), false, 'and it lets go')
+
+    -- only what §54 switched off is restored: a radar that was hidden before stays hidden
+    game.calls = {}
+    env.DisplayRadar(false)
+    game.calls = {}
+    asPlugin(Core, 'admin', function() UI.hideHud('editor') end)
+    eq(table.concat(game.calls, '|'), 'hud:false', 'a radar already hidden is not touched')
+    asPlugin(Core, 'admin', function() UI.showHud('editor') end)
+    eq(table.concat(game.calls, '|'), 'hud:false|hud:true', 'and not switched on afterwards')
+    eq(game.radar, false, 'so the other script keeps its hidden radar')
+    env.DisplayRadar(true)
+
+    -- a stopping owner cannot leave the HUD hidden behind it
+    game.calls = {}
+    asPlugin(Core, 'admin', function() UI.hideHud('editor') end)
+    asPlugin(Core, 'admin', function() UI.hideHud('preview') end)
+    stubs.triggerOn(env, 'onResourceStop', 0, 'admin')
+    eq(UI.isHudHidden(), false, 'the owner stop drops every reason it held')
+    eq(lastMessage('shell:hud') and lastMessage('shell:hud').hidden, false, 'the shell hears it')
+    eq(table.concat(game.calls, '|'), 'radar:false|hud:false|radar:true|hud:true', 'the natives are restored')
+    eq(hooks[#hooks], false, 'and the hook says visible')
+
+    -- core's own reasons are verbatim, and core's stop restores the natives it switched off
+    game.calls = {}
+    eq(UI.hideHud('cutscene'), true, 'core may hide the HUD itself')
+    eq(keepOf(lastMessage('shell:hud')), 'core', 'keeping core-owned overlays')
+    stubs.triggerOn(env, 'onResourceStop', 0, 'core')
+    eq(table.concat(game.calls, '|'), 'radar:false|hud:false|radar:true|hud:true',
+        "core's stop gives the radar and the native HUD back")
+end
+
+--- The world prompts and the interact key while the HUD is hidden (DESIGN §54 + §6.7).
+local function suiteHudHidePrompts()
+    suite('hud hide prompts')
+    local env, Core, frame = newInteractionsClient('nui')
+    local UI, I = Core.UI, Core.Interactions
+    hudNatives(env)
+    local projection, scan = frame[1], frame[2]
+    stubs.nui('ui_ready', {})
+    local used = 0
+    local id = I.add({ coords = stubs.vector3(1.0, 0.0, 0.0), radius = 2.0, label = 'Pick up',
+        worldPrompt = true, onInteract = function() used = used + 1 end })
+    check(id ~= nil, 'the prompted interaction registered')
+    stubs.projectWorld = function() return true, 0.5, 0.5 end
+    wpFrame(scan)
+    wpFrame(projection)
+    local sets = #stubs.nuiOf('worldprompts:set')
+    check(sets >= 1, 'the dot is sent while the HUD is visible')
+
+    asPlugin(Core, 'admin', function() UI.hideHud('editor') end)
+    local projections = stubs.screenProjections
+    for _ = 1, 4 do wpFrame(projection, 300) end
+    eq(#stubs.nuiOf('worldprompts:set'), sets, 'a hidden HUD sends no world prompt set')
+    eq(stubs.screenProjections, projections, 'and projects nothing (the thread idles)')
+    env.__vm.commands['core_interact'].fn()
+    eq(used, 0, 'core_interact does nothing while the HUD is hidden')
+
+    asPlugin(Core, 'admin', function() UI.showHud('editor') end)
+    wpFrame(projection)
+    eq(#stubs.nuiOf('worldprompts:set'), sets + 1, 'showing again re-sends the whole set at once')
+    env.__vm.commands['core_interact'].fn()
+    eq(used, 1, 'and the interact key works again')
+end
+
+--- Core.Keys.capture / release / isCaptured (DESIGN §54) across REAL VMs: core's client VM and
+--- two plugin VMs built from import.lua, whose proxy reaches core through exports.core:call.
+local function suiteKeyCapture()
+    suite('key capture')
+    local env, Core = newClient()
+    env.SetTextChatEnabled = function() end
+    env.DisableMultiplayerChat = function() end
+    stubs.loadFile(env, 'client/chat.lua')
+    stubs.nui('ui_ready', {})
+
+    local function pluginVM(name)
+        local penv = stubs.newEnv('client', name)
+        stubs.loadImport(penv)
+        return penv, penv.Core
+    end
+    local inv, InvCore = pluginVM('inventory')
+    local adm, AdmCore = pluginVM('admin')
+    local counts = { slot = 0, slotUp = 0, fly = 0, always = 0, core = 0 }
+    InvCore.Keys.register({ name = 'slot1', key = '1', debounce = 0,
+        onPress = function() counts.slot = counts.slot + 1 end,
+        onRelease = function() counts.slotUp = counts.slotUp + 1 end })
+    InvCore.Keys.register({ name = 'radio', key = 'F9', debounce = 0, whileCaptured = true,
+        onPress = function() counts.always = counts.always + 1 end })
+    AdmCore.Keys.register({ name = 'fly_slot1', key = '1', debounce = 0,
+        onPress = function() counts.fly = counts.fly + 1 end })
+    Core.Keys.register({ name = 'lock', key = 'L', debounce = 0,
+        onPress = function() counts.core = counts.core + 1 end })
+    local function press(vmEnv, command) vmEnv.__vm.commands['+' .. command].fn() end
+    local function release(vmEnv, command) vmEnv.__vm.commands['-' .. command].fn() end
+
+    check(rawget(InvCore.Keys, 'capture') == nil, 'the lib defines no capture in a plugin VM (the proxy does)')
+    local captured, mine = InvCore.Keys.isCaptured()
+    eq(captured, false, 'isCaptured through the proxy: nothing held')
+    eq(mine, false, 'and not by the caller')
+
+    -- a key that goes down BEFORE the capture still comes up (nothing stays stuck)
+    press(inv, 'inventory_slot1')
+    eq(counts.slot, 1, 'a press without a capture fires')
+    eq(AdmCore.Keys.capture('editor'), true, 'capture through the proxy answers true')
+    release(inv, 'inventory_slot1')
+    eq(counts.slotUp, 1, 'a release is delivered while captured')
+
+    captured, mine = AdmCore.Keys.isCaptured()
+    eq(captured, true, 'isCaptured is true while a capture is held')
+    eq(mine, true, 'and the holder learns it is its own')
+    captured, mine = InvCore.Keys.isCaptured()
+    eq(captured == true and mine == false, true, 'another resource learns it is not its own')
+    eq(Core.Keys.isCaptured(), true, 'core itself sees it too')
+
+    stubs.tick(10)
+    press(inv, 'inventory_slot1')
+    eq(counts.slot, 1, "another resource's press is swallowed (the inventory hotbar)")
+    release(inv, 'inventory_slot1')
+    eq(counts.slotUp, 1, 'and so is the release of a press that never fired')
+    press(adm, 'admin_fly_slot1')
+    eq(counts.fly, 1, "the holder's own binding fires")
+    release(adm, 'admin_fly_slot1')
+    press(inv, 'inventory_radio')
+    eq(counts.always, 1, 'a whileCaptured binding of another resource fires')
+    release(inv, 'inventory_radio')
+    press(env, 'core_lock')
+    eq(counts.core, 0, "core's own plain bindings are swallowed as well")
+    release(env, 'core_lock')
+    stubs.tick(300)
+    local opened = #stubs.nuiOf('chat:open')
+    press(env, 'core_chat')
+    eq(#stubs.nuiOf('chat:open'), opened + 1, "core's chat key is whileCaptured: T still opens the chat")
+    release(env, 'core_chat')
+    Core.UI['chat.setTyping'](false)
+
+    -- the swallowed press did not start the debounce window: the next free press fires at once
+    eq(InvCore.Keys.capture('photo'), true, 'a second resource may capture too')
+    eq(AdmCore.Keys.release('photo'), false, 'nobody can release a foreign capture')
+    eq(AdmCore.Keys.release('editor'), true, 'release answers true for its own')
+    stubs.tick(10)
+    press(adm, 'admin_fly_slot1')
+    eq(counts.fly, 1, "admin's key is swallowed by inventory's capture now")
+    release(adm, 'admin_fly_slot1')
+    press(inv, 'inventory_slot1')
+    eq(counts.slot, 2, "and inventory's own key fires")
+    release(inv, 'inventory_slot1')
+
+    -- the owner stop sweeps its captures
+    stubs.triggerOn(env, 'onResourceStop', 0, 'inventory')
+    eq(Core.Keys.isCaptured(), false, 'a stopping owner releases its captures')
+    stubs.tick(10)
+    press(adm, 'admin_fly_slot1')
+    eq(counts.fly, 2, 'everything fires again')
+    release(adm, 'admin_fly_slot1')
+
+    -- press time only, and a key never goes dead with core
+    AdmCore.Keys.capture('editor')
+    stubs.resourceStates.core = 'stopping'
+    stubs.tick(10)
+    press(inv, 'inventory_slot1')
+    eq(counts.slot, 3, 'with core unreachable the press goes through')
+    release(inv, 'inventory_slot1')
+    stubs.resourceStates.core = 'started'
+    eq(Core.Keys.capture('bad reason'), false, 'an invalid reason is refused')
+    check(printed('Keys.capture: invalid reason') ~= nil, 'and logged with the API name')
+end
+
+--- §54 + doors: `core_door` is a RAW key mapping on the interact key (E — the editor's fly-up key), so the lib's
+--- capture check never sees it; client/doors.lua asks Core.Keys.isCaptured() itself.
+local function suiteDoorKeyCapture()
+    suite('door key capture')
+    local env, Core = newClient()
+    local bagHandler
+    env.AddStateBagChangeHandler = function(_, bag, fn) if bag == 'global' then bagHandler = fn end return 1 end
+    env.IsDoorRegisteredWithSystem = function() return true end
+    env.AddDoorToSystem = function() end
+    env.DoorSystemGetDoorState = function() return 1 end
+    env.DoorSystemSetDoorState = function() end
+    env.SetStateOfClosestDoorOfType = function() end
+    env.GetClosestObjectOfType = function() return 5 end
+    -- FiveM runs a SetTimeout callback in its own coroutine (the door's canUse prefetch awaits in one);
+    -- the stubs' timer runner does not, so route it through the stub scheduler's threads here
+    env.SetTimeout = function(ms, fn) env.CreateThread(function() env.Wait(ms) fn() end) end
+    stubs.loadFile(env, 'client/doors.lua')
+    check(bagHandler ~= nil, 'doors.lua listens to GlobalState door keys')
+    bagHandler('global', 'door:d1', { model = 1234, x = 0.5, y = 0.0, z = 0.0, locked = true })
+    stubs.tick(1000)
+    eq(Core.Doors.tryToggleNearest(), true, 'the door key toggles a door in reach')
+
+    local adm = stubs.newEnv('client', 'admin')
+    stubs.loadImport(adm)
+    eq(adm.Core.Keys.capture('editor'), true, 'the admin editor captures the keys')
+    stubs.tick(1000)
+    eq(Core.Doors.tryToggleNearest(), false, 'while captured the door key does nothing (E flies up in the editor)')
+    eq(adm.Core.Keys.release('editor'), true, 'released')
+    stubs.tick(1000)
+    eq(Core.Doors.tryToggleNearest(), true, 'and the door key works again')
+end
+
+--- `core:ui:<id>:closed { reason, by? }`: the Lua owner of a page learns why it went away — above all when
+--- ANOTHER exclusive page replaced it (the admin editor under the F10 panel soft-locked: its camera and control
+--- capture kept running for a page that was no longer on screen).
+local function suiteCloseReasons()
+    suite('page closed reasons')
+    local env, Core = newClient()
+    local UI = Core.UI
+    stubs.nui('ui_ready', {})
+    asPlugin(Core, 'admin', function()
+        UI.registerPage('ed', { type = 'page', escape = 'event', onHide = 'suspend' })
+        UI.registerPage('pan', { type = 'page', escape = 'event' })
+        UI.registerPage('act', { type = 'modal' })
+    end)
+    local heard = {}
+    local function listen(id)
+        UI.on(id, 'closed', function(d) heard[#heard + 1] = id .. ':' .. tostring(d.reason) .. ':' .. tostring(d.by) end)
+    end
+    listen('ed'); listen('pan'); listen('act')
+
+    UI.open('ed')
+    UI.open('act')
+    UI.open('pan')
+    eq(table.concat(heard, ' '), 'act:replaced:pan ed:replaced:pan',
+        'a page replacing the layer closes the modal and the page with reason replaced, by = the new page')
+    eq(UI.isOpen('ed'), false, 'the replaced page is closed')
+    heard = {}
+    UI.close('pan')
+    eq(table.concat(heard, ' '), 'pan:close:nil', 'UI.close says close')
+    heard = {}
+    UI.open('ed')
+    UI.closeAll()
+    eq(table.concat(heard, ' '), 'ed:closeAll:nil', 'UI.closeAll says closeAll')
+    heard = {}
+    UI.open('pan')
+    UI.hide('cutscene')
+    eq(table.concat(heard, ' '), 'pan:hidden:nil', 'a page without onHide = suspend closed by hiding says hidden')
+    UI.show('cutscene')
+    heard = {}
+    UI.open('ed')
+    UI.hide('cutscene')
+    eq(#heard, 0, 'a suspend page is not closed by hiding')
+    UI.show('cutscene')
+    UI.close('ed')
+    heard = {}
+    UI.open('pan')
+    UI.unregisterPage('pan')
+    eq(table.concat(heard, ' '), 'pan:unregister:nil', 'unregistering an open page says unregister')
+end
+
+--------------------------------------------------------------------------------
 -- runner
 --------------------------------------------------------------------------------
 
-local SUITES <const> = { suiteSkillCheck, suiteManifest, suiteDiscovery, suiteFocus, suitePatch, suitePaths,
+local SUITES <const> = { suiteSkillCheck, suiteManifest, suiteDiscovery, suiteFocus, suiteInputModes,
+    suiteHidePolicy, suitePatch, suitePaths,
     suiteFeed, suiteRequests, suiteServerForward, suiteHudKeys, suiteHudStats,
     suiteHudFeed, suiteHudFeedConfig, suiteWorldPrompts, suiteWorldPromptsNative,
-    suiteWorldPromptsScaleform, suiteWorldPromptsCadence, suiteWorldPromptsEntity }
+    suiteWorldPromptsScaleform, suiteWorldPromptsCadence, suiteWorldPromptsEntity,
+    suiteHudHide, suiteHudHidePrompts, suiteKeyCapture, suiteDoorKeyCapture, suiteCloseReasons }
 
 for i = 1, #SUITES do SUITES[i]() end
 

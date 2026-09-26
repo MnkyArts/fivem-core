@@ -27,13 +27,20 @@
        NetworkResurrectLocalPlayer (client), ClearPedTasksImmediately, ClearPlayerWantedLevel,
        SetEntityVisible (client), ShutdownLoadingScreen (client), ShutdownLoadingScreenNui (client),
        DoScreenFadeOut, DoScreenFadeIn, IsScreenFadedOut, IsScreenFadingOut (client), GetGameTimer.
+     §48 teleport (fxref 2026-09-26, client): GetVehiclePedIsIn(ped, includeEntering),
+       GetPedInVehicleSeat(vehicle, seatIndex, p2), NetworkHasControlOfEntity(entity),
+       NetworkRequestControlOfEntity(entity). Sticky states come from client/player.lua (§48): spawn and
+       teleport end with Core.Player.reapplyStates and never unfreeze a sticky-frozen ped.
 ]]
 
 local Streaming = Core.Streaming
 local Validate = Core.Validate
 local Log = Core.Log
+local Utils = Core.Utils
 
 local FADE_MS <const> = 500
+local MAPS_WAIT_MS <const> = 3000    -- §48/§52: how long a teleport waits for the map region
+local CONTROL_WAIT_MS <const> = 1000 -- §48 withVehicle: how long to ask for the car's network control
 local MAX_COMPONENT <const> = 11
 local MAX_PROP <const> = 8
 local MAX_FEATURE <const> = 19       -- DESIGN §34.1: face features 0..19, GTA's order
@@ -234,6 +241,43 @@ function Spawn.setModel(model, appearance)
     return true
 end
 
+--- §48: true while the server keeps this player frozen (client/player.lua holds the sticky set).
+local function stickyFrozen()
+    local getStates = Core.Player.getStates
+    local states = Utils.isCallable(getStates) and getStates() or nil
+    return type(states) == 'table' and states.frozen == true
+end
+
+--- §48: re-applies the non-default sticky states (frozen, invincible, invisible, no controls).
+local function reapplyStates(ped)
+    local reapply = Core.Player.reapplyStates
+    if Utils.isCallable(reapply) then reapply(ped) end
+end
+
+--- §52: waits (bounded) until the map runtime has the destination region ready — only once
+--- client/maps.lua exists; without it the collision wait above is all there is.
+local function waitMaps(coords)
+    local maps = Core.Maps
+    if type(maps) ~= 'table' or not Utils.isCallable(maps.waitAreaReady) then return end
+    local ok, err = pcall(maps.waitAreaReady, coords, MAPS_WAIT_MS)
+    if not ok then Log.warn('Spawn.teleport: Maps.waitAreaReady failed: %s', tostring(err)) end
+end
+
+--- §48 withVehicle: the car the local ped DRIVES, once we hold its network control; else 0.
+local function drivenVehicle(ped)
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    if vehicle == 0 or GetPedInVehicleSeat(vehicle, -1, false) ~= ped then return 0 end
+    if NetworkHasControlOfEntity(vehicle) then return vehicle end
+    local deadline = GetGameTimer() + CONTROL_WAIT_MS
+    repeat
+        NetworkRequestControlOfEntity(vehicle)
+        Wait(50) -- bounded by CONTROL_WAIT_MS; the owner hands control over within a few ticks
+    until NetworkHasControlOfEntity(vehicle) or GetGameTimer() >= deadline
+    if NetworkHasControlOfEntity(vehicle) then return vehicle end
+    Log.warn('Spawn.teleport: no network control of the vehicle, moving the ped alone')
+    return 0
+end
+
 --- Full spawn sequence (DESIGN §6.1). Returns false when the model or collision failed to load in time;
 --- the ped is unfrozen and placed either way.
 function Spawn.spawnPlayer(opts)
@@ -278,7 +322,8 @@ function Spawn.spawnPlayer(opts)
     ClearPedTasksImmediately(ped)
     ClearPlayerWantedLevel(PlayerId())
     SetEntityVisible(ped, true, false)
-    FreezeEntityPosition(ped, false)
+    FreezeEntityPosition(ped, stickyFrozen())
+    reapplyStates(ped)
 
     if not firstSpawnDone then
         firstSpawnDone = true
@@ -290,25 +335,35 @@ function Spawn.spawnPlayer(opts)
     return success
 end
 
---- Faded teleport: fade out -> freeze -> move -> collision -> heading -> fade in.
-function Spawn.teleport(coords, heading)
+--- Faded teleport (§6.1, §48): fade out -> freeze -> move -> collision + map region -> heading ->
+--- unfreeze (never a sticky-frozen ped) -> re-apply the sticky states -> fade in.
+--- opts = { withVehicle = false, fade = true }: withVehicle moves the car the local ped drives, and
+--- with it everybody inside; fade = false skips both fades.
+function Spawn.teleport(coords, heading, opts)
     local ok, err = Validate.value('vector3', coords)
     if not ok then
         Log.warn('Spawn.teleport: %s', err or 'invalid coords')
         return false
     end
+    if type(opts) ~= 'table' then opts = {} end
+    local fade = opts.fade ~= false
 
-    fadeOutAndWait()
+    if fade then fadeOutAndWait() end
 
     local ped = PlayerPedId()
-    FreezeEntityPosition(ped, true)
+    local vehicle = opts.withVehicle == true and drivenVehicle(ped) or 0
+    local entity = vehicle ~= 0 and vehicle or ped
+    FreezeEntityPosition(entity, true)
     -- same ordering rule as spawnPlayer: move first, then wait for collision around the ped
-    SetEntityCoords(ped, coords.x, coords.y, coords.z, false, false, false, false)
+    SetEntityCoords(entity, coords.x, coords.y, coords.z, false, false, false, false)
     Streaming.requestCollision(coords)
-    if heading ~= nil then SetEntityHeading(ped, toFloat(heading)) end
-    FreezeEntityPosition(ped, false)
+    waitMaps(coords)
+    if heading ~= nil then SetEntityHeading(entity, toFloat(heading)) end
+    if vehicle ~= 0 then FreezeEntityPosition(vehicle, false) end
+    FreezeEntityPosition(ped, stickyFrozen())
+    reapplyStates(ped)
 
-    DoScreenFadeIn(FADE_MS)
+    if fade then DoScreenFadeIn(FADE_MS) end
     return true
 end
 

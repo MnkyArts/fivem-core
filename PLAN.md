@@ -722,3 +722,111 @@ submenu back navigation is owned by the central keyboard handler. New regression
 Dev deployment state: existing `core` symlink already points at this checkout. FXServer is stopped;
 no server/config changes, process start, restart, live resmon measurement or in-game claim was made.
 Use README's §40 acceptance checklist after starting the dev server through txAdmin.
+
+## Admin platform build (DESIGN §41–§53 + `resources/admin`) — 2026-09-26
+
+Liam: "a dynamic admin system … easy to add new menus, settings through other plugins … like the MTA:SA Map Editor …
+also live place stuff as admin to make fun events". Research `resources/admin/research/RESEARCH.md`; core contract
+DESIGN §41–§53 (each section ends in its implementation notes); plugin contract `resources/admin/DESIGN.md`.
+Liam's constraint: map streaming must NOT copy the inventory's drop scoping — §52 is its own region design.
+The orchestrator planned, integrated the shared files (fxmanifest, api.lua block-list, config, stubs.lua,
+check.sh) and reviewed every diff; implementers were subagents with exact file ownership and a common brief
+(scratchpad `admin-build/BRIEF-COMMON.md`: shared files never edited by a run, integration notes instead, ≤ 900
+lines per file, natives via fxref, own test suite per module). All counts below were re-run by the orchestrator or
+by DOCS-CORE.
+
+| run | owner (files) | result |
+|---|---|---|
+| W1-UI | `client/ui.lua` (+158/−31 → 2175), `client/raycast.lua` (175), `ui/src/runtime/{protocol,pages,layers,inspector}.ts`, `ui/src/shell/{PageHost,Inspector}.vue`, `ui/src/store.js` (+6/−3, accepted extra), `ui/sdk/src/{contract.ts,dev/mock.ts}`, fx_alpha fixture, unit + regression tests, `tests/raycast_tests.lua` | §41 + §42. client_ui 675 (+100), raycast 100, node 212, runtime-regression 199, shell 125 |
+| W1-SCHEMA | `lib/schema/shared.lua` (854), `import.lua` (+1), `server/settings.lua` (733), `client/settings.lua` (127), `tests/{schema,settings}_tests.lua` | §43 + §45. schema 317 (after the UI-only-keys follow-up: `icon`, `rows`, `presets`), settings 149 |
+| W1-PERMS | `server/perms.lua` (894, rewritten, v1 API kept), `lib/callback/shared.lua` (376), `server/buckets.lua` (139), `tests/{perms,buckets}_tests.lua` | §44 + §50. perms 226, buckets 41. Accepted: `tempPermissions` map, rank rules on group edits, first owner keeps a perm |
+| W1-AUDIT | `server/audit.lua`, `server/bans.lua`, `lib/log/shared.lua`, `tests/{audit,bans}_tests.lua` | §46 + §47. audit 119, bans 142 (after the `bans.*` settings follow-up); `recordLog` not re-posted to the webhook |
+| W1-PLAYER | `server/player.lua` (899), `server/getters.lua` (565; getHealth/getArmour/getInfo moved in), `lib/commands/shared.lua` (398), `client/{player,environment,spawn}.lua`, `tests/server_tests.lua` (+93), `tests/targets_tests.lua` | §47 connect path, §48, §49. server 956, targets 115. Accepted: exact name wins, `no_match`/`self`/`too_many`, bucket + withVehicle moves car and riders |
+| W1-KIT | `ui/src/kit/components/Core{VirtualList,Tree,Combobox,VectorInput,ColorPicker,Pagination,SchemaForm}.vue` + `CoreTable.vue`, `ui/src/kit/schema/{SchemaField.vue,schema.js}`, four kit css partials, 7 stories + galleries + `schemaFixtures.js`, `kit-regression.js`, `sdk/src/client.d.ts`, `DesignSystem.mdx` | §53. 71 components; kit 312/312 on the rebuilt `html/`; compile check 223 files 0/0 |
+| W1-CAT | `admin/tools/catalogue/**`, `admin/data/catalogue/3751/*.json` | spawn catalogue from the game files: props 14,942, vehicles 916, peds 1,109, weapons 159 (allow 139), 3.03 MB raw / 0.63 MB gz, deterministic |
+| W1-PROBE | `resources/admin_probe/**` (standalone) | in-game probes (camera relevance, input modes, selection, gizmo, models); 155 offline checks, fxlint 0/0/0 |
+| W2-ADMIN-S1 | `admin/fxmanifest.lua`, `shared/config.lua`, `server/{main,teleport,catalogue,actions_self,actions_world}.lua`, locales, `tests/harness{,_core,_admin}.lua` + runner + 3 suites | admin bootstrap, catalogue gate, self/world actions; 558 checks |
+| W2-ADMIN-C1 | `admin/client/{editor/math,camera,noclip,spectate,overlay,main}.lua` | admin client core; math 174 + smoke |
+| W2-ADMINAPI | `server/adminapi.lua` (695), `server/adminapi_dispatch.lua` (467), `server/security.lua` (+32), `tests/admin_api_tests.lua` | §51. admin api 299. Accepted: cooldown stamped on handler run, 5 s denied-row dedupe, chat command = confirmation |
+| W2-MAPS | `server/maps_types.lua` (437), `maps_runtime.lua` (648), `maps.lua` (847), `maps_apply.lua` (563), `tests/maps_tests.lua` | §52.1/§52.2. maps 340 (after the `extra.t/f` + `mapCfg.rot` follow-up) |
+| W2-REGIONS | `server/maps_regions.lua` (568), `tests/maps_regions_tests.lua` | §52.3. maps regions 216 (after the per-src pack budget follow-up) |
+| W2-MAPS-C | `client/maps_spawn.lua` (895), `client/maps_view.lua` (310), `client/maps.lua` (681), `tests/client_maps_tests.lua` | §52.4. client maps 218; 0 B per steady-state evaluation; follow-up: `CreateModelHideExcludingScriptObjects` |
+| W2-ADMIN-S2 | `admin/server/actions_players.lua` (607) + suite; core `server/chat.lua` (+33/−8), `tests/chat_hook_tests.lua` | player actions; `chat:beforeMessage` hook (§23 note), chat hook 31 |
+| W2-ADMIN-S3 | `admin/server/{players,sanctions,reports,rpc}.lua`, `tests/harness_ext.lua` + 4 suites | players service, sanctions, reports, 23 callbacks; 607 checks |
+| W3-EDITOR-S | `admin/server/editor.lua`, `admin/server/editor_maps.lua`, `tests/harness_editor.lua`, `tests/suites/editor.lua` | editor sessions + maps RPC; editor 286 |
+| W3-EDITOR-C · W3-UI-PANEL · W3-UI-EDITOR | admin client editor, the panel frontend, the editor frontend (`admin/client/editor/*`, `admin/ui/**`) | running while this table was written — see `resources/admin` |
+| R-CORE · R-ADMIN-S | reviewers (read-only) | core and admin-server review passes, launched after W2 |
+| DOCS-CORE | `types/core.lua`, `README.md`, `DESIGN.md` (notes, §23, §37.5/§37.7, §45 line, §52.4a addenda), `AGENTS.md` (§1, §2, §5, §8), `PLAN.md` | stubs for every §41–§53 API; `fxref core build` → 586 functions; `fxlint admin` 42 K013 warnings → 0; `fxlint core` 0/0 |
+
+Orchestrator integration (REVIEW-LOG): `tests/stubs.lua` JSON decoder fixed (`false` survived as nil); manifest
+entries in load order (audit + bans before notify/perms; buckets after perms; settings → adminapi →
+adminapi_dispatch after globals; maps_regions + the four maps files after cron; client settings after ui_plugins;
+client maps_spawn → maps_view → maps after spawn); `server/api.lua` block-list += `MapRegions`, `MapsRuntime`,
+`Bans.checkConnecting`; `shared/config.lua` += `Perms.Weights/Inherits` (six seed groups), `Admin.RequireDuty/Scope/
+StaffPerm`, `Buckets.Range`, `Maps.*` incl. `PackBudgetBytes/WindowMs`; `server/player.lua` `CORE_STATE_KEYS` +=
+`duty`, `staffModes`; `client/interactions.lua` ignores E while a noclip/editor/spectate staff mode is on;
+`scripts/check.sh` runs the thirteen new suites. Contract fix: page ids must be plain (`admin_panel`, …; the
+`ui_event` bridge refuses `:`), the editor camera feed is channel `admin` with flat keys.
+
+Verification (DOCS-CORE, 2026-09-26): run_tests 402 · geometry 190 · client_zones 36 · client_actions 48 ·
+context_streaming 122 · hooks 94 · ui_forms 98 · client_chat 40 · interiors 999 · client_ui 675 · server 956 ·
+raycast 100 · schema 317 · settings 149 · perms 226 · buckets 41 · audit 119 · bans 142 · targets 115 · admin api 299
+· maps 340 · maps regions 216 · client maps 218 · chat hook 31 — all 0 failed; node 212/0; vue-tsc exit 0;
+gen-kit-types 71 up to date; kit-compile-check 223 files 0/0; check-plugins 0 errors, 1 warning (`admin` dist older
+than src — W3 UI runs in progress); admin runner 2462/0. Browser suites (orchestrator, after the html rebuild):
+shell 125, kit 312, runtime 199. Nothing deployed; the in-game checklists (README "Admin platform APIs", admin
+DESIGN §15) are open.
+
+### Review rounds (2026-09-26, after W1–W3)
+
+Five read-only reviews, findings routed to the owning runs (each fix re-tested by the owner and re-run by the
+orchestrator): **R-CORE** (2 high, 7 medium, 13 low), **R-ADMIN-S** (1 high, 7 medium, 11 low), **R2-CLIENT** (6 medium,
+8 low), **R2-CORE** (1 high, 4 medium, 10 low; R2-10 accepted as is), **R2-UI** (2 high, 5 medium — root cause: callback
+refusals were a bare nil).
+
+| run | fixes (core side) | suite after |
+|---|---|---|
+| W1-SCHEMA | L12 whole numbers ≤ 2^53 | schema 338 |
+| W1-PERMS | M5 rank rules (strictly below, `not_held`), L2 cache on `permsChanged(src, 'grants'\|'group')`, L11 evacuation through `Player.setBucket`; R2-UI callback refusal reasons (`await` → `nil, err`) | perms 241, buckets 48, callback 34 (new) |
+| W1-AUDIT | H2 ban rank over accounts + online holders, M3 `tokenMatches` 2 + enrichment rule, M4 `unavailable` + `bans.failClosed`; R2-6 retention pools + rate cap (`audit.logMaxRows`), R2-9 `Cron.remove` owner check, R2-12 migration relink; split `server/bans_identity.lua` | audit 139, bans 193 |
+| W1-PLAYER | M2 bounded selectors, M4 connect fallback, L2 `permsChanged` from player.lua, L3 `basic` grammar, identifier colon; account index `findAccountsByIdentifier` + `getGroup`; R2-1/2/3/7/11/13/15: legacy commands under duty/audit/echo + `Config.Admin.LegacyCommands`, `/weapon(s)` moved to admin.lua, all identifier types, 8-name cap + 100 ms throttle, `moveRiders` | server 1108, targets 154 |
+| W1-UI | registerPage refuses non-plain ids; props wrapper follows the definition's `reactivity` (§38.10 note) | client_ui 684, node 214, runtime-regression 201 |
+| W2-ADMINAPI | H1 staff-only `core:admin:run`, M1 per-coroutine Registry caller (server + client), M2 dispatch, L1–L13; R2-CLIENT F1 staff state by event (`client/adminstate.lua`, hooks `staffSelfChanged` / `staffStateChanged` / `staffModeChanged`), R2-14 per-action denied budget, plain `page` ids | admin api 349, registry caller 26, client registry caller 31, client adminstate 34 |
+| W2-MAPS | M7 weighted journal + `maps.journalMaxOps`, L6 restore ops, L7 id cap, L8 `referenced`, L9 rollback re-validation, L10 `targetBucket` outside the bucket range | maps 301, maps store 72 (new) |
+| W2-REGIONS | M6 editor-only data tuples (full `v` / public `pv`), R2-8 `reaudience` on staffModeChanged/permsChanged + per-flush check | maps regions 272 |
+| W2-MAPS-C | editor flip re-request (`staffSelfChanged`), F12 forget absent `mapCfg` entities, F14 marker cap + behind-camera cull, model hardening | client maps 239 |
+| W2-ADMIN-S2 | R2-4 chat fan-out through `emitMany` + staff set + `Config.Chat.JoinLeave`, R2-5 permission before filters/hooks | chat hook 52 |
+| W2-ADMIN-C1 | R2-CLIENT F5 `Controls.acquire({ all, except })` (core/client/controls.lua) | client actions 74 |
+| orchestrator | `/setgroup` help, `outranks()` guards (superseded by W1-PLAYER round 4), stubs.lua `GetPlayerIdentifierByType` prefix match, manifest (`bans_identity` before bans, `client/adminstate` after shared/hooks), api.lua `BanIdentity`, config `Admin.LegacyCommands` + `Chat.JoinLeave`, settings `audit.logMaxRows` + `maps.journalMaxOps`, check.sh (five new suites), interactions.lua reads `getSelf()` | — |
+| DOCS-CORE (refresh) | types/core.lua (4531 lines: callback errors, client Core.Admin, staff hooks, Player getGroup/findAccountsByIdentifier, selector `basic`, Controls `all/except`, Cron owner, `Weapons.isAllowed`, Registry per coroutine, Maps restore ops, MapRegions audience), DESIGN notes rewritten for §44 §46–§51 §52.x + notes in §2.3 §3.5 §4.8 §17 §23 §38.10 §40, README, AGENTS §2/§5/§8, this table | — |
+
+Verification (DOCS-CORE refresh, all run here): run_tests 402 · geometry 190 · client_zones 36 · client_actions 74 ·
+context_streaming 122 · hooks 94 · ui_forms 98 · client_chat 40 · interiors 999 · client_ui 684 · server 1108 ·
+raycast 100 · schema 338 · settings 149 · perms 241 · buckets 48 · audit 139 · bans 193 · targets 154 · admin api 349 ·
+registry caller 26 · client registry caller 31 · client adminstate 34 · callback 34 · maps 301 · maps store 72 ·
+maps regions 272 · client maps 239 · chat hook 52 — all 0 failed; admin runner 3090/0. Node units, gen-kit-types and
+the lint results are in the DOCS-CORE report; browser suites per W1-UI: shell 125, kit 312, runtime 201.
+
+## Run UX (2026-09-26) — admin editor overhaul (DESIGN §54, §52 notes "run UX C2")
+
+Liam's in-game feedback on the admin editor (HUD and minimap visible, key hints not full width, quick slots fired
+the inventory hotbar, "placed by someone else", a gizmo not like Blender's, vehicles changing colour when moved) was
+fixed across core and `resources/admin` by five implementers with exact file ownership (brief: scratchpad
+`ux-run/BRIEF.md`); the orchestrator integrated the shared files and re-ran every gate. The admin side is recorded
+in `resources/admin/PLAN.md` → *Run UX*; core's two packages and the orchestrator's core fix:
+
+| package | owner | files | tests |
+|---|---|---|---|
+| HUD hiding + key capture (§54) | C1 | `client/ui.lua` (`UI.hideHud/showHud/isHudHidden`, `Keys.capture/release/isCaptured`, Registry kinds `uihud` / `keycapture`, core stop restores `DisplayRadar` / `DisplayHud`), `lib/keys/client.lua` (`whileCaptured`, press-time `isCaptured` across VMs through the export proxy), `client/chat.lua` (chat key `whileCaptured = true`), `client/interactions.lua` (world prompts / text UI suppressed, hook `hudHiddenChanged`), shell `ui/src/runtime/{protocol,layers}.ts` (`shell:hud`), `store.js`, `App.vue` (`data-core-hud` wrappers), `shell/PageHost.vue` (`data-core-overlay`), `stories/Shell.stories.js` (HudHidden), `html/` rebuilt, `types/core.lua`, DESIGN §54 (+ pointers in §3.8, §8, §38.5), README, AGENTS §5 counts + §8 gotchas | client_ui 684 → 773, run_tests 402 → 417, unit `# pass` 214 → 216, runtime browser 201 → 212 (shell 125, kit 312 unchanged); `scripts/check.sh` exit 0; Storybook build ok |
+| in-place networked map updates + stable paint | C2 | `server/maps_runtime.lua` (`updateNet` → `moveInPlace`, `core:maps:pose` to the owning client, 2 s verification, paint `joaat(uid) % 22` of a curated list, spawn-queue tail fix), `client/maps.lua` (+26: the pose handler, `SetEntityCoordsNoOffset` + heading / rotation), `tests/maps_harness.lua` (`H.owners`, `H.rpcs`, `H.poses`), `tests/maps_tests.lua`, `tests/client_maps_tests.lua` (19b2); DESIGN §52.2 / §52.4 / §52.4a / §52.5 notes and README merged by the orchestrator | maps 301 → 385, client_maps 239 → 250, maps_store 72, maps_regions 272, server 1108 unchanged |
+| admin: gizmo + modal G / R | A1 | `resources/admin` only (see its PLAN) | admin editor_gizmo 302 |
+| admin: editor UX Lua + server | A2 | `resources/admin` only; consumes §54 pcall-safe | admin editor_ux 155 |
+| admin UI (Vue) | V1 | `resources/admin/ui` only | typecheck 0, kit-compile 0/0, check-plugins 0/0 |
+| orchestrator | — | `client/doors.lua` (+3: `Doors.tryToggleNearest` returns false while `Core.Keys.isCaptured()` — `core_door` is a RAW key mapping on E, which the capture does not swallow by itself, and E flies the editor camera up) + its check in `tests/client_ui_tests.lua`; admin `actions_self` perm count, manifest, locale key | client_ui 773 → 779 |
+
+Verification (orchestrator, 2026-09-26): client_ui 779 · run_tests 417 · maps 385 · client_maps 250 · server 1108 —
+all 0 failed; node units `# pass 216`, `# fail 0`; browser suites shell 125/125, kit 312/312, runtime 212/212;
+admin runner 3572 / 0; admin_probe 157; `fxlint core` and `fxlint admin` 0 errors, 0 warnings. Deploy: `refresh`,
+`restart core`, then `ensure admin` and restart every resource that uses `Core.Keys` (inventory …) — the key lib is
+compiled into each VM, an old copy never checks the capture. In-game checklist: core README items 38–40 (§54) and
+admin README §3 / §6 / §7 / §10.

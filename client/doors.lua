@@ -316,6 +316,9 @@ end
 ---@return boolean sent
 function Doors.tryToggleNearest()
     if stopping or IsNuiFocused() or interactionActive() then return false end
+    -- a raw key mapping, so §54's key capture does not swallow it by itself: while another resource holds a
+    -- capture (the admin editor flies up on E, the same default key) the door key does nothing
+    if Core.Keys and Core.Keys.isCaptured and Core.Keys.isCaptured() then return false end
     local now = GetGameTimer()
     if now - lastPress < PRESS_COOLDOWN_MS then return false end
     local id = nearestInReach()

@@ -10,9 +10,9 @@
 // It touches no DOM: `deliver` is injected (the dev host passes the shell's), which is also what
 // makes the unit tests possible without a browser.
 
-import type { EventMap, Off, ReqOf, ResOf, RpcMap } from '../contract.ts'
+import type { EventMap, Off, PageInputMode, ReqOf, ResOf, RpcMap } from '../contract.ts'
 import type {
-  CbUiClose, CbUiEvent, CbUiRequest, CbUiResponse, FocusEntry, PageType, PatchOp, RequestResult,
+  CbUiClose, CbUiEvent, CbUiRequest, CbUiResponse, FocusEntry, PageEscapeMode, PageType, PatchOp, RequestResult,
 } from '../../../src/runtime/protocol.ts'
 import type { TransportImpl } from '../../../src/runtime/transport.ts'
 
@@ -25,7 +25,12 @@ export type PagePropsMap = Record<string, object>
 
 export interface MockPageDecl {
   type?: PageType
+  /** Legacy: `true` without `input` is `'mixed'` (DESIGN §41). */
   keepInput?: boolean
+  /** §41: `'ui'` (default) · `'mixed'` · `'look'` · `'game'` (no focus entry, click-through). */
+  input?: PageInputMode
+  /** §41: `'event'` keeps the page open on Escape and fires its `escape` page event. */
+  escape?: PageEscapeMode
 }
 
 export interface MockRequestOptions {
@@ -57,6 +62,8 @@ export interface LuaMock<Rpc extends object = RpcMap, Pages extends object = Pag
   registerPlugin(id: string, opts?: { pages?: Record<string, MockPageDecl | PageType> }): void
   open<K extends keyof Pages & string>(id: K, props?: Pages[K]): void
   close(id?: string): void
+  /** `Core.UI.setInput(id, mode)` (§41): `page:input`, then the focus stack again. */
+  setInput(id: string, mode: PageInputMode): void
   update<K extends keyof Pages & string>(id: K, partial: Partial<Pages[K] & object>): void
   /**
    * `patch('inventory', 'slots.12', slot)`; the value left out DELETES the key (§38.10).
@@ -108,7 +115,7 @@ export function createMockTransport<Rpc extends object = RpcMap, Pages extends o
 ): MockTransport<Rpc, Pages> {
   const posts: MockPost[] = []
   const messages: MockMessage[] = []
-  const decls = new Map<string, { type: PageType; keepInput: boolean; owner: string }>()
+  const decls = new Map<string, { type: PageType; input: PageInputMode; escape: PageEscapeMode; owner: string }>()
   const openOrder: string[] = []
   const handlers = new Map<string, { fn: (d: unknown) => unknown; delayMs?: number }>()
   const listeners = new Map<string, Set<(data: unknown) => void>>()
@@ -129,12 +136,13 @@ export function createMockTransport<Rpc extends object = RpcMap, Pages extends o
     send(msg)
   }
 
-  /** §38.9: the exclusive page, then modals in open order. Overlays never take focus. */
+  /** §38.9: the exclusive page, then modals in open order. Overlays never take focus, and neither
+   *  does a page or modal in `game` input mode (§41). */
   function refreshFocus(): void {
     const stack: FocusEntry[] = []
     for (const id of openOrder) {
       const decl = decls.get(id)
-      if (!decl || !RANK[decl.type]) continue
+      if (!decl || !RANK[decl.type] || decl.input === 'game') continue
       stack.push({ key: decl.type + ':' + id, layer: decl.type as FocusEntry['layer'], id, owner: decl.owner })
     }
     stack.sort((a, b) => RANK[a.layer] - RANK[b.layer])
@@ -226,14 +234,26 @@ export function createMockTransport<Rpc extends object = RpcMap, Pages extends o
       for (const pageId of Object.keys(pages)) {
         const raw = pages[pageId]
         const decl: MockPageDecl = typeof raw === 'string' ? { type: raw } : raw || {}
-        const entry = { type: decl.type || 'page', keepInput: decl.keepInput === true, owner: id }
+        const input: PageInputMode = decl.input || (decl.keepInput === true ? 'mixed' : 'ui')
+        const entry = { type: decl.type || 'page', input, escape: decl.escape || 'close', owner: id }
         decls.set(pageId, entry)
-        out({ action: 'page:register', id: pageId, type: entry.type, keepInput: entry.keepInput, owner: id })
+        out({
+          action: 'page:register', id: pageId, type: entry.type, owner: id,
+          input: entry.input, escape: entry.escape, keepInput: input === 'mixed' || input === 'look',
+        })
       }
     },
 
     open(id, props) { doOpen(id, props) },
     close(id) { doClose(id) },
+
+    setInput(id, mode) {
+      const decl = decls.get(id)
+      if (!decl || decl.input === mode) return
+      decl.input = mode
+      out({ action: 'page:input', id, input: mode })
+      if (openOrder.includes(id)) refreshFocus()
+    },
 
     update(id, partial) {
       const ops: PatchOp[] = Object.keys(partial as object).map((key) => ({ p: key, v: (partial as Record<string, unknown>)[key] }))

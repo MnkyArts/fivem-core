@@ -86,7 +86,7 @@ test('pages report declared / open / mounted and their owner', async () => {
   let s = Inspector.snapshot(1000)
   assert.deepEqual(s.pages.find((p) => p.id === 'good_page'), {
     id: 'good_page', owner: 'good', type: 'page', open: false, mounted: false,
-    keepAlive: false, reactivity: 'deep', crashed: false, error: null,
+    keepAlive: false, reactivity: 'deep', crashed: false, error: null, input: 'ui', escape: 'close',
   })
   Pages.openPage({ action: 'page:open', id: 'good_page', props: {} })
   s = Inspector.snapshot(2000)

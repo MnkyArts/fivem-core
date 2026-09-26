@@ -26,11 +26,20 @@ Config = {
     },
     Money = { Accounts = { cash = true, bank = true }, MaxAmount = 999999999 },
     Perms = {
+        -- Seed only (DESIGN §44): on first start these become documents in the `perm_groups` collection, which is
+        -- the source of truth afterwards. Lists stay cumulative for the pre-§44 code paths.
         Groups = {
-            user  = {},
-            mod   = { 'core.mod' },
-            admin = { 'core.admin', 'core.mod' },
+            user   = {},
+            helper = { 'core.helper' },
+            mod    = { 'core.mod', 'core.helper' },
+            admin  = { 'core.admin', 'core.mod', 'core.helper' },
+            senior = { 'core.senior', 'core.admin', 'core.mod', 'core.helper' },
+            owner  = { 'core.owner', 'core.senior', 'core.admin', 'core.mod', 'core.helper' },
         },
+        -- rank: an actor acts on a player only with a strictly higher weight (Perms.canTarget)
+        Weights = { user = 0, helper = 100, mod = 200, admin = 300, senior = 400, owner = 1000 },
+        -- seed inheritance (each group inherits the one below)
+        Inherits = { helper = { 'user' }, mod = { 'helper' }, admin = { 'mod' }, senior = { 'admin' }, owner = { 'senior' } },
     },
     Factions = {
         CreateCost = 25000, CostAccount = 'bank', MaxMembers = 30, MaxRanks = 8,
@@ -99,7 +108,9 @@ Config = {
     Chat = { Mode = 'proximity', ProximityRange = 20.0, MaxLength = 200, CooldownMs = 800,
         -- Format = '{tag}{name}: {msg}', -- optional custom format; nil keeps structured name/message styling
         ScreamRange = 60.0, ScreamCommand = 's', History = 80, HideDelayMs = 8000, VisibleLines = 8,
-        FadeMeters = { near = 20.0, far = 90.0 } },
+        FadeMeters = { near = 20.0, far = 90.0 },
+        -- join/leave lines: 'staff' (default; a server-wide line per connect does not scale), 'all' or 'off'
+        JoinLeave = 'staff' },
     Security = { EntityLockdown = 'inactive', EnforceLoadout = true, BlockExplosions = false, MaxWeaponDamageMultiplier = 1.0,
         WeaponDamage = {}, KickOnDetect = false, ExemptWeapons = nil },   -- ExemptWeapons nil = the built-in melee/vehicle/environment list
     Http = { AllowPrivate = false, AllowHosts = nil },
@@ -168,7 +179,24 @@ Config = {
     },
     -- Adapter: 'kvp' (no setup) | 'mysql' (oxmysql, untested) | 'postgres' (needs the core_pg_url convar)
     DB = { KeyPrefix = 'doc:', FlushIntervalMs = 5000, Adapter = 'postgres' },
-    Admin = { CarDefaultModel = 'adder' },
+    Admin = {
+        CarDefaultModel = 'adder',
+        -- Core.Admin dispatch (DESIGN §51)
+        RequireDuty = true,
+        Scope = { helper = 1, mod = 5, admin = 50, senior = 200, owner = 2000 },   -- max player targets per action run
+        StaffPerm = 'core.admin.staff',
+        -- core's legacy staff chat commands (/tp /bring /kick /ban /setcash …, DESIGN §4.8); false = not registered
+        LegacyCommands = true,
+    },
+    -- Core.Buckets allocation range (DESIGN §50); charcreator's studio uses 1000 + src, below it
+    Buckets = { Range = { 10000, 60000 } },
+    -- Core.Maps runtime (DESIGN §52); limits are Core.Settings keys `maps.limits.*`
+    Maps = {
+        RegionSize = 512, WindowHysteresis = 64, CacheRegions = 25, LatentBps = 250000, PushOpsMax = 32,
+        MaxSpawnRadius = 400, SpawnPerFrame = 8, DespawnPerFrame = 32, MaxLocalObjects = 1500, MaxMarkers = 64,
+        -- per-player pack byte budget (anti-abuse token bucket; a legit client refills faster than it spends)
+        PackBudgetBytes = 2000000, PackBudgetWindowMs = 10000,
+    },
     Texts = {
         loading = 'Loading your character...', respawn_in = 'Respawn in %d s', respawn_now = 'Respawning...',
         locked = 'Vehicle locked', unlocked = 'Vehicle unlocked',

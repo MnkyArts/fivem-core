@@ -6,7 +6,8 @@
 //   * a token utility (`bg-panel`), which must resolve to core's `--color-panel` by reference,
 //   * a `<style scoped>` rule, which travels in the plugin's own stylesheet,
 //   * an imported asset, whose URL must resolve against the PLUGIN's origin (`base: './'`),
-//   * a handler that throws (the tree survives) and a child that throws while rendering (it does not).
+//   * a handler that throws (the tree survives) and a child that throws while rendering (it does not),
+//   * §41: `page.input` (reactive, drawn below) and the framework's page events escape/suspend/resume.
 import { ref } from 'vue'
 import { useNui, usePage } from '@core/ui'
 import Crash from './Crash.vue'
@@ -23,6 +24,9 @@ const echo = ref('')
 const pageEvents = ref(0)
 
 page.on('ping', () => { pageEvents.value++ })
+page.on('escape', () => { counters.escapes++ })
+page.on('suspend', () => { counters.suspends++ })
+page.on('resume', () => { counters.resumes++ })
 
 async function callEcho() {
   try {
@@ -44,6 +48,7 @@ function throwInHandler(): void {
     <p class="fx-alpha-scoped">scoped</p>
     <p class="fx-alpha-counts">{{ counters.setups }}/{{ pageEvents }}</p>
     <p class="fx-alpha-echo">{{ echo }}</p>
+    <p class="fx-alpha-mode">{{ page.input }}</p>
     <img class="fx-alpha-mark" :src="markUrl" alt="" width="8" height="8" />
     <CoreButton class="fx-alpha-btn px-8" @click="page.emit('hello', { at: 1 })">emit</CoreButton>
     <CoreButton class="fx-alpha-echo-btn" @click="callEcho()">echo</CoreButton>

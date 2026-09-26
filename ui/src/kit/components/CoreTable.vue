@@ -4,12 +4,17 @@
 // the shrinking. The ROOT is the scroll wrapper, not the table, because `stickyHeader` needs a
 // scroll container and the caller's max-height has to land on it (`<CoreTable style="max-height:…">`).
 // Selection is `v-model:selected` on the ROW KEY, never on the index: rows get re-sorted.
+// Sorting (DESIGN §53) is PRESENTATION only: a sortable header is a button that flips
+// `sortKey` / `sortDir` (`v-model:sortKey`, `v-model:sortDir`, plus one `update:sort` with both)
+// and shows the arrow — the table never reorders `rows` itself, because the players list, the
+// audit log and the bans are sorted by the server. `loading` puts a sweeping bar on the top edge and
+// dims the rows; with no rows yet it draws skeleton rows instead of the empty line.
 import { computed, ref } from 'vue'
 
 const ALIGNS = ['left', 'center', 'right']
 
 const props = defineProps({
-  /** `[{ key, label, align?: 'left'|'center'|'right', width?, format?(value, row) }]` */
+  /** `[{ key, label, align?: 'left'|'center'|'right', width?, format?(value, row), sortable? }]` */
   columns: { type: Array, default: () => [] },
   /** The data. Anything array-like of plain objects. */
   rows: { type: Array, default: () => [] },
@@ -23,9 +28,20 @@ const props = defineProps({
   stickyHeader: { type: Boolean, default: false },
   /** The line shown when `rows` is empty; the `empty` slot replaces it. */
   empty: { type: String, default: 'Nothing to show.' },
+  /** Every column sorts unless it says `sortable: false` (a column's own `sortable: true` works alone). */
+  sortable: { type: Boolean, default: false },
+  /** Busy: a sweeping bar on the top edge, dimmed rows — skeleton rows while there are none. */
+  loading: { type: Boolean, default: false },
+  /** How many skeleton rows a loading, empty table draws. */
+  loadingRows: { type: Number, default: 5 },
 })
 
-const emit = defineEmits(['row-click'])
+const emit = defineEmits(['row-click', 'update:sort'])
+
+/** The sorted column's key (`v-model:sortKey`); `null` = unsorted. */
+const sortKey = defineModel('sortKey', { type: String, default: null })
+/** `'asc'` | `'desc'` (`v-model:sortDir`). */
+const sortDir = defineModel('sortDir', { type: String, default: 'asc' })
 
 /** The selected ROW KEY (`v-model:selected`), not the index. */
 const selected = defineModel('selected', { type: [String, Number, null], default: null })
@@ -47,10 +63,33 @@ const colStyle = (column) => {
 
 const alignOf = (column) => (ALIGNS.indexOf(column.align) === -1 ? 'left' : column.align)
 
-const rootClass = computed(() => ['core-table__wrap', 'core-scroll', { 'is-sticky': props.stickyHeader }])
+const isSortable = (column) => (column.sortable === undefined ? props.sortable : Boolean(column.sortable))
+const sortState = (column) => (sortKey.value === column.key ? (sortDir.value === 'desc' ? 'desc' : 'asc') : null)
+const ariaSort = (column) => {
+  if (!isSortable(column)) return undefined
+  const state = sortState(column)
+  return state === 'asc' ? 'ascending' : state === 'desc' ? 'descending' : 'none'
+}
+
+/** A new column starts ascending; the sorted one flips. */
+function sortBy (column) {
+  if (!isSortable(column)) return
+  const dir = sortKey.value === column.key && sortDir.value === 'asc' ? 'desc' : 'asc'
+  sortKey.value = column.key
+  sortDir.value = dir
+  emit('update:sort', { key: column.key, dir })
+}
+
+const showSkeleton = computed(() => props.loading && props.rows.length === 0)
+
+const rootClass = computed(() => ['core-table__wrap', 'core-scroll', {
+  'is-sticky': props.stickyHeader,
+  'is-loading': props.loading,
+}])
 const tableClass = computed(() => ['core-table', {
   'core-table--dense': props.dense,
   'is-selectable': props.selectable,
+  'is-loading': props.loading,
 }])
 
 function pick(row, i) {
@@ -80,17 +119,29 @@ function onKeydown(event) {
 
 <template>
   <div :class="rootClass">
-    <table :class="tableClass">
+    <div v-if="loading" class="core-table__progress" aria-hidden="true"><span class="core-table__progress-fill"></span></div>
+    <table :class="tableClass" :aria-busy="loading ? 'true' : undefined">
       <thead>
         <tr>
           <th
             v-for="column in columns"
             :key="column.key"
             class="core-table__th"
-            :class="'core-table__th--' + alignOf(column)"
+            :class="['core-table__th--' + alignOf(column), { 'is-sortable': isSortable(column), 'is-sorted': sortState(column) }]"
             :style="colStyle(column)"
+            :aria-sort="ariaSort(column)"
             scope="col"
-          >{{ column.label }}</th>
+          >
+            <button v-if="isSortable(column)" type="button" class="core-table__sort" @click="sortBy(column)">
+              <span>{{ column.label }}</span>
+              <CoreIcon
+                class="core-table__sort-icon"
+                :name="sortState(column) === 'desc' ? 'arrow-down' : sortState(column) === 'asc' ? 'arrow-up' : 'sort'"
+                size="xs"
+              />
+            </button>
+            <template v-else>{{ column.label }}</template>
+          </th>
         </tr>
       </thead>
 
@@ -120,7 +171,15 @@ function onKeydown(event) {
           </td>
         </tr>
 
-        <tr v-if="rows.length === 0" class="core-table__empty">
+        <template v-if="showSkeleton">
+          <tr v-for="n in loadingRows" :key="'skeleton-' + n" class="core-table__row core-table__row--skeleton">
+            <td v-for="column in columns" :key="column.key" class="core-table__cell" :class="'core-table__cell--' + alignOf(column)">
+              <CoreSkeleton :width="(40 + ((n * 17 + String(column.key).length * 11) % 45)) + '%'" :height="12" />
+            </td>
+          </tr>
+        </template>
+
+        <tr v-else-if="rows.length === 0" class="core-table__empty">
           <td class="core-table__cell" :colspan="Math.max(1, columns.length)">
             <slot name="empty"><p>{{ empty }}</p></slot>
           </td>

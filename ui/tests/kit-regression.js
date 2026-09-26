@@ -168,11 +168,13 @@
       'CoreButton', 'CoreIconButton', 'CoreKey', 'CoreKeyHint', 'CoreKeyHints', 'CorePrompt', 'CorePromptGroup',
       'CorePanel', 'CoreCard', 'CoreBackground', 'CoreScreen', 'CoreHeading', 'CoreDivider', 'CoreDash',
       'CoreTagline', 'CoreBrand',
-      'CoreTabs', 'CoreMenu', 'CoreChips', 'CoreStepper',
-      'CoreField', 'CoreInput', 'CoreTextarea', 'CoreNumberInput', 'CoreSelect',
-      'CoreCheckbox', 'CoreRadioGroup', 'CoreRadio', 'CoreSwitch', 'CoreSlider', 'CoreSwatches',
+      'CoreTabs', 'CoreMenu', 'CoreChips', 'CoreStepper', 'CorePagination',
+      'CoreField', 'CoreInput', 'CoreTextarea', 'CoreNumberInput', 'CoreSelect', 'CoreCombobox', 'CoreVectorInput',
+      'CoreCheckbox', 'CoreRadioGroup', 'CoreRadio', 'CoreSwitch', 'CoreSlider', 'CoreSwatches', 'CoreColorPicker',
+      'CoreSchemaForm',
       'CoreProgress', 'CoreRing', 'CoreStatBar', 'CoreStatRow', 'CoreSpinner', 'CoreSkeleton', 'CoreVital',
       'CoreBadge', 'CoreTag', 'CoreAvatar', 'CorePlayerChip', 'CoreTable', 'CoreKeyValue', 'CoreEmpty',
+      'CoreVirtualList', 'CoreTree',
       'CoreSlot', 'CoreSlotGrid', 'CoreHotbar', 'CoreList', 'CoreListItem', 'CoreObjective', 'CoreTracker',
       'CoreCompass', 'CoreInteractionDot', 'CoreHudTile',
       'CoreAlert', 'CoreToast', 'CoreShard', 'CoreDialog', 'CoreDrawer', 'CorePopover', 'CoreContextMenu',
@@ -217,6 +219,8 @@
       CoreCard: [{ title: 'Card', subtitle: 'Sub', eyebrow: 'Last played' }, () => 'body'],
       CoreCheckbox: [{ modelValue: false, label: 'Check' }],
       CoreChips: [{ items: ITEMS, modelValue: 'a' }],
+      CoreColorPicker: [{ modelValue: '#F6503F', alpha: true }],
+      CoreCombobox: [{ options: ITEMS, modelValue: 'a' }],
       CoreCompass: [{ heading: 90, markers: [{ heading: 180, label: 'WP' }], showBearing: true }],
       CoreInteractionDot: [{ focused: true, keys: 'F', label: 'Enter vehicle', icon: 'steering', x: 200, y: 120, options: [{ keys: 'R', label: 'Open trunk' }] }],
       CoreContextMenu: [{ open: true, position: { x: 40, y: 40 }, items: ITEMS }],
@@ -241,6 +245,7 @@
       CoreMenu: [{ items: ITEMS, modelValue: 'a' }],
       CoreNumberInput: [{ modelValue: 3, min: 0, max: 9 }],
       CoreObjective: [{ text: 'Do it', state: 'active' }],
+      CorePagination: [{ page: 2, pageCount: 9, total: 200 }],
       CorePanel: [{ title: 'Panel', subtitle: 'Sub' }, () => 'body'],
       CorePlayerChip: [{ name: 'Ada', level: 5, progress: 0.4 }],
       CorePopover: [{ open: true, trigger: 'manual' }, () => 'pop'],
@@ -250,6 +255,7 @@
       CoreRadio: [{ value: 'a', label: 'A', modelValue: 'a' }],
       CoreRadioGroup: [{ items: ITEMS, modelValue: 'a' }],
       CoreRing: [{ value: 40 }],
+      CoreSchemaForm: [{ fields: [{ name: 'a', type: 'string', label: 'A' }, { name: 'b', type: 'vector3' }], modelValue: {} }],
       CoreScreen: [{ background: 'scrim' }, () => 'body'],
       CoreSelect: [{ items: ITEMS, modelValue: 'a' }],
       CoreShard: [{ title: 'WASTED', variant: 'wasted' }],
@@ -271,6 +277,9 @@
       CoreToast: [{ tone: 'success', title: 'Saved', message: 'ok', dismissible: true }],
       CoreTooltip: [{ text: 'Tip' }, () => 'anchor'],
       CoreTracker: [{ title: 'Quest', text: 'Go', distance: '120 m' }],
+      CoreTree: [{ items: [{ id: 1, label: 'Root', children: [{ id: 2, label: 'Leaf' }] }], expanded: [1] }],
+      CoreVectorInput: [{ modelValue: { x: 1, y: 2, z: 3 } }],
+      CoreVirtualList: [{ items: ITEMS, itemHeight: 30 }, ({ item }) => item.label],
       CoreVital: [{ label: 'Health', icon: 'hud-heart', value: 80, subValue: 60, subIcon: 'hud-food', subLabel: 'Hunger' }],
     }
     const noProps = NAMES.filter((n) => !MOUNT[n])
@@ -1270,6 +1279,372 @@
       check('every §39 hud-* glyph resolves through CoreIcon', drawn.length === 0, drawn.join(', '))
     }
 
+    // ---- 9c. the §53 additions: virtual list, tree, combobox, vector, colour, pagination, table --
+    {
+      // CoreVirtualList — a window of rows over a spacer that carries every row; scrollToIndex.
+      const many = Array.from({ length: 1000 }, (_, i) => ({ id: i, label: 'Row ' + i }))
+      let vl = null
+      c = mountCase({
+        render: () => h(K.components.CoreVirtualList, {
+          ref: (r) => { vl = r }, items: many, itemHeight: 30, overscan: 4, style: 'height: 300px',
+        }, { default: ({ item }) => h('span', item.label) }),
+      })
+      await tick()
+      const vbox = c.q('.core-virtuallist')
+      const inDom = c.all('.core-virtuallist__row').length
+      check('CoreVirtualList keeps only a window of 1000 rows in the DOM', inDom > 0 && inDom < 30, inDom + ' rows')
+      check('CoreVirtualList: the spacer carries every row', c.q('.core-virtuallist__spacer').style.height === '30000px',
+        c.q('.core-virtuallist__spacer').style.height)
+      vl.scrollToIndex(500, 'start')
+      await tick()
+      check('scrollToIndex moves the box and the window', vbox.scrollTop === 15000 && !!c.q('[data-index="500"]'),
+        vbox.scrollTop + ' / ' + !!c.q('[data-index="500"]'))
+      check('the window is placed by one transform', /translateY\(\d+px\)/.test(c.q('.core-virtuallist__window').style.transform),
+        c.q('.core-virtuallist__window').style.transform)
+      await c.destroy()
+    }
+    {
+      // CoreTree — keyboard walk (→ opens, ↓ moves, Enter selects, ← steps out then closes).
+      const TREE = [{ id: 'a', label: 'A', children: [{ id: 'a1', label: 'A1' }, { id: 'a2', label: 'A2' }] }, { id: 'b', label: 'B' }]
+      c = mountCtl('CoreTree', { items: TREE, modelValue: null }, { events: ['select', 'toggle'] })
+      await tick()
+      const tree = c.q('.core-tree')
+      check('CoreTree is one tab stop with role=tree', tree.getAttribute('role') === 'tree' && tree.tabIndex === 0)
+      check('CoreTree shows the top level while collapsed', c.all('.core-tree__row').length === 2, c.all('.core-tree__row').length + ' rows')
+      tree.focus()
+      await tick()
+      kd(tree, 'ArrowRight')
+      await tick()
+      check('→ opens the cursor row', c.all('.core-tree__row').length === 4, c.all('.core-tree__row').length + ' rows')
+      kd(tree, 'ArrowDown')
+      await tick()
+      kd(tree, 'Enter')
+      await tick()
+      check('↓ + Enter selects the child', c.st.value === 'a1', String(c.st.value))
+      const sel = c.q('.core-tree__row.is-selected')
+      check('the selected row wears is-selected and aria-selected', !!sel && sel.getAttribute('aria-selected') === 'true')
+      check('the root points aria-activedescendant at the cursor row',
+        !!sel && tree.getAttribute('aria-activedescendant') === sel.id, tree.getAttribute('aria-activedescendant'))
+      kd(tree, 'ArrowLeft')
+      await tick()
+      kd(tree, 'ArrowLeft')
+      await tick()
+      check('← steps out to the parent, then closes it', c.all('.core-tree__row').length === 2, c.all('.core-tree__row').length + ' rows')
+      check('CoreTree emits toggle for open and close', c.emitted('toggle').length === 2, c.emitted('toggle').length + ' events')
+      await c.destroy()
+
+      c = mountCtl('CoreTree', { items: TREE, multiple: true, modelValue: [], expanded: ['a'] })
+      await tick()
+      let rows = c.all('.core-tree__row')
+      rows[1].click()
+      await tick()
+      rows = c.all('.core-tree__row')
+      rows[2].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }))
+      await tick()
+      check('multiple: click selects, Ctrl-click adds', JSON.stringify(c.st.value) === '["a1","a2"]', JSON.stringify(c.st.value))
+      c.all('.core-tree__row')[3].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: true }))
+      await tick()
+      check('multiple: Shift-click selects the range from the anchor', JSON.stringify(c.st.value) === '["a2","b"]', JSON.stringify(c.st.value))
+      await c.destroy()
+    }
+    {
+      // CoreCombobox — local filter, Enter picks, Escape closes the list first; multiple + creatable;
+      // async search; the virtualised list.
+      const spy = escapeSpy()
+      try {
+        c = mountCtl('CoreCombobox', { options: ITEMS, modelValue: null })
+        let input = c.q('.core-combobox__input')
+        input.focus()
+        setValue(input, 'rav')
+        await tick()
+        check('CoreCombobox: typing opens the list', !!c.oq('.core-combobox__popup'))
+        check('CoreCombobox filters the local options', c.oall('.core-combobox__option').length === 1,
+          c.oall('.core-combobox__option').length + ' options')
+        kd(input, 'Enter')
+        await tick()
+        check('Enter picks the active option', c.st.value === 'b', String(c.st.value))
+        check('the field shows the picked label', input.value === 'Bravo', input.value)
+        check('a single pick closes the list', await waitFor(() => !c.oq('.core-combobox__popup'), 800))
+        kd(input, 'ArrowDown')
+        await tick()
+        const mark = spy.seen()
+        spy.esc()
+        await tick()
+        check('an open combobox list swallows Escape', spy.seen() === mark, spy.seen() - mark + ' hits')
+        check('…and closes on it, keeping the value', await waitFor(() => !c.oq('.core-combobox__popup'), 800) && c.st.value === 'b')
+        await c.destroy()
+      } finally { spy.stop() }
+
+      c = mountCtl('CoreCombobox', { options: ITEMS, modelValue: ['a'], multiple: true, creatable: true }, { events: ['create'] })
+      let input = c.q('.core-combobox__input')
+      input.focus()
+      setValue(input, 'Zulu')
+      await tick()
+      const first = c.oq('.core-combobox__option')
+      check('creatable offers the typed text first', !!first && first.classList.contains('is-create'), first && first.className)
+      kd(input, 'Enter')
+      await tick()
+      check('multiple + create appends the new value', JSON.stringify(c.st.value) === '["a","Zulu"]', JSON.stringify(c.st.value))
+      check('create is emitted with the text', c.emitted('create').length === 1 && c.last('create').args[0] === 'Zulu')
+      check('the picks render as tags', c.all('.core-combobox__tag').length === 2, c.all('.core-combobox__tag').length + ' tags')
+      kd(input, 'Backspace')
+      await tick()
+      check('Backspace in an empty field drops the last pick', JSON.stringify(c.st.value) === '["a"]', JSON.stringify(c.st.value))
+      await c.destroy()
+
+      const asked = []
+      const search = (q) => { asked.push(q); return new Promise((r) => setTimeout(() => r(ITEMS.filter((i) => i.label.toLowerCase().indexOf(q) !== -1)), 30)) }
+      c = mountCtl('CoreCombobox', { search, debounce: 10, modelValue: null })
+      input = c.q('.core-combobox__input')
+      input.focus()
+      setValue(input, 'ch')
+      check('an async search fills the list', await waitFor(() => c.oall('.core-combobox__option').length === 1, 1200),
+        c.oall('.core-combobox__option').length + ' options')
+      check('the search saw the typed query', asked.indexOf('ch') !== -1, JSON.stringify(asked))
+      kd(input, 'Enter')
+      await tick()
+      check('a searched option is picked and its label kept', c.st.value === 'c' && input.value === 'Charlie', c.st.value + ' / ' + input.value)
+      await c.destroy()
+
+      const BIG = Array.from({ length: 500 }, (_, i) => 'opt_' + i)
+      c = mountCtl('CoreCombobox', { options: BIG, modelValue: null })
+      input = c.q('.core-combobox__input')
+      input.focus()
+      kd(input, 'ArrowDown')
+      await tick(3)
+      const popup = c.oq('.core-combobox__popup')
+      const opts = c.oall('.core-combobox__option').length
+      check('past virtualThreshold the list is virtualised', !!popup && popup.classList.contains('is-virtual') && opts > 0 && opts < 40,
+        (popup && popup.className) + ' / ' + opts + ' options')
+      // ↑ from the first row wraps to the last: the cursor lands ~500 rows away and must be scrolled to.
+      for (let i = 0; i < 3; i += 1) { kd(input, 'ArrowUp'); await nextTick() }
+      await tick(3)
+      check('the keyboard cursor scrolls the virtual list', !!c.oq('.core-combobox__option.is-active'),
+        'active row not rendered')
+      await c.destroy()
+    }
+    {
+      // CoreVectorInput — one axis steps alone; a pasted vector fills all three; copy → paste.
+      c = mountCtl('CoreVectorInput', { modelValue: { x: 1, y: 2, z: 3 }, step: 0.5 }, { events: ['paste', 'copy'] })
+      const fields = c.all('.core-number__el')
+      check('CoreVectorInput renders three number inputs', fields.length === 3, fields.length + ' inputs')
+      fields[1].focus()
+      kd(fields[1], 'ArrowUp')
+      await tick()
+      check('↑ on the Y field steps only Y', JSON.stringify(c.st.value) === '{"x":1,"y":2.5,"z":3}', JSON.stringify(c.st.value))
+      const data = new DataTransfer()
+      data.setData('text', '{ x = 10.5, y = -4, z = 7 }')
+      fields[0].focus()
+      fields[0].dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }))
+      await tick(3)
+      check('a pasted Lua table fills all three axes', JSON.stringify(c.st.value) === '{"x":10.5,"y":-4,"z":7}', JSON.stringify(c.st.value))
+      check('the focused field shows the pasted number', fields[0].value === '10.5', fields[0].value)
+      check('paste is emitted once', c.emitted('paste').length === 1, c.emitted('paste').length + ' events')
+      fields[0].blur()
+      await tick()
+      check('blurring the pasted field keeps the paste', JSON.stringify(c.st.value) === '{"x":10.5,"y":-4,"z":7}', JSON.stringify(c.st.value))
+      const [copyBtn] = c.all('.core-vector__actions .core-iconbtn')
+      copyBtn.click()
+      await tick()
+      check('copy emits `x, y, z` at the shared precision', c.emitted('copy').length === 1 && c.last('copy').args[0] === '10.5, -4.0, 7.0',
+        JSON.stringify(c.emitted('copy').map((e) => e.args[0])))
+      await c.destroy()
+
+      c = mountCtl('CoreVectorInput', { modelValue: { x: 0, y: 0, z: 0 }, step: 0.5 })
+      c.all('.core-vector__actions .core-iconbtn')[1].click()
+      check('the paste button reads the copied vector (browser or kit clipboard)',
+        await waitFor(() => JSON.stringify(c.st.value) === '{"x":10.5,"y":-4,"z":7}', 1500), JSON.stringify(c.st.value))
+      await c.destroy()
+    }
+    {
+      // CoreColorPicker — channel slider, hex field (live + refusal), swatch, alpha, popover.
+      c = mountCtl('CoreColorPicker', { modelValue: '#F6503F' })
+      check('CoreColorPicker has no native colour input', !c.q('input[type="color"]'))
+      const ranges = c.all('.core-colorpicker__range')
+      check('one range per RGB channel', ranges.length === 3, ranges.length + ' ranges')
+      check('each track is painted with its own gradient', /gradient/.test(ranges[0].style.getPropertyValue('--core-cp-track')))
+      setValue(ranges[1], '255')
+      await tick()
+      check('a channel slider rewrites the hex', c.st.value === '#F6FF3F', c.st.value)
+      const hex = c.q('.core-inputbox__el')
+      hex.focus()
+      setValue(hex, '00ff00')
+      await tick()
+      check('a full hex applies live, upper-cased', c.st.value === '#00FF00', c.st.value)
+      setValue(hex, 'zz')
+      hex.dispatchEvent(new FocusEvent('blur'))
+      await tick()
+      check('a bad hex marks the field and keeps the colour', !!c.q('.core-inputbox.is-invalid') && c.st.value === '#00FF00', c.st.value)
+      c.all('.core-swatch')[0].click()
+      await tick()
+      check('a swatch picks its colour', c.st.value === '#FFFFFF', c.st.value)
+      await c.destroy()
+
+      c = mountCtl('CoreColorPicker', { modelValue: '#FFFFFF', alpha: true })
+      const aRanges = c.all('.core-colorpicker__range')
+      check('alpha adds a fourth range on a checkerboard', aRanges.length === 4 && aRanges[3].classList.contains('core-colorpicker__range--alpha'))
+      setValue(aRanges[3], '128')
+      await tick()
+      check('a translucent colour is 8-digit', c.st.value === '#FFFFFF80', c.st.value)
+      await c.destroy()
+
+      c = mountCtl('CoreColorPicker', { modelValue: '#112233', popover: true })
+      check('popover: a trigger and no panel while closed', !!c.q('.core-colorpicker__trigger') && !c.oq('.core-colorpicker__panel'))
+      c.q('.core-colorpicker__trigger').click()
+      await tick()
+      check('popover: the trigger opens the panel in the overlay layer', !!c.oq('.core-colorpicker__panel'))
+      kd(document.body, 'Escape')
+      check('popover: Escape closes it', await waitFor(() => !c.oq('.core-colorpicker__panel'), 800))
+      await c.destroy()
+    }
+    {
+      // CorePagination — numbered, gaps, bounds; the cursor pager.
+      c = mountCtl('CorePagination', { page: 1, pageCount: 10, total: 250, pageSize: 25 }, { modelProp: 'page', events: ['change'] })
+      await tick()
+      check('the prev arrow is disabled on page 1', c.q('.core-pagination__btn--prev').disabled === true)
+      c.q('.core-pagination__btn--next').click()
+      await tick()
+      check('next moves to page 2', c.st.value === 2, String(c.st.value))
+      check('change carries page and size', c.emitted('change').length === 1
+        && JSON.stringify(c.last('change').args[0]) === '{"page":2,"pageSize":25}', JSON.stringify(c.st.events))
+      const labels = () => c.all('.core-pagination__pages > *').map((el) => el.textContent.trim()).filter((t) => t)
+      check('numbers: first, the window, a gap, last', labels().join(' ') === '1 2 3 … 10', labels().join(' '))
+      c.all('.core-pagination__page').find((b) => b.textContent.trim() === '10').click()
+      await tick()
+      check('a page button jumps; next disables on the last page', c.st.value === 10 && c.q('.core-pagination__btn--next').disabled === true)
+      check('the read-out prints the range', /226–250 of 250/.test(c.q('.core-pagination__range').textContent), c.q('.core-pagination__range').textContent)
+      await c.destroy()
+
+      c = mountCtl('CorePagination', { page: 3, hasNext: false, pageSizes: [] }, { modelProp: 'page' })
+      await tick()
+      check('no pageCount = the cursor pager', !!c.q('.core-pagination.is-cursor') && /Page 3/.test(c.q('.core-pagination__current').textContent))
+      check('the cursor pager follows hasNext', c.q('.core-pagination__btn--next').disabled === true)
+      c.q('.core-pagination__btn--prev').click()
+      await tick()
+      check('…and still steps back', c.st.value === 2, String(c.st.value))
+      await c.destroy()
+    }
+    {
+      // CoreTable (§53) — sortable headers report, never reorder; loading states.
+      const st = V.reactive({ key: null, dir: 'asc', events: [] })
+      const rows = [{ id: 1, a: 'b' }, { id: 2, a: 'a' }]
+      c = mountCase({
+        render: () => h(K.components.CoreTable, {
+          columns: [{ key: 'a', label: 'A', sortable: true }, { key: 'b', label: 'B' }],
+          rows,
+          sortKey: st.key,
+          sortDir: st.dir,
+          'onUpdate:sortKey': (v) => { st.key = v },
+          'onUpdate:sortDir': (v) => { st.dir = v },
+          'onUpdate:sort': (v) => { st.events.push(v) },
+        }),
+      })
+      await tick()
+      const ths = c.all('.core-table__th')
+      check('only a sortable column gets the sort button', c.all('.core-table__sort').length === 1)
+      check('aria-sort: none on a sortable column, absent on the other',
+        ths[0].getAttribute('aria-sort') === 'none' && !ths[1].hasAttribute('aria-sort'))
+      c.q('.core-table__sort').click()
+      await tick()
+      check('a header click emits update:sort asc', JSON.stringify(st.events) === '[{"key":"a","dir":"asc"}]', JSON.stringify(st.events))
+      check('aria-sort follows', c.all('.core-table__th')[0].getAttribute('aria-sort') === 'ascending')
+      c.q('.core-table__sort').click()
+      await tick()
+      check('a second click flips to desc', st.dir === 'desc' && st.events.length === 2, st.dir)
+      check('the table never reorders rows itself', c.all('.core-table__row')[0].textContent.trim() === 'b')
+      await c.destroy()
+
+      c = mountCase({ render: () => h(K.components.CoreTable, { columns: [{ key: 'a', label: 'A' }], rows: [], loading: true, loadingRows: 4 }) })
+      await tick()
+      check('loading + no rows = skeleton rows, no empty line',
+        c.all('.core-table__row--skeleton').length === 4 && !c.q('.core-table__empty'), c.all('.core-table__row--skeleton').length + ' skeleton rows')
+      check('loading draws the top-edge bar and sets aria-busy',
+        !!c.q('.core-table__progress') && c.q('table').getAttribute('aria-busy') === 'true')
+      await c.destroy()
+    }
+    {
+      // CoreSchemaForm — a control per §43 type, hidden / visibleWhen / order, the client check,
+      // server errors, array rows, duration presets, submit.
+      const BIG = Array.from({ length: 12 }, (_, i) => 'W' + i)
+      const FIELDS = [
+        { name: 'count', type: 'integer', min: 1, max: 5, default: 2, order: 2 },
+        { name: 'name', type: 'string', label: 'Name', required: true, order: 1 },
+        { name: 'mode', type: 'enum', options: ['a', 'b'], default: 'a', order: 3 },
+        { name: 'extra', type: 'string', visibleWhen: { field: 'mode', equals: 'b' }, order: 4 },
+        { name: 'on', type: 'boolean' },
+        { name: 'tint', type: 'color' },
+        { name: 'dur', type: 'duration', allowPermanent: true },
+        { name: 'pos', type: 'vector3' },
+        { name: 'who', type: 'player' },
+        { name: 'secret', type: 'string', label: 'Secret thing', hidden: true },
+        { name: 'list', type: 'array', items: { type: 'string' }, maxItems: 2 },
+        { name: 'obj', type: 'object', fields: [{ name: 'x', type: 'number' }] },
+        { name: 'big', type: 'enum', options: BIG },
+      ]
+      const resolvers = { player: () => [{ value: 7, label: 'Ada' }] }
+      c = mountCtl('CoreSchemaForm', { fields: FIELDS, modelValue: {}, resolvers }, { events: ['submit', 'invalid'] })
+      await tick()
+      const form = c.q('form.core-schemaform')
+      const fieldOf = (label) => c.all('.core-field').find((f) => {
+        const l = f.querySelector('.core-field__label')
+        return l && l.textContent.trim().replace(/\*$/, '') === label
+      })
+      const labelsInOrder = c.all('.core-schemaform > .core-schemaform__group > .core-field .core-field__label')
+        .map((l) => l.textContent.trim().replace(/\*$/, ''))
+      check('fields follow `order`, unordered ones after', labelsInOrder.slice(0, 3).join(',') === 'Name,Count,Mode', labelsInOrder.join(','))
+      const want = [['Name', '.core-inputbox'], ['Count', '.core-number'], ['Mode', '.core-selectbox'], ['On', '.core-switch'],
+        ['Tint', '.core-colorpicker'], ['Dur', '.core-schemaform__duration'], ['Pos', '.core-vector'], ['Who', '.core-combobox'],
+        ['List', '.core-schemaform__array'], ['Big', '.core-combobox']]
+      const wrongCtl = want.filter(([label, sel]) => { const f = fieldOf(label); return !f || !f.querySelector(sel) }).map((w) => w[0])
+      check('every §43 type gets its kit control', wrongCtl.length === 0, 'wrong or missing: ' + wrongCtl.join(', '))
+      check('an object field is a nested group', !!c.q('fieldset.core-schemaform__object'))
+      check('hidden fields are not rendered', !/Secret thing/.test(form.textContent))
+      check('visibleWhen hides a field until its condition holds', !fieldOf('Extra'))
+      c.st.value = { mode: 'b' }
+      await tick()
+      check('…and shows it once it does', !!fieldOf('Extra'))
+
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      await tick()
+      check('submit with a required field empty emits invalid', c.emitted('invalid').length === 1
+        && c.last('invalid').args[0].name === 'required' && c.emitted('submit').length === 0, JSON.stringify(c.st.events))
+      check('…and marks that field', fieldOf('Name').classList.contains('is-invalid'))
+      setValue(fieldOf('Name').querySelector('input'), 'Ada')
+      await tick()
+      check('an edit writes the whole values object (defaults filled)', c.st.value.name === 'Ada' && c.st.value.count === 2
+        && c.st.value.mode === 'b', JSON.stringify(c.st.value))
+      check('the client error clears live after the edit', !fieldOf('Name').classList.contains('is-invalid'))
+      const chip = Array.from(fieldOf('Dur').querySelectorAll('.core-chip')).find((b) => b.textContent.trim() === '1h')
+      chip.click()
+      await tick()
+      check('a duration preset writes seconds', c.st.value.dur === 3600, String(c.st.value.dur))
+      const add = fieldOf('List').querySelector('.core-schemaform__array-add')
+      add.click()
+      await tick()
+      add.click()
+      await tick()
+      check('Add appends array rows up to maxItems', c.st.value.list.length === 2 && add.disabled === true,
+        JSON.stringify(c.st.value.list) + ' / ' + add.disabled)
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      await tick()
+      check('a valid form emits submit with the values', c.emitted('submit').length === 1
+        && c.last('submit').args[0].name === 'Ada' && c.last('submit').args[0].dur === 3600, JSON.stringify(c.emitted('submit')))
+      await c.destroy()
+
+      c = mountCtl('CoreSchemaForm', {
+        fields: FIELDS, modelValue: { count: 9, list: ['a', 'b'] },
+        errors: { count: 'max', obj: 'x.custom:Nope. Try again', list: '2.length' },
+      })
+      await tick()
+      check('server error codes are worded per field', /Must be at most 5\./.test(c.el.textContent))
+      check('a nested checkAll path (obj = \'x.custom:…\') lands on the member, dots in the text intact',
+        /Nope\. Try again/.test(c.el.textContent) && !!c.q('.core-schemaform__object .core-field.is-invalid'))
+      const rowErr = c.all('.core-schemaform__array-row')[1]
+      check('an array row error (list = \'2.length\') lands on row 2, counted from 1',
+        !!rowErr && /characters/.test(rowErr.textContent), rowErr ? rowErr.textContent : 'no row 2')
+      await c.destroy()
+    }
+
     // ---- 10. pointer events (§37.4: the shell is click-through) --------------------------------
     {
       const HUD = [
@@ -1294,6 +1669,13 @@
         ['CoreSelect', { items: ITEMS }, '.core-selectbox'],
         ['CoreSlot', { count: 1 }, '.core-slot'],
         ['CorePrompt', { keys: 'F', label: 'Buy', interactive: true }, '.core-prompt'],
+        ['CoreVirtualList', { items: ITEMS }, '.core-virtuallist'],
+        ['CoreTree', { items: ITEMS }, '.core-tree'],
+        ['CoreCombobox', { options: ITEMS }, '.core-combobox'],
+        ['CoreVectorInput', {}, '.core-vector'],
+        ['CoreColorPicker', {}, '.core-colorpicker'],
+        ['CorePagination', { pageCount: 3 }, '.core-pagination'],
+        ['CoreSchemaForm', { fields: [{ name: 'a', type: 'string' }] }, '.core-schemaform'],
       ]
       const wrong = []
       for (const [name, props, sel, slot] of HUD) {

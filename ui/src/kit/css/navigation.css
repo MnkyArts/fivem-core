@@ -1,5 +1,5 @@
 /* core UI kit — Navigation (DESIGN §37.5).
-   CoreTabs, CoreMenu, CoreChips, CoreStepper.
+   CoreTabs, CoreMenu, CoreChips, CoreStepper, CorePagination (§53).
    Imported by src/styles.css into the components layer; plain CSS over the tokens of §37.2,
    following the naming and Chromium 103 rules of DESIGN §37.4 / §37.5.
 
@@ -655,3 +655,98 @@ ul.core-list,
 .core-stepper--lg { --core-stepper-h: var(--core-h-lg); }
 .core-stepper--lg .core-stepper__label { font-size: 18px; }
 .core-stepper--lg .core-stepper__count { font-size: 14px; }
+
+/* ---- CorePagination (§53) -------------------------------------------------------------------
+   Read-out left (`1–25 of 312`, label voice), the page buttons in the middle, the inline size select
+   right. Page buttons are chip-shaped: idle is type only, hover a white 6 % tile, the current page
+   the solid accent gradient like an active chip. A cursor pager (no pageCount) swaps the numbers
+   for `PAGE 3` between the arrows. */
+
+.core-pagination {
+  --core-page-h: 32px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  font-family: var(--font-display);
+  pointer-events: auto;
+}
+.core-pagination--sm { --core-page-h: 26px; }
+.core-pagination--lg { --core-page-h: 38px; }
+
+.core-pagination__range {
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg-faint);
+}
+
+.core-pagination__pages {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.core-pagination__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--core-page-h);
+  height: var(--core-page-h);
+  margin: 0;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-ui-sm);
+  background: none;
+  color: var(--color-fg-dim);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease-ui), color 0.12s var(--ease-ui);
+}
+.core-pagination__btn:not(.is-active):hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-fg);
+}
+.core-pagination__btn:focus-visible {
+  outline: 2px solid var(--color-accent-hi);
+  outline-offset: 2px;
+}
+.core-pagination__btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.core-pagination__page.is-active {
+  background: var(--core-grad-accent);
+  color: var(--color-on-accent);
+  cursor: default;
+}
+.core-pagination--sm .core-pagination__btn { font-size: 13px; padding: 0 6px; }
+.core-pagination--lg .core-pagination__btn { font-size: 17px; }
+
+.core-pagination__gap {
+  min-width: 18px;
+  text-align: center;
+  color: var(--color-fg-faint);
+}
+
+.core-pagination__current {
+  padding: 0 10px;
+  font-weight: 600;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg);
+}
+
+/* Disabled dims the bar ONCE: its buttons and the size select would otherwise add their own. */
+.core-pagination.is-disabled { opacity: 0.45; }
+.core-pagination.is-disabled .core-pagination__btn:disabled,
+.core-pagination.is-disabled .core-selectbox.is-disabled { opacity: 1; }

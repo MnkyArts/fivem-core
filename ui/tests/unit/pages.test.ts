@@ -5,7 +5,7 @@ import * as Pages from '../../src/runtime/pages.ts'
 import * as Plugins from '../../src/runtime/plugins.ts'
 import { setTransport, resetTransport } from '../../src/runtime/transport.ts'
 import { setNotify } from '../../src/runtime/errors.ts'
-import { isReactive } from 'vue'
+import { isReactive, isShallow, watchEffect } from 'vue'
 import type { MsgPluginRegister } from '../../src/runtime/protocol.ts'
 import type { PluginManifest } from '../../sdk/src/contract.ts'
 
@@ -442,8 +442,7 @@ test('page hooks fire in the documented order', async () => {
 })
 
 test('a page whose plugin asks for shallow reactivity gets a shallowReactive props object', async () => {
-  // A page id no other test has touched: `propsById` is deliberately never cleared (§7.4), so the
-  // proxy flavour is decided exactly once, the first time an id is seen.
+  // A page id no other test has touched: `propsById` is deliberately never cleared (§7.4).
   registerPlugin('sh', { sh_page: { component: COMPONENT, reactivity: 'shallow' } })
   await flush()
   Pages.registerPage({ action: 'page:register', id: 'sh_page', type: 'page', owner: 'sh' })
@@ -533,5 +532,145 @@ test('a page that is ALREADY mounted is unmounted and failed when its plugin die
   assert.ok(posts.some((p) => p.name === 'ui_event' && (p.body as { event: string }).event === '__error'))
   assert.ok(posts.some((p) => p.name === 'ui_close' && p.body.page === 'flip_page'))
   assert.equal(Pages.pageState().openPage, null)
+  resetTransport()
+})
+
+// ---------------------------------------------------------------- §41 input modes, Escape
+
+test('page:register carries the input mode; keepInput alone still means mixed', () => {
+  Pages.registerPage({ action: 'page:register', id: 'plain', type: 'page' })
+  Pages.registerPage({ action: 'page:register', id: 'legacy', type: 'page', keepInput: true })
+  Pages.registerPage({ action: 'page:register', id: 'ed', type: 'page', input: 'game', keepInput: false, escape: 'event' })
+  Pages.registerPage({ action: 'page:register', id: 'odd', type: 'page', input: 'fly' as never })
+  const pages = Pages.pageState().pages
+  assert.equal(pages.plain.input, 'ui', "the default is 'ui'")
+  assert.equal(pages.plain.escape, 'close', "Escape closes by default")
+  assert.equal(pages.legacy.input, 'mixed', 'an older sender with keepInput = true')
+  assert.equal(pages.ed.input, 'game', 'input wins over keepInput')
+  assert.equal(pages.ed.escape, 'event')
+  assert.equal(pages.odd.input, 'ui', 'an unknown mode falls back to the default')
+  // a re-registration replaces both
+  Pages.registerPage({ action: 'page:register', id: 'ed', type: 'page', input: 'look' })
+  assert.equal(pages.ed.input, 'look')
+  assert.equal(pages.ed.keepInput, true, 'keepInput is derived: look keeps game input')
+  assert.equal(pages.ed.escape, 'close')
+  resetTransport()
+})
+
+test('page:input switches a page and PageHandle.input follows it reactively', () => {
+  Pages.registerPage({ action: 'page:register', id: 'ed', type: 'page' })
+  const handle = Pages.pageHandle('ed')
+  assert.equal(handle.input, 'ui')
+  const seen: string[] = []
+  const stop = watchEffect(() => { seen.push(handle.input) }, { flush: 'sync' })
+  Pages.setPageInput({ action: 'page:input', id: 'ed', input: 'game' })
+  assert.equal(handle.input, 'game')
+  assert.equal(Pages.pageState().pages.ed.keepInput, false)
+  Pages.setPageInput({ action: 'page:input', id: 'ed', input: 'mixed' })
+  assert.equal(Pages.pageState().pages.ed.keepInput, true)
+  Pages.setPageInput({ action: 'page:input', id: 'ed', input: 'bogus' as never })
+  assert.equal(handle.input, 'mixed', 'an unknown mode is ignored')
+  Pages.setPageInput({ action: 'page:input', id: 'nobody', input: 'game' })
+  assert.equal(Pages.pageState().pages.nobody, undefined, 'an unknown page is not created')
+  stop()
+  assert.deepEqual(seen, ['ui', 'game', 'mixed'], 'every change re-ran the effect once')
+  assert.equal(Pages.inputOf('nobody'), 'ui', 'an unknown id reads as ui')
+  assert.equal(Object.getOwnPropertyDescriptor(handle, 'input')?.set, undefined, 'the handle has no setter')
+  resetTransport()
+})
+
+test("Escape on an 'event' page emits the page event and asks Lua nothing about closing", () => {
+  Pages.setPageComponent('ed', COMPONENT)
+  Pages.registerPage({ action: 'page:register', id: 'ed', type: 'page', escape: 'event' })
+  Pages.openPage({ action: 'page:open', id: 'ed', props: {} })
+  let escapes = 0
+  const off = Pages.onPageEvent('ed', 'escape', () => { escapes++ })
+  posts.length = 0
+  assert.equal(Pages.escapePage('ed'), 'event')
+  assert.equal(escapes, 1, "the page's own on('escape') ran")
+  assert.equal(Pages.pageState().openPage, 'ed', 'the page stays open')
+  assert.ok(!posts.some((p) => p.name === 'ui_close'), 'no ui_close')
+  const ev = posts.find((p) => p.name === 'ui_event')
+  assert.equal(ev && ev.body.page, 'ed', 'Lua hears it through ui_event')
+  assert.equal(ev && ev.body.event, 'escape')
+  assert.equal(Pages.escapePage(null), 'event', 'no id = the open page')
+  off()
+  Pages.setPageInput({ action: 'page:input', id: 'ed', input: 'look' })
+  assert.equal(Pages.escapePage('ed'), 'event', 'the input mode does not change the escape policy')
+  resetTransport()
+})
+
+test("Escape on a 'close' page closes it exactly like before", () => {
+  Pages.setPageComponent('shop', COMPONENT)
+  Pages.registerPage({ action: 'page:register', id: 'shop', type: 'page' })
+  Pages.openPage({ action: 'page:open', id: 'shop', props: {} })
+  posts.length = 0
+  assert.equal(Pages.escapePage(), 'close')
+  assert.equal(Pages.pageState().openPage, null, 'hidden right away')
+  assert.ok(posts.some((p) => p.name === 'ui_close' && p.body.page === 'shop'), 'Lua is asked to close it')
+  assert.ok(!posts.some((p) => p.name === 'ui_event'), 'no escape event')
+  assert.equal(Pages.escapePage(), null, 'nothing open, nothing to do')
+  resetTransport()
+})
+
+test('suspend and resume are ordinary page events: the page stays mounted', () => {
+  Pages.setPageComponent('ed', COMPONENT)
+  Pages.registerPage({ action: 'page:register', id: 'ed', type: 'page', input: 'game' })
+  Pages.openPage({ action: 'page:open', id: 'ed', props: { a: 1 } })
+  const seen: string[] = []
+  Pages.onPageEvent('ed', 'suspend', () => { seen.push('suspend') })
+  Pages.onPageEvent('ed', 'resume', () => { seen.push('resume') })
+  Pages.emitPageEvent('ed', 'suspend', {})
+  assert.equal(Pages.pageState().openPage, 'ed')
+  assert.ok(Pages.pageScope('ed'), 'the page keeps its scope while suspended')
+  Pages.emitPageEvent('ed', 'resume', {})
+  assert.deepEqual(seen, ['suspend', 'resume'])
+  resetTransport()
+})
+
+// ---------------------------------------------------------------- reactivity decided by the definition
+
+test('a page declared BEFORE its plugin loads still gets the definition\'s shallow props', async () => {
+  // A lazy plugin (or one still loading) has no definition when `page:register` arrives: the props
+  // start deep and are re-wrapped — same raw data — the moment the definition is known.
+  Pages.registerPage({ action: 'page:register', id: 'late_sh', type: 'page', owner: 'late' })
+  const early = Pages.propsFor('late_sh')
+  assert.equal(Pages.propsMode('late_sh'), 'deep', 'no definition yet: the deep default')
+  const seen: unknown[] = []
+  const stop = watchEffect(() => { seen.push(early.label) }, { flush: 'sync' })
+  Pages.openPage({ action: 'page:open', id: 'late_sh', props: { label: 'one', big: { n: 1 } } })
+  registerPlugin('late', { late_sh: { component: COMPONENT, reactivity: 'shallow' } })
+  await flush()
+  const rec = Pages.pageState().pages.late_sh
+  assert.equal(rec.component, COMPONENT, 'the page resolved')
+  assert.equal(rec.reactivity, 'shallow')
+  assert.equal(Pages.propsMode('late_sh'), 'shallow', 'the wrapper follows the definition')
+  assert.equal(isShallow(rec.props), true, 'the record carries the shallow wrapper')
+  assert.equal(Pages.propsFor('late_sh'), rec.props, 'propsFor hands out the same one')
+  assert.equal(Pages.pageHandle('late_sh').props, rec.props, 'and so does the page handle')
+  assert.equal(isReactive(rec.props.big as object), false, 'nested values are no longer proxied')
+  // The early (deep) proxy sits on the same raw object: it still reads and TRIGGERS on later writes.
+  Pages.openPage({ action: 'page:open', id: 'late_sh', props: { label: 'two' } })
+  assert.equal(early.label, 'two', 'a proxy captured early still sees later opens')
+  Pages.applyPatch('late_sh', [{ p: 'label', v: 'three' }])
+  assert.equal(early.label, 'three', 'and later patches')
+  stop()
+  // (`page:open` replaces the content key by key, so a delete may show up as `undefined` in between)
+  assert.deepEqual(seen.filter((v) => v !== undefined), ['one', 'two', 'three'], 'effects on the early proxy re-ran on every write')
+  resetTransport()
+})
+
+test('an unknown definition never forces deep back onto a shallow container', async () => {
+  registerPlugin('keep', { keep_sh: { component: COMPONENT, reactivity: 'shallow' } })
+  await flush()
+  Pages.registerPage({ action: 'page:register', id: 'keep_sh', type: 'page', owner: 'keep' })
+  const shallow = Pages.propsFor('keep_sh')
+  assert.equal(Pages.propsMode('keep_sh'), 'shallow')
+  Pages.unregisterPage('keep_sh')
+  Plugins.unregister('keep')
+  // Re-declared while its plugin is gone: no definition, so the wrapper is left alone.
+  Pages.registerPage({ action: 'page:register', id: 'keep_sh', type: 'page', owner: 'keep' })
+  assert.equal(Pages.propsFor('keep_sh'), shallow, 'same wrapper, same identity')
+  assert.equal(Pages.propsMode('keep_sh'), 'shallow')
   resetTransport()
 })

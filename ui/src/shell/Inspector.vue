@@ -73,6 +73,7 @@ const bytes = (n) => (n >= 1024 ? Math.round(n / 102.4) / 10 + ' kB/s' : Math.ro
           <td class="pr-2 text-fg">{{ p.id }}</td>
           <td class="pr-2">{{ p.owner || 'core' }}</td>
           <td class="pr-2">{{ p.type }}</td>
+          <td class="pr-2">{{ p.input }}{{ p.escape === 'event' ? ' · esc→event' : '' }}</td>
           <td class="pr-2" :class="p.mounted ? 'text-success' : p.open ? 'text-warning' : ''">
             {{ p.mounted ? 'mounted' : p.open ? 'open' : 'declared' }}
           </td>

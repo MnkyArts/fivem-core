@@ -4,6 +4,9 @@
 --- Natives verified with fxref on 2026-09-12: PlayerPedId (client),
 --- GetEntityCoords (client form: entity, alive), GetEntityHeading (client+server),
 --- SetEntityHealth (client), GetEntityMaxHealth (client+server), SetPedArmour (client+server).
+--- §48 sticky states (fxref 2026-09-26, client): PlayerId, SetPlayerControl(player, bHasControl, flags),
+--- FreezeEntityPosition(entity, toggle), SetEntityInvincible(entity, toggle, dontResetOnCleanup),
+--- SetEntityVisible(entity, toggle, p2).
 
 local Player = Core.Player          -- lib namespace from lib/player/client.lua — extend, never replace
 local Net = Core.Net
@@ -17,12 +20,75 @@ local PUBLIC <const> = {            -- payload fields a plugin may read
 
 local cached = nil                  -- last core:client:loaded payload
 
---- Stores the payload delivered by core:client:loaded (client/main.lua owns that handler).
+-- §48 sticky states: the server's last word per key; every value that differs from its default is
+-- re-applied after pedChanged, a (re)spawn and every teleport (client/spawn.lua calls reapplyStates)
+local STATE_DEFAULTS <const> = { frozen = false, invincible = false, visible = true, controls = true }
+local states = { frozen = false, invincible = false, visible = true, controls = true }
+
+local function applyState(ped, key, value)
+    if key == 'controls' then
+        SetPlayerControl(PlayerId(), value, 0)          -- flags 0: no extra ped handling
+    elseif key == 'frozen' then
+        FreezeEntityPosition(ped, value)
+    elseif key == 'invincible' then
+        SetEntityInvincible(ped, value, false)          -- dontResetOnCleanup = false
+    elseif key == 'visible' then
+        SetEntityVisible(ped, value, false)
+    end
+end
+
+--- Stores sticky values from the server and applies them now (client/environment.lua's
+--- core:client:playerState handler). Core-internal: the server is the authority, see Player.setFrozen.
+function Player.setStates(partial)
+    if type(partial) ~= 'table' then return false end
+    local ped = PlayerPedId()
+    for key in pairs(STATE_DEFAULTS) do
+        local value = partial[key]
+        if type(value) == 'boolean' then
+            states[key] = value
+            applyState(ped, key, value)
+        end
+    end
+    return true
+end
+
+--- Re-applies every sticky state that differs from its default to `ped` (default: the current ped).
+function Player.reapplyStates(ped)
+    ped = ped or PlayerPedId()
+    for key, default in pairs(STATE_DEFAULTS) do
+        if states[key] ~= default then applyState(ped, key, states[key]) end
+    end
+end
+
+--- Player.getStates() -> { frozen, invincible, visible, controls } (a copy).
+function Player.getStates()
+    return { frozen = states.frozen, invincible = states.invincible, visible = states.visible,
+        controls = states.controls }
+end
+
+--- Stores the payload delivered by core:client:loaded (client/main.lua owns that handler). Its
+--- `states` replace the sticky set: a key that changed is applied, the other non-default ones are
+--- re-applied, defaults that did not change are left alone (another resource may own them).
 function Player.setCached(payload)
     if type(payload) ~= 'table' then return false end
     cached = payload
+    local incoming = payload.states
+    if type(incoming) == 'table' then
+        local ped = PlayerPedId()
+        for key in pairs(STATE_DEFAULTS) do
+            local value = incoming[key]
+            if type(value) == 'boolean' and value ~= states[key] then
+                states[key] = value
+                applyState(ped, key, value)
+            end
+        end
+        Player.reapplyStates(ped)
+    end
     return true
 end
+
+-- a new ped entity (model swap, spawn, character switch) loses everything bound to the old one
+Core.on('pedChanged', function(ped) Player.reapplyStates(ped) end)
 
 --- Player.getData(key) -> value — public payload fields only, tables as copies.
 function Player.getData(key)
@@ -46,8 +112,9 @@ Net.on('core:client:setModel', { { 'string', max = 64 }, 'table?' }, function(mo
     Core.Spawn.setModel(model, appearance)
 end)
 
-Net.on('core:client:teleport', { 'vector3', 'number?' }, function(coords, heading)
-    Core.Spawn.teleport(coords, heading)
+-- opts = { withVehicle, fade } (§48), only sent when something differs from a plain faded teleport
+Net.on('core:client:teleport', { 'vector3', 'number?', 'table?' }, function(coords, heading, opts)
+    Core.Spawn.teleport(coords, heading, opts)
 end)
 
 Net.on('core:client:revive', {}, function()

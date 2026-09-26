@@ -13,9 +13,9 @@ version '1.0.0'
 shared_scripts { 'import.lua', 'shared/config.lua', 'shared/ui_manifest.lua', 'shared/ui_forms.lua' }
 
 client_scripts {
-    'client/api.lua', 'shared/hooks.lua', 'client/world.lua', 'client/zones.lua', 'client/controls.lua', 'client/interiors_data.lua', 'client/interiors.lua', 'client/markers.lua', 'client/textlabels.lua', 'client/blips.lua',
-    'client/interactions.lua', 'client/ui.lua', 'client/ui_plugins.lua', 'client/vehicles.lua', 'client/raycast.lua',
-    'client/spawn.lua', 'client/player.lua', 'client/context.lua', 'client/actions.lua',
+    'client/api.lua', 'shared/hooks.lua', 'client/adminstate.lua', 'client/world.lua', 'client/zones.lua', 'client/controls.lua', 'client/interiors_data.lua', 'client/interiors.lua', 'client/markers.lua', 'client/textlabels.lua', 'client/blips.lua',
+    'client/interactions.lua', 'client/ui.lua', 'client/ui_plugins.lua', 'client/settings.lua', 'client/vehicles.lua', 'client/raycast.lua',
+    'client/spawn.lua', 'client/maps_spawn.lua', 'client/maps_view.lua', 'client/maps.lua', 'client/player.lua', 'client/context.lua', 'client/actions.lua',
     'client/worldsync.lua', 'client/doors.lua', 'client/environment.lua', 'client/stats.lua', 'client/weapons.lua',
     'client/remote.lua', 'client/ui_remote.lua', 'client/hudfeed.lua', 'client/chat.lua',
     'client/main.lua',
@@ -23,10 +23,13 @@ client_scripts {
 
 server_scripts {
     'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/db_pg.js', 'server/db_pg.lua',
-    'server/notify.lua', 'server/perms.lua', 'server/player.lua', 'server/playergrid.lua',
+    'server/audit.lua', 'server/bans_identity.lua', 'server/bans.lua',
+    'server/notify.lua', 'server/perms.lua', 'server/buckets.lua', 'server/player.lua', 'server/playergrid.lua',
     'server/money.lua', 'server/factions.lua', 'server/vehicles.lua',
-    'server/getters.lua', 'server/globals.lua', 'server/services.lua', 'server/worldsync.lua', 'server/doors.lua',
-    'server/environment.lua', 'server/cron.lua', 'server/stats.lua', 'server/weapons.lua', 'server/remote.lua',
+    'server/getters.lua', 'server/globals.lua', 'server/settings.lua', 'server/adminapi.lua', 'server/adminapi_dispatch.lua', 'server/services.lua', 'server/worldsync.lua', 'server/doors.lua',
+    'server/environment.lua', 'server/cron.lua',
+    'server/maps_regions.lua', 'server/maps_types.lua', 'server/maps_runtime.lua', 'server/maps.lua', 'server/maps_apply.lua',
+    'server/stats.lua', 'server/weapons.lua', 'server/remote.lua',
     'server/ui.lua', 'server/ui_plugins.lua', 'server/chat.lua', 'server/http.lua', 'server/webhook.lua', 'server/security.lua',
     'server/admin.lua', 'server/main.lua',
 }

@@ -10,11 +10,12 @@
 ]]
 
 local currentCaller <const> = 'core'
+-- The caller of the dispatch currently being served. A dispatched call may yield for seconds
+-- (Core.UI.menu.open and friends await an NUI answer), and FiveM runs export calls, event handlers and
+-- threads in coroutines: the caller therefore lives PER COROUTINE, and a coroutine without an entry is
+-- core's own code ('core'). `caller` is used only on the main thread, where nothing can yield (resource
+-- load, the offline suites). Weak keys: finished coroutines drop out on their own.
 local caller = currentCaller
--- Per-coroutine caller. A dispatched call may yield for seconds (Core.UI.menu.open
--- and friends await an NUI answer); another plugin's call running during that yield
--- must not take over the first call's ownership. Weak keys: finished coroutines drop
--- out on their own, the dispatcher clears its own entry anyway.
 local callerByCoroutine = setmetatable({}, { __mode = 'k' })
 
 ---@type table<string, table<string, string>>  kind -> id -> owner resource
@@ -32,32 +33,50 @@ local INTERNAL_NS <const> = { World = true, Registry = true, UIInternal = true, 
 
 local Registry = {}
 
---- Set by the `call` export before dispatch; registration APIs read it back.
---- Recorded for the calling coroutine as well as globally (see getCaller).
+local function ownerName(name)
+    return (type(name) == 'string' and name ~= '') and name or currentCaller
+end
+
+--- The running coroutine, or nil on the main thread.
+local function running()
+    local co, main = coroutine.running()
+    if main then return nil end
+    return co
+end
+
+--- Sets the caller of the running coroutine (the main-thread value outside one).
 ---@param name string|nil
 function Registry.setCaller(name)
-    caller = (type(name) == 'string' and name ~= '') and name or currentCaller
-    local co = coroutine.running()
-    if co then callerByCoroutine[co] = caller end
+    local co = running()
+    if co then
+        callerByCoroutine[co] = ownerName(name)
+    else
+        caller = ownerName(name)
+    end
 end
 
---- The resource whose call is currently being dispatched ('core' when internal).
---- The coroutine-local value wins, so concurrent (yielding) calls keep their own
---- owner; the global value is the fallback for core's own threads.
+--- The resource whose call is currently being dispatched in this coroutine ('core' when internal).
+--- A coroutine without its own entry is core's (a thread core started, a handler, a timer).
 ---@return string
 function Registry.getCaller()
-    local co = coroutine.running()
-    local owner = co and callerByCoroutine[co]
-    return owner or caller
+    local co = running()
+    if co then return callerByCoroutine[co] or currentCaller end
+    return caller
 end
 
--- Internal callback ownership scope: never changes the global fallback across a yield.
+--- Runs callback(...) as `owner` in this coroutine only, restored afterwards -> pcall results.
 function Registry.withCaller(owner, callback, ...)
-    local co = coroutine.running()
-    local previous = co and callerByCoroutine[co]
-    if co then callerByCoroutine[co] = owner end
+    local co = running()
+    local previous
+    if co then
+        previous = callerByCoroutine[co]
+        callerByCoroutine[co] = ownerName(owner)
+    else
+        previous = caller
+        caller = ownerName(owner)
+    end
     local result = table.pack(pcall(callback, ...))
-    if co then callerByCoroutine[co] = previous end
+    if co then callerByCoroutine[co] = previous else caller = previous end
     return table.unpack(result, 1, result.n)
 end
 
@@ -140,16 +159,10 @@ exports('call', function(callerName, namespace, fn, ...)
         error(('core: no API %s.%s'):format(namespace, fn), 2)
     end
 
-    local co = coroutine.running()
-    local prevCaller, prevCoCaller = caller, co and callerByCoroutine[co]
-    Registry.setCaller(callerName)
-
-    -- pcall so the caller is restored even when the API function errors; pcall is
-    -- yieldable in Lua 5.4, so an API that waits (NUI, callbacks) still works.
-    local ret = table.pack(pcall(f, ...))
-
-    if co then callerByCoroutine[co] = prevCoCaller end
-    caller = prevCaller
+    -- withCaller pcalls, so the caller is restored even when the API function errors; pcall is
+    -- yieldable in Lua 5.4, so an API that waits (NUI, callbacks) still works. Inside a coroutine only
+    -- that coroutine's entry changes: an overlapping yielding call can never leak its owner.
+    local ret = table.pack(Registry.withCaller(callerName, f, ...))
 
     if not ret[1] then error(ret[2], 0) end
     return table.unpack(ret, 2, ret.n)

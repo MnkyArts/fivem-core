@@ -1,7 +1,8 @@
 <script setup>
 // TableGallery — CoreTable (DESIGN §37.5, Data — display): a faction roster with cell slots, a
-// selectable garage list with keyboard selection, a dense sticky-header log and the empty state.
-import { ref } from 'vue'
+// selectable garage list with keyboard selection, a dense sticky-header log, the empty state, and
+// (§53) a sortable garage the gallery sorts itself on `update:sort` plus the two loading states.
+import { computed, ref } from 'vue'
 import KitStage from './KitStage.vue'
 import KitSection from './KitSection.vue'
 import avatar from '../assets/avatar.jpg'
@@ -42,6 +43,21 @@ const garage = [
 
 const selected = ref('LS 09 TRV')
 const lastClicked = ref('')
+
+// §53: the table only reports the sort; the caller (here: this computed, in game: the server) sorts.
+const sortKey = ref('value')
+const sortDir = ref('desc')
+const busy = ref(false)
+const sortColumns = garageColumns.map((c) => Object.assign({}, c, { sortable: c.key !== 'state' }))
+const sortedGarage = computed(() => {
+  const key = sortKey.value
+  const dir = sortDir.value === 'desc' ? -1 : 1
+  return garage.slice().sort((a, b) => (a[key] < b[key] ? -dir : a[key] > b[key] ? dir : 0))
+})
+function reload () {
+  busy.value = true
+  setTimeout(() => { busy.value = false }, 1400)
+}
 
 const logColumns = [
   { key: 'time', label: 'Time', width: 90 },
@@ -126,6 +142,29 @@ const log = [
             <span :style="{ color: row.amount < 0 ? 'var(--color-error)' : 'var(--color-success)' }">{{ value }}</span>
           </template>
         </CoreTable>
+      </div>
+    </KitSection>
+
+    <KitSection label="Sortable + loading (§53)" layout="column" :gap="12" note="Click a header: the arrow and aria-sort follow sortKey / sortDir, the caller re-sorts. State is not sortable (sortable: false).">
+      <div :style="PANEL">
+        <CoreTable
+          v-model:sort-key="sortKey"
+          v-model:sort-dir="sortDir"
+          :columns="sortColumns"
+          :rows="sortedGarage"
+          :loading="busy"
+        >
+          <template #cell-state="{ row }">
+            <CoreTag size="sm" :tone="row.tone" :label="row.state" />
+          </template>
+        </CoreTable>
+      </div>
+      <div class="flex items-center gap-3">
+        <CoreButton size="sm" icon="refresh" :loading="busy" @click="reload">Reload</CoreButton>
+        <span class="text-ui-sm text-fg-faint">sorted by <b class="text-fg">{{ sortKey }} {{ sortDir }}</b></span>
+      </div>
+      <div :style="PANEL">
+        <CoreTable :columns="sortColumns" :rows="[]" loading :loading-rows="3" sort-key="plate" />
       </div>
     </KitSection>
 

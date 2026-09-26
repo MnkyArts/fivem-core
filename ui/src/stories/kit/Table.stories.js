@@ -31,7 +31,11 @@ export default {
           + 'portrait and a rank chip without a second component. The component root is the SCROLL '
           + 'WRAPPER, not the table — `stickyHeader` needs a scroll container, so the max-height you '
           + 'set on `<CoreTable>` is what the header sticks inside. `v-model:selected` holds the row '
-          + 'KEY (`rowKey`, `id` by default), never the index, because rows get re-sorted.',
+          + 'KEY (`rowKey`, `id` by default), never the index, because rows get re-sorted. Sorting (§53): '
+          + '`sortable` (or a column\'s own `sortable`) turns headers into buttons that flip `v-model:sortKey` / '
+          + '`v-model:sortDir` and emit one `update:sort` ({ key, dir }) — the table never reorders rows itself, the '
+          + 'caller (usually the server) does. `loading` sweeps a bar along the top edge and dims the rows; with no '
+          + 'rows yet it draws `loadingRows` skeleton rows instead of the empty line.',
       },
     },
   },
@@ -40,11 +44,13 @@ export default {
     dense: { control: 'boolean', description: '36 px rows instead of 44 px.' },
     stickyHeader: { control: 'boolean', description: 'Needs a max-height on the component.' },
     rowKey: { control: 'text' },
+    sortable: { control: 'boolean', description: 'Every column sorts unless it says sortable: false.' },
+    loading: { control: 'boolean', description: 'Sweeping bar + dimmed rows; skeleton rows when empty.' },
     empty: { control: 'text' },
     columns: { control: false },
     rows: { control: false },
   },
-  args: { selectable: true, dense: false, stickyHeader: false, rowKey: 'id', empty: 'No vehicle is registered to this character.' },
+  args: { selectable: true, dense: false, stickyHeader: false, rowKey: 'id', empty: 'No vehicle is registered to this character.', sortable: true, loading: false },
 }
 
 const panel = {
@@ -62,12 +68,23 @@ export const Playground = {
     setup () {
       const selected = ref('LS 09 TRV')
       const clicked = ref('')
+      const sort = ref({ key: null, dir: 'asc' })
+      // The story plays the caller: it sorts on update:sort, the table only reports.
+      const sorted = () => {
+        const { key, dir } = sort.value
+        if (!key) return rows
+        const d = dir === 'desc' ? -1 : 1
+        return rows.slice().sort((a, b) => (a[key] < b[key] ? -d : a[key] > b[key] ? d : 0))
+      }
       return () => h('div', { class: 'pointer-events-auto', style: { padding: '48px' } }, [
         h('div', { style: panel }, [
           h(CoreTable, {
             ...args,
             columns,
-            rows,
+            rows: sorted(),
+            sortKey: sort.value.key,
+            sortDir: sort.value.dir,
+            'onUpdate:sort': (s) => { sort.value = s },
             selected: selected.value,
             'onUpdate:selected': (v) => { selected.value = v },
             onRowClick: (row) => { clicked.value = row.model },
@@ -89,6 +106,13 @@ export const Playground = {
     // The header cells wear the label voice, the alignment modifier comes from the column.
     expect(canvasElement.querySelectorAll('.core-table__th').length).toBe(4)
     expect(canvasElement.querySelectorAll('.core-table__th--right').length).toBe(2)
+    // §53: a sortable header reports the sort; the story re-sorts and aria-sort follows.
+    const sortBtn = canvasElement.querySelectorAll('.core-table__sort')[3]
+    if (sortBtn) {
+      sortBtn.click()
+      await waitFor(() => expect(canvasElement.querySelectorAll('.core-table__th')[3].getAttribute('aria-sort')).toBe('ascending'))
+      expect(canvasElement.querySelectorAll('.core-table__row')[0].textContent).toContain('Maibatsu Sanchez')
+    }
   },
 }
 
@@ -114,20 +138,23 @@ export const Gallery = {
   render: () => ({ setup: () => () => h(TableGallery) }),
   parameters: {
     docs: {
-      description: { story: 'A faction roster built from cell slots, a selectable garage, a dense sticky-header ledger and both empty states.' },
-      story: { inline: false, height: '1600px' },
+      description: { story: 'A faction roster built from cell slots, a selectable garage, a dense sticky-header ledger, the sortable garage with both loading states (§53) and both empty states.' },
+      story: { inline: false, height: '2150px' },
     },
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     await waitFor(() => expect(canvas.getByText('CoreTable')).toBeInTheDocument())
-    expect(canvasElement.querySelectorAll('.core-table').length).toBe(5)
+    expect(canvasElement.querySelectorAll('.core-table').length).toBe(7)
+    expect(canvasElement.querySelectorAll('.core-table__row--skeleton').length).toBe(3)
+    expect(canvasElement.querySelector('.core-table__th[aria-sort="descending"]')).not.toBeNull()
     expect(canvasElement.querySelector('.core-table--dense')).not.toBeNull()
     expect(canvasElement.querySelector('.core-table__wrap.is-sticky')).not.toBeNull()
     // ↑/↓ on the focused body move the selection without a mouse.
     const body = canvasElement.querySelectorAll('.core-table__body')[1]
     body.focus()
     body.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
-    await waitFor(() => expect(canvas.getByText('ZZ 77 MRC').closest('tr').classList.contains('is-selected')).toBe(true))
+    // Scoped to that body: the §53 sortable table below lists the same plates.
+    await waitFor(() => expect(Array.from(body.querySelectorAll('tr')).find((tr) => tr.textContent.includes('ZZ 77 MRC')).classList.contains('is-selected')).toBe(true))
   },
 }

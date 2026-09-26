@@ -5,6 +5,7 @@
 // after `plugin:register`, and the server must have seen no request for the entry either.
 import { defineUIPlugin, definePage } from '@core/ui'
 import Page from './Page.vue'
+import Shallow from './Shallow.vue'
 
 export interface LazyCounters { evals: number; setups: number }
 
@@ -14,6 +15,10 @@ export const counters: LazyCounters = ((bag as Record<string, unknown>).lazy ||=
 counters.evals++
 
 export default defineUIPlugin({
-  pages: { fx_lazy: definePage({ component: Page }) },
+  pages: {
+    fx_lazy: definePage({ component: Page }),
+    // declared by Lua before this module is even fetched: its props must still end up shallow
+    fx_lazy_shallow: definePage({ component: Shallow, reactivity: 'shallow' }),
+  },
   setup() { counters.setups++ },
 })

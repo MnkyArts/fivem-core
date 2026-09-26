@@ -1,16 +1,24 @@
 --[[
-    core lib: Core.Keys (DESIGN §3.8) — rebindable key bindings, zero per-frame cost.
+    core lib: Core.Keys (DESIGN §3.8, §54) — rebindable key bindings, zero per-frame cost.
 
     Loaded into the CALLER's VM by import.lua (`local ns = ...`), client side only.
 
         Core.Keys.register({ name = 'menu', description = 'Open the menu', key = 'F5',
                              mapper = 'keyboard', onPress = fn, onRelease = fn?, debounce = 250,
-                             whileFocused = false }) -> commandName
+                             whileFocused = false, whileCaptured = false }) -> commandName
 
     Uses the +cmd/-cmd convention (patterns/keymapping.lua): the engine calls the commands on key down
     and key up, so nothing polls controls per frame. Presses are swallowed while the NUI has focus or
     the pause menu is open unless `whileFocused` is set. A key-up can get lost (alt-tabbing while the
     key is held), so a press arriving more than STALE_DOWN_MS after the last one is treated as fresh.
+
+    §54 key capture: `capture` / `release` / `isCaptured` are NOT defined here — they are stateful and
+    live in core (client/ui.lua), so in a plugin VM they resolve through the import.lua proxy to
+    exports.core:call, and inside core they are core's own functions on this very table. A press asks
+    `ns.isCaptured()` once, AFTER every cheap check passed: a capture held by another resource
+    swallows it unless the binding says `whileCaptured = true`. Releases are never swallowed (a key
+    that went down before the capture still comes up), and nothing about it runs per frame. When core
+    cannot answer (stopped, restarting) the press goes through: a key never goes dead with core.
 
     Natives (verified with fxref 2026-09-12): RegisterCommand (shared), RegisterKeyMapping (client),
     IsNuiFocused (client), IsPauseMenuActive (client), GetGameTimer (client+server).
@@ -27,6 +35,14 @@ local bindings = {}   -- commandName -> { down = bool, downAt = ms, lastPressAt 
 --- True while the player is typing in a NUI page or sitting in the pause menu.
 local function inputBlocked()
     return IsNuiFocused() or IsPauseMenuActive()
+end
+
+--- §54: true while a key capture is held by a resource other than this VM's. Press time only —
+--- one export hop in a plugin VM (the proxy), a plain call inside core. `ns.isCaptured` answers
+--- (captured, heldByCaller); any failure (core down, the proxy refusing) means "not captured".
+local function capturedElsewhere()
+    local ok, captured, mine = pcall(ns.isCaptured)
+    return ok and captured == true and mine ~= true
 end
 
 --- Runs a binding callback without letting its error kill the key handler.
@@ -55,6 +71,7 @@ function ns.register(opts)
 
     local debounce = type(opts.debounce) == 'number' and opts.debounce or DEFAULT_DEBOUNCE_MS
     local whileFocused = opts.whileFocused == true
+    local whileCaptured = opts.whileCaptured == true
     local onRelease = type(opts.onRelease) == 'function' and opts.onRelease or nil
     local state = { down = false, downAt = 0, lastPressAt = 0 }
     bindings[pressCommand] = state
@@ -72,6 +89,8 @@ function ns.register(opts)
         end
         if not whileFocused and inputBlocked() then return end
         if now - state.lastPressAt < debounce then return end
+        -- §54: last, because it is the only check that may cost an export hop
+        if not whileCaptured and capturedElsewhere() then return end
         state.lastPressAt = now
         state.down = true
         state.downAt = now

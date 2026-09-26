@@ -6,34 +6,57 @@
 local ownerOf = {}          -- [kind] = { [id] = ownerResource }
 local byOwner = {}          -- [ownerResource] = { [kind] = { [id] = true } }
 local removers = {}         -- [kind] = fn(id, owner)
+-- The caller of the dispatch currently being served. A dispatched function may yield (Wait), and FiveM runs
+-- export calls, event handlers and threads in coroutines: the caller therefore lives PER COROUTINE, and a
+-- coroutine without an entry is core's own code ('core'). The global is used only on the main thread, where
+-- nothing can yield (resource load, the offline suites). Weak keys: dead coroutines go.
 local currentCaller = 'core'
--- A dispatched function may yield (Wait); a second `call` arriving meanwhile would clobber the global.
--- The per-coroutine record keeps each in-flight dispatch on its own caller. Weak keys: dead coroutines go.
 local callerByCoroutine = setmetatable({}, { __mode = 'k' })
 
 local Registry = {}
 Core.Registry = Registry
 
---- Called by the `call` export right before dispatch; anything else is 'core'.
-function Registry.setCaller(name)
-    currentCaller = (type(name) == 'string' and name ~= '') and name or 'core'
+local function ownerName(name)
+    return (type(name) == 'string' and name ~= '') and name or 'core'
 end
 
---- The resource whose call is currently being served ('core' when core called itself).
+--- The running coroutine, or nil on the main thread.
+local function running()
+    local co, main = coroutine.running()
+    if main then return nil end
+    return co
+end
+
+--- Sets the caller of the running coroutine (the global on the main thread).
+function Registry.setCaller(name)
+    local co = running()
+    if co then
+        callerByCoroutine[co] = ownerName(name)
+    else
+        currentCaller = ownerName(name)
+    end
+end
+
+--- The resource whose call is currently being served in this coroutine ('core' when core runs itself).
 function Registry.getCaller()
-    local co = coroutine.running()
-    local owner = co and callerByCoroutine[co]
-    if owner then return owner end
+    local co = running()
+    if co then return callerByCoroutine[co] or 'core' end
     return currentCaller
 end
 
--- Internal callback ownership scope: never changes the global fallback across a yield.
+--- Runs callback(...) as `owner` in this coroutine only, restored afterwards -> pcall results.
 function Registry.withCaller(owner, callback, ...)
-    local co = coroutine.running()
-    local previous = co and callerByCoroutine[co]
-    if co then callerByCoroutine[co] = owner end
+    local co = running()
+    local previous
+    if co then
+        previous = callerByCoroutine[co]
+        callerByCoroutine[co] = ownerName(owner)
+    else
+        previous = currentCaller
+        currentCaller = ownerName(owner)
+    end
     local result = table.pack(pcall(callback, ...))
-    if co then callerByCoroutine[co] = previous end
+    if co then callerByCoroutine[co] = previous else currentCaller = previous end
     return table.unpack(result, 1, result.n)
 end
 
@@ -97,13 +120,19 @@ end
 -- Not reachable through the export: core's own plumbing. A plugin replacing a remover, the DB adapter or
 -- the session/autosave machinery would take the whole server down with it when it stops.
 -- PlayerGrid (§22.1) is core's own spatial index; plugins reach it through Player.getInRange/getClosest.
-local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true, UIForms = true }
+-- MapRegions (§52.3) is the map runtime's region/pack/subscription engine; only server/maps.lua drives it.
+-- MapsRuntime is the internal table the four server/maps*.lua files share (activation, apply, journal).
+-- BanIdentity (§47) is the bans module's internal identity/account resolution helper (server/bans_identity.lua).
+local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true, UIForms = true, MapRegions = true,
+    MapsRuntime = true, BanIdentity = true }
 local INTERNAL_FUNCTIONS <const> = {
     ['DB.setAdapter'] = true,
     ['Player.loadSession'] = true,
     ['Player.loadAllConnected'] = true,
     ['Player.startAutosave'] = true,
     ['Player.stopAutosave'] = true, ['DB.markDegraded'] = true,
+    -- §47: the playerConnecting path only — it enriches the matching ban and counts a hit
+    ['Bans.checkConnecting'] = true,
 }
 
 --- Look up an API function. Dotted sub-names ('menu.open') are stored flat on the namespace (§2.2);
@@ -139,15 +168,7 @@ exports('call', function(caller, namespace, fn, ...)
         end
         error(('core: no API %s.%s'):format(tostring(namespace), tostring(fn)), 0)
     end
-    owner = owner or 'core'
-    local co = coroutine.running()
-    local previousGlobal = currentCaller
-    local previousForCo = co and callerByCoroutine[co]
-    Registry.setCaller(owner)
-    if co then callerByCoroutine[co] = owner end
-    local returned = table.pack(pcall(f, ...))
-    if co then callerByCoroutine[co] = previousForCo end
-    Registry.setCaller(previousGlobal)
+    local returned = table.pack(Registry.withCaller(owner or 'core', f, ...))
     if not returned[1] then error(returned[2], 0) end
     return table.unpack(returned, 2, returned.n)
 end)

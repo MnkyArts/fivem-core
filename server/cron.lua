@@ -267,14 +267,25 @@ function Cron.schedule(expr, fn)
     return addClockJob('cron', fields, fn, expr)
 end
 
---- Cron.remove(id) -> boolean removed. A run already in flight finishes.
-function Cron.remove(id)
+--- Drops one job, no owner check (the owner-stop sweep and Cron.remove use it).
+local function removeJob(id)
     local job = jobs[id]
     if not job then return false end
     jobs[id], clockJobs[id] = nil, nil
     if job.kind == 'every' then dequeue(id) end
     Core.Registry.untrack('cron', id)
     return true
+end
+
+--- Cron.remove(id) -> boolean removed. Only the resource that registered the job (or core itself) may
+--- remove it, like Hooks.remove / Buckets.release: a plugin can never cancel core's retention or expiry
+--- jobs by id (Cron.list hands every id out). A run already in flight finishes.
+function Cron.remove(id)
+    local job = jobs[id]
+    if not job then return false end
+    local caller = Core.Registry.getCaller()
+    if caller ~= job.owner and caller ~= 'core' then return false end
+    return removeJob(id)
 end
 
 --- Cron.list() -> array of { id, kind, owner, runs, lastRun, interval?, expr? } in creation order.
@@ -297,7 +308,7 @@ end
 
 -- A plugin that stops takes its jobs with it (DESIGN §2.3): its funcrefs are dead.
 Core.Registry.onOwnerStop('cron', function(id)
-    Cron.remove(id)
+    removeJob(id)
 end)
 
 AddEventHandler('onResourceStop', function(resource)

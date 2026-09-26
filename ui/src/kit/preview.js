@@ -19,6 +19,7 @@ window.Vue = Vue
 import '../styles.css'
 import { installCoreUI } from '../coreui.js'
 import { installGameBlur } from '../gameblur.js'
+import PaletteLabPanel from '../lab/PaletteLabPanel.vue'
 import keyartUrl from '../stories/kit/assets/keyart.jpg'
 import keyartMenuUrl from '../stories/kit/assets/keyart-menu.jpg'
 
@@ -39,6 +40,10 @@ const bg = (params.get('bg') || 'game').trim()
 // full-page screenshot only ever captures one viewport. `&scroll=page` lets the root grow with its
 // content instead — one `agent-browser screenshot --full` then holds the whole gallery.
 const pageScroll = params.get('scroll') === 'page'
+// The palette lab (src/lab/palette.js, dev only): `&lab` (or a `palette` / `roles` param) floats
+// its panel over the scene and re-tones the page. PaletteLab brings its own per-column lab, which
+// a page-wide one would fight, so it never gets the panel.
+const withLab = (params.has('lab') || params.has('palette') || params.has('roles')) && sceneName !== 'PaletteLab'
 
 // The same stack .storybook/preview.js paints (and the same colours gameblur.js falls back to):
 // a dusk street — cool key light top left, warm sodium bounce bottom right. The NUI itself is
@@ -123,6 +128,21 @@ function indexNode () {
         ? { borderColor: 'var(--color-accent)', color: 'var(--color-accent)' }
         : null),
     }, name))),
+    h('p', { class: 'core-label', style: { margin: '26px 0 10px' } }, 'palette lab'),
+    h('p', { class: 'core-text', style: { maxWidth: '74ch' } },
+      'A second colour next to the coral: add &lab to any scene for the floating panel '
+      + '(&palette=teal|blue|ice|steel|violet|gold|<hex>&roles=light|split|swap), or open PaletteLab '
+      + 'for every candidate side by side.'),
+    h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } }, [
+      ['PaletteLab', 'side by side'],
+      ['ShowcaseMainMenu', 'main menu'],
+      ['ShowcaseInventory', 'inventory'],
+      ['ShowcaseHud', 'hud'],
+      ['ShowcaseMap', 'map'],
+    ].map(([scene, text]) => h('a', {
+      href: '?scene=' + scene + '&bg=' + encodeURIComponent(bg) + (scene === 'PaletteLab' ? '' : '&lab'),
+      style: linkStyle,
+    }, text))),
     h('p', { class: 'core-label', style: { margin: '26px 0 10px' } }, names.length + ' scene(s)'),
     names.length
       ? h('div', {
@@ -153,6 +173,7 @@ const Root = {
         ]),
       // §37.3: the Teleport target of every kit popup, inside .core-root so §31 hides it too.
       h('div', { id: 'core-overlays', class: 'core-overlays' }),
+      withLab && !state.error ? h(PaletteLabPanel) : null,
     ])
   },
 }

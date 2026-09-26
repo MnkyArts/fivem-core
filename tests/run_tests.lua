@@ -701,7 +701,7 @@ local function suiteCallback()
     eq(limited[1], 1, 'the first request is answered')
     eq(limited[2], 2, 'the second request is answered')
     eq(runs, 2, 'the third request never reaches the handler (rate limited)')
-    eq(limited[3], 'unset', 'the rate-limited request is simply not answered')
+    eq(limited[3], nil, "the rate-limited request is refused at once (nil, 'rate_limit'; tests/callback_tests.lua)")
     stubs.tick(Core.Config.CallbackTimeoutMs + 100)
     eq(limited[3], nil, 'the rate-limited request ends in a timeout')
     Core.Config.RateLimits.CallbackPerSecond = 20
@@ -988,6 +988,76 @@ local function suiteKeys()
     check(printed('key binding +core_example_boom failed') ~= nil,
         'an erroring callback is caught and logged')
     eq(#stubs.failures, 0, 'the key handler never throws at the engine')
+
+    -- §54 key capture: the lib asks core (the import.lua proxy) at PRESS time, after every cheap
+    -- check, and swallows the press when ANOTHER resource holds a capture
+    local asked, answer, proxied = 0, { false, false }, {}
+    stubs.exports.core = {
+        call = function(caller, namespace, fn, ...)
+            proxied[#proxied + 1] = caller .. ' ' .. namespace .. '.' .. fn
+            if namespace == 'Keys' and fn == 'isCaptured' then
+                asked = asked + 1
+                if answer == 'error' then error('core: no API Keys.isCaptured') end
+                return answer[1], answer[2]
+            end
+            return true
+        end,
+    }
+    check(rawget(Core.Keys, 'capture') == nil and rawget(Core.Keys, 'release') == nil,
+        'the lib defines no capture functions of its own (the proxy provides them)')
+    eq(Core.Keys.capture('editor'), true, 'Core.Keys.capture reaches core through the proxy')
+    eq(proxied[#proxied], 'core_example Keys.capture', 'as call(caller, "Keys", "capture")')
+
+    local downs, ups, always = 0, 0, 0
+    Core.Keys.register({ name = 'slot', key = '1', debounce = 0,
+        onPress = function() downs = downs + 1 end, onRelease = function() ups = ups + 1 end })
+    Core.Keys.register({ name = 'radio', key = 'F9', debounce = 0, whileCaptured = true,
+        onPress = function() always = always + 1 end })
+    local slot = client.__vm.commands['+core_example_slot'].fn
+    local slotUp = client.__vm.commands['-core_example_slot'].fn
+    local radio = client.__vm.commands['+core_example_radio'].fn
+
+    stubs.tick(10)
+    slot()
+    eq(downs, 1, 'no capture: the press fires')
+    eq(asked, 1, 'after asking core exactly once')
+    answer = { true, false }
+    slotUp()
+    eq(ups, 1, 'a key that went down before the capture still comes up')
+    eq(asked, 1, 'a release never asks')
+    stubs.tick(10)
+    slot()
+    eq(downs, 1, 'a capture held by another resource swallows the press')
+    slotUp()
+    eq(ups, 1, 'and the release of that swallowed press stays silent')
+    answer = { true, true }
+    stubs.tick(10)
+    slot()
+    eq(downs, 2, "the capture holder's own binding fires")
+    slotUp()
+    answer = { true, false }
+    local before = asked
+    radio()
+    eq(always, 1, 'a whileCaptured binding fires while captured')
+    eq(asked, before, 'without asking core at all')
+    stubs.nuiFocused = true
+    stubs.tick(10)
+    slot()
+    eq(asked, before, 'the cheap checks run first: a focused NUI swallows without a hop')
+    stubs.nuiFocused = false
+    answer = 'error'
+    stubs.tick(10)
+    slot()
+    eq(downs, 3, 'core not answering never makes a key go dead')
+    slotUp()
+    stubs.resourceStates.core = 'stopped'
+    answer = { true, false }
+    stubs.tick(10)
+    slot()
+    eq(downs, 4, 'core stopped: the press goes through')
+    slotUp()
+    stubs.resourceStates.core = 'started'
+    stubs.exports.core = nil
 end
 
 --------------------------------------------------------------------------------

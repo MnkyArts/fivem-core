@@ -228,6 +228,13 @@ Core.Registry.onOwnerStop(kind, fn(id, owner))  -- module registers its remover 
 and calls the kind's remover. Vehicles are tracked for bookkeeping only — they are **not** deleted when the
 spawning plugin stops (only when core stops).
 
+**Note (2026-09-26, admin build, review M1).** The caller is tracked PER COROUTINE on both sides (`server/api.lua`,
+`client/api.lua`): `getCaller()` inside a coroutine is that coroutine's entry or `'core'`; the process-wide value is
+only the main-thread fallback (resource load, offline suites). `setCaller`/`withCaller(owner, fn, ...)` write the
+running coroutine's entry, and the `call` export dispatches through `withCaller`, so a thread core starts while a
+plugin's yielding export call is parked stays core's. Tests: `tests/registry_caller_tests.lua` (26),
+`tests/client_registry_caller_tests.lua` (31).
+
 ### 2.4 Hooks, readiness, restarts
 
 - `Core.on(hook, fn)` = `AddEventHandler('core:hook:' .. hook, fn)`; `Core.emitHook(hook, ...)` =
@@ -342,6 +349,14 @@ in a table cleared in `playerDropped`) and `pcall`s the handler; a handler error
 logs. Names are global strings; the convention is `<resource>:<name>` (`core:faction:create`,
 `core_example:getStats`).
 
+**Note (2026-09-26, admin build, R2-UI).** Refusals carry a reason: the response event is `(key, true, ...results)`
+or `(key, false, reason)`, and every await form (`await`, `awaitTimeout`, `awaitClient`, `awaitClientTimeout`) returns
+the handler's results or `nil, err` with err ∈ `'rate_limit'|'schema'|'cooldown'|'permission'|'timeout'|'error'`
+('timeout' also = the asked player dropped; 'error' = handler error, no handler, invalid arguments, or an unknown reason
+from the other side — a client cannot forge one). Rate-limited requests are now answered `'rate_limit'` (≤ 10 answers
+per src and second; the rest still time out). Server registrations take `opts = { permission?, cooldownMs? }` (§44).
+Tests: `tests/callback_tests.lua` (34).
+
 ### 3.6 `Core.Net` (`lib/net/shared.lua`) — validated net events
 
 ```lua
@@ -405,7 +420,8 @@ Keys.register({ name = 'menu', description = 'Open the menu', key = 'F5', mapper
 Registers `RegisterCommand('+' .. Core.name .. '_' .. name, ...)` and the matching `-` command, then
 `RegisterKeyMapping('+' .. Core.name .. '_' .. name, description, mapper, key)`. Ignores presses while
 `IsNuiFocused()` or `IsPauseMenuActive()` unless `opts.whileFocused = true`. Debounced per key. Zero
-per-frame cost.
+per-frame cost. §54 adds `opts.whileCaptured` and `Core.Keys.capture/release/isCaptured` (key capture: a
+press of another resource's binding is swallowed while a capture is held).
 
 ### 3.9 `Core.Streaming` (`lib/streaming/client.lua`) — from `patterns/model-loading.lua`
 
@@ -671,6 +687,10 @@ loops). `type ∈ { info, success, error, warning }`; message sanitized to ≤ 2
 | `/revive [player]` | `core.mod` | `Player.respawn(target, coords of target)` → `core:client:revive` semantics: spawn at current coords |
 | `/heal [player]` | `core.mod` | `core:client:heal` (full health + armour via client natives) |
 | `/faction <create|invite|accept|leave|kick|rank|info|list> ...` | — | thin chat front-end over `Core.Factions` (see §5.2 callbacks for the UI route) |
+
+**Note (2026-09-26, admin build, R2-15).** The staff commands follow §51's duty rule, write an audit row
+`core.cmd.<name>` and echo to on-duty staff (not `admin:before`), check ranks themselves, and are not registered at all
+with `Config.Admin.LegacyCommands = false`; `/weapon` and `/weapons` moved here from weapons.lua. Details: §51 notes.
 
 ### 4.9 `server/main.lua`
 
@@ -1286,6 +1306,7 @@ Hooks (local events `core:hook:<name>`, cross-resource, same side):
 | client | `playerDied` / `playerRespawned` | — |
 | client | `pedChanged` | `ped, previous` — the local player's ped ENTITY changed (model swap, spawn, character switch); `previous` is `0` the first time |
 | client | `uiReady` | — |
+| client | `hudHiddenChanged` | `hidden` — §54: the first `Core.UI.hideHud` reason arrived (`true`) / the last one went (`false`) |
 | client | `core:ui:<page>:<event>` (not under `hook:`) | `data` |
 
 `pedChanged` comes out of the death-watch thread (§6.11): the `PlayerPedId()` it already reads every second is
@@ -1597,6 +1618,9 @@ events `core:client:timeOverride (h, m | false)`, `core:client:weatherOverride (
 screen/control events `core:client:screen (op, ...)`, `core:client:playerState ({ controls?, frozen?, invincible?,
 visible?, health?, armour? })`. One thread (1000 ms) re-applies the clock while an override or frozen time is active.
 
+**Note (2026-09-26, admin build, R2-9).** `Cron.remove(id)` is owner-checked like `Hooks.remove`: only the job's owner
+or core removes it (`false` otherwise); the owner-stop sweep still removes a stopped plugin's jobs.
+
 ## 18. Stats (`Core.Stats`) — Rebar `useStatus` / needs
 
 Files: `server/stats.lua`, `client/stats.lua`. Config:
@@ -1819,6 +1843,25 @@ console `say` as a SYSTEM broadcast and sends join/leave system lines itself.
 
 Formats understand `{tag}`, `{name}`, `{id}`, `{msg}`. Sanitizing: `Utils.sanitize` + all carets stripped
 (cleanText). Hook `chatMessage (src, channel, msg)` fires once a message passed the filter, before delivery.
+
+**Veto hook `chat:beforeMessage` (2026-09-26, admin build, W2-ADMIN-S2).** Before a player's message is delivered —
+the default channel, the CEF `core:server:chat:send`, channel commands, `/s` and `/pm` — and after the `setFilter`
+veto, core runs `Core.Hooks.run('chat:beforeMessage', { src, channel, text })` (§40 pipeline; `channel` is the channel
+name, `'scream'` or `'pm'`). A veto (`return false, reason`) drops the message and sends the sender one system line
+with the reason; a bare veto or a Hooks-internal code (`veto`, `reentrant`, `invalid_name`, `invalid_payload`,
+`callback_*`, `filter_*`) shows "Your message was not sent." Hooks fail closed, so an erroring hook blocks the message
+(the admin plugin's mute catches its own errors and fails open). `setFilter` is unchanged — one filter, not
+owner-tracked, a throwing filter lets the message through — and when it vetoes, the hook is not asked. The admin
+plugin's mute is built on the hook, not on `setFilter`.
+
+**Order and delivery (2026-09-26, R2-4/R2-5).** `dispatch` runs sanitize → channel permission → cooldown → `setFilter`
+→ `chat:beforeMessage` → the `chatMessage` observer → route, so a channel the sender may not use never reaches the
+filters, hooks or observers and does not stamp the cooldown (`/s` and `/pm` have no channel permission). Global
+channels (`ooc`, every `global = true` channel) and faction lines go out through `Core.Net.emitMany`, packed once —
+a player-triggered line is never a -1 broadcast. `staffOnly` channels (and `/a`) reach the cached staff set
+(`Core.Admin.staff()`) filtered by the channel permission. Join/leave lines follow `Config.Chat.JoinLeave`: `'staff'`
+(default; the leaver is excluded), `'all'` (one broadcast per connect/drop, small servers) or `'off'`.
+Tests: `tests/chat_hook_tests.lua` (52).
 
 ## 24. HTTP (`Core.Http`) — Rebar `useProxyFetch`, `useHono`
 
@@ -2913,6 +2956,18 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   a settings column is one Tab per control; centre display 600 15 px (sm 13, lg 18) uppercase, count `fg-faint`.
   ←/↓ and →/↑ step, Home/End jump to the ends, the chevrons disable themselves at the bounds unless `loop`,
   and a float step is re-rounded to 6 decimals so `0.1 + 0.2` never prints as `0.30000000000000004`.
+- **CorePagination** — page / cursor controls (§53). `v-model:page` (1-based, 1), `v-model:pageSize` (25),
+  `pageCount` (`null` = unknown → the cursor pager), `hasNext` / `hasPrev` (`null` = derived from `pageCount` /
+  `page > 1`), `total` (`null` hides the `1–25 of 312` read-out), `pageSizes` (`[25, 50, 100]`; `[]` hides the
+  select), `sizeLabel` (`Rows:`), `siblings` (1), `size`, `disabled` · — · `update:page`, `update:pageSize`,
+  `change` ({ page, pageSize }, once per move; a size change goes back to page 1) · `core-pagination
+  core-pagination--<size> is-cursor is-disabled` + `__range __pages __btn __btn--prev __btn--next __page is-active
+  __gap __current __size` · a wrapping row, space-between: read-out in the label voice `fg-faint` tabular, the
+  pages centred, an inline sm CoreSelect right. Buttons are chip-shaped squares at `--core-page-h` (26 / 32 / 38),
+  display 600 15 px (sm 13, lg 17) tabular `fg-dim`, hover white 6 % + `fg`, the current page `--core-grad-accent`
+  with `on-accent` text; the gap `…` in `fg-faint`, and a gap that would hide one page shows that page instead.
+  Numbered = first, last, the current page ± `siblings`; cursor mode prints `PAGE 3` between the arrows. It never
+  fetches — the caller loads on `change`. Disabled dims the bar once (its buttons and select do not add theirs).
 
 #### Forms — text (`css/forms-text.css`)
 
@@ -2960,6 +3015,38 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   once. Space/Enter/↑/↓ open, ↑/↓ and Home/End move, Enter/Space picks, Tab and an outside pointerdown close,
   Escape closes through the kit's layer, and typing jumps to a label (700 ms buffer). Focus never leaves the
   trigger: the list is a `role="listbox"` driven by `aria-activedescendant`.
+- **CoreCombobox** — the filterable select (§53). `v-model` (a value, or an array with `multiple`), `options`
+  (strings or `{ value, label, description?, icon?, disabled? }`), `search` (`(query) => Option[] | Promise`;
+  replaces the local filter), `debounce` (200 ms), `multiple`, `creatable`, `clearable`, `placeholder`
+  (`Search…`), `size`, `maxHeight` (280), `virtualThreshold` (100), `emptyText` (`No matches.`), `invalid`,
+  `disabled`, `id` · `option` ({ item, selected, active }) · `update:modelValue`, `create` (text), `open`,
+  `close`, `focus`, `blur` · exposes `focus/open/close` · `core-combobox core-combobox--<size> is-open is-focused
+  is-invalid is-disabled is-multiple is-loading` + `__box __tag __input __spinner __clear __chevron`, popup
+  `core-combobox__popup is-virtual` > `__option is-active is-selected is-disabled is-create` + `__option-icon
+  __option-body __option-label __option-desc __check __empty` · the box look (min-height `--core-box-h`, it wraps
+  with `multiple`: the picks are sm removable CoreTags in the well); popup, options, active bar and check are
+  CoreSelect's — the same selector lists. Focus stays in the input (`role="combobox"`, the list driven by
+  aria-activedescendant, options prevent their mousedown). Local filter: label, value and description,
+  case-insensitive. `search` is debounced and an answer older than the latest query is dropped; every option
+  seen is remembered, so a picked value keeps its label. `creatable` puts `+ Create "…"` first when nothing
+  matches exactly. Past `virtualThreshold` rows the list renders through CoreVirtualList (36 px rows, 54 with
+  descriptions). ↑/↓ open and move (wrapping), Enter picks, Escape closes the list through the kit's layer,
+  Tab closes, Backspace in an empty field drops the last pick; a single pick closes the list, a multiple pick
+  keeps it open.
+- **CoreVectorInput** — `{ x, y, z }` (§53). `v-model`, `step` (0.01), `precision` (`null` = from `step`),
+  `min` / `max` (a number, or per axis `{ x, y, z }`; `null` = unbounded), `labels` (`['X', 'Y', 'Z']`),
+  `axisColors` (true), `rotation` (the `°` suffix), `suffix`, `copyable` (true), `size` (`sm`), `invalid`,
+  `disabled`, `id` · — · `update:modelValue`, `copy` (text), `paste` (vector) · exposes `copy/paste/parseVector`
+  · `core-vector core-vector--<size> has-axis-colors is-disabled is-invalid` + `__cell __cell--x|y|z __axis
+  __actions` · three CoreNumberInputs, each behind a 22 px axis cap fused to its left edge (radius 4 on the
+  outer corners only), display 700 12 px; with `axisColors` the caps are `error` / `success` / `info` with ink
+  text (the gizmo convention through tokens), else white 6 % + `fg-dim`; then ghost copy / paste icon buttons.
+  Cells are `flex: 1 1 128px` and wrap one per row in a narrow column. Copy writes `x, y, z` at the shared
+  precision to the browser clipboard (fire and forget) AND the kit's own; paste tries the browser clipboard
+  for 250 ms (a permission prompt the off-screen CEF cannot show would hang it), then the kit's. Parses
+  `1, 2, 3`, `vector3(…)`, `{ x = …, y = …, z = … }` and JSON; Ctrl+V of a whole vector into any field fills all
+  three (the focused field is re-synced a tick later, §37.4's defineModel note). The size default is `sm`, not
+  `md`: three steppers side by side.
 
 #### Forms — choice (`css/forms-choice.css`)
 
@@ -3006,6 +3093,46 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   30 px (22 / 30 / 38), radius 3, an inset white 22 % line so a near-black paint still has an edge; selected:
   2 px ink gap, then a 2 px `accent-hi` ring and a coral glow. One tab stop; ←/→ rove AND pick as they go
   (a colour picker is judged by what the ped looks like right now), Home/End jump.
+- **CoreColorPicker** — hex field + swatches + channel sliders (§53). `v-model` (`'#RRGGBB'`, upper-case;
+  `'#RRGGBBAA'` with `alpha` while the colour is translucent), `alpha`, `swatches` (strings or `{ value,
+  label }`; a 16-colour palette by default, `[]` hides the row), `popover` (a box-look trigger opening the panel
+  in a CorePopover), `size` (the trigger), `placeholder` (`No colour`), `invalid`, `disabled`, `id` · — ·
+  `update:modelValue` · `core-colorpicker core-colorpicker--inline|popover core-colorpicker--<size> is-open
+  is-invalid is-disabled has-alpha` + `__anchor __trigger __chip __chip-fill __value __chevron __frame __panel
+  __top __preview __channels __channel __channel-label __range __range--alpha __channel-value` · never
+  `<input type="color">` (an OS popup the off-screen CEF never shows). Panel 296 px column, gap 14: a 44 × 30
+  preview chip + an sm CoreInput with a `#` prefix (commits live on a full 3/6/8-digit value, on Enter and on
+  blur; a bad value marks the field and keeps the colour), sm CoreSwatches in 8 columns, one row per channel:
+  label (display 700 12 px), a real range painted through `::-webkit-slider-*` whose 12 px track is the live
+  gradient of its own channel (`--core-cp-track`, inline), the alpha track over an 8 px checkerboard, a
+  10 × 20 `--color-key` thumb with a 5 px accent halo on hover/focus, the value display 600 13 px tabular.
+  Chips carry the checkerboard too. Popover trigger: the box look, a 26 px chip, the hex in display 600 15 px
+  0.06 em, a chevron that turns when open.
+- **CoreSchemaForm** — a whole form from `Core.Schema.public(fields)` (§53 over §43). `v-model` (the values
+  object; a missing key shows its `default` or a neutral value and is filled on the first write), `fields`,
+  `errors` (the server map exactly as `Core.Schema.checkAll` returns it — `{ name = code }`, nested codes with
+  their path in front, `{ list = '2.pos.min' }`; flat path keys `list.2.pos` work too; array rows count from 1),
+  `resolvers` (`{ player | model | ref | faction | item: (query, field) => Option[] | Promise }`), `messages`
+  (wording per code, `{min}`-style holes), `inline` (CoreField settings rows), `disabled`, `submitLabel` (`''` =
+  no button), `busy` · `footer` ({ submit, errors }) · `submit` (values — only when the advisory client check
+  passes), `invalid` (errors), `update:modelValue` · exposes `submit/validate` · `core-schemaform
+  core-schemaform--inline is-disabled` + `__group has-title __group-title __object is-bare is-invalid __legend
+  __desc __error __reason __templates __template __duration __array __array-row __array-index __array-item
+  __array-empty __array-add __bare __footer __empty` · controls per type: boolean → CoreSwitch · integer /
+  number / heading → CoreNumberInput (`unit` as suffix; heading 0–359.99 °) · string / password (and any
+  `secret`) → CoreInput · text → CoreTextarea · reason → CoreTextarea (2 rows, counter) + sm template buttons ·
+  enum → CoreSelect (≤ 8 options), CoreChips (`multiple`, ≤ 8) or CoreCombobox (> 8) · color → CoreColorPicker
+  `popover` · duration → preset chips (15m 1h 1d 1w, + Perm with `allowPermanent`) + a free `2h 30m` field ·
+  vector3 / rotation → CoreVectorInput (`world` → the §43 box) · model / player / ref / faction / item →
+  CoreCombobox over the resolver (model `creatable`; no resolver: a text field, a digits-only server id for
+  `player`) · array → numbered rows of the item field drawn bare, a remove button each (stops at `minItems`),
+  Add (stops at `maxItems`) · object → a framed group (white 2 %, hairline, radius 4, label-voice legend).
+  `hidden` fields are skipped, the rest ordered by `order` (stable; unordered last) under their `group` (eyebrow
+  voice over a hairline, in order of first appearance), `visibleWhen` re-evaluated on every change, `readonly`
+  disables the control. The client check is ADVISORY (required, bounds, step, lengths, options, items, colour
+  form, duration bounds — mirroring lib/schema) and runs from the first submit on; `errors` always wins.
+  Per-field renderer and helpers live in `ui/src/kit/schema/` (`SchemaField.vue`, `schema.js`) — outside
+  `components/`, so they are not registered and not in this catalogue.
 
 #### Data — meters (`css/data-meters.css`)
 
@@ -3081,16 +3208,53 @@ hover → `accent` + `--core-focus` halo when focused, `error` when invalid, 4 p
   296 × ≥ 74 px, `--color-hud` fill + sheen + hairline + `--shadow-ui-sm`, click-through; 72 px avatar column
   flush left, name display 700 18 px uppercase. The XP rail is the chip's OWN 4 px bar, not a CoreProgress: it
   shares a flex row with the level and must not inherit a meter's label/value chrome.
-- **CoreTable** — `columns: [{ key, label, align?, width?, format?(value, row) }]`, `rows`, `rowKey` (`id`),
-  `selectable`, `v-model:selected` (the ROW KEY, never the index — rows get re-sorted), `dense`, `stickyHeader`,
-  `empty` · `cell-<key>` ({ row, value, column }), `empty` · `row-click` ·
-  root `core-table__wrap core-scroll is-sticky` (the scroll box, so a caller's `max-height` lands on it) around
-  `<table class="core-table core-table--dense is-selectable">` + `__th __th--<align> __body __row __cell
-  __cell--<align> __empty` · header label voice `fg-faint` 34 px (dense 30) over a hairline, rows 44 px (dense
-  36) with white 6 % hairlines, hover white 3 % while selectable, selected
-  `accent-soft` + a 2 px inset bar on the first cell (a collapsed table discards an inset shadow put on the
-  `<tr>`). The
-  `<tbody>` is the tab stop: ↑/↓ and Home/End move the selection, Enter/Space re-fires `row-click`.
+- **CoreTable** — `columns: [{ key, label, align?, width?, format?(value, row), sortable? }]`, `rows`, `rowKey`
+  (`id`), `selectable`, `v-model:selected` (the ROW KEY, never the index — rows get re-sorted), `dense`,
+  `stickyHeader`, `empty`, `sortable` (every column sorts unless it says `sortable: false`), `v-model:sortKey`
+  (`null`), `v-model:sortDir` (`asc`), `loading`, `loadingRows` (5) · `cell-<key>` ({ row, value, column }),
+  `empty` · `row-click`, `update:sort` ({ key, dir }) ·
+  root `core-table__wrap core-scroll is-sticky is-loading` (the scroll box, so a caller's `max-height` lands on
+  it) around `<table class="core-table core-table--dense is-selectable is-loading">` + `__th __th--<align>
+  is-sortable is-sorted __sort __sort-icon __body __row __row--skeleton __cell __cell--<align> __empty
+  __progress __progress-fill` · header label voice `fg-faint` 34 px (dense 30) over a hairline, rows 44 px
+  (dense 36) with white 6 % hairlines, hover white 3 % while selectable, selected `accent-soft` + a 2 px inset
+  bar on the first cell (a collapsed table discards an inset shadow put on the `<tr>`). The `<tbody>` is the tab
+  stop: ↑/↓ and Home/End move the selection, Enter/Space re-fires `row-click`. Sorting (§53) is presentation
+  only: a sortable header is a button (label + a `sort` glyph at 55 %, `arrow-up` / `arrow-down` in `accent`
+  and the label in `fg` once sorted, `aria-sort` on the `<th>`); a new column starts `asc`, the sorted one
+  flips; the table NEVER reorders `rows` — the caller (usually the server) does on `update:sort`. `loading`: a
+  2 px `--core-grad-accent` sweep (`core-indeterminate`) sticky on the top edge that takes no room, rows at
+  55 %, `aria-busy`; with no rows it draws `loadingRows` CoreSkeleton rows instead of the empty line.
+- **CoreVirtualList** — fixed-row-height virtualised list (§53). `items`, `itemHeight` (36), `keyField`
+  (`id`; the index when a row has none), `overscan` (6), `endThreshold` (4 rows), `role` (`list`; `listbox`,
+  `presentation`, `none` — rows are `listitem`s only under `list`), `empty` · default ({ item, index }),
+  `empty` · `range` ({ start, end }, when the rendered window changes), `reach-end` (once per list length,
+  near the bottom — a cursor loader) · exposes `scrollToIndex(index, align = 'auto'|'start'|'center'|'end')`,
+  `measure()` · `core-virtuallist core-scroll is-empty` + `__spacer __window __row __empty` · the ROOT is the
+  scroll box (give it a `height` / `max-height`; without one it grows to the list and renders every row); a
+  spacer as tall as every row keeps the scrollbar honest and the rendered rows (viewport + `overscan` each side)
+  ride ONE `transform: translateY()` on the window; rows are exactly `itemHeight` and clip. The viewport comes
+  from a ResizeObserver, the offset from a passive scroll listener; start/end are number computeds, so a
+  scroll inside the same window re-renders nothing.
+- **CoreTree** — nested rows with expand / collapse and selection (§53). `items` (`[{ id, label, icon?, badge?,
+  description?, disabled?, children? }]`), `v-model` (the selected key, an array with `multiple`),
+  `v-model:expanded` (open keys; uncontrolled when unbound), `keyField` (`id`, then `value`), `childrenField`
+  (`children`), `multiple`, `dense`, `indent` (16 px), `overscan` (8), `disabled`, `empty` (`Nothing here.`),
+  `label` (aria-label) · `icon` ({ node, open, depth }), `label` ({ node, depth }), `badge` ({ node }),
+  `trailing` ({ node, depth, open, selected } — its clicks never select the row), `empty` · `select` (node),
+  `toggle` (node, open), `activate` (node — double click) · `core-tree core-tree--dense is-disabled is-multiple`
+  + `__list __row is-selected is-active is-open is-disabled has-children __twisty is-hidden __icon __label
+  __badge __trailing __empty` · the visible rows are FLATTENED and rendered through CoreVirtualList (32 px, dense
+  28), so a caller's `max-height` on the root makes it scroll and only the rows on screen exist. The root is
+  the one tab stop (`role="tree"`, aria-activedescendant; rows are `treeitem`s with level / posinset / setsize /
+  expanded / selected). Rows: sans 14 px (dense 13) `fg-dim`, indent per level, a 20 px twisty (chevron-right
+  turned 90° by `transform` when open, hidden on leaves, toggles on click), icon `fg-faint` (`accent` when
+  selected), ellipsised label, an 18 px white 6 % count badge, trailing actions; hover white 4 %; selected
+  `accent` 16 % + a 2 px inset bar (the select list's language); the keyboard cursor is a 1 px accent 55 %
+  ring shown only while the tree has focus. ↑/↓ move, → opens or steps into the first child, ← closes or steps
+  out to the parent, Home/End jump, Enter selects, Space toggles in `multiple`; click selects, Ctrl/⌘-click
+  toggles and Shift-click selects the visible range from the anchor (`multiple`). A cursor whose row vanished
+  climbs to its nearest visible ancestor.
 - **CoreKeyValue** — `items: [{ label, value, icon?, tone? }]`, `columns` (1), `lastRule` (true; `false` drops
   the last row's hairline so a block can sit flush on a panel edge) · `value-<i>` ({ item, value }), `label-<i>`
   ({ item }) · — · `core-kv` (a `<dl>`) + `__item is-toned __label __icon __value` · rows ≥ 32 px under a white 6 %
@@ -3282,16 +3446,21 @@ plugin pages that predate the kit (inventory, charcreator, trucking) and are del
 - **Storybook**: `Kit/Foundations/{Tokens,Icon}` (colours, type, the icon registry), then one
   `Kit/<Group>/<Name>` file per component — several carry the pair they document, so the titles are:
   *Actions*: Button, Icon Button, Key & Key Hint, Key Hints, Prompt & Prompt Group · *Surfaces*: Panel, Card,
-  Background, Screen, Heading, Divider & Dash, Brand & Tagline · *Navigation*: Tabs, Menu, Chips, Stepper ·
-  *Forms*: Field, Input & Textarea, Number Input, Select, Checkbox, Radio & Radio Group, Switch, Slider,
-  Swatches · *Data*: Progress, Ring, Stat Bar, Stat Row, Spinner & Skeleton, Badge & Tag,
-  Avatar & Player Chip, Table, Key Value, Empty · *Game*: Slot & Grid, Hotbar, List & List Item,
+  Background, Screen, Heading, Divider & Dash, Brand & Tagline · *Navigation*: Tabs, Menu, Chips, Stepper,
+  Pagination · *Forms*: Field, Input & Textarea, Number Input, Select, Combobox, Vector Input, Checkbox,
+  Radio & Radio Group, Switch, Slider, Swatches, Color Picker, Schema Form · *Data*: Progress, Ring, Stat Bar,
+  Stat Row, Spinner & Skeleton, Badge & Tag, Avatar & Player Chip, Table, Virtual List, Tree, Key Value,
+  Empty · *Game*: Slot & Grid, Hotbar, List & List Item,
   Objective & Tracker, Compass · *Feedback*: Alert, Toast, Dialog, Drawer, Popover, Context Menu, Tooltip.
   Each has a `Playground` (controls) and a `Gallery` story (a scene SFC in `stories/kit/scenes/` — the shipped
   bundle has no runtime compiler, so scenes are compiled SFCs or `h()`), and
   `Kit/Showcase/{MainMenu,Hud,Inventory,Map}`:
   the four mockups rebuilt from kit components only (the completeness proof; art in `stories/kit/assets/`,
   Storybook-only, never in `html/`). `storySort` puts `Kit` after `Built-ins`, Foundations and Showcase first.
+  The seven §53 components (2026-09-26) each have a Playground and a Gallery (Schema Form also
+  `Playground — settings rows`); Table's story also covers sorting and loading. Schema Form's fixtures live in
+  `stories/kit/scenes/schemaFixtures.js` (`Core.Schema.public`-shaped data and fake resolvers — plain data, not a
+  scene: the harness only globs `*.vue`).
   Every gallery scene is built from
   `scenes/KitStage.vue` (`title`, `description`, `width` (1100), `center`, `padded`; the page frame) and
   `scenes/KitSection.vue` (`label`, `layout: 'row'|'column'|'grid'`, `columns`, `gap`, `note`; one labelled
@@ -3484,6 +3653,7 @@ Lua → NUI (`SendNUIMessage { action = … }`):
 | `focus` | `focused, stack = { { key, layer, id?, owner } … }` | `stack` is NEW (top last) |
 | `dev:set` | `enabled, log, inspector, loadTimeoutMs` | NEW; on `ui_ready` and on change |
 | `inspector:toggle` | — | NEW |
+| `shell:hud` | `hidden, keep = { resource … }` | §54 (2026-09-26): hides core's HUD widgets and the overlays of every owner not in `keep` |
 
 NUI → Lua (`RegisterNuiCallback`; every one answers `cb`):
 
@@ -3689,6 +3859,13 @@ Core.UI.feed({ speed = 132, rpm = 0.71, gear = 4 })                 -- telemetry
   `close`, `focus`, events, requests, results) is never delayed.
 - Budget (replaces the §9 line): idle = 0 messages/s; with feeds ≤ 20 messages/s total; `hud:set` (100 ms),
   `stats:set`/`state:set` (250 ms) and the notify queue keep their own coalescing.
+
+**Note (2026-09-26, run W1-UI).** The props data of an id lives for the life of the shell; its wrapper follows the page
+definition's `reactivity` and is fixed before the first mount — a page declared before its plugin loaded (every lazy
+plugin) starts deep and is re-wrapped over the same data when the definition arrives. (`propsFor(id, mode?)` keeps
+`{ raw, mode, proxy }`; Vue tracks by the raw target, so a proxy captured before the switch still sees every later
+open/update/patch — only `===` identity between that early capture and the new wrapper changes. New export
+`propsMode(id)`. Tests: `pages.test.ts` +2, `runtime-regression.js` +2 with the `fx_lazy_shallow` fixture page.)
 
 ### 38.11 Development workflow
 
@@ -4025,8 +4202,1325 @@ Forms are bounded to 32 fields, select lists to 200 options, menus to 200 rows/e
 have 1..20 stages, 1..10 keys, speed 20..200, areaSize 5..80, and a derived watchdog capped at 120000 ms.
 Required checkboxes must be true. Hook payload `money:beforeTransfer` is `{from,to,account,amount,reason}`.
 
+**Note (2026-09-26, admin build, R2-CLIENT F5).** `Core.Controls.acquire({ all = true, except = { ids }?, groups? })`
+disables a whole group with `DisableAllControlActions` plus one `EnableControlAction` per exception (a camera mode:
+~6 natives per frame instead of one per control). With several handles on one group `all` wins; a control stays
+enabled only when EVERY `all` handle excepts it and no list handle disables it; the per-frame plan is rebuilt on
+acquire/release as dense arrays. Known limit: re-enabling an exception can undo another resource's disable of that
+control if theirs ran earlier in the frame. Other pipelines core runs: `chat:beforeMessage` (§23), `admin:before`
+(§51), `maps:beforeApply` (§52). Tests: `client_actions_tests.lua` 74.
+
 Menu changes are acknowledged, not optimistic: the browser allows one outstanding change and commits its
 display only after the bridge accepts it. Throttled/rejected changes retain the prior display; an unknown
 transport outcome cancels the menu. Final selection waits for the outstanding change, and stale replies
 cannot mutate a replacement menu. Acceptance means schema/state acceptance, not that a gameplay action
 is authorized; notification callback errors are logged without changing the accepted row state.
+
+---
+
+# Admin platform additions (§41–§53, 2026-09-26 — Liam: "a dynamic admin system … easy to add new menus, settings through other plugins … like the MTA:SA Map Editor … also live place stuff as admin to make fun events")
+
+Research: `resources/admin/research/RESEARCH.md` (+ R1–R7). The plugin contract is `resources/admin/DESIGN.md`. These
+sections add the framework pieces every plugin (not only the admin resource) builds on. They are additive: no existing
+signature changes meaning; where a default changes it is said explicitly. Every new stateful registration is owner-
+tracked through `Core.Registry` and removed when its owner stops (§2.3). Every server entry point validates in the §3
+order. Every native named here must be confirmed with `fxref show` in the session that writes the code (AGENTS §3).
+
+## 41. UI input modes, Escape and hide policy (client/ui.lua, shell runtime, SDK)
+
+A page can switch at runtime between "cursor over the UI" and "the game gets the input" without being unmounted —
+the editor's fly ↔ cursor switch and its hold-RMB-to-look need it (research §3.3a).
+
+```lua
+Core.UI.registerPage(id, { type = 'page'|'overlay'|'modal', keepInput?, input?, escape?, onHide? }) -> bool
+--   input  = 'ui' (default) | 'mixed' | 'look' | 'game'     (keepInput = true without `input` means 'mixed' — unchanged behaviour)
+--   escape = 'close' (default) | 'event'   ('event': Escape does not close the page; the shell emits page event 'escape')
+--   onHide = 'close' (default) | 'suspend' (§31 hidden transition keeps the page mounted instead of closing it)
+Core.UI.setInput(id, mode) -> bool      -- owner of the page only (Registry owner == caller); works whether open or not
+Core.UI.getInput(id) -> mode|nil
+```
+
+| mode | SetNuiFocus(focus, cursor) | SetNuiFocusKeepInput | meaning |
+|---|---|---|---|
+| `ui` | true, true | false | today's page: cursor over the UI, the game gets nothing |
+| `mixed` | true, true | true | cursor over the UI **and** the game receives input (today's `keepInput = true`) |
+| `look` | true, false | true | no cursor, the game receives input, the page still gets keyboard events — experimental, in-game probe §6.2 of the research |
+| `game` | — | — | the page contributes **no** focus entry: it stays open and rendered, the focus stack is decided by the rest; the shell sets `pointer-events: none` on it |
+
+- Overlays ignore `input` (they never take focus). Modals honour it like pages.
+- `applyFocus()` (§38.9) skips page/modal entries whose mode is `game`; `cursor` = mode ~= 'look'; `keep` = mode is
+  `mixed` or `look`. The native triple is still only written when it changes.
+- Shell message `{ action = 'page:input', id, input }` on every change and inside `page:register`; the runtime stores it
+  per page; the SDK exposes it read-only and reactive as `PageHandle.input` (`contract.ts`: `readonly input: PageInputMode`,
+  `type PageInputMode = 'ui' | 'mixed' | 'look' | 'game'`). Additive — `API_VERSION` stays 1.
+- `escape = 'event'`: when the page (or a modal above it that is itself `escape = 'event'`) is the top layer and no kit
+  escape layer consumed the key, the store does not close it; it emits the page event `escape` (Lua:
+  `Core.UI.on(id, 'escape', fn)`; SDK: the page's own `on('escape')`). The system layer and kit escape layers are unchanged.
+- `onHide = 'suspend'`: the §31 hidden transition does not close the page; its focus entry is skipped while hidden; on
+  show focus is re-applied. Modals are still cancelled on hide (§31.4). The page receives page events `suspend` / `resume`.
+- The focus watchdog (§38.9) treats a suspended or `game` page as holding no focus.
+- Tests: `client_ui_tests.lua` (focus triple per mode, `game` skipped, mode change while open, owner check, suspend/resume
+  across hide/show, escape routing), `ui/tests/unit/layers.test.ts` + `pages.test.ts`, a `runtime-regression.js` check per
+  new behaviour.
+
+**Implementation notes (2026-09-26, run W1-UI).**
+- **Validation.** `input`, `escape`, `onHide` must be one of their strings when present; anything else (wrong case, a
+  number) makes `registerPage` return `false` with a `Log.error` instead of silently falling back (a typo like `'Game'`
+  would otherwise ship a page that grabs the cursor). `input` wins over `keepInput`; `keepInput = true` alone is
+  `'mixed'`, bit for bit the old behaviour.
+- **Owner check.** `setInput` compares `Registry.getCaller()` with the page's owner strictly — core cannot switch a
+  plugin's page either. The current mode again answers `true` and sends nothing. `getInput` is open to every caller.
+  No server API (the §21 op whitelist is unchanged). Re-registering an open page with another mode re-applies focus.
+- **Focus stack.** `focusStack()` skips a page/modal whose mode is `game` and the suspended page. **Chat** is dropped
+  only when something that HOLDS focus sits above it, so the chat input works while a `game` page (fly mode) is open
+  (before, any open page dropped it). The watchdog condition is `focusOwned and not chatTyping and not
+  focusAboveChat()` (allocation-free).
+- **Escape.** Lua routes nothing: the shell decides (`store.handleKeydown` → `Pages.escapePage`; `ui/src/store.js`
+  was touched for this, because Escape and a close button both end in `closePage`) and posts `ui_event { page,
+  event = 'escape' }`, which becomes `TriggerEvent('core:ui:<id>:escape')` → `Core.UI.on(id, 'escape', fn)`.
+  `layers.ts` (`topModalId`, `modalIds`, `escapeTarget`) skips `game` ids, so a `game` modal never makes the page
+  under it `inert` and is never the Escape target. Kit escape layers and built-ins keep precedence.
+- **Deviation — `onHide = 'suspend'` is honoured for the exclusive page only.** Modals (plugin and built-in) are
+  always cancelled on hide, overlays never closed (§31.4 unchanged). `suspend`/`resume` reach BOTH listeners (shell
+  `page:event`, Lua `Core.UI.on(id, 'suspend')`); a suspend page opened while hidden starts suspended, so every
+  `resume` pairs with a `suspend`; a page closed/replaced while suspended gets no `resume`; the `ui_ready` replay
+  re-sends `page:event suspend` to the shell only. Unchanged: a non-suspend page opened while hidden takes focus at once.
+- **Wire (Lua → NUI).** `page:register` carries `input` and `escape` (`keepInput` kept for older readers; `onHide`
+  is never sent); `{ action = 'page:input', id, input }` on every change, open or not (it flushes the page's patch
+  queue first); `{ action = 'page:event', id, event = 'suspend'|'resume', data = {} }`.
+- **Shell/SDK.** `PageHost.vue` gives `game` layers inline `pointer-events: none` plus the utility
+  `[&_*]:pointer-events-none!` (compiles flat, beats the kit's `pointer-events: auto`) and `data-core-input`.
+  `contract.ts` (additive, `API_VERSION` stays 1): `PageInputMode`, `PageSystemEvent`, readonly reactive
+  `PageHandle.input`, an `on(PageSystemEvent, fn)` overload that needs no `In` entry. Dev mock: `input`/`escape` per
+  page, `lua.setInput(id, mode)`; suspend is not emulated. `/uiinspect` shows each page's mode and `esc→event`.
+- **Page ids must be plain.** The NUI → Lua `ui_event` bridge (page events, `escape`, `Core.UI.on`), requests and
+  feed channels accept only `^[%w_%-]+$` (≤ 64), so since the follow-up `registerPage` refuses any other id
+  (`Log.error` + `false`; it used `Validate 'id'`, which let `:` through and produced pages that never heard an
+  event). `Core.Admin` page/tab `page` fields follow the same rule (`admin_panel`, not `admin:panel`).
+- **Limits.** `look` is untested in game (the §6.2 probe decides it). The click-through rule is `!important` on every
+  descendant of a `game` layer: a page cannot keep one control clickable in `game` mode — switch the mode instead.
+- Tests: `client_ui_tests.lua` suites `ui input modes` + `ui hide policy` (+100) and the plain-id checks (684 total), `ui/tests/unit/
+  input-modes.test.ts` (mock ↔ runtime) + layers/pages/inspector cases, `runtime-regression.js` section 10b (+17).
+- **`closed` lifecycle event (2026-09-26, after Liam's F10 soft-lock in the admin editor).** Every close of a page,
+  modal or overlay now also reaches its Lua owner as `core:ui:<id>:closed { reason, by? }` (`UI.on(id, 'closed',
+  fn)`): `'close'` (UI.close), `'replaced'` (another EXCLUSIVE page took the layer — `by` = its id; open modals go
+  with it), `'closeAll'`, `'hidden'` (the shell hid a page that is not `onHide = 'suspend'`), `'unregister'`.
+  Before, `UI.open` of a second exclusive page closed the first one silently: an owner that runs a camera or holds
+  controls for its page (the admin editor under the F10 panel) kept running for a page that was gone and the player
+  was stuck. The event is Lua only (the shell already hears `page:close`). Suite `page closed reasons`.
+
+## 42. Raycasts from the rendered camera and from screen points (client/raycast.lua)
+
+`Core.Raycast.fromCamera` uses the *gameplay* camera, which is wrong under a scripted camera (research §5.2 #3). Added:
+
+```lua
+Core.Raycast.screenToWorld(fx, fy) -> origin: vector3, direction: vector3|nil   -- fx, fy in 0..1 of the game viewport; GetWorldCoordFromScreenCoord
+Core.Raycast.worldToScreen(coords) -> onScreen: boolean, fx, fy
+Core.Raycast.fromScreen(fx, fy, distance = 1000, flags = -1, ignore = 0) -> hit, coords, normal, entity
+Core.Raycast.fromRenderedCamera(distance = 1000, flags = -1, ignore = 0) -> hit, coords, normal, entity  -- GetFinalRenderedCamCoord/Rot
+```
+Arguments are validated (finite, 0..1, distance 0 < d ≤ 5000); BOOL out-values are read as `v == true or v == 1`
+(§30.4). These are proxy calls — a per-frame tool (the editor) calls the natives in its own VM; these exist for the
+occasional query. Tests in `tests/run_tests.lua` style with native stubs.
+
+**Implementation notes (2026-09-26, run W1-UI).**
+- Natives (fxref, all client): `GetWorldCoordFromScreenCoord(sx, sy) -> world, normal`, `GetScreenCoordFromWorldCoord`
+  `-> BOOL, sx, sy`, `GetFinalRenderedCamCoord()`, `GetFinalRenderedCamRot(2)`,
+  `StartExpensiveSynchronousShapeTestLosProbe(…, flags, entity, 7)`, `GetShapeTestResult`. Every BOOL, return and
+  out-value, is read as `v == true or v == 1`; `between` now uses the same helper.
+- Validation: `fx`/`fy` finite in 0..1 (edges included); `distance` nil → 1000, else finite, 0 < d ≤ 5000; `flags`
+  nil → -1, `ignore` nil → 0, else whole numbers (`1.0` is passed as an integer).
+- Refusals cast no probe and log nothing (query helpers): `screenToWorld` → `nil, nil`; `worldToScreen` →
+  `false, nil, nil` (also off-screen / non-finite projection); `fromScreen` / `fromRenderedCamera` →
+  `false, nil, nil, 0`. `screenToWorld` normalises the native's direction and answers `origin, nil` when it has no
+  length. `fromRenderedCamera` ignores entity 0 by default, unlike `fromCamera` (the local ped).
+- Tests: own suite `tests/raycast_tests.lua` (100 checks, native stubs) instead of `run_tests.lua`.
+
+## 43. Field schemas (`Core.Schema`, lib `lib/schema/shared.lua`, pure, every VM)
+
+One typed vocabulary for settings (§45), admin action arguments (§51) and map element fields (§52), so one kit form
+renderer serves all three (research §4).
+
+```lua
+Core.Schema.field(def) -> field|nil, err         -- normalise one definition (copies; strips `validate` into a private slot)
+Core.Schema.fields(list) -> fields|nil, err      -- array, 1..64, unique names
+Core.Schema.check(field, value) -> ok, valueOrErr               -- validate one value; never coerces types
+Core.Schema.checkAll(fields, values, { partial = false }) -> ok, out|errs   -- errs = { [name] = err }; unknown keys refused
+Core.Schema.default(field) -> deep copy of the default (or nil)
+Core.Schema.public(fields) -> JSON-safe array for the UI (no functions, secret defaults removed)
+```
+
+Common keys: `name` (`^[%a_][%w_]*$`, ≤ 48), `type`, `label`, `description`, `default`, `required`, `placeholder`,
+`group`, `order`, `hidden`, `readonly`, `unit`, `secret`, `visibleWhen = { field = 'x', equals = v } | { field = 'x',
+['in'] = { … } }`, `persistDefault` (default true), `validate` (callable, server-side only, `fn(value, all) -> ok, err`,
+never sent to clients). Types and their keys:
+
+| type | value | keys |
+|---|---|---|
+| `boolean` | boolean | — |
+| `integer` / `number` | finite number (integer: no fraction) | `min`, `max`, `step` (value on the step grid from `min or 0`) |
+| `string` / `text` (multiline) / `password` | string | `minLength`, `maxLength` (default 256, cap 4096), `pattern` (Lua pattern) + `patternMessage` |
+| `reason` | string | as string; `minLength` default 3, `maxLength` 256, `templates = { strings }` (UI only) |
+| `enum` | scalar, or array of scalars with `multiple = true` | `options` 1..200: `value` or `{ value, label, description }` |
+| `array` | array | `items = field`, `minItems`, `maxItems` (≤ 1000) |
+| `object` | table with exactly the declared keys | `fields = list` (nesting ≤ 4) |
+| `color` | `'#RRGGBB'` or `'#RRGGBBAA'` | `alpha = true` allows the 8-digit form |
+| `duration` | integer seconds ≥ 0 | `allowPermanent` (0 = permanent), `max` |
+| `vector3` | `{ x, y, z }` finite | `min`/`max` (per component), `world = true` → x,y ±10000, z −1000..3000 |
+| `heading` | number, normalised to [0, 360) | — |
+| `rotation` | `{ x, y, z }` degrees, finite | — |
+| `model` | model name `^[%w_%-]+$` ≤ 64 | `kinds = { 'prop'|'vehicle'|'ped'|'weapon' }` (the consumer checks existence) |
+| `player` | server id integer 1..65535 | (the consumer checks it is loaded) |
+| `ref` | element id string `^[%w_%-:]+$` ≤ 64 | `refType` (a §52 element type id) |
+| `faction`, `item` | id string `^[%w_%-]+$` ≤ 64 | (the consumer checks existence) |
+
+Errors are short machine strings (`'required'`, `'type'`, `'min'`, `'max'`, `'step'`, `'pattern'`, `'option'`,
+`'length'`, `'items'`, `'unknown'`, `'custom:<text>'`). Tests: `tests/schema_tests.lua` (every type, bounds, nesting,
+defaults, public view, refusal of unknown keys).
+
+**Implementation notes (2026-09-26, run W1-SCHEMA).**
+- **`name` is optional in `Schema.field`**, required in `Schema.fields` (lists, object `fields`): settings keys hold
+  dots, so a setting's field has no `name` and `Settings.list` sets `name = key`.
+- **Unknown definition keys are dropped, not refused** — only vocabulary keys are copied, so `public()` cannot leak
+  anything. `checkAll` still refuses unknown VALUE keys (`'unknown'`, reporting stops after 16 keys).
+- **Definition errors** name the bad key: `'type'`, `'min'`, `'options'`, `'depth'`, `'items.<err>'`,
+  `'fields.<name>.<err>'`, `'default:<err>'`; in a list `'<name>.<err>'`, and the list itself `'count'` or
+  `'duplicate:<name>'`. A default is checked with the built-in rules only (the plugin's `validate` is not run on it).
+- **Nested value errors carry a path**, `'<index|name>.<err>'` (`'2.reason.length'`, 1-based indexes). `checkAll`
+  returns `errs[name]` without the prefix and `errs['*']` for a non-table input (`'type'`) or a broken raw list
+  (`'schema:<err>'`). Array/enum counting stops at `maxItems + 1`: a hostile payload costs bounded work.
+- **`required`**: nil or `''` fails; a field hidden by `visibleWhen` (sibling value, or its default) is never
+  required, but a value it is given is still checked. **`persistDefault`**: `checkAll` (not partial) and object
+  values fill a missing value with the default unless `false`; `check` never fills.
+- **Custom `validate`** runs after the built-in checks with `all` = the normalised output (nil for a single `check`);
+  a throw → `'custom:error'`, a bare false → `'custom:invalid'`, text cut to 128 bytes. It lives in a weak-keyed
+  private slot (kept by re-normalising); a copy that crossed a VM has none (functions do not cross JSON).
+- **Normalisation**: fresh tables; vector3/rotation as `{ x, y, z }` (a `vector3` userdata is accepted); heading
+  `v % 360`; whole floats of integer/duration/player as integers. **`duration`**: 0 passes with `allowPermanent`,
+  otherwise `min` (default 0) and `max` apply. **`reason`**: `minLength` counts the trimmed text; the value is
+  returned untouched. **`enum multiple`**: duplicates fail `'option'`. Lengths are bytes, not UTF-8 characters.
+- **Addition — UI-only keys for CoreSchemaForm** (kept by `field()`/`public()`, validated, never read by `check`):
+  common `icon` (≤ 32); `options[].icon` (≤ 32); `rows` (integer 2..20, `text` only); `presets` (`duration` only, ≤ 12
+  integer seconds; `0` needs `allowPermanent`, every other preset must lie within `min`/`max`, so a preset is always a
+  value `check` accepts). Refused as `'icon'`, `'options'`, `'rows'`, `'presets'`.
+- Tests: `tests/schema_tests.lua` (317).
+
+## 44. Permissions v2: catalogue, ranked groups in the DB, targeting (server/perms.lua, lib/callback)
+
+Unchanged: `Perms.has/getGroup/setGroup/isAdmin/grant/revoke/list` and their check order (console → ACE → account →
+character → group). Added:
+
+```lua
+Perms.define(perm, { label, description?, category?, default? }) -> bool
+--   owner-tracked (kind 'permDef'); `default` = a group name that receives the grant ONCE: if the group's document does
+--   not list the perm and never had it removed (group.removed[perm]), it is added. An owner's edit is never overwritten.
+Perms.catalogue() -> array of { perm, label, description, category, owner, default }
+Perms.groups() -> array of { name, label, weight, inherits = { names }, perms = { strings }, color? }
+Perms.saveGroup(name, { label?, weight?, inherits?, perms?, color? }, actorSrc?) -> bool, err   -- actor needs 'core.perms.manage'
+Perms.deleteGroup(name, actorSrc?) -> bool, err                  -- not 'user', no member online; members fall back to 'user' on load
+Perms.getWeight(src) -> integer                                  -- console: math.huge; unknown/no session: 0
+Perms.canTarget(actorSrc, targetSrc) -> bool, reason             -- console or self: true; else weight(actor) > weight(target)
+Perms.effective(src) -> { [perm] = true }                        -- group chain + account + character (ACE not enumerable)
+Perms.explain(src, perm) -> { allowed, via = 'console'|'ace'|'account'|'character'|'group:<name>'|nil }
+Perms.grant(src, perm, scope?, { expiresAt? })                   -- temporary grants: expired entries are ignored and pruned on load
+```
+
+- Groups live in the collection `perm_groups` (doc id = name): `{ name, label, weight, inherits, perms, removed = {},
+  color }`. First start seeds them from `Config.Perms.Groups` and the new `Config.Perms.Weights` (`user 0, helper 100,
+  mod 200, admin 300, senior 400, owner 1000`); afterwards the DB is the source of truth and the config is only the seed.
+- `inherits` is resolved recursively with a cycle guard; each group's resolved set is cached and invalidated on save.
+  The existing "`core.admin` in a group implies the admin group's list" rule stays for compatibility.
+- `Player.setGroup` accepts any group that exists in `perm_groups`.
+- Hook `permsChanged (src|nil, what)` after every grant/revoke/setGroup/saveGroup/deleteGroup (src nil = a whole group
+  changed); consumers (the admin rights snapshot, §51) refresh on it. Demotion takes effect immediately.
+- `Core.Callback.register(name, schema?, fn, opts?)` gains `opts = { permission?, cooldownMs? }` enforced before `fn`
+  exactly like `Net.on` (permission via `Core.Perms.has`, per-src cooldown) — lib change, every VM.
+- New core perms (defined by core at start): `core.perms.manage`, `core.settings.view`, `core.audit.view`.
+- Tests: `tests/perms_tests.lua` (seed, inheritance + cycles, weights, canTarget, define-once/never-overwrite, removed
+  tracking, temporary grants, explain, hook emission) + the callback option in `tests/run_tests.lua`.
+
+**Implementation notes (2026-09-26, run W1-PERMS; review rounds REVIEW-CORE M5/L2/L11 and R2-UI).**
+- **Default change — the seed.** `Config.Perms.Groups` now seeds six groups (`user`, `helper`, `mod`, `admin`,
+  `senior`, `owner`; cumulative lists for the pre-§44 code paths) with `Weights` (0/100/200/300/400/1000) and
+  `Inherits` (each group inherits the one below). The config is only read into an EMPTY `perm_groups`.
+- **Deviation — temporary grants live next to the arrays**: `tempPermissions = { [perm] = expiresAt }` (unix seconds)
+  on the account document (`Player.setAccountData`) or the character data (`Player.setData`); `permissions` stays an
+  array of plain strings, so every pre-§44 reader keeps working. `has` ignores an expired entry at once; the
+  per-session cache build prunes and writes back; one `SetTimeout` per player (the soonest expiry, superseded by
+  token) prunes, audits and emits `permsChanged(src, 'expired')`. A permanent grant removes a temporary one; a
+  temporary grant of a permanently held perm is a no-op; `revoke` removes both. `expiresAt` must be in the future
+  and ≤ 10 years ahead.
+- **Caches**: grant state per src, dropped on `playerDataChanged` for `permissions`/`tempPermissions`, on
+  `permsChanged (src, 'grants'|'group')` — which `Player.setAccountData` / `Player.setGroup` emit themselves, so an
+  out-of-band write counts at once (L2) — on `playerLoaded` and `playerDropped`; nothing cached for a src without a
+  session. Resolved group chains per group name, dropped whole on every saveGroup/deleteGroup/default grant/load.
+- **Loading**: `perm_groups` is read inside a coroutine (first yieldable caller, else a thread) and eagerly on core's
+  start; until then — and while the collection is degraded — checks run on the config seed held in memory (never
+  written over the collection); a failed read retries after 30 s; `saveGroup`/`deleteGroup` answer `not_ready`.
+  The load emits `permsChanged(nil, 'load')`.
+- **explain** returns `{ allowed, via, group, expiresAt? }` (`group` = the player's group; `via = 'group:<name>'` names
+  the first group of the resolved walk that lists the perm). **effective(0)** = every catalogued + group-listed perm.
+- **Hook** `permsChanged (src|nil, what, detail)`, what ∈ `grant|revoke|group|grants|saveGroup|deleteGroup|define|
+  expired|load`. `Player.setGroup` / `setAccountData` emit `(src, 'group')` / `(src, 'grants')`; `Perms.setGroup`
+  emits `(src, 'group', name)` only when Player.setGroup did not; a grant through Perms produces `(src, 'grants')`
+  (player.lua) and `(src, 'grant', perm)` (perms.lua) — listeners must be idempotent.
+- **define**: the first owner keeps a perm (a second resource's define is ignored with a warning and answers true);
+  `category` defaults to the prefix; `default` applies at once when the groups are loaded, else right after the load.
+  Core defines the legacy rank perms (`core.helper/mod/admin/senior/owner`, no default), `core.perms.manage`
+  [owner], `core.settings.view` [admin], `core.audit.view` [admin] and `Config.Admin.StaffPerm` (`core.admin.staff`)
+  [helper]. `removed`: saveGroup marks every perm that leaves a list and clears it for every perm in the new one; a
+  group CREATED by saveGroup marks every catalogued `default` naming it (that the creator did not list) as removed.
+- **Addition — rank rules on group edits** (M5, privilege-escalation guard): a non-console actor may only save or
+  delete groups weighted STRICTLY below its own (never its own or an equal one), may not set any weight ≥ its own,
+  may inherit only from groups below it (`rank`), and may only ADD perms it holds itself (`Perms.has`) — listed
+  directly or brought in by a newly added parent's chain (`not_held`); removing perms is free inside the groups it may
+  edit. Editing `owner` therefore needs the console (or core). `deleteGroup` also refuses while another group
+  inherits it (`inherited`). `actorSrc = nil` is core itself (no checks) — a plugin acting for a player passes the
+  player's src. Cycles are refused at save (`cycle`) and tolerated at resolution. saveGroup/deleteGroup write audit
+  rows `perms.saveGroup` / `perms.deleteGroup`, denials too (`message` = rank | not_held | no_permission);
+  grant/revoke/setGroup/expiry keep `Log.audit('perms', …)`, mirrored by §46.
+- **Callback options**: rate limit → schema → cooldown → permission → handler; `cooldown` is accepted as Net.on's
+  spelling; invalid opts refuse the registration; the client accepts and ignores them. Since the R2-UI round every
+  refusal is answered with its reason (§3.5 note): `await` returns `nil, 'rate_limit'|'schema'|'cooldown'|
+  'permission'|'timeout'|'error'`. The permission gate costs one export hop per request in a plugin VM.
+- Tests: `tests/perms_tests.lua` (241, including suite `callback opts` — not in `run_tests.lua` as the contract said),
+  `tests/callback_tests.lua` (34, the refusal reasons). `server/perms.lua` is 891 lines: split the group management
+  into its own file on the next addition.
+
+## 45. Settings (`Core.Settings`, server/settings.lua + client read side)
+
+Runtime-editable, schema-validated settings any plugin declares; a generic UI lists them (research §4).
+
+```lua
+-- server
+Settings.define({ id = 'inventory', title, icon?, order?, properties = {
+    ['inventory.maxWeight'] = { type = 'number', default = 30, min = 1, max = 500, label, description, group, order,
+        scope = 'server', edit = '<perm>'?, view = '<perm>'?, replicate = false, secret = false, restart = false,
+        config = <the plugin's config value, optional> },
+} }) -> bool, err            -- owner-tracked (kind 'settings'); keys must start with '<id>.'; a key belongs to one owner
+Settings.get(key) -> value                      -- effective: override > config > default (deep copy for tables)
+Settings.set(key, value, actorSrc?, reason?) -> bool, err     -- actorSrc given: needs `edit` (default 'core.admin')
+Settings.reset(key, actorSrc?, reason?) -> bool, err          -- deletes the override
+Settings.inspect(key) -> { value, default, config, override, source = 'default'|'config'|'override' }
+Settings.list(viewerSrc?) -> sections { id, title, icon, order, owner, properties = { public schema + value + source } }
+--   viewerSrc filters by `view` (default 'core.settings.view'); secret values are never included (masked '••••')
+Settings.onChange(prefix, fn(key, new, old)) -> handle     -- owner-swept; runs in a new thread after persist
+Settings.offChange(handle)
+-- client (proxy): only replicate = true keys
+Settings.get(key) -> value;  client hook 'settingChanged' (key, new, old)
+```
+
+- Validation: `Core.Schema.check` (type → range/pattern → custom validate); invalid values are refused with the error,
+  never coerced; a config value that fails validation falls back to the default with a console warning.
+- Persistence: collection `settings` (doc id = key, `{ value, updatedAt, by }`), loaded at start; only overrides are
+  stored. When the owner stops, its definitions go but its overrides stay in the DB (re-applied on the next define).
+- Recursion guard: a `set` of key K from inside an onChange handler for K is refused (`'recursive'`).
+- Replication: `replicate = true` keys are mirrored to `GlobalState['cs:' .. key]` (changes are rare admin actions); the
+  client proxy reads GlobalState; core's client emits `settingChanged` from a GlobalState change handler. Secret keys
+  can never replicate (define refuses the combination).
+- Every set/reset writes an audit record (§46) `action = 'settings.set'`, `changes = {{ key, old, new }}` (secret: masked).
+- Core defines its own sections at start: `maps.*` (§52 limits), `audit.*` (§46 retention) and `bans.*` (§47
+  token matching and enrichment).
+- Tests: `tests/settings_tests.lua`.
+
+**Implementation notes (2026-09-26, run W1-SCHEMA).**
+- **Deviation — document id = the key with `.` → `:`** (`inventory.maxWeight` → `settings/inventory:maxWeight`):
+  Core.DB ids refuse dots and keys cannot contain `:`, so the mapping is a bijection. The document stores
+  `{ key, value, updatedAt, by }`, `by = { kind = 'player'|'console'|'resource', src?, accountId?, name?, resource? }`.
+- **Keys**: `<id>.<segment>(.<segment>)*` of `[%w_]`, ≤ 64 bytes (the DB id limit); section id `^[%a_][%w_]*$` ≤ 32;
+  ≤ 128 properties per section.
+- **`scope`**: only `'server'` (the default) is implemented; `'faction'`/`'player'` are refused (`'scope'`) rather
+  than silently treated as server.
+- **Load**: the async barrier of globals.lua — the first `get`/`set`/`list` or core's start preload runs
+  `DB.all('settings')`, concurrent callers wait on one promise; `define` never needs it. A degraded collection leaves
+  `get` on config/default and makes `set`/`reset` answer `'unavailable'` (retry ≤ every 10 s).
+- **A stored override the current field refuses** (the owner tightened a bound) is ignored with one warning per
+  definition; `source` falls back to config/default; it stays in the DB and `inspect(key).override` shows it.
+- **Admission order** of set/reset: key → actor (0 or 1..65535) → reason (≤ 256) → load → existence → value
+  (`Schema.check` incl. the plugin's `validate`) → recursion guard → permission. A permission refusal writes an audit
+  row `result = 'denied'`.
+- **Recursion guard** is "the resource whose handler for K is running right now may not set K" (`'recursive'`), which
+  holds across yields and the export hop, where coroutine identity does not survive; other resources may write K.
+- **onChange** fires only when the effective value changed (a set equal to the current value persists and audits,
+  but replicates and notifies nothing); one new thread per change, handlers in registration order, deep copies,
+  unmasked (server code), errors logged.
+- **Audit**: set and reset both write `action = 'settings.set'` with `ctx = { op = 'set'|'reset', section }`,
+  `source = actorSrc and 'api' or 'core'`, `actor = actorSrc or 'system'`; secret values masked. `inspect` masks
+  secrets too — `get` is the only unmasked read (server only).
+- **Replication**: one paced queue (40 keys per 1 s drain, like doors §16) writes the value effective at write time,
+  skipping unchanged ones; the sorted index `GlobalState['cs:keys']` is written after the values once the queue is
+  empty; a key that stops replicating is set to nil and leaves the index; core stop clears every mirrored key.
+  **Client**: one global `AddStateBagChangeHandler` with a prefix test plus a last-seen cache seeded from `cs:keys`
+  (20 × 500 ms boot retries) so `old` is right for keys that existed before the script started; a key leaving the
+  index emits `settingChanged(key, nil, old)` exactly once; seeding emits nothing.
+- **Core's own sections** (owner core): `maps` (order 800 — `maps.limits.elements` 3000, `perModel` 300,
+  `uniqueModels` 200, `networked` 20, `networkedTotal` 200, `opsPerApply` 200, `maps.journalMax` 5000,
+  `maps.journalMaxOps` 20000) and `audit` (order 900 — `retentionDays` 90, `maxRows` 50000, `logMaxRows` 20000) in
+  settings.lua; `bans` (order 910, icon `gavel` — `tokenMatches` 2, `enrichTokens`, `enrichIdentifiers`, `failClosed`)
+  is defined by server/bans.lua at start (§47).
+- Tests: `tests/settings_tests.lua` (149).
+
+## 46. Audit trail (`Core.Audit`, server/audit.lua)
+
+`Log.audit` only prints (§3.4). This is the persisted, queryable trail (research §1.5).
+
+```lua
+Audit.record({ actor = src|0|'system', action = 'admin.kick', source? = 'menu'|'palette'|'chat'|'console'|'editor'|'api'|'core',
+    targets? = { { type = 'player'|'account'|'vehicle'|'entity'|'map'|'setting'|'ban'|'group', id, name? } },
+    changes? = { { key, old, new } }, reason?, ctx? = {}, result? = 'ok'|'denied'|'error', message? }) -> id
+Audit.query({ action?, actionPrefix?, actorAccount?, target? = { type, id }, resource?, result?, from?, to?, text?,
+    limit? = 50 (≤ 200), before? = cursor }) -> { rows, next }      -- newest first
+Audit.get(id) -> row|nil
+```
+
+- A row: `{ id, ts (os.time() ms precision from GetGameTimer offset), actor = { kind = 'player'|'console'|'system', src?,
+  accountId?, name?, group? }, action, source, resource (caller), targets, changes, reason, ctx, result, message }`.
+  `actor = src` is resolved to the account snapshot at record time; player targets get `accountId` + `name` added.
+- `resource` is the calling resource (`Registry.getCaller()`); strings are sanitised and bounded (message 512, reason
+  256, 32 targets, 64 changes, values stringified ≤ 256).
+- Storage: collection `audit`, append-only (never updated). Core.DB keeps collections in memory, so retention is
+  bounded by the settings `audit.retentionDays` (90) and `audit.maxRows` (50000); a Cron job prunes daily, oldest first.
+  Rows whose action starts with `sanction.` or `ban.` are exempt from `maxRows` (still subject to retention ×4).
+- `Log.audit(category, src, fmt, …)` keeps printing and emitting the `audit` hook, and additionally records
+  `{ actor = 'system', action = 'core.' .. category, targets = { player src }, message }`.
+- Webhook: `result = 'ok'|'denied'` rows mirror to `Core.Webhook.send('audit', …)` (existing convar); denied rows
+  are also mirrored to `Core.Webhook.send('audit_denied', …)` when that convar is set.
+- View permission `core.audit.view` (enforced by consumers such as the admin plugin, not by `query` itself).
+- Tests: `tests/audit_tests.lua`.
+
+**Implementation notes (2026-09-26, run W1-AUDIT; review rounds M1 and R2-6/R2-9).**
+- **Index.** `server/audit.lua` keeps one POSITIONAL array per row (`{ ts, id, action, actorAccount, result,
+  resource, exempt, targetKeys, text }`, ~200 B + strings) ascending by (ts, id); Core.DB holds the full documents.
+  Built at start through a `DB.find` predicate that reads each document in place and returns false (nothing is
+  copied). `query` walks backwards with an early stop at `from`, binary-searches `to`/`before`, and does one `DB.get`
+  per returned row (≤ 201) — never a `DB.find` per query. `targetKeys` is one string `|type:id|…|`; a player target
+  also adds `|account:<id>|`, so `target = { type = 'account', id }` finds rows where that account's player was a
+  target. `text` is a lower-cased haystack (action, actor name, message, reason, target names; ≤ 640 bytes).
+- **Ids and time.** `ts` = `os.time()*1000` calibrated by `GetGameTimer()` (resynced on > 2 s drift, never backwards);
+  id = `'a' .. %013d ts .. %03d seq` (sortable; after the index loads new ids start after the newest stored row).
+  The page cursor is `'<ts>/<id>'` (a bare row id works too); `from`/`to` take ms, or seconds when < 1e11.
+- **Never yields, never throws.** `record` builds the row under `pcall`; rows recorded before the index loaded are
+  queued (≤ 2000, oldest dropped with a warning) and written by the loader; a degraded collection keeps them queued
+  (retry every 30 s).
+- **Bounds.** Strings via `Utils.sanitize`, cut on a UTF-8 boundary; change/ctx values: nil/boolean/finite numbers
+  stay, strings ≤ 256, tables JSON-stringified ≤ 256; `ctx` ≤ 32 string keys; target `type` = `^[%w_%-]+$` ≤ 32 (any
+  type, not only the listed ones); a `source` outside the list defaults to `'core'` for core, else `'api'`.
+- **Filters never widen.** A filter key that is present but unusable (wrong type, over-long, a target without `id`)
+  matches NOTHING instead of being ignored (also `Bans.list`'s `accountId`).
+- **Addition — three retention pools** (R2-6), derived from the action (no stored field): `sanction.*`/`ban.*` →
+  *exempt* (no row cap, retentionDays × 4); `core.<category>` whose category is not a staff category (`admin`, `perms`,
+  `player`, `native`, `settings`, `maps`, `bans`) → *log*, capped by the new setting `audit.logMaxRows` (20000);
+  everything else → *main* (`audit.maxRows`). Each pool is pruned oldest-first on its own; the overflow trigger
+  (cap + max(500, cap/20)) is per pool, so a busy economy never evicts the admin trail. **Rate cap**: `recordLog`
+  writes at most 20 rows per log-pool category per second; the rest is counted into the next row's `ctx.suppressed`
+  (staff categories are never capped).
+- **Retention** limits are CACHED (refreshed in the prune thread, never read in `record`). Prune = start +
+  `Cron.at(4, 30)` + `Settings.onChange('audit.')` + the overflow trigger. The index swap is synchronous; DB deletes
+  run in slices of 250 with a 50 ms pause. `Audit.prune()` and `recordLog` stay public (maintenance / the plugin-VM
+  mirror). The Cron jobs, settings sections and watchers of audit.lua and bans.lua are registered from core's own
+  threads, which are core's under the per-coroutine caller (§2.3 note) — no wrapper needed.
+- **Webhooks.** `recordLog` rows are NOT posted to `audit` — webhook.lua's `audit` hook subscription already posts
+  every `Log.audit` line, so each line reaches Discord exactly once. Other ok/denied rows go to `audit`, denied ones
+  also to the new optional convar `core_webhook_audit_denied`; convars are checked before an embed is built.
+- **Log.audit** (`lib/log/shared.lua`) keeps print + hook, then calls `Audit.recordLog(category, src, message)` —
+  `rawget(Core, 'Audit')` inside core, the export proxy in a plugin VM, always under `pcall`. The category is made
+  action-safe (`[^%w_.%-:]` → `_`); `src` ≤ 0 adds no target; `resource` is the plugin that logged the line.
+- **§17 — `Cron.remove` is owner-checked** (R2-9, like `Hooks.remove`): only the job's owner or core removes it; the
+  owner-stop sweep uses an internal remover.
+- Tests: `tests/audit_tests.lua` (139, pools, rate cap and the Cron owner check included).
+
+## 47. Bans on identifiers and tokens (`Core.Bans`, server/bans.lua; connect path in server/player.lua)
+
+Replaces the license-only, online-only ban with its linear scan per connect (research §1.4).
+
+```lua
+Bans.add({ target = src | { accountId?, identifiers?, tokens?, name? }, reason, duration = seconds (0 = permanent),
+    by = actorSrc|0, evidence? }) -> ban|nil, err          -- online target: identifiers + tokens collected now, then kicked
+Bans.remove(banId, by, reason) -> bool, err                -- marks revoked (kept for history); clears account.banned
+Bans.get(banId) -> ban|nil
+Bans.list({ active? = true, text?, accountId?, limit? = 50, before? }) -> { rows, next }
+Bans.check(identifiers, tokens) -> ban|nil                 -- O(#ids + #tokens) index lookups, active and unexpired only
+Bans.forAccount(accountId) -> array
+```
+
+- A ban: `{ id, accountId?, name, identifiers = { 'license:…', 'discord:…', … }, tokens = { … }, reason, evidence?,
+  by = { accountId?, name }, createdAt, expiresAt (0 = permanent), revoked? = { by, at, reason }, hits, lastHitAt }`.
+  `ip:` identifiers are never stored.
+- Index: in memory, `identifier|token → { [banId] = true }` for active bans, built at start, maintained on add/remove,
+  expired bans dropped lazily on hit and by a daily Cron sweep.
+- Connect (`playerConnecting` deferral in player.lua): identifiers via `GetNumPlayerIdentifiers/GetPlayerIdentifier`
+  (skip `ip:`), tokens via `GetNumPlayerTokens/GetPlayerToken`; `Bans.check`; on a hit the ban is **enriched** with the
+  new identifiers/tokens (catches a second account on the same PC), `hits`/`lastHitAt` updated, and the deferral is
+  rejected with reason, expiry and ban id. `GetPlayerIdentifierByType(src, 'license:')` needs the colon (prefix match).
+- `Player.ban(src, reason, seconds?, by?)` keeps its signature and delegates to `Bans.add`.
+- Migration `DB.migrate('bans', 2, fn)`: old `{ license, until, by = string }` → the new shape.
+- Every add/remove is audited (`ban.add` / `ban.remove`).
+- Tests: `tests/bans_tests.lua` (index, expiry, enrichment, revoke, migration, connect path with stub natives).
+
+**Implementation notes (2026-09-26, runs W1-AUDIT + W1-PLAYER; review rounds H2/M3/M4 and R2-3/R2-11/R2-12).**
+- **Files.** `server/bans.lua` (Core.Bans) + `server/bans_identity.lua`, loaded right before it: the internal
+  `Core.BanIdentity` (block-listed in the export) — identity reads (`GetNumPlayerIdentifiers`/`GetPlayerIdentifier`,
+  `GetNumPlayerTokens`/`GetPlayerToken`), the online identity index (filled on `playerJoining`, ~15 natives per join,
+  cleared on `playerDropped`, seeded from `GetPlayers()`), account lookup and the rank check.
+- **Index.** `index[identifier or token] = { [banId] = true }`, `active[banId] = { expiresAt, accountId, keys }` and
+  `accountActive[accountId] = n` (`account.banned` is cleared only with the last active ban of that account); built at
+  start with a non-copying `DB.find` predicate. New ban ids are `'B' .. DB.nextId('bans')`; migrated v1 bans keep their
+  uuid; documents carry `_v = 2`.
+- **Connect.** `Bans.checkConnecting(src) -> ban, message | nil | nil, 'unavailable'` (INTERNAL, block-listed)
+  collects identifiers (no `ip:`, ≤ 32) and tokens (≤ 64), picks the best active ban (permanent first, then the latest
+  expiry), enriches it and returns the finished text: `You are permanently banned. Reason: <reason> (ban <id>)` /
+  `You are banned until <YYYY-MM-DD HH:MM>. Reason: <reason> (ban <id>)` (used verbatim). `Bans.check` also answers
+  `nil, 'unavailable'` while the collection cannot be read. **player.lua (M4)**: on `'unavailable'` it falls back to a
+  license-only lookup that reads both document shapes; if that throws or `bans` is degraded, the deferral is refused
+  ("Ban service unavailable, please try again in a minute.") unless the setting `bans.failClosed` is false. The license
+  is read with `GetPlayerIdentifierByType(src, 'license:')` and accepted only with that prefix (`license2:` never
+  passes as `license:`).
+- **Matching and enrichment (M3).** An identifier matches on one overlap; tokens alone need `bans.tokenMatches`
+  (**default 2**, 0 = never) DISTINCT tokens in one ban. `bans.enrichTokens` adds the refused player's unseen tokens;
+  `bans.enrichIdentifiers` adds unseen identifiers only after an identifier match or ≥ 2 matching tokens, so one shared
+  token never spreads a ban to a stranger's license/discord; an account-less ban learns an account only after an
+  identifier match. Settings are cached (start + `Settings.onChange('bans.')`).
+- **add and rank (H2).** `target = src` must be connected (`not_connected`); `{ accountId }` of an ONLINE account is
+  treated like a src; offline it takes the stored `license` + `identifiers`. `duration` 0..100 years, `evidence`
+  ≤ 512, `by` = src | 0 | nil (console) | a legacy name. Every banned identifier is mapped to the accounts holding it
+  (`Player.findAccountsByIdentifier`) and to the online players the ban would refuse; a player `by` must outrank all
+  of them (account weights < the actor's, `Perms.canTarget` for the online ones, the actor's own account/src
+  excepted), else `nil, 'rank'`; when the account index is unreadable a player actor gets `'db'` (never a blind
+  pass, R2-11). Console / nil / a legacy name are not rank-checked. The ban stores `accountIds` (every matched
+  account, the explicit one first; one match also becomes `accountId`); `list({ accountId })` and `forAccount` find
+  both. **Every online holder is kicked with the target** (this replaces the first round's "caught at the next
+  connect"). The audit row `ban.add` targets the ban and the player/account, `ctx = { duration, expiresAt }`.
+  `Player.ban` delegates to `Bans.add` with `by` = the actor src and writes no `Log.audit` line of its own.
+- **Account index** (`server/getters.lua`, `Player.findAccountsByIdentifier`): built lazily by a non-copying `DB.find`
+  walk, folded with live sessions, maintained on `playerJoining`/`playerLoaded`; every identifier type except `ip:` is
+  stored (R2-3); stale entries are re-checked at query time; a miss re-reads `accounts` when the count changed or the
+  index is older than 5 minutes; an index read from a degraded `accounts` is never cached (`nil, 'unavailable'`).
+  `Player.setAccountData` refuses `identifiers` (a join is the only writer).
+- **Expiry** lazily on a hit and by `Bans.sweep()` at start + `Cron.at(4, 40)`. `list({ active = false })` = every ban.
+- **Migration v2**: `{ license, reason, by = 'name', until }` → `{ identifiers = { license }, tokens = {}, accountId +
+  name from the account with that license, by = { name }, expiresAt = until, hits = 0 }`; expired v1 bans are kept
+  (history) but never indexed. **R2-12**: when `accounts` cannot be read during the migration the document keeps
+  `relink = '<license>'` and the start thread (every 60 s until done) and every `sweep()` link it later.
+- **Why the settings exist.** Token matching + enrichment spread a ban to every account that shows one of its tokens;
+  shared hardware (cafés, cloud gaming, VMs) could chain-ban strangers. `hits`/`lastHitAt` and `Bans.remove` are the
+  tools to spot and undo a spread.
+- Tests: `tests/bans_tests.lua` (193); the connect path, `Player.ban`, the index and the legacy commands in
+  `tests/server_tests.lua` (suites `player admin`, `admin ranks`, `legacy commands`).
+
+## 48. Sticky player states, teleport, account reader (server/player.lua, client/environment.lua, client/spawn.lua)
+
+- `Player.setFrozen/setInvincible/setVisible/setControls(src, on)` store the value in the session (`session.states`) and
+  the client re-applies them after `pedChanged`, respawn and every teleport; `Player.getStates(src) -> { frozen,
+  invincible, visible, controls }`. Core stop still resets everything (§31 unchanged).
+- `Spawn.teleport` no longer unfreezes a ped that is sticky-frozen.
+- `Player.setCoords(src, coords, heading?, opts?)` — `opts = { withVehicle = false, fade = true, bucket? }`:
+  `withVehicle` moves the vehicle the player drives (driver only) with its occupants; `fade = false` skips the screen
+  fade; `bucket` changes the routing bucket first.
+- `Player.getAccount(src) -> { id, name, group, identifiers, firstSeen, lastSeen, playtime, banned }` (read-only copy of
+  the live account; no permissions list) and `Player.getAccountById(accountId)` (from the DB, offline players).
+- `Player.setBucket` additionally emits the client event `core:client:bucketChanged (bucket)` to that player (§52 uses it).
+- Tests: extend `tests/server_tests.lua` (states persistence, opts) — the owner of this section owns those edits.
+
+**Implementation notes (2026-09-26, run W1-PLAYER; review rounds L2 and R2-3/R2-13).**
+- Sticky states are session-only (not persisted): a reconnect starts from the defaults. The `core:client:loaded`
+  payload carries `states`; the client applies a changed key at once and re-applies only NON-DEFAULT values after
+  pedChanged / spawn / teleport, so core never undoes another resource's own freeze or invisibility.
+  `client/environment.lua` hands controls/frozen/invincible/visible of `core:client:playerState` to the sticky store
+  (`Player.setStates`, core-internal); health/armour are unchanged.
+- `setCoords`: `withVehicle` is checked server-side (driver seat) and again client-side; the client asks for network
+  control of the car for ≤ 1 s and falls back to moving the ped alone. With `bucket` + `withVehicle` the car
+  (`SetEntityRoutingBucket`) follows; **the other riders change bucket only with `opts.moveRiders = true`** (R2-13:
+  the caller vouches for its own rank checks on them — the admin plugin's teleport passes it after `canTarget`). Opts
+  are sent to the client only when they differ from the plain faded teleport; the 4th arg of `core:client:teleport`
+  is `{ withVehicle, fade }`. `Spawn.teleport` (and `spawnPlayer`) wait for `Core.Maps.waitAreaReady(coords, 3000)`
+  when it exists, never unfreeze a sticky-frozen ped and re-apply sticky states.
+- Account reader: `getAccountById` prefers the live session (index `byAccountId`); **additions** `Player.getGroup(src)`
+  (the raw account group, no copy) and `Player.findAccountsByIdentifier(identifier)` (§47 notes).
+  `Player.setAccountData` refuses `id`, `license` and `identifiers`; `'group'` emits `permsChanged (src, 'group')`,
+  `'permissions'`/`'tempPermissions'` emit `permsChanged (src, 'grants')` (L2). `collectIdentifiers` stores every
+  identifier type except `ip:` (R2-3).
+- `CORE_STATE_KEYS` += `duty`, `staffModes`: the names stay RESERVED although core no longer writes those bags (§51
+  notes — staff state goes by event), so no plugin can publish a look-alike.
+- Size: `Player.getHealth/getArmour` and the `core:player:getInfo` callback moved from server/player.lua to
+  server/getters.lua (no behaviour change) to keep player.lua under 900 lines.
+- Tests: `tests/server_tests.lua` suites `player admin`, `admin ranks`, `legacy commands` (1108 total).
+
+## 49. Target selectors (`Player.resolveTargets`, server/getters.lua; `lib/commands` param types)
+
+```lua
+Player.resolveTargets(actorSrc, selector, opts? = { max?, allowSelf? = true }) -> array of src | nil, err, candidates?
+```
+Grammar (comma = union, `!` = remove): `me`/`^` actor · numeric id / `$<id>` · `c:<charId>` · `r:<metres>` loaded
+players within the radius of the actor's **server-side** coords (player grid, radius ≤ 500) · `#<group>` exactly that
+group · `%<group>` weight ≥ that group's weight · `f:<faction>` · `*` all loaded · `others` all but the actor ·
+anything else = partial name (case-insensitive; one match → it, several → `nil, 'ambiguous', candidates` (≤ 10)).
+The result is de-duplicated, loaded players only, capped by `opts.max` (`'too_many'` above it). Permission checks on
+multi-target selectors are the caller's job (§51 enforces scope caps). `@` (crosshair target) is resolved by the admin
+plugin client-side and sent as an id.
+`Core.Commands` gains param types `target` (exactly one player via `resolveTargets`) and `targets` (≥ 1); server only.
+Tests: `tests/targets_tests.lua`.
+
+**Implementation notes (2026-09-26, run W1-PLAYER; review rounds M2, L3 and R2-7).**
+- Decisions beyond the grammar: (1) several partial-name matches with exactly ONE exact (case-insensitive) match
+  resolve to it (`bob` → Bob, not ambiguous with Bobby); (2) an explicit single target that is missing (`99`, `c:x`,
+  a name) fails the whole selector with `not_found`, while a `!` token that matches nobody is a no-op; (3) an empty
+  result is `nil, 'no_match'` (or `'self'` when only `allowSelf = false` emptied it); (4) `r:` includes the actor
+  (distance 0), radius in (0, 500]; (5) `#`/`%` try the group as written, then lower-cased; `f:` matches id, tag or
+  name case-insensitively; (6) ≤ 256 characters and ≤ 32 tokens per selector. Order: first-seen; set tokens
+  ascending src; `r:` nearest first.
+- **Bounded work (M2, R2-7)**: tokens are de-duplicated (case-insensitively, except `c:`); at most **4 set tokens**
+  (`*` `others` `r:` `f:` `#` `%`, removals included) and **8 distinct names** per selector (`bad_selector` above);
+  removals resolve first and the union stops as soon as it passes `opts.max` (`too_many`, detail = max + 1). The
+  loaded list, lower-cased names and the group table are read once per call (no per-player `getWeight`/`getInfo`).
+- **Addition — `opts.basic`** (L3): only `me`, `^`, ids, `c:` and names; anything else → `nil, 'not_allowed', token`.
+  The `target`/`targets` command params pass `basic = not Perms.has(src, Config.Admin.StaffPerm)` (console: full), and
+  lib/commands throttles (100 ms per src) command lines whose selector has a name or set token (reply
+  `target_too_fast`; id/me/^/c: lines are O(1) and not throttled).
+- Error codes: `bad_actor`, `bad_selector`, `not_allowed`, `not_found`, `ambiguous` (3rd = `{ src, name }` ≤ 10),
+  `no_self`, `no_origin`, `bad_radius`, `unknown_group`, `unknown_faction`, `self`, `no_match`, `too_many`.
+- Command params: `target` = `resolveTargets(src, word, { max = 1, allowSelf, basic })` → one src; `targets` → an
+  array; one word each. Declaring either on the client errors at register. A failed selector replies with a specific
+  text (defaults built in; optional `Config.Texts` keys `target_not_found`, `target_ambiguous`, `target_too_many`,
+  `target_self`, `target_unknown_group`, `target_unknown_faction`, `target_bad_radius`, `target_no_origin`,
+  `target_bad_selector`, `target_not_allowed`, `target_too_fast`) instead of the usage line.
+- Tests: `tests/targets_tests.lua` (154: every token, union/negation, ambiguity, caps, early stop, basic grammar,
+  throttle, command params in the core VM, a plugin VM through the export proxy and the client VM).
+
+## 50. Routing bucket allocation (`Core.Buckets`, server/buckets.lua)
+
+```lua
+Buckets.allocate({ label?, population = false, lockdown = 'strict'|'relaxed'|'inactive' = 'strict' }) -> bucket|nil
+Buckets.release(bucket) -> bool                 -- owner only; players still inside are moved to bucket 0
+Buckets.info(bucket) -> { owner, label }|nil
+Buckets.list() -> array
+```
+Owner-tracked (kind 'bucket'), allocated from `Config.Buckets.Range = { 10000, 60000 }` (charcreator's studio uses
+`1000 + src`, below the range). `allocate` applies `SetRoutingBucketPopulationEnabled` and
+`SetRoutingBucketEntityLockdownMode`. Tests: `tests/buckets_tests.lua`.
+
+**Implementation notes (2026-09-26, run W1-PERMS; review L11).**
+- Ids are handed out round robin after the last allocated one (wrapping inside `Config.Buckets.Range`), so a
+  just-released id is not reused at once; an exhausted range logs an error and answers nil. A `lockdown` outside
+  `strict|relaxed|inactive`, a non-boolean `population` or a non-string `label` (kept ≤ 64) refuse the call.
+- `release` is owner-only; core (caller `core`) may release any bucket. Evacuation is one pass over `GetPlayers()`
+  with `GetPlayerRoutingBucket`; a loaded player goes through `Core.Player.setBucket(src, 0)` (so
+  `core:client:bucketChanged` reaches the map runtime, L11), a connected player without a session gets the raw
+  `SetPlayerRoutingBucket`. Release is rare (map close, owner stop), never on a timer. Entities left inside are not
+  touched (their owner cleans them).
+- The owner-stop sweep releases every bucket of the stopped resource; a core stop does not sweep (ids are free again
+  after the restart). `info`/`list` also return `population` and `lockdown` (additive). §52's editor buckets are
+  allocated AS core, so a plugin stopping does not release them; a map's `targetBucket` may not lie inside the range.
+- Tests: `tests/buckets_tests.lua` (48).
+
+## 51. Admin contributions and dispatch (`Core.Admin`, server/adminapi.lua)
+
+Any plugin contributes admin categories, actions, pages and player tabs as **data plus a server handler**; core owns
+the registry, the rights snapshot and the one dispatch path, so every action gets the same checks and audit no matter
+who wrote it (research §1.2, §7.2). The `admin` resource is only the frontend and the built-in actions; a plugin never
+needs `dependency 'admin'` — without the admin resource its registrations are simply not shown.
+
+```lua
+Admin.category{ id, label, icon?, order? = 100, permission? }
+Admin.action{
+  id,                      -- '^[%w_%-%.]+$' ≤ 64, globally unique (convention '<resource>.<verb>'); owner = caller
+  category, label, description?, icon?, order? = 100,
+  permission?,             -- default 'admin.' .. id; Perms.define'd automatically with `default`
+  default? = 'admin',      -- the group that receives the permission once (§44)
+  target = 'none'|'player'|'players'|'entity'|'coords',
+  self? = true,            -- player targets may include the actor
+  hierarchy? = true,       -- every player target must pass Perms.canTarget
+  max? ,                   -- 1 for 'player', 50 for 'players'; also capped by Config.Admin.Scope[actor group]
+  args? = { Core.Schema fields },
+  reason? = 'none'|'optional'|'required',
+  danger? = 'none'|'confirm'|'typed',
+  cooldown? = 1,           -- seconds, per (actor, action)
+  duty? = Config.Admin.RequireDuty,
+  echo? = true,            -- tell on-duty staff (actor, action label, targets)
+  command? = false|'name', -- also a chat command (target param first, then scalar args in order, reason as `rest`)
+  key? = nil,              -- a default key the admin client may bind ('' / nil = unbound)
+  hidden? = false,         -- palette/commands only
+  handler = fn(ctx) -> ok?, message?, data?
+}   -- ctx = { id, actor, targets (array of src | { entity, netId } | vector3), args, reason, source }
+Admin.page{ id, category?, label, icon?, order?, permission?, page? = '<ui page id>', provider? = fn(ctx) -> blocks }
+Admin.playerTab{ id, label, icon?, order?, permission?, page? = '<ui page id>', provider? = fn(ctx) -> blocks }
+Admin.run(actorSrc, id, { targets?, args?, reason?, source?, confirm? }) -> ok, resultOrErr
+Admin.snapshot(src) -> { rank = { group, weight, scope }, duty, categories, actions, pages, playerTabs }
+Admin.setDuty(src, on) -> bool;  Admin.isOnDuty(src) -> bool
+Admin.setMode(src, mode, on, data?) -> bool;  Admin.getModes(src) -> { [mode] = data|true }
+Admin.staff(onDutyOnly?) -> array of src;  Admin.echo(text, { perm?, exclude? })
+```
+
+- All four registrations are owner-tracked (kinds `adminCategory`, `adminAction`, `adminPage`, `adminPlayerTab`); an
+  id is owned by the first registrant; re-registering by the same owner replaces. Handlers/providers are callables
+  (`Core.Utils.isCallable`); a provider runs on demand (one hop per view), never on a timer.
+- `page` = the plugin's own UI page, opened by the admin frontend as a `modal` on top of the panel with
+  `{ target? , params? }` as props (§38 — a plugin cannot render inside another plugin's page). `provider` = a schema
+  page rendered by the admin frontend from blocks: `{ kind = 'keyvalue', title?, rows = {{ label, value }} }`,
+  `{ kind = 'table', title?, columns = {{ key, label }}, rows (≤ 200) }`, `{ kind = 'text', text }`,
+  `{ kind = 'stats', items = {{ label, value, icon? }} }`, `{ kind = 'actions', title?, ids = { actionIds } }`,
+  `{ kind = 'form', title?, fields = schema, submit = actionId }`.
+- **Dispatch** (`Admin.run`, the only way an action runs), in order; every refusal except cooldown writes an audit row
+  with `result = 'denied'`:
+  1. action exists → 2. actor loaded (console allowed) → 3. `Perms.has(actor, action.permission)` → 4. duty (console
+  exempt) → 5. cooldown (actor, action) → 6. `Schema.checkAll(action.args, args)` → 7. reason policy → 8. targets:
+  `player(s)`: array of ids or one selector string resolved with `Player.resolveTargets` (§49); each loaded; `self`;
+  `hierarchy` (`Perms.canTarget`); count ≤ min(action max, `Config.Admin.Scope[group]`) · `entity`: `{ netId }` →
+  `NetworkGetEntityFromNetworkId` + `DoesEntityExist` · `coords`: vector3 with world bounds → 9. `danger ~= 'none'`
+  requires `confirm == true` → 10. `Core.Hooks.run('admin:before', { id, actor, targets, args })` (filter by id) →
+  11. handler under `pcall` → 12. audit `ok`/`error` (`action = id`, `source`, targets, reason, `changes` if the handler
+  returns them in `data.changes`) → 13. staff echo (`Core.Net.emitMany` to on-duty staff) → 14. observer hook
+  `adminAction`.
+- Transport (core-owned, rate-limited): callbacks `core:admin:snapshot`, `core:admin:run` (`{ id, targets?, args?, reason?,
+  source?, confirm? }` → `{ ok, message?, data? }`, cooldown 100 ms), `core:admin:page` (`{ id, params? }` → blocks),
+  `core:admin:playerTab` (`{ id, target }` → blocks); client events `core:admin:echo`, `core:admin:snapshotChanged`
+  (to online staff via `emitMany`, debounced 1 s, after `permsChanged`, duty changes and (un)registrations).
+- The snapshot contains only what the viewer may use (permission + duty), public fields only (no handlers, no
+  `validate`). It is advisory: the server re-checks everything on `run`.
+- **Duty** is a session flag mirrored to the server-written player state bag `duty`; **modes** (`noclip`, `vanish`,
+  `spectate`, `god`, `editor`) are session state mirrored to `staffModes`; both are audited on change and cleared on
+  drop. `server/security.lua` consults `getModes` before flagging invisibility/collision/teleport anomalies.
+- Chat commands generated from `command` go through `Core.Commands` and then `Admin.run` with `source = 'chat'`.
+- Config: `Config.Admin.RequireDuty = true`, `Config.Admin.Scope = { helper = 1, mod = 5, admin = 50, senior = 200,
+  owner = 2000 }` (default 1 for unlisted groups), `Config.Admin.StaffPerm = 'core.admin.staff'`.
+- Tests: `tests/admin_api_tests.lua` (every dispatch step and its audit row, snapshot filtering, owner sweep, selectors,
+  duty, modes, command generation).
+
+**Implementation notes (2026-09-26, run W2-ADMINAPI; review rounds H1/M1/M2/L1–L13, R2-CLIENT F1, R2-14, R2-15).**
+- **Files**: `server/adminapi.lua` (registry, snapshot, provider blocks, duty/modes/staff/echo, the snapshot/page/
+  playerTab callbacks) + `server/adminapi_dispatch.lua` (`Admin.run`, `core:admin:run`, chat commands). The private
+  state goes from the first to the second through a one-shot metatable slot on `Core.Admin` (cleared once read, not
+  reachable through the export, which resolves with rawget): the two files must stay ADJACENT in the manifest.
+  `client/adminstate.lua` is the client half (below).
+- **Deviation — no replicated staff state (R2-CLIENT F1).** Core writes NO `duty` / `staffModes` state bag: every
+  client could read who is on duty, vanished or spectating. Duty and modes are session state sent by event —
+  `core:admin:self { duty, modes = { [name] = true } }` to the player itself (every duty/mode change, a mode clear,
+  once on `playerLoaded` for staff); `core:admin:staffState { src, duty, modes? }` to the on-duty staff through
+  `Net.emitMany` (modes only while on duty; `{ src, duty = false }` when an on-duty member drops);
+  `core:admin:staffStates { … }` once to a player that goes ON duty. The server hook `staffModeChanged (src, modes)`
+  (a names map; `{}` on clear/drop) feeds §52.3's audience check. **`client/adminstate.lua`** caches self + the staff
+  map (dropped when self goes off duty), fires the client hooks `staffSelfChanged (state)` and
+  `staffStateChanged (src, state|nil)`, and adds the client proxy functions `Core.Admin.getSelf()` and
+  `Core.Admin.getStaffStates()` (display only). `CORE_STATE_KEYS` keeps `duty` and `staffModes` reserved.
+  `client/interactions.lua` ignores the interact key (E) while `getSelf().modes` has noclip, editor or spectate.
+- **Registry caller per coroutine (M1, §2.3 note).** The `call` export dispatches through `withCaller`; a coroutine
+  without its own entry is `'core'`, so a thread core starts never inherits a parked plugin call (on both sides).
+- Registration errors are returned as `false, '<key>'` (the offending key, `args:<schema error>`,
+  `page_or_provider`, `owned`) and logged. A registration needs no existing category; the snapshot lists a category
+  only when the viewer may see it AND it holds a visible action or page. `page` must be a plain UI page id
+  (`^[%w_%-]+$` ≤ 64; else `'page'`).
+- `permission` defaults to `'admin.' .. id` LITERALLY (`admin.kick` → `admin.admin.kick`; pass `permission` to
+  choose), refused above 64 characters; `default = false` defines the permission without a group.
+- **Deviations in the dispatch**: (a) the player-target COUNT is checked before the hierarchy, and selectors resolve
+  with `max = min(action max, scope)`; (b) the cooldown is stamped when the handler runs AND when the targets are
+  refused (a refused selector costs a cooldown), never for the earlier refusals; (c) denied rows have a budget per
+  (actor, action id) — one persisted row per 5 s, the refusals in between counted into that action's next row
+  (`ctx.suppressed`, R2-14); every unknown id of an actor shares one budget (`core.admin.unknown`, `ctx.requested`);
+  `unknown_action`/`not_loaded` of a non-staff actor are never persisted; (d) the audit row's `resource` is the
+  action's owner, `ctx = { step, detail?, count?, coords?, suppressed? }`. `invalid_args` returns the `checkAll`
+  errors as the 3rd value.
+- **Targets**: `player(s)` take a selector string (resolved with `allowSelf = action.self`, so `*` quietly drops the
+  actor of a `self = false` action while `me` is refused `self`), one id or an id array (≤ 2000 entries,
+  de-duplicated, JSON floats accepted); `entity` takes `{ netId }` or `{ { netId } }` — **entity targets pass the
+  hierarchy too** (a player ped via `IsPedAPlayer` → `NetworkGetEntityOwner` → `GetPlayerPed`, and every player in
+  seats -1..14 of a vehicle; an unmatched player ped is refused `rank`); `coords` a vector3 or `{ x, y, z }`. The
+  console has no scope cap (only the action max).
+- `danger = 'typed'` is checked like `'confirm'` on the server (the typed text is a UI concern). A generated chat
+  command is its own confirmation (`confirm = true`) and runs with `source = 'chat'` (`'console'` from src 0).
+- **Chat commands**: the target param first (`target`/`targets`; entity → `netId`; coords → `x y z`), then args mapped
+  boolean/integer/duration/player/number/heading/string-likes/scalar enums; an optional arg followed by a required
+  param is left out; with `reason = 'none'` the last string arg becomes `rest`, else the reason is `rest`. Unmappable
+  args or reserved arg names (target, targets, netId, x, y, z, reason) skip the command with a warning; an existing
+  command is never replaced. `Core.Commands` checks the permission first, so a chat attempt without it is not audited.
+- **Transport** (every callback StaffPerm-gated): `core:admin:snapshot` (1000 ms), `core:admin:page` /
+  `core:admin:playerTab` (250 ms), `core:admin:run` (100 ms — H1: a non-staff request is answered nil before any work
+  or audit row; an action meant for everyone is reached through its chat command or the owning plugin's own RPC).
+  `core:admin:playerTab` refuses `rank` when the viewer may not target the player, unless the tab sets
+  `hierarchy = false` (addition). A client may claim only `source` menu/palette/editor (else menu). Answers:
+  snapshot | nil; `{ ok, page?, blocks? }` / `{ ok = false, error = 'unknown'|'no_permission'|'rank'|'payload'|
+  'error' }`; run `{ ok = true, message?, data? }` / `{ ok = false, error, message, data? }`.
+- **Addition**: pages and player tabs take `duty` (default `Config.Admin.RequireDuty`), enforced in the snapshot and
+  the callbacks. Provider blocks are sanitised: ≤ 32 blocks, unknown kinds dropped, table rows ≤ 200 with only the
+  declared columns, cells scalar ≤ 512 chars, text ≤ 4096, `actions.ids` filtered to what the viewer may use, a
+  `form` whose `submit` the viewer may not use dropped, form fields through `Schema.public`.
+- **Staff** = loaded holders of `Config.Admin.StaffPerm`, a set updated on `playerLoaded`, `permsChanged(src)`,
+  `permsChanged(nil)` (coalesced: one walk per 1 s window) and `playerDropped`; runtime ACE changes are seen at the
+  next permsChanged/load. Losing the staff permission ends the duty and the modes. Going off duty turns every mode
+  off (each audited and sent). Duty/mode rows: `core.admin.duty` / `core.admin.mode` with `changes = {{ key, old,
+  new }}`. Mode names are open (`^%a[%w_]*$` ≤ 32, ≤ 16 per player); clients only ever get `{ [mode] = true }` —
+  mode data (spectate target, …) stays on the server (`getModes`). `Admin.staff()` is O(staff).
+- `snapshotChanged`: one 1 s debounce over a pending set; no payload, the client refetches. The action echo
+  `core:admin:echo { text, at, id, label, actor = { src, name }, targets (≤ 10), count }` goes to on-duty staff except
+  the actor after an ok run; `Admin.echo` sends `{ text, at }`. `adminAction` runs after every executed handler (ok
+  and error), never for refusals.
+- **§4.8 legacy commands (R2-15)**: core's own staff commands (`/tp /tpto /bring /car /dv /setcash /setbank /givecash
+  /givebank /setgroup /kick /ban /announce /revive /heal /weapon /weapons` and the `/tpm` handler) follow this
+  section's duty rule (`Config.Admin.RequireDuty`; without Core.Admin they are refused), write an audit row
+  `core.cmd.<name>` and echo to on-duty staff — but do NOT run `admin:before`. They check ranks themselves (`/kick`,
+  `/ban`, `/bring`, money, `/setgroup`, `/weapons`, `/dv` occupants; `/tpto` refuses only a vanished/spectating
+  higher-ranked target). `Config.Admin.LegacyCommands = false` registers none of them (servers with the admin plugin);
+  `/id`, `/players` and `/faction` always stay. `/weapon(s)` moved from weapons.lua to admin.lua
+  (`Weapons.isAllowed` is the public name rule).
+- **security.lua**: there are no invisibility/collision/teleport detections yet; `Security.isStaffExempt(src, what)`
+  maps what → sanctioning modes (invisible: vanish/noclip/spectate/editor; collision + teleport: noclip/spectate/
+  editor; god: god/noclip/spectate/editor; speed: noclip/editor) and `report()` consults it for every kind.
+- Tests: `tests/admin_api_tests.lua` (349, harness `tests/admin_harness.lua`), `tests/registry_caller_tests.lua` (26),
+  `tests/client_registry_caller_tests.lua` (31), `tests/client_adminstate_tests.lua` (34); the legacy commands in
+  `tests/server_tests.lua`.
+
+## 52. Maps: element types, documents, live editing and the region runtime (`Core.Maps`)
+
+Files: `server/maps.lua` (types, documents, apply, publish, journal, networked elements), `server/maps_regions.lua`
+(regions, packs, subscriptions, pushes), `client/maps.lua` (window, cache, streaming, spawning). World content placed by
+admins — permanent maps and **live event maps** — for every player, at 1,000–2,000 players. Designed from scratch for
+low-churn, high-volume content (research §3.3g); it does not reuse the inventory's drop scoping.
+
+### 52.1 Element types (the EDF successor)
+
+```lua
+Maps.defineType{
+  id = 'garage:spot',       -- '^[%w_%-]+:[%w_%-]+$', owner-tracked (kind 'mapType')
+  label, icon?, category? = 'Gameplay', description?,
+  kind = 'prop'|'vehicle'|'ped'|'marker'|'hide'|'point'|'zone',
+  model? = 'prop_name',     -- fixed model; otherwise prop/vehicle/ped types need a field `model` of Schema type 'model'
+  fields? = { Schema fields },
+  preview? = { { kind = 'marker', type, scale?, color? } | { kind = 'box', size } | { kind = 'sphere', radius }
+               | { kind = 'label', text = 'literal or $field' } },     -- editor view only, declarative (no callbacks)
+  transform? = { rotate = 'full'|'yaw'|'none' },
+  networked? = false,       -- prop kind only: a server-created networked (physics) object
+  limits? = { perMap? }, parents? = { typeIds },
+  validate? = fn(record, ctx) -> ok, err,     -- server, on create/update; ctx = { mapId, actor, op }
+  version? = 1, migrate? = fn(fields, fromVersion) -> fields,
+}
+Maps.types() -> public list (no functions)
+```
+Built-ins (owner core): `core:prop`, `core:physprop` (networked), `core:vehicle`, `core:ped`, `core:marker`,
+`core:hide` (world model hide), `core:point`, `core:zone` (box, `size` + rotation). A record whose type is not
+defined (its resource stopped or was removed) is **kept** and shown as a placeholder; it is never dropped.
+
+### 52.2 Documents and modes
+
+- Map `{ id, name, mode = 'draft'|'live', active, targetBucket = 0, publishedVersion, nextElementId, meta = { description },
+  limits?, expiresAt?, createdAt, createdBy, updatedAt }` in collection `maps`; elements one document each in
+  `map_elements` (id `<mapId>:<elementId>`) so a commit writes only what changed; published snapshots in `map_versions`
+  (`{ mapId, version, elements, by, note, at }`); commands in `map_journal` (≤ `maps.journalMax` 5000 per map, pruned).
+- Element `{ id, type, typeVersion, pos = {x,y,z}, rot = {x,y,z}, fields, layer = 'default', cam?, by, updatedAt }`
+  (model **names**, Euler degrees, rotation order 2).
+- **live** map: every change affects the world immediately in `targetBucket` while `active` (events: build while players
+  watch); optional `expiresAt` → deactivated by Cron (not deleted); `Maps.clear` empties it in one command.
+- **draft** map: `Maps.openDraft(id) -> bucket` allocates an editor bucket (§50) in which the draft is live for whoever
+  is in that bucket (the editors); `closeDraft` releases it. The world sees the **published** snapshot (if `active`)
+  in `targetBucket`; `publish` snapshots the draft, `rollback(version)` publishes a copy of an older snapshot.
+
+```lua
+Maps.create({ name, mode, targetBucket?, meta?, expiresAt? }, actor) -> map|nil, err
+Maps.get(id) / Maps.list({ mode?, active?, text? }) / Maps.update(id, { name?, meta?, expiresAt?, targetBucket? }, actor)
+Maps.delete(id, actor) / Maps.setActive(id, on, actor)
+Maps.elements(id) -> array (the draft/live elements)
+Maps.apply(id, ops, actor, { source?, expect? = { [elementId] = updatedAt } }) -> ok, applied | nil, err, detail
+--   ops (≤ maps.limits.opsPerApply): { op = 'create', type, pos, rot?, fields?, layer? }
+--                                    { op = 'update', id, set = { pos?, rot?, fields? (partial), layer? } }
+--                                    { op = 'delete', id }
+--   all-or-nothing; applied = { seq, ops = { { op, id, before?, after? } } }; `expect` → 'conflict' if changed since
+Maps.invert(applied) -> ops                      -- for undo
+Maps.publish(id, actor, note?) -> version / Maps.versions(id) / Maps.rollback(id, version, actor)
+Maps.openDraft(id, actor) -> bucket / Maps.closeDraft(id)
+Maps.clear(id, actor) -> ok, applied
+Maps.journal(id, { limit?, before?, author? }) -> rows
+Maps.respawn(id, elementId?)                     -- re-create destroyed networked elements
+Maps.setModelValidator(fn(kind, model) -> ok, info)   -- one validator, owner-tracked; info.vehicleType for vehicles
+Maps.on(typeId, fn(event, record, mapId)) -> handle   -- 'added'|'changed'|'removed' for ACTIVE world content, owner-swept
+Maps.records(typeId) -> array                         -- active world content of that type
+```
+- `apply` validates every op before applying any: type (new elements need a defined type), world bounds, finite
+  rotation (restricted by `transform.rotate`), `Schema.checkAll` on fields, model via the validator (props without a
+  validator: name pattern only; vehicle/ped/physprop without one: refused), parents, per-type and per-map limits
+  (`maps.limits.*` settings: elements 3000, perModel 300, uniqueModels 200, networked 20, networkedTotal 200,
+  opsPerApply 200), `type.validate`, then `Core.Hooks.run('maps:beforeApply', …)`. Journaled; not audited per call
+  (publish, rollback, clear, delete, setActive, create are audited).
+- Networked elements (`core:vehicle`, `core:ped`, networked props) are created by the **server** when their content
+  becomes active (`CreateVehicleServerSetter` / `CreatePed` / `CreateObjectNoOffset(…, true, true, true)` + rotation),
+  put in the bucket (`SetEntityRoutingBucket` — server entities start in bucket 0), `SetEntityOrphanMode(e, 2)`, state
+  bag `mapEl = '<mapId>:<id>'`; deleted with their element or when the content deactivates; not respawned
+  automatically (`Maps.respawn`).
+- Core.Maps is a trusted server API: callers authorise their users (the admin plugin checks editor permissions). The
+  only client-facing endpoints are the read-only region callback and events below.
+
+**Implementation notes (2026-09-26, run W2-MAPS) — §52.1/§52.2 server.**
+- **Deviation — four files** instead of `server/maps.lua`: `maps_types.lua` → `maps_runtime.lua` → `maps.lua` →
+  `maps_apply.lua` (manifest order required; each asserts its predecessor). They share the internal
+  `Core.MapsRuntime`, block-listed in the export next to `MapRegions`. maps_runtime.lua is the MapRegions caller
+  (looked up at call time, pcall'ed).
+- Ids: maps `m<n>` (`DB.nextId('maps')`); element ids are digit strings counted per map; `apply` accepts integer or
+  string ids (and `expect` keys). An element's `updatedAt` is a strictly increasing wall-clock MILLISECOND stamp; Core.DB
+  overwrites a document's top-level `updatedAt` with seconds, so the element document stores it as `rev`. Map
+  `createdAt/updatedAt/expiresAt` are unix seconds.
+- Additive element key `info = { lod?, vehicleType? }` — the validator's answer, kept so activation never needs the
+  validator (registered by a plugin that starts after core). Tuple lod = `info.lod` else 150; vehicles spawn with
+  `info.vehicleType` else `'automobile'`. Validator results are cached per `<kind>:<model>` (≤ 4096) until it changes.
+- **Additions to ops**: create may carry `id` (a free id) and `cam`; update takes `set.cam` and `replace = true`
+  (fields replaced instead of merged). **Restore ops** (review L6): `{ op = 'create', id, restore = <record> }` and
+  `{ op = 'update', id, restore = <record> }` bring back a raw earlier record — type (defined or not), fields,
+  typeVersion, info, cam — with only position/rotation/layer checked (no Schema, model, `type.validate` or ref check
+  on the restored element; limits, parents, `referenced` and the hook still run); an update-restore keeps the
+  element's creator and needs the same type. **Deviation**: `invert(applied)` returns `ops, expect` and emits restore
+  ops; expects are per step (after undoing one step, rebase the next on the undo's own `applied`). `expect` mismatch →
+  `'conflict'`, detail `{ id, current }`. Automatic ids stop at 999 999 999 and an explicit id past it is refused
+  (`'id'`, L7). Deleting an element another untouched element still references → `'referenced'` (detail `{ id, by }`;
+  L8).
+- Validation order: expect → per op (type, position/bounds, rotation, fields, layer, model) → refs → parents → limits →
+  `type.validate` → `maps:beforeApply`. Rotation wraps to (-180, 180], 0.01; a `'yaw'` type refuses pitch/roll,
+  `'none'` any. Bounds x/y ±10000, z −1000..3000.
+- Limits refuse only an apply that RAISES a count above its limit (lowering a limit never blocks deletes/moves).
+  Per-map `limits = { elements, perModel, uniqueModels, networked }` via create/update. `networkedTotal` counts
+  networked elements of every ACTIVE context (a closed draft costs nothing) and is also checked by `setActive(true)`,
+  `openDraft`, `publish`, `rollback`. Hides do not count as models. `parents`: only a newly introduced violation is
+  refused. `ref` fields (top level) must name an element of the staged map (of `refType` when given). `migrate` runs
+  when an element with an older `typeVersion` gets new fields, not at define time.
+- Hook payload `maps:beforeApply`: `{ mapId, mode, actor = by, source, count, ops = first 200 { op, id, type, model?,
+  pos } }`.
+- **Placeholders**: a record of an undefined type is packed as kind 4 with flags 8|16 and hash 0 (editor view only)
+  and re-rendered when the type returns; networked ones despawn meanwhile; pos/rot/layer stay editable, fields do
+  not (`'type'`).
+- Prop flags: collision unless `fields.collision == false`, frozen unless `fields.frozen == false`, unbreakable when
+  `fields.unbreakable == true`. Marker `bob`/`face` are booleans, `dd` 2 decimals.
+- **Networked entities**: one spawn worker (exists only while queued), 5 s existence wait (a cancelled spawn still
+  waits so it can delete). Bucket → orphan mode 2 → state bags `mapEl = uid` and `mapCfg` (§52.4a addendum) →
+  cosmetic RPC natives (plate, colours, doors, freeze, rotation). A change updates the entity in place when it can (notes below); core stop deletes
+  every map entity.
+- Activation per map (`R.syncMap`): live + active → working set in `targetBucket`; draft + active → published
+  snapshot there; open draft → working set in its editor bucket. publish/rollback swap the target context by diff (id,
+  type, updatedAt). Closing a draft clears its editor bucket with one `clearBucket` when nothing else renders into it.
+  A `targetBucket` that is an open editor bucket is refused. The editor bucket is allocated AS core (owner core,
+  population off, lockdown strict); the opener is owner-tracked (kind `mapsDraft`) and its stop closes the draft.
+  `rollback` leaves the draft untouched (and dirty). Versions: the newest 20 kept (candidate setting).
+- **Addition — events**: `Maps.on(typeId|'*', fn)` / `Maps.off(handle)` (kind `mapsListener`), delivered by one drain
+  thread after the context pass; records carry `bucket`, `key` (`'<bucket>|<uid>'`) and `editor` (editor buckets emit
+  too, so a gameplay type works in the editor's test). Not replayed: seed with `records()`.
+- Audited: create, update (addition), delete, setActive (expiry: actor `'system'`, `ctx.reason = 'expired'`),
+  publish, rollback, clear. Journal rows `{ mapId, seq, at (s), by, actor = { kind, src, name }, source, count, ops }`
+  (M7): update entries store only the changed keys (+ `after.updatedAt`), a clear row is `{ clear = true, count, ids }`;
+  each row weighs its stored ops, pruned per map to `maps.journalMax` rows AND the new setting `maps.journalMaxOps`
+  (20000) weight (the newest row always stays) and server-wide to 200000 (the oldest rows of the heaviest map go
+  first). `apply`/`clear` still RETURN full before/after records. `rollback` re-runs today's model validator
+  (`'model'`/`'no_validator'`, detail `{ ids }`) and the per-map limits on the snapshot (L9). A `targetBucket` inside
+  `Config.Buckets.Range` is refused (L10). Expiry: `Cron.every(10 s)` (warns when Cron is missing).
+- Loading: one barrier for all four collections; journal/version indexes through a non-copying `DB.find` predicate;
+  a degraded `maps`/`map_elements` makes the API answer `'unavailable'` (retry every 10 s). Callback
+  `core:maps:types`: public data, no permission, 1000 ms cooldown. Registry kinds: `mapType`, `mapsModelValidator`,
+  `mapsListener`, `mapsDraft`. Tests: `tests/maps_tests.lua` (301) + `tests/maps_store_tests.lua` (72; journal, clear,
+  expiry, delete, rollback, persistence, async barrier), shared harness `tests/maps_harness.lua`.
+
+**Implementation notes (2026-09-26, run UX C2) — networked elements updated in place, stable paint.**
+- **Why**: every change re-created vehicles, peds and physics props (hide + show), so moving or rotating a vehicle
+  gave it new random colours, a flicker and a new net id (Liam, editor test).
+- **In place** (`maps_runtime.lua` `updateNet` → `moveInPlace`): a changed networked element keeps its entity when
+  its type, kind and model are unchanged, the entity exists with `mapEl` = its uid in the context's bucket
+  (`GetEntityRoutingBucket`), a CLIENT owns it (`NetworkGetEntityOwner >= 1`) and it is alive (vehicles/peds:
+  `GetEntityHealth > 0`, the synced health node). The config goes out as context RPCs + the `mapCfg` bag (set only
+  when it changed): plate (`SetVehicleNumberPlateText`), custom colour, `locked` on AND off
+  (`SetVehicleDoorsLocked` 2 / 1), ped `frozen` on and off (`FreezeEntityPosition`), a cleared scenario
+  (`ClearPedTasks`); invincible on / another scenario / a prop's `rot` ride `mapCfg` (the client applies "on"
+  states). **Everything else keeps the respawn path**: another type/kind/model, the entity missing, dead, not
+  ours or in another bucket, a server-owned entity (nobody has it in scope, so a re-creation is exact and unseen),
+  and the three transitions only a re-creation undoes — a cleared plate, a cleared custom colour (the clearing
+  natives are client-only; `SET_VEHICLE_COLOURS` does not clear it, GTA `commands_vehicle.cpp`) and a ped that
+  stops being invincible (`SetEntityInvincible` is client-only). Instance states: still queued → nothing (the
+  worker reads the latest element when it starts); being created or failed → re-created (the creating one is
+  deleted once it appears, as before); configured → in place or re-created.
+- **The pose goes to the owning client** — event `core:maps:pose (netId, uid, x, y, z, rx, ry, rz)`, sent only to
+  `NetworkGetEntityOwner(entity)`: the server's `SET_ENTITY_COORDS` RPC adds the ped capsule's ground-to-root offset
+  (~1 m) to peds and `GetDistanceFromCentreOfMassToBaseOfModel` to vehicles (GTA `commands_entity.cpp`,
+  `SetPedCoordinates` OffsetZ, `SetCoordsOfScriptCar` bAddOffset), while the server-setter creation puts the ROOT at
+  the authored position — a frozen ped would hover and a vehicle drop. client/maps.lua applies it with
+  `SetEntityCoordsNoOffset(e, x, y, z, keepTasks = true, keepIK = false, warp = true)` + `SetEntityHeading(rz % 360)`
+  (vehicles, peds — they are created with a heading) or `SetEntityRotation(rx, ry, rz, 2)` (physics props), only
+  while it has network control and the entity's `mapEl` is that uid. **Verification**: `SetTimeout(2000)` later the
+  server reads the synced `GetEntityCoords` (horizontal distance ≤ 0.75 m) and, for vehicles and peds,
+  `GetEntityHeading` (≤ 20°); a move that did not land (control migrated meanwhile) is re-created at the target.
+  Only the latest move of an instance is checked (`poseSeq`).
+- **Stable paint**: `configureEntity` calls `SetVehicleColours(e, primary, secondary)` with a pair picked by
+  `joaat(uid) % 22` from a curated list of normal paints (metallic black, graphite, silver, dark silver, shadow
+  silver, gun metal, white, frost white, red, cabernet, orange, race yellow, green, racing green, dark blue, blue,
+  bright blue, midnight blue, bronze, champagne, golden brown, purple); a set `color` (custom primary + secondary)
+  is applied after it and wins. The same uid gets the same paint on every spawn and in the editor bucket as in the
+  target bucket. `R.paintOf(uid)` is internal.
+- **Fixed — lost spawns**: `queueSpawn` appended at `#spawnQueue + 1`; once the worker had nil'ed the consumed head,
+  `#` read 0 and an instance queued while the worker waited on its last creation landed behind the head and was
+  dropped. The queue now keeps an explicit tail.
+- Also in place now: a type redefined by its owner (`refreshType`) and publish/rollback (`swapContext`) re-render
+  unchanged or moved networked elements without re-creating them. Activation, deactivation, a draft opening or
+  closing and a `targetBucket` change still create/delete (the content appears/disappears or changes bucket).
+- Natives added (fxref + natives_cfx.json, server): `SetVehicleColours`, `ClearPedTasks`, `GetEntityRoutingBucket`,
+  `GetEntityHealth`, `GetEntityCoords`, `GetEntityHeading`, `NetworkGetNetworkIdFromEntity`,
+  `NetworkGetEntityOwner` (shared); client: `SetEntityCoordsNoOffset`, `SetEntityHeading`.
+- Tests: `tests/maps_tests.lua` 385 (was 301; new section "networked elements updated in place, stable vehicle
+  paint"), `tests/client_maps_tests.lua` 250 (was 239; section 19b2 the pose event). Harness: `H.owners[e]` /
+  `H.owner` (NetworkGetEntityOwner), `H.rpcs` + `H.rpcCalls(name)`, `H.poses(from)`.
+
+### 52.3 Server regions
+
+- The world is cut into **regions** of `Config.Maps.RegionSize` (512 m), integer key `(rx + 32768) * 65536 + (ry + 32768)`.
+  Per (bucket, region): `version` (monotonic), the active client-rendered element refs, and a **pack** — one string
+  `json.encode({ v, e = { tuples } })` built lazily on the first request after a change and cached until the next one,
+  so N clients fetching a region cost one encode. Tuple: `{ uid, kind, modelHash, x, y, z, rx, ry, rz, flags, lod, extra? }`
+  (`flags`: 1 collision, 2 frozen, 4 unbreakable, 8 editor-only helper, 16 data kind — `point`/`zone` are packed for the
+  editor view and ignored by the runtime).
+- Callback `core:maps:window` (cooldown 250 ms): `{ c = centreKey, h = { [key] = version } }` (≤ 9 entries). The server
+  takes the bucket from `GetPlayerRoutingBucket(src)` (never from the client), moves the player's subscription to the
+  3×3 keys around `c`, answers `{ b = bucket, v = { [key] = version } }`, and sends every region whose version differs
+  from `h[key]` with `TriggerLatentClientEvent('core:maps:pack', src, Config.Maps.LatentBps, bucket, key, pack)` (a
+  Lua runtime helper, bandwidth-limited: a join or a teleport never floods the reliable channel). Empty regions are
+  answered inline as version 0. The client's position is trusted only for *which public content to download*.
+- Changes bump the region version and are coalesced per server tick: ≤ `Config.Maps.PushOpsMax` (32) element changes →
+  `Core.Net.emitMany(subscribers, 'core:maps:delta', bucket, key, fromV, toV, opsJson)`; more → `core:maps:stale`
+  (bucket, key, toV) and the clients re-fetch through the window callback. A client whose version ≠ `fromV` re-fetches.
+- Subscriptions `subs[bucket][key] = { [src] = true }` change only when a client re-centres; cleared on drop and on a
+  bucket change (`core:client:bucketChanged`, §48). No loop over players anywhere.
+
+**Implementation notes (2026-09-26, run W2-REGIONS).**
+- **Versions come from one module-wide counter; 0 = empty.** A region that runs empty is answered as 0 and its table
+  is dropped; when it fills again it gets a fresh counter value, so a version never repeats with other content (no ABA
+  across evict/recreate). "Monotonic per region" therefore holds for non-zero versions only.
+- **Identity is (bucket, uid)**: the same uid may live in several buckets (a draft in its editor bucket and the
+  published copy in `targetBucket`). A move across regions queues `del` + `put`; across buckets it is the caller's
+  `remove` + `put`.
+- The tuple shape is checked on `put` (a NaN would make rapidjson throw inside the flush); encodes are `pcall`ed (a
+  delta that does not encode becomes a `stale`; a pack that does not encode is skipped and logged).
+- **Flush before answer**: a window request first flushes pending pushes, so a new subscriber gets the fresh pack and
+  never a delta it already has.
+- **Addition — per-src pack budget** (anti-abuse): a token bucket per player, capacity `Config.Maps.PackBudgetBytes`
+  (2,000,000) refilled linearly over `PackBudgetWindowMs` (10,000) — 200 kB/s sustained, 2 MB burst; a pack costs its
+  string length; the centre region is served first; a pack larger than the whole capacity goes out from a full
+  bucket into debt. Withheld keys are listed in the answer's `w` (§52.4a addendum); `stats().withheld` counts them.
+- **Addition — per-subscription pack memory**: the server remembers which version of each window region it already
+  sent to a src during the current subscription, so a client spamming the same window cannot multiply outbound
+  bytes; the memory for a key goes when it leaves the window, all of it on a bucket change.
+- `clearBucket` queues a stale (toV 0) per region that had content; a clear and a refill in one tick coalesce.
+- Config: `RegionSize` read once (clamped 64..4096; the key encoding depends on it); `LatentBps` (≥ 1000) and
+  `PushOpsMax` (0..1000, 0 = always stale) read live. Window validation: schema (≤ 2 keys, `c` integer 0..2^32-1,
+  `h` ≤ 9 keys) before the cooldown, `h` entries (integer keys and versions ≥ 0) in the handler; only the 9 block keys
+  are consulted. Bucket changes are detected at the next window request (`GetPlayerRoutingBucket`).
+- **Addition — two audiences (review M6).** Data kinds and editor helpers (flags 16/8) reach EDITORS only: a src
+  is an editor when Admin mode `editor` is on or its bucket is an open draft's editor bucket, decided per window
+  request and stored per subscription. **Deviation from "one version per region"**: each region has a full version
+  `v` (editors) and a public `pv` from the same counter (`pv = v` while nothing is hidden, 0 when nothing public is
+  left), two cached packs, and deltas split per audience (a data-only edit sends the public nothing). A client still
+  sees one version per region, and a number never names two contents, so a client that switches audience is always
+  detected as stale by its `h`. A public client sees a region with nothing public as `v = 0`.
+- **Losing the audience applies at once (R2-8)**: `MapRegions.reaudience(src)` downgrades an editor subscriber that
+  left its bucket or the editor role, switches its subscriptions to public and sends `core:maps:stale (bucket, key,
+  pv)` where the views differ; triggered by the `staffModeChanged` / `permsChanged` hooks, with a per-flush re-check
+  of every editor target of a dirty region as the backstop (covers `setBucket` and the bucket evacuation). A GAIN
+  still waits for the client's next window request.
+- Extra internal helpers: `keyOf(x, y)`, `version(bucket, key) -> full, public`, `unsubscribe(src)`,
+  `reaudience(src, modeOn?)`; `stats().hidden`; `put` also requires an integer `flags`.
+- Risks: the budget bounds each client, not the server total; latent events need `sv_enableNetEventReassembly`
+  (default true) or packs never arrive. Tests: `tests/maps_regions_tests.lua` (272).
+
+### 52.4 Client runtime (client/maps.lua)
+
+- **Window**: a thread samples `GetFinalRenderedCamCoord()` (camera, so noclip/editor/spectate stream where you look)
+  every 500 ms (1000 ms after 5 still samples) and re-centres when the camera is more than `WindowHysteresis` (64 m)
+  outside the centre region; it sends its cached versions so unchanged regions cost nothing. Up to
+  `CacheRegions` (25) regions stay cached after leaving the window (versions are re-checked on return).
+- **Index**: elements of loaded regions go into a 64 m spawn grid; each element spawns within `r = clamp(lod, 30,
+  MaxSpawnRadius 400)` of the camera and despawns beyond `r + 15`.
+- **Streaming** (one thread): evaluates only when the camera moved ≥ 4 m since the last evaluation or content changed,
+  visiting only grid cells within `MaxSpawnRadius`; queues spawns nearest-first (16 m distance rings, no full sort) and
+  despawns; creates ≤ `SpawnPerFrame` (8) and deletes ≤ `DespawnPerFrame` (32) per frame, with `Wait(0)` **only while a
+  queue is non-empty**, otherwise 100 ms (moving) / 500 ms (still). No allocation in the evaluation loop (reused
+  arrays, integer keys). Cap `MaxLocalObjects` (1500): the farthest wanted elements beyond it stay unspawned.
+- **Models**: ref-counted; `RequestModel` once, polled in the spawn step, 10 s timeout marks the element failed for the
+  session (logged once); `SetModelAsNoLongerNeeded` 30 s after the last instance went.
+- **Objects**: `CreateObjectNoOffset(hash, x, y, z, false, false, false)`, `SetEntityRotation(e, rx, ry, rz, 2, false)`,
+  frozen/collision/unbreakable per flags, `SetEntityLodDist(e, lod)`; never `PlaceObjectOnGroundProperly` (positions
+  are authored). **Markers**: gathered per evaluation within their draw distance, drawn by a per-frame loop that exists
+  only while that list is non-empty (≤ 64). **Hides**: `CreateModelHide` on region load, `RemoveModelHide` on unload.
+- Client API (proxy): `Maps.isAreaReady(coords, radius = 50) -> bool`, `Maps.waitAreaReady(coords, timeoutMs) -> bool`
+  (teleports in §48 wait for it, so nobody lands before an event platform exists), `Maps.handleOf(uid) -> entity|nil`,
+  `Maps.uidOf(entity) -> uid|nil`, `Maps.hold(uid)` / `Maps.release(uid)` (the runtime leaves a held element alone
+  while an editor drags it), `Maps.setEditorView(on)` (owner-tracked: draws previews of data kinds and editor-only
+  helpers within 150 m), `Maps.stats() -> { regions, elements, spawned, queued, models, failed }`.
+- Budget: idle and still = one distance check per 500 ms; moving through dense content ≤ 0.05 ms average in resmon.
+
+**Implementation notes (2026-09-26, run W2-MAPS-C).**
+- **Deviation — three files**: `client/maps_spawn.lua` (engine: grid, evaluation, queues, models, objects, holds,
+  readiness) → `client/maps_view.lua` (the one draw loop, hides, editor view) → `client/maps.lua` (wire, regions,
+  window, API). They hand over through a one-shot global `CoreMapsEngine` that maps.lua clears; nothing internal is
+  on `Core`, so the export cannot reach it.
+- **Window**: sampled only once `LocalPlayer.state.loaded == true`; one request in flight, ≥ 300 ms apart,
+  coalesced; `h` carries `pending or version` per key as integers; a nil answer retries after 2 s; a safety request
+  every 60 s even when still. A different `b` resets everything; `v = 0` empties a region; `w[key]` keeps the cached
+  content, marks the region not ready and re-asks after 2 s; a pack announced but not landed after 15 s is asked for
+  again; an answer to a request sent before a local `bucketChanged` is ignored.
+- **Editor audience**: the client listens to `staffSelfChanged` (seeded from `Core.Admin.getSelf()` at load); on an
+  `editor` flip the window regions' versions are forgotten (content kept until the new packs land, regions not ready),
+  cached out-of-window regions are dropped and the window is asked again; answers to requests sent before the flip are
+  ignored.
+- **Versions**: each region keeps `floor` = the highest non-zero version seen; a pack/delta at or below it is stale
+  and ignored (a late pack never resurrects an emptied region); a delta applies only when `fromV == version`, else the
+  region is re-fetched. Regions leaving the window stay cached (LRU, `CacheRegions`); cached regions keep their hides,
+  their props never spawn.
+- **Evaluation**: 64 m cells keyed like regions, props/markers/data kept apart per cell with conservative bounds and
+  counts; a cell wholly out of range with nothing spawned, or wholly in range with every prop spawned or failed, is
+  skipped. **Measured: 0 bytes allocated per steady-state evaluation.** Objects awaiting deletion still count
+  against `MaxLocalObjects`.
+- **Queues**: ≤ `SpawnPerFrame` creations, ≤ `DespawnPerFrame` deletions, ≤ 64 entries looked at per frame; `Wait(0)`
+  only while a queue holds work, 50 ms polls while only models stream, else 100 ms / 500 ms; nothing loaded = a bare
+  500 ms sleep with no native. A refused create (pool full) pauses creation for 1 s.
+- **Models**: `IsModelInCdimage` + `IsModelValid` first (a missing model fails at once, never requested), then
+  `IsModelAVehicle` / `IsModelAPed` (a vehicle or ped model in a prop tuple fails the same way — hardening); one
+  `HasModelLoaded` poll per model at ≤ 20 Hz; 10 s timeout fails every element of that model for the session,
+  logged once. **Objects**: flag 4 → `SetEntityInvincible` + `SetDisableFragDamage`; unchanged elements keep their
+  objects across a new pack version; a changed position/rotation/lod with the same model and flags moves the object
+  in place; another model or flags re-creates it; a uid that changes region hands its object over (no blink).
+- **Holds** (kind `mapHold`): per uid, per owner; changes arriving meanwhile apply on release; a copy the server
+  deleted while held stays until released. Holding does not stop a not-yet-spawned element from spawning.
+- **Readiness**: every region overlapping the circle in the window, versioned, not pending, not withheld, in our
+  bucket; then every prop within `min(radius, its r)` spawned, failed, capped or held. `waitAreaReady` re-centres on
+  a target outside the window and polls every 50 ms (call it from a thread).
+- **Deviation — hides** use `CreateModelHideExcludingScriptObjects(x, y, z, radius, hash, true)` instead of
+  `CreateModelHide` (the runtime's own props of that model inside the radius stay visible), removed with
+  `RemoveModelHide` on delete, eviction, emptying, bucket reset and core stop; a zero hash hides nothing.
+- **Editor view** (kind `mapEditorView`): the type list is fetched once through `core:maps:types`; data kinds and
+  helpers within 150 m (≤ `MaxMarkers`) are drawn from their type's `preview` when the tuple names its type
+  (`extra.t`, §52.4a addendum), else per-kind defaults (point → small sphere, zone → its box, helper → 1 m box).
+- **Networked map entities**: an entity state-bag handler on `mapCfg` plus a round-robin sweep (≤ 16 known entities
+  per sample) apply the config only while this client has network control, once per control period: peds →
+  `SetBlockingOfNonTemporaryEvents`, `SetEntityInvincible` if `invincible`, `FreezeEntityPosition` if `frozen`,
+  `TaskStartScenarioInPlace` unless `IsPedUsingScenario`; vehicles → `SetVehicleDoorsLocked(veh, 2)` if `locked`;
+  `rot` → `SetEntityRotation`. The net-id guard runs first; outside the handler the LIVE bag is read (`mapEl` must
+  be present) because net ids are recycled; an id whose entity is absent for 10 consecutive sweeps is forgotten (F12;
+  streaming back in fires the handler again)). The same client applies an in-place move, `core:maps:pose` (§52.4a), with
+  `SetEntityCoordsNoOffset` (keep tasks, warp) and the heading (vehicles, peds) or rotation (props).
+- **Markers** (F14): gathered within their `dd`, capped at 150 m; the draw loop reads `GetFinalRenderedCamRot(2)` once
+  per frame and skips markers behind the camera.
+- **Measured budgets** (counting stubs): nothing loaded 0 natives; loaded and still ~3 camera reads + 3 timers per
+  second; worst spawn frame 39 natives (8 objects); despawn ≤ 32 × 2; 1 `DrawMarker` per marker per frame; editor
+  previews: marker/sphere 1, box 12 `DrawLine`, label 10. `stats()` returns more fields than the contract listed
+  (`CoreMapsClientStats` in types/core.lua). Tests: `tests/client_maps_tests.lua` (239).
+
+### 52.4a Wire format and the internal region interface (binding for server/maps*.lua and client/maps.lua)
+
+- Kind codes in tuples: `1` prop · `2` marker · `3` hide · `4` point · `5` zone (vehicles, peds and networked props are
+  server entities and never packed). Tuple = `{ uid, kind, modelHash, x, y, z, rx, ry, rz, flags, lod, extra }` with
+  coordinates rounded to 3 decimals, rotations to 2, `modelHash` a signed 32-bit int (0 for non-model kinds), `lod`
+  an integer (props: the validator's `info.lod`, else 150), `extra`: marker `{ type, r, g, b, a, sx, sy, sz, dd, bob,
+  face }`, hide `{ radius }`, zone `{ sx, sy, sz }`, otherwise absent. Flags: 1 collision · 2 frozen · 4 unbreakable ·
+  8 editor-only helper · 16 data kind.
+- Pack string: `json.encode({ v = version, e = { tuple, … } })`.
+- `core:maps:window` callback: request `{ c = centreKey, h = { [key] = version } }`, answer `{ b = bucket, v = { [key] = version } }`
+  (integer keys survive msgpack). `core:maps:pack (bucket, key, packString)` (latent). `core:maps:delta (bucket, key,
+  fromV, toV, opsString)` with `opsString = json.encode({ { o = 'put', t = tuple } | { o = 'del', u = uid }, … })`.
+  `core:maps:stale (bucket, key, toV)`. `core:client:bucketChanged (bucket)` (§48). Callback `core:maps:types` → the public
+  type list (`Maps.types()`, for the editor view's preview descriptors).
+- Internal server interface (not exported; `Core.MapRegions`, added to the export block-list): `MapRegions.put(bucket,
+  uid, tuple)` adds or moves an element (the module remembers each uid's region), `MapRegions.remove(bucket, uid)`,
+  `MapRegions.clearBucket(bucket)`, `MapRegions.stats()`. Each call bumps the affected region versions and queues the
+  delta; one flush per server tick sends the coalesced deltas/stale notices. `server/maps.lua` is the only caller.
+
+**Addenda (2026-09-26, agreed between W2-MAPS, W2-REGIONS and W2-MAPS-C; binding like the rest of §52.4a).**
+- **Withheld packs.** The `core:maps:window` answer is `{ b = bucket, v = { [key] = version }, w = { [key] = true } }`.
+  `w` is ALWAYS present (empty when nothing is withheld) and lists the keys whose pack the per-src byte budget
+  (`Config.Maps.PackBudgetBytes` / `PackBudgetWindowMs`) withheld; their `v` is still reported. The client re-requests
+  them after ~2 s (withheld keys are not remembered as sent, so they go out as soon as the budget allows).
+- **Versions.** Non-zero versions only grow (one module-wide counter); `0` = empty. A pack or delta with a non-zero
+  version at or below the one the client holds is old and ignored. The version a client sees is the one of ITS
+  audience (full for editors, public otherwise, §52.3 notes); `core:maps:stale` may carry a public version.
+- **Audience.** Tuples with flag 8 (editor helper) or 16 (data kind) are delivered to editors only (Admin mode `editor`
+  or an open draft's editor bucket); the client re-requests its window after an `editor` flip.
+- **Editor extras.** Data kinds (`point`, `zone`) and editor-only helpers (flag 8, records of an undefined type) also
+  carry `extra.t = <type id>` and — when the type's `preview` has `{ kind = 'label', text = '$field' }` entries —
+  `extra.f = { [field] = value }` for exactly those fields (scalars as strings, ≤ 64 chars; absent when none has a
+  value). A zone's extra is therefore `{ sx, sy, sz, t, f? }`, a point's `{ t, f? }`, a placeholder's `{ t }`. The
+  runtime ignores them; the editor view draws the type's preview from them.
+- **`mapCfg` state bag** on networked map entities (next to `mapEl`), applied by the client that has network control
+  (the server's cosmetic natives are fallible RPCs): peds `{ invincible, frozen, scenario? }`, vehicles `{ locked }`,
+  networked physics props `{ rot = { x, y, z } }` (degrees, order 2).
+- **`core:maps:pose (netId, uid, x, y, z, rx, ry, rz)`** (server → the entity's owning client, reliable): an
+  in-place move of a networked map entity. The client applies it only with network control and `mapEl == uid`
+  (after the `NetworkDoesEntityExistWithNetworkId` guard); vehicles/peds take `rz` as heading, props the full
+  rotation (order 2). Not state: a client that takes control later never re-applies it.
+
+### 52.5 Config, scale, tests
+
+`Config.Maps = { RegionSize = 512, WindowHysteresis = 64, CacheRegions = 25, LatentBps = 250000, PushOpsMax = 32,
+MaxSpawnRadius = 400, SpawnPerFrame = 8, DespawnPerFrame = 32, MaxLocalObjects = 1500, MaxMarkers = 64 }`; limits are
+`Core.Settings` keys `maps.limits.*`, `maps.journalMax`. Scale: the only movement-driven traffic is one small callback
+per ~512 m of travel (2,000 players at 20 m/s ≈ 80 requests/s server-wide, nearly all "unchanged"); content crosses the
+wire once per (client, region, version); a change reaches only the players holding that region. Tests:
+`tests/maps_tests.lua` (types, apply validation and atomicity, limits, invert, expect/conflict, publish/rollback, live
+vs draft activation, region packs + versions + coalesced pushes, subscriptions, networked lifecycle with stubs) and
+`tests/client_maps_tests.lua` (window/hysteresis, cache, grid evaluation, queue budgets, model ref-counting, cap,
+hold/release, area readiness).
+
+**Implementation notes (2026-09-26).** `Config.Maps` also has `PackBudgetBytes = 2000000` and
+`PackBudgetWindowMs = 10000` (§52.3 notes); settings `maps.journalMaxOps` (20000) joined `maps.journalMax`. Tests
+as run: `tests/maps_tests.lua` 385 (was 301 before run UX C2) + `tests/maps_store_tests.lua` 72, `tests/maps_regions_tests.lua` 272,
+`tests/client_maps_tests.lua` 250 (two `[bench]` lines).
+In game (open): resmon flying through ≥ 1000 props within 400 m, DLC prop streaming, a teleport onto an event
+platform, a hide over a world bench (it must come back), `mapCfg` on an entity placed before a client joined.
+
+## 53. Kit additions (catalogue entries in §37.5; the §6 kit protocol applies to each)
+
+| component | purpose / API sketch |
+|---|---|
+| `CoreVirtualList` | fixed-row-height virtualised list: `items`, `itemHeight`, `keyField`, `overscan`; default slot `{ item, index }`; `scrollToIndex()` |
+| `CoreTree` | nested rows with expand/collapse, selection (single/multi), per-row icon/badge/trailing slot, keyboard (↑↓←→ Enter) |
+| `CoreCombobox` | filterable select: `options` (or async `search(query)`), `multiple`, `creatable?`, virtualised when > 100 options |
+| `CoreVectorInput` | `{ x, y, z }` (or rotation) as three `CoreNumberInput`s with shared `step`/`precision`, optional axis colours, `copy`/`paste` |
+| `CoreColorPicker` | hex input + swatches + RGB(A) sliders (no native `<input type=color>` popup — CEF off-screen) |
+| `CorePagination` | cursor/page controls: `page`, `pageCount?`, `hasNext`, `hasPrev`, size select |
+| `CoreTable` (extended) | sortable columns (`sortable`, `sortKey`, `sortDir`, `update:sort`), `loading`, `empty` slot — server-side sorting stays the caller's |
+| `CoreSchemaForm` | renders `Core.Schema.public` fields with kit controls (incl. the above), `visibleWhen`, groups, errors per field; `resolvers` prop supplies options for `player`/`model`/`ref`/`faction`/`item`; emits `update:modelValue`, `submit` |
+
+**Implementation notes (2026-09-26, run W1-KIT).** The kit is 71 components (64 + the seven above; catalogue entries
+in §37.5, stories in §37.7).
+- **Helper files outside the catalogue**: CoreSchemaForm recurses through `ui/src/kit/schema/SchemaField.vue` with
+  pure helpers in `ui/src/kit/schema/schema.js` (sort/group/visibleWhen/defaults/advisory check/error wording/duration
+  parse + format/`normalizeErrors`). They live outside `kit/components/` on purpose: the registry stays at 71 and the
+  SDK types list only the public tag.
+- **CoreTable**: sorting is presentation only on both sides — the table never reorders rows. Added a table-level
+  `sortable` default (a column's `sortable` overrides it), `v-model:sortKey` / `v-model:sortDir` next to `update:sort`,
+  and `loadingRows`. Two-state toggle (asc ↔ desc), no "unsorted" third click.
+- **CoreVirtualList** additions: `range` and `reach-end` emits (+ `endThreshold`) for cursor paging, a `role` prop
+  (CoreTree and the combobox pass `presentation` so their own roles hold), an `empty` prop/slot, `measure()`.
+- **CoreTree** additions: `v-model:expanded`, `keyField` / `childrenField`, `dense`, `indent`, `label`; emits
+  `select`, `toggle`, `activate`. Always virtualised (it grows to its content when unconstrained).
+- **CoreCombobox**: `search` REPLACES local filtering (the server filters); `creatable` also emits `create`; the
+  virtualised row height is fixed (36, or 54 when any option has a description).
+- **Deviation — CoreVectorInput's default `size` is `sm`** (the kit default is `md`): three steppers in a row. The kit
+  keeps its own clipboard (module scope) because `navigator.clipboard` may be unavailable in the CEF; paste races the
+  browser clipboard against 250 ms.
+- **CoreColorPicker**: added `popover` (the form-row shape CoreSchemaForm uses) and a default palette; the model is
+  upper-case and 8-digit only while translucent. **CorePagination**: `page` is 1-based; `hasNext`/`hasPrev` default
+  to `null` (derived); `total`, `sizeLabel`, `siblings`, `change` added.
+- **CoreSchemaForm vs §43**: errors are `checkAll`'s shape exactly — `{ name = code }` with nested paths PREFIXED to
+  the code (`'2.pos.min'`, 1-based rows); `normalizeErrors` flattens that to path keys (`list.2.pos`) and stops at
+  `custom:` so a message containing dots survives. The advisory check mirrors lib/schema's CHECK rules but is never
+  authoritative (`submit` fires only when it passes; the server validates again). `duration` shows the field's
+  `presets` (now a §43 UI-only key) or 15m / 1h / 1d / 1w (+ Perm), filtered by `min`/`max`. `number` without `step`
+  shows 2 decimals, `integer` 0; `player` without a resolver is a digits-only text field; `secret` strings are
+  password inputs (the public view has no default); `visibleWhen` is evaluated per nesting level; `messages`
+  localises the English defaults; `custom:<text>` shows the text; `pattern` uses `patternMessage`.
+- Chromium 103: no `:has()`, `color-mix()`, nesting, container queries, `dvh`, individual transforms or the banned
+  filter; chevrons/twisties turn with `transform: rotate()`; the checkerboard is `repeating-conic-gradient`.
+- **Limits**: CoreCombobox's label map grows with every option seen in that instance (bounded by what the resolver
+  returns); CoreTree's parent walk on a vanished cursor is O(n), on that path only.
+- Tests: `kit-regression.js` catalogue + mount-all entries for the seven, section 9c (84 checks), seven new
+  interactive roots in §10 — `PASS 312/312` on the built `html/` (305 on the dev server, which skips §11); every new
+  story's play function finishes; `gen-kit-types --check` → 71.
+
+## 54. Editor focus: HUD hiding and key capture (client/ui.lua, lib/keys/client.lua, shell runtime) — 2026-09-26
+
+Liam, after the first in-game run of the admin map editor: "The HUD and minimap show … The quick slots aren't usable
+because of the inventory." A full-screen tool (the editor, a photo mode, a cutscene script) needs two things §31 and
+§3.8 did not give it: the HUD layer out of the way WITHOUT hiding its own page (`Core.UI.hide` hides the whole shell and
+closes the focused page), and its keys to itself — the inventory binds 1–5 through `Core.Keys`, the editor binds 1–9, and
+both fired. Both APIs are owner-tracked reason sets with the §31.1 namespacing, reached from a plugin through the proxy.
+
+### 54.1 Client API
+
+```lua
+Core.UI.hideHud(reason?) -> boolean     -- false only for an invalid reason; true when held afterwards (also if it was)
+Core.UI.showHud(reason?) -> boolean     -- true when it removed the CALLER's reason
+Core.UI.isHudHidden() -> boolean        -- at least one reason is held (by anyone)
+Core.Keys.capture(reason?) -> boolean   -- same answers as hideHud
+Core.Keys.release(reason?) -> boolean   -- same answers as showHud
+Core.Keys.isCaptured() -> captured, byCaller   -- any capture held; does the CALLER hold one itself
+Core.Keys.register({ …, whileCaptured = true })  -- this binding keeps firing while another resource captures
+Core.on('hudHiddenChanged', function(hidden) end)   -- client hook, on the hidden <-> visible flip only
+```
+
+- Reasons follow §31.1 exactly (`reasonKeyFor`): pattern `^[%w_%-%.:]+$`, default `default`, ≤ 48 characters after
+  prefixing; a plugin's reason is stored as `<resource>:<reason>`, core's verbatim; a plugin can never clear another
+  one's. Registry kinds `uihud` and `keycapture`: a stopping owner drops every reason it held (the HUD, the radar and
+  the keys come back with it).
+- **The holder keeps its own things.** The owner resources holding a hideHud reason form the KEEP list: their overlay
+  pages, their text UI and their key hints stay; a capture holder's own `Core.Keys` bindings keep firing.
+
+### 54.2 HUD hiding — what goes and what stays
+
+While ≥ 1 hideHud reason is held:
+
+| element | while hidden | who does it |
+|---|---|---|
+| core's vitals strip (`Hud.vue`), stat bars (`StatsBars.vue`), world prompt layer (`WorldPrompts.vue`) | hidden | shell (`shell:hud`) |
+| overlay pages (`type = 'overlay'`) whose owner is NOT in keep (the inventory hotbar) | hidden, never closed — state survives | shell |
+| overlay pages of a holder (the admin HUD of the admin resource) | stay | shell |
+| `Core.UI.textUI` / `Core.UI.keys` shown by a resource that holds no reason | taken off the screen, shown again afterwards | client/ui.lua |
+| the §6.7 world prompts (native renderer) and `core_interact` | not drawn / does nothing | client/interactions.lua |
+| GTA radar and native HUD | `DisplayRadar(false)` / `DisplayHud(false)` ONCE on the first reason | client/ui.lua |
+| toasts, progress bar, spinner, shard, chat, pages, modals, built-in menus/dialogs | untouched | — |
+
+- **Wire.** ONE Lua → NUI message: `{ action = 'shell:hud', hidden, keep = { resource, … } }` (keep sorted; an empty
+  Lua table arrives as `{}`, which the shell reads as "nobody"). Sent on every change of `hidden` or of the keep list,
+  and on `ui_ready` while hidden — BEFORE the overlays are re-opened, so a hidden one never flashes. The text UI / key
+  hint suppression is ordinary `textui:*` / `keys:*` traffic after it.
+- **Natives** (apiset client, HUD namespace, verified with `fxref show` 2026-09-26): `DisplayRadar(toggle)`,
+  `DisplayHud(toggle)`, `IsRadarHidden()`, `IsHudHidden()`. In the game (`script/commands_hud.cpp`) `IS_RADAR_HIDDEN`
+  is `!CScriptHud::bDisplayRadar` and `IS_HUD_HIDDEN` is `!CScriptHud::bDisplayHud` — pure read-backs of the two
+  DISPLAY_* flags, no per-frame hides in them. So on the first reason core switches off only what reads as on and
+  remembers it (`hudNatives.radar` / `.hud`); on the last reason (or the owner stop, or core's own stop) it switches
+  back on ONLY what it switched off. A radar another script had hidden stays hidden. The BOOL readbacks are read by
+  truthiness (AGENTS §8). `sf_minimap` follows the game radar, so it hides by itself.
+- **§31.3 `hud` watcher.** `IsHudHidden()` turns true the moment §54 calls `DisplayHud(false)`; with
+  `Config.UI.AutoHide.HudHidden = true` that would hide the WHOLE shell (and close the editor's page). The watcher
+  therefore reads `IsHudHidden() and not hudNatives.hud` — a native HUD that §54 hid is not a `game:hud` reason. (This
+  also answers §31.3's "semantics undocumented": the native reads the DISPLAY_HUD flag, nothing else.)
+- **World prompts.** client/interactions.lua keeps ONE local flag from the `hudHiddenChanged` hook. The projection
+  thread treats it like NUI focus — `Wait(250)`, nothing projected, drawn or sent (no new per-frame work, one boolean
+  per iteration) — and on the way back sets `focusDirty` + `forceSend`, so the next frame re-projects and the `'nui'`
+  renderer re-sends the whole set. The scan's text UI prompt goes through `Core.UI.textUI` and is suppressed there.
+  `core_interact` returns at once while hidden (no prompt is visible, and E is the editor's "up" key).
+- **Shell.** `store.hudHide = { hidden, keep }` (owned by `runtime/layers.ts`: `attachHudStore`, `applyHudHide`,
+  `hudHidden()`, `overlayHidden(owner)`; an overlay without an owner counts as `core`). `App.vue` wraps the three core
+  widgets and `PageHost.vue` every overlay in a `display: contents` element with `v-show` (`data-core-hud="vitals" |
+  "stats" | "worldprompts"`, `data-core-overlay="<id>"`): no layout of its own, nothing unmounts, a hidden overlay keeps
+  receiving props, patches and feeds. A malformed `shell:hud` (not `hidden === true`) is a VISIBLE HUD.
+- **Hook.** `hudHiddenChanged(hidden)` fires once per flip (never for a second reason or a keep-list change), after the
+  message and the natives, in core's VM and — as every hook — in every resource on the client.
+
+### 54.3 Key capture — the press-time check across VMs
+
+- `lib/keys/client.lua` is compiled into every VM; the capture state is not. `capture`, `release` and `isCaptured` are
+  defined by core (client/ui.lua) on core's own `Core.Keys` lib table and NOT by the lib, so in a plugin VM they fall
+  through to the import.lua proxy (`exports.core:call(resource, 'Keys', fn, …)`, §2.2) and the caller is known.
+- A press runs the old cheap checks first (stale key-up, `whileFocused`/NUI focus/pause menu, debounce), then — unless
+  the binding has `whileCaptured = true` — asks `ns.isCaptured()` ONCE: inside core that is core's function, in a plugin
+  VM one export hop (multiple returns cross it: FiveM's Lua scheduler packs `{ ref(…) }` and unpacks it on the caller
+  side). The press is swallowed when `captured and not byCaller`. The swallowed press does not start the debounce
+  window and sets no `down` state, so its key-up stays silent; a key that went down BEFORE the capture still delivers
+  its release. Nothing runs per frame; a failing answer (core stopped or restarting, an older core without §54) counts
+  as "not captured" — a key never goes dead with core.
+- **Why not a state bag.** A non-replicated `LocalPlayer.state:set(k, v, false)` IS visible to every resource on the
+  client (`SET_STATE_BAG_VALUE` / `GET_STATE_BAG_VALUE` resolve the bag through the one `StateBagComponent` of the
+  client's ResourceManager; strict mode only blocks REPLICATED client writes) and would save the export hop, but the
+  value outlives core: a core restart or crash while a capture is held would leave every other resource's keys dead
+  until somebody cleared it. The hop costs microseconds and happens once per key press.
+- core's chat key (`client/chat.lua`) is `whileCaptured = true`. core's other `Core.Keys` bindings (vehicle lock) are
+  swallowed like anyone's. Raw `RegisterKeyMapping` commands are not `Core.Keys` bindings and are not affected:
+  `core_interact` is covered by the HUD hiding above, `core_door` asks `Core.Keys.isCaptured()` itself (see the
+  notes); `core_cancel` only acts on a cancellable progress bar and is left alone.
+
+### 54.4 Implementation notes (2026-09-26, run UX / package C1)
+
+- **Deviation — key hints.** The brief named the text UI; `Core.UI.keys` (instructional buttons, bottom right) follows
+  the same owner rule, because another resource's bar would sit on the editor's own full-width hint bar.
+- **Owner of a text UI line.** `textUI.show` now remembers the calling resource (`Registry.getCaller()`) next to the
+  free-form `owner` tag; only the resource decides the §54 rule. Core's interaction and door prompts are `core`.
+- `reasonKeyFor(fn, reason)` takes the full API name for its log line (`UI.hide`, `UI.hideHud`, `Keys.capture`); the
+  messages of `UI.hide`/`UI.show` are unchanged.
+- **`core_door` (fixed by the orchestrator).** client/doors.lua binds E (`core_door`) with a raw key mapping, which
+  the lib's capture check never sees: in the editor's fly mode (E = up) a door within 2 m of the parked ped toggled.
+  `Doors.tryToggleNearest` now returns while `Core.Keys.isCaptured()` answers true (suite `door key capture`).
+- **Limits.** Another script that calls `DisplayRadar(true)` while a reason is held shows the radar again; §54 does not
+  re-assert it (once, by contract). `hudHiddenChanged` is not re-fired for a resource that starts while hidden — read
+  `Core.UI.isHudHidden()` at start. The keep list is per resource, not per page.
+- Tests: `client_ui_tests.lua` suites `hud hide` (reasons, owners, keep list, natives incl. a pre-hidden radar, hook,
+  text UI + key hints, the §31 watcher, the ui_ready order, owner stop, core stop), `hud hide prompts` (nothing
+  projected or sent while hidden, `core_interact`, re-send on show) and `key capture` (REAL VMs: core's client VM + two
+  plugin VMs from import.lua whose proxy reaches core's `call` export; swallowed / own / `whileCaptured` / release /
+  chat / owner stop / core down) — 773 total; `run_tests.lua` keys suite (+15: lib-side proxy use, cheap checks first,
+  failure = not captured) — 417; `ui/tests/unit/layers.test.ts` (+2) — `# pass 216`; `runtime-regression.js` section
+  9b (+11) — `PASS 212/212`; Storybook `Shell/HUD hidden (editor focus)` with a play function.
