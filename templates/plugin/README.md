@@ -46,6 +46,11 @@ inside `Core.onReady` are replayed automatically.
   interactions, UI pages) inside `Core.onReady`; keys, callbacks and net handlers at file scope.
 - `server/main.lua` — `Core.Net.on` handlers, `Core.Callback.register`, `Core.Commands.register`.
   The server owns money, factions and vehicles; the client only ever asks.
+- `sql/0001_init.sql` — this plugin's own table (an example `my_plugin_things` row per character), registered
+  with `Core.DB.migrate({ 'sql/0001_init.sql' })` at file scope, right at the top of `server/main.lua` (core
+  `DESIGN.md` §56.9). Persist through your own tables this way, never your own files or a second database.
+  A schema change is always a new numbered file (`0002_*.sql`, ...) — never edit an applied one in place.
+  Nothing to add to `fxmanifest.lua`: `sql/` is read by path, not packed for the client.
 
 Split into more files when it grows — `client/*.lua` and `server/*.lua` are globbed by the manifest.
 
@@ -200,7 +205,8 @@ then `restart my_plugin`).
 | Utils / Math / Validate / Log | §3.1–§3.4 |
 | `Core.Callback`, `Core.Net`, `Core.Commands` | §3.5–§3.7 |
 | `Core.Keys`, `Core.Streaming`, `Core.Anim`, client `Core.Player` | §3.8–§3.11 |
-| `Core.DB`, `Core.Player`, `Core.Money`, `Core.Perms`, `Core.Factions` (server) | §4.1–§4.5 |
+| `Core.DB` (server, a lib — no export hop): relational tables via migrations, awaited vs queued calls | §56 |
+| `Core.Player`, `Core.Money`, `Core.Perms`, `Core.Factions` (server) | §4.2–§4.5 |
 | `Core.Vehicles`, `Core.Notify` (server) | §4.6, §4.7 |
 | What a net event is allowed to do (security table) | §5 |
 | `Core.Spawn`, markers, text labels, blips, interactions, raycast (client) | §6.1–§6.9 |

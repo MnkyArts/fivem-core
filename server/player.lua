@@ -1,25 +1,31 @@
 --[[
-    core/server/player.lua — Core.Player (DESIGN §4.2, §5, §8)
+    core/server/player.lua — Core.Player (DESIGN §4.2, §5, §8, §56)
 
-    Sessions and persistence: account + character documents (Core.DB), the connection lifecycle
-    (playerConnecting deferrals + ban check, playerJoining load, core:server:requestLoad answer),
-    the autosave loop, death/respawn, and the replication of the §8 player state-bag keys through
-    the single replicate(src, key?) helper.
+    Sessions: the connection lifecycle (playerConnecting deferrals + ban check, playerJoining load,
+    core:server:requestLoad answer), the autosave loop, death/respawn, and the replication of the §8
+    player state-bag keys through the single replicate(src, key?) helper. Core owns those keys
+    (CORE_STATE_KEYS below); plugin keys go through Player.setReplicated.
 
-    Plugins must never write the `characters` / `accounts` collections directly while a session
-    exists: Player.save rewrites both documents from the live session, so a direct Core.DB write is
-    lost at the next autosave. Use Core.Player.setData (and Core.Money / Core.Player.setGroup).
+    Persistence (§56.6, §56.8) lives in server/player_store.lua, which loads RIGHT BEFORE this file and hands
+    its table over once (the global CorePlayerStore). A session is read with { sync = true } (a READ ERROR
+    refuses the join, it never creates a row); every change (setData, setModel, setCoords, money, the death
+    counter, setAccountData, setGroup) is QUEUED at once; the autosave adds position, playtime, last_seen /
+    last_played and whatever is still dirty. Save paths never yield. Plugins never write the `characters` /
+    `accounts` rows directly while a session exists (its next write wins): use setData / Money / setGroup.
 
-    Core owns the §8 player state-bag keys (CORE_STATE_KEYS below); plugin keys go through
-    Player.setReplicated. Server side only: every native used here is apiset server or client+server.
-
-    §47/§48: bans through Core.Bans (license fallback without it), sticky session.states, setCoords opts.
     Natives (fxref 2026-09-26, CFX server): GetVehiclePedIsIn(ped, lastVehicle), GetPedInVehicleSeat(vehicle,
-    seatIndex), SetEntityRoutingBucket(entity, bucket), SetPlayerRoutingBucket, GetPlayerRoutingBucket.
+    seatIndex), SetEntityRoutingBucket(entity, bucket), SetPlayerRoutingBucket, GetPlayerRoutingBucket, GetPlayerName,
+    GetPlayerPed, GetEntityCoords, GetEntityHeading, GetEntityHealth, DropPlayer, NetworkGetNetworkIdFromEntity
+    (the identifier natives and the connect-time ban gate live in server/player_store.lua).
 ]]
 
 -- runtime Player(src) state-bag accessor, captured before the module table shadows the global
 local playerBag = Player
+
+local Store = CorePlayerStore
+assert(type(Store) == 'table', 'server/player_store.lua must load right before server/player.lua (CorePlayerStore)')
+-- fxlint-disable-next-line C003 -- clears the one-shot hand-off created by server/player_store.lua
+CorePlayerStore = nil
 
 local Player = {}
 
@@ -29,14 +35,15 @@ local Net = Core.Net
 
 local sessions = {}      -- [src] = session table (see DESIGN §4.2)
 local byCharId = {}      -- [charId] = src
-local byAccountId = {}   -- [accountId] = src (Player.getAccountById prefers the live document)
+local byAccountId = {}   -- [accountId] = src (Player.getAccountById prefers the live session)
 local loadCooldown = {}  -- [src] = GetGameTimer() of the last requestLoad
+local loading = {}       -- [src] = true while its session loads (the reads yield)
+local loadingLicense = {} -- [license] = src while a load of that license runs (one account, one character)
 local autosaveRunning = false
 
 local MAX_BUCKET <const> = 65535
 local LOAD_WAIT_MS <const> = 10000
 local LOAD_POLL_MS <const> = 250
-local ID_TYPES <const> = { 'license', 'license2', 'discord', 'fivem', 'steam', 'xbl', 'live' }   -- fallback list
 
 -- character keys that mirror into the player state bag (§8)
 local REPLICATED <const> = { name = true, money = true, faction = true }
@@ -60,30 +67,7 @@ local function playerName(src)
     return Utils.sanitize(GetPlayerName(src) or 'Unknown', Config.Player.MaxNameLength)
 end
 
---- One identifier of a kind. The engine PREFIX-matches, so 'license' may answer 'license2:…': ask with the
---- colon (§47) and accept only a value that carries it.
-local function identifierOf(src, kind)
-    local prefix = kind .. ':'
-    local value = GetPlayerIdentifierByType(src, prefix)
-    return type(value) == 'string' and value:sub(1, #prefix) == prefix and value or nil
-end
-
---- Collects the identifier set stored on the account document.
---- R2-3: EVERY identifier type except ip: (the §47 index and ban holders must see license2/xbl/live too).
-local function collectIdentifiers(src)
-    local out = {}
-    local count = GetNumPlayerIdentifiers ~= nil and tonumber(GetNumPlayerIdentifiers(src)) or nil
-    if not count then
-        for i = 1, #ID_TYPES do out[ID_TYPES[i]] = identifierOf(src, ID_TYPES[i]) end
-        return out
-    end
-    for i = 0, count - 1 do
-        local id = GetPlayerIdentifier(src, i)
-        local kind = type(id) == 'string' and #id <= 128 and id:match('^(%w+):.') or nil
-        if kind and kind ~= 'ip' and out[kind] == nil then out[kind] = id end
-    end
-    return out
-end
+local identifierOf, collectIdentifiers = Store.identifierOf, Store.collectIdentifiers
 
 --- Faction summary for the state bag (§8): the six public fields, or false when in no faction.
 local function factionSummary(src)
@@ -152,34 +136,56 @@ local function resolvePath(root, path, create)
     return node, last
 end
 
---- Marks the session dirty and drops the cached core:client:loaded payload (§5 requestLoad).
+--- Drops the cached core:client:loaded payload (§5 requestLoad) after a change of the session.
 local function touch(session)
-    session.dirty = true
     session.loadPayload = nil
 end
 
---- Refreshes data.position from the live ped (skipped while dead or without a ped).
+--- Queues the given top-level character keys NOW (never yields): the queue coalesces per row, so money and
+--- every other change are durable within one flush instead of one autosave (§56.8 rule 3).
+local function persistChar(session, ...)
+    for i = 1, select('#', ...) do Store.markChar(session, (select(i, ...))) end
+    Store.flush({ session })
+end
+
+--- The same for account keys (setAccountData, setGroup).
+local function persistAccount(session, key)
+    Store.markAccount(session, key)
+    Store.flush({ session })
+end
+
+-- a stored position within these of the live ped is not rewritten (standing still writes nothing)
+local POSITION_EPSILON <const> = 0.05
+local HEADING_EPSILON <const> = 1.0
+
+--- Refreshes data.position from the live ped (skipped while dead or without a ped); marks it dirty only when
+--- the ped moved (the autosave writes it).
 local function refreshPosition(session)
     if session.deadSince then return end
     local ped = GetPlayerPed(session.src)
     if ped == 0 then return end
     local coords = GetEntityCoords(ped)
     if coords.x == 0.0 and coords.y == 0.0 and coords.z == 0.0 then return end
-    session.data.position = {
-        x = coords.x, y = coords.y, z = coords.z, heading = GetEntityHeading(ped) + 0.0,
-    }
+    local heading = GetEntityHeading(ped) + 0.0
+    local stored = session.data.position
+    if type(stored) == 'table' and type(stored.x) == 'number' and type(stored.y) == 'number'
+        and type(stored.z) == 'number' and math.abs(stored.x - coords.x) < POSITION_EPSILON
+        and math.abs(stored.y - coords.y) < POSITION_EPSILON and math.abs(stored.z - coords.z) < POSITION_EPSILON
+        and math.abs((tonumber(stored.heading) or 0.0) - heading) < HEADING_EPSILON then
+        return
+    end
+    session.data.position = { x = coords.x, y = coords.y, z = coords.z, heading = heading }
+    Store.markChar(session, 'position')
     touch(session)
 end
 
---- Adds the seconds elapsed since the last accounting tick to the character and account playtime.
+--- Adds the seconds elapsed since the last accounting tick to the character and account playtime and marks
+--- stats / last_played / playtime / last_seen dirty (nothing when no second passed).
 local function addPlaytime(session)
     local now = os.time()
     local elapsed = now - (session.playtimeAt or now)
-    if elapsed <= 0 then
-        session.playtimeAt = now
-        return
-    end
     session.playtimeAt = now
+    if elapsed <= 0 then return end
     local stats = session.data.stats
     if type(stats) ~= 'table' then
         stats = { deaths = 0, playtime = 0 }
@@ -187,94 +193,98 @@ local function addPlaytime(session)
     end
     stats.playtime = (stats.playtime or 0) + elapsed
     session.account.playtime = (session.account.playtime or 0) + elapsed
-    touch(session)
+    session.account.lastSeen = now
+    session.playedAt = now
+    Store.markChar(session, 'stats')
+    Store.markAccount(session, 'playtime')
+    Store.markAccount(session, 'lastSeen')
 end
 
---- Default character document for a brand new account (§4.2, §10 Config.Player.NewCharacter).
-local function newCharacterDoc(account)
-    local spawn = Config.Player.SpawnPoint
-    local defaults = Config.Player.NewCharacter or {}
-    return {
-        accountId = account.id,
-        name = account.name,
-        model = Config.Player.DefaultModel,
-        appearance = {},
-        position = {
-            x = spawn.coords.x, y = spawn.coords.y, z = spawn.coords.z, heading = spawn.heading + 0.0,
-        },
-        money = Utils.deepCopy(defaults.money or { cash = 0, bank = 0 }),
-        stats = { deaths = 0, playtime = 0 },
-        meta = {},
-    }
+local LOAD_FAILED_TEXT <const> = 'Your account could not be loaded right now. Please reconnect in a minute.'
+
+--- A read failed (or the load threw): the join is refused with a retry message — never a new row (§56.8 rule 4).
+local function refuseLoad(src, what, err)
+    Log.error('could not load the %s of [%d] (%s): join refused', what, src, tostring(err))
+    if GetPlayerName(src) ~= nil then DropPlayer(src, LOAD_FAILED_TEXT) end
+    return nil
 end
 
---- Finds or creates the account + character documents and builds the in-memory session. fresh = true for
---- a real join (the client should spawn), false when core restarted under a player already in the world.
-local function loadSession(src, fresh)
-    local existing = sessions[src]
-    if existing then return existing end
+-- [license] = releases of a session of that license WHILE a load of it runs. The load's { sync = true } reads only
+-- wait for writes queued BEFORE they started: a session saved and released while they ran is read again.
+local releaseGen = {}
+local MAX_READS <const> = 3
 
-    local license = identifierOf(src, 'license')
-    if not license then
-        DropPlayer(src, 'No license identifier.')
-        return nil
-    end
+--- Removes a session after queueing its final save; the playerDropped hook runs first, while the session is still
+--- loaded (the engine's drop and a takeover alike — every module forgets the src the same way).
+local function releaseSession(src, session)
+    refreshPosition(session)
+    addPlaytime(session)
+    Core.emitHook('playerDropped', src, session.charId)
+    Player.save(src)
+    -- only when this src still owns the character: a fast reconnect may have re-bound it already
+    if byCharId[session.charId] == src then byCharId[session.charId] = nil end
+    if byAccountId[session.accountId] == src then byAccountId[session.accountId] = nil end
+    sessions[src] = nil
+    loadCooldown[src] = nil
+    if loadingLicense[session.license] then releaseGen[session.license] = (releaseGen[session.license] or 0) + 1 end
+end
 
-    local db = Core.DB
+--- Unclean reconnect before the drop was noticed: the ghost session on the older src holds the newest state. It
+--- is released like a drop (its save QUEUED); the load then reads again with { sync = true }, which waits for it.
+local function releaseGhost(ghostSrc, src)
+    local ghost = sessions[ghostSrc]
+    Log.warn('character %s was still bound to [%d]; handing it to [%d]', tostring(ghost.charId), ghostSrc, src)
+    releaseSession(ghostSrc, ghost)
+end
+
+--- The live src bound to this account or character other than `src`, or nil.
+local function ghostOf(src, accountId, charId)
+    local other = byAccountId[accountId]
+    if other and other ~= src and sessions[other] then return other end
+    other = charId and byCharId[charId]
+    if other and other ~= src and sessions[other] then return other end
+    return nil
+end
+
+--- Reads (or creates) the rows and builds the in-memory session; nil when the join was refused. Yields. The reads
+--- repeat (with sync) while a session of this license was released meanwhile — a takeover included.
+local function buildSession(src, fresh, license, sync)
     local name = playerName(src)
-    local account = db.findOne('accounts', { license = license })
-    if not account then
-        local accountId = db.create('accounts', {
-            license = license, identifiers = collectIdentifiers(src), name = name, group = 'user',
-            firstSeen = os.time(), lastSeen = os.time(), playtime = 0, banned = false,
-        })
-        account = accountId and db.get('accounts', accountId)
+    local account, character
+    for attempt = 1, MAX_READS do
+        local generation = releaseGen[license]
+        local ok, a, b = Store.readRows(license, name, sync or attempt > 1)
+        if not ok then return refuseLoad(src, a, b) end
+        account, character = a, b
+        local ghostSrc = ghostOf(src, account.id, character and character.id)
+        if ghostSrc then releaseGhost(ghostSrc, src) end
+        if releaseGen[license] == generation then break end
+        if attempt == MAX_READS then return refuseLoad(src, 'account', 'released again while it loaded') end
     end
-    if not account then
-        Log.error('could not load or create an account for [%d] %s', src, name)
+    if character == false then
+        local err
+        character, err = Store.createCharacter(account.id, name)
+        if not character then return refuseLoad(src, 'character', err) end
+    end
+    if GetPlayerName(src) == nil then   -- left while the reads ran: no session, nothing stamped
+        Log.info('[%d] left while the session loaded', src)
         return nil
-    end
-    local function stampAccount(doc)
-        doc.name = name
-        doc.lastSeen = os.time()
-        doc.identifiers = collectIdentifiers(src)
-        return doc
-    end
-    stampAccount(account)
-
-    local character = db.findOne('characters', { accountId = account.id })
-    if not character then
-        local charId = db.create('characters', newCharacterDoc(account))
-        character = charId and db.get('characters', charId)
-    end
-    if not character then
-        Log.error('could not load or create a character for [%d] %s', src, name)
-        return nil
-    end
-
-    -- Unclean reconnect before the drop was noticed: the ghost session on the older src holds the newest
-    -- state, so save it, release it and re-read both documents (its next save / drop would clobber this one).
-    local ghostSrc = byCharId[character.id]
-    local ghost = ghostSrc and ghostSrc ~= src and sessions[ghostSrc] or nil
-    if ghost then
-        Log.warn('character %s was still bound to [%d]; handing it to [%d]', character.id, ghostSrc, src)
-        Player.save(ghostSrc)
-        sessions[ghostSrc] = nil
-        loadCooldown[ghostSrc] = nil
-        byCharId[ghost.charId] = nil
-        if byAccountId[ghost.accountId] == ghostSrc then byAccountId[ghost.accountId] = nil end
-        character = db.get('characters', character.id) or character
-        account = stampAccount(db.get('accounts', account.id) or account)
     end
 
     local now = os.time()
+    account.name, account.lastSeen, account.identifiers = name, now, collectIdentifiers(src)
     local session = {
         src = src, accountId = account.id, charId = character.id, license = license,
-        name = character.name or name, account = account, data = character,
-        dirty = true, loadedAt = now, playtimeAt = now, deadSince = nil,
+        name = (type(character.name) == 'string' and character.name ~= '') and character.name or name,
+        account = account, data = character, loadedAt = now, playtimeAt = now, deadSince = nil,
         fresh = fresh and true or false, answered = false,
         states = Utils.deepCopy(STATE_DEFAULTS),
     }
+    Store.initSession(session)
+    Store.markAccount(session, 'name')
+    Store.markAccount(session, 'lastSeen')
+    Store.flush({ session })
+    Store.saveIdentifiers(account.id, account.identifiers)
     sessions[src] = session
     byCharId[character.id] = src
     byAccountId[account.id] = src
@@ -283,58 +293,32 @@ local function loadSession(src, fresh)
     return session
 end
 
---- Reject text for a ban of either shape (§47 `expiresAt` or the pre-§47 `until`): reason, expiry, id.
-local function banNotice(ban)
-    local expiry = tonumber(ban.expiresAt or ban['until']) or 0
-    local head = expiry == 0 and 'You are permanently banned.'
-        or ('You are banned until %s.'):format(os.date('%Y-%m-%d %H:%M', math.floor(expiry)))
-    return ('%s Reason: %s%s'):format(head, Utils.sanitize(ban.reason or 'No reason given', 128),
-        ban.id ~= nil and (' (ban %s)'):format(tostring(ban.id)) or '')
-end
-
---- Fallback while Core.Bans is unavailable: an active, unrevoked ban on this license, either shape.
-local function legacyBan(license)
-    local now = os.time()
-    return Core.DB.findOne('bans', function(doc)
-        local expiry = tonumber(doc.expiresAt or doc['until']) or 0
-        if doc.revoked or (expiry ~= 0 and expiry <= now) then return false end
-        if doc.license == license then return true end
-        local ids = type(doc.identifiers) == 'table' and doc.identifiers or {}
-        for i = 1, #ids do if ids[i] == license then return true end end
-        return false
-    end)
-end
-
---- Setting `bans.failClosed` (§47, defined by server/bans.lua): default true = refuse while unreadable.
-local function failClosed()
-    local settings = Core.Settings
-    if type(settings) ~= 'table' or not Utils.isCallable(settings.get) then return true end
-    local ok, value = pcall(settings.get, 'bans.failClosed')
-    return not (ok and value == false)
-end
-
---- The ban blocking this connection and its reject text, or nil (§47). Core.Bans collects, checks and enriches;
---- when it is missing, throws or answers `nil, 'unavailable'` the license is looked up here, and when `bans`
---- cannot be read at all (degraded reads empty, it does not throw) bans.failClosed refuses the connection.
-local function connectingBan(src, license)
-    local bans = Core.Bans
-    if type(bans) == 'table' and Utils.isCallable(bans.checkConnecting) then
-        local ok, ban, notice = pcall(bans.checkConnecting, src)
-        if ok and ban then
-            if type(notice) == 'string' then return ban, notice end
-            return ban, type(ban) == 'table' and banNotice(ban) or 'You are banned from this server.'
-        end
-        if ok and notice ~= 'unavailable' then return nil end
-        Log.error('Core.Bans %s for [%d], using the license check', ok and 'unavailable' or tostring(ban), src)
+--- Finds or creates the account + character rows and builds the in-memory session. fresh = true for a real
+--- join (the client should spawn), false when core restarted under a player already in the world; sync = false
+--- only for the restore after `restart core` (it flushed once). Yields.
+local function loadSession(src, fresh, sync)
+    local existing = sessions[src]
+    if existing then return existing end
+    if loading[src] then return nil end
+    local license = identifierOf(src, 'license')
+    if not license then
+        DropPlayer(src, 'No license identifier.')
+        return nil
     end
-    local ok, ban = pcall(legacyBan, license)
-    if ok and ban then return ban, banNotice(ban) end
-    local isDegraded = Core.DB.isDegraded
-    if (not ok or (Utils.isCallable(isDegraded) and isDegraded('bans'))) and failClosed() then
-        Log.error('the ban list cannot be read: refusing [%d] (bans.failClosed)', src)
-        return true, 'Ban service unavailable, please try again in a minute.'
+    loading[src] = true   -- a second load of this src (a join racing the restore) returns at once
+    -- one load per license at a time: two quick joins of one account must never both create a character
+    local deadline = GetGameTimer() + LOAD_WAIT_MS
+    while loadingLicense[license] and GetGameTimer() < deadline do Wait(LOAD_POLL_MS) end
+    if sessions[src] or loadingLicense[license] then
+        loading[src] = nil
+        if sessions[src] then return sessions[src] end
+        return refuseLoad(src, 'account', 'another load of this license is running')
     end
-    return nil
+    loadingLicense[license] = src
+    local ok, session = pcall(buildSession, src, fresh, license, sync ~= false)
+    loading[src], loadingLicense[license], releaseGen[license] = nil, nil, nil
+    if not ok then return refuseLoad(src, 'session', session) end
+    return session
 end
 
 AddEventHandler('playerConnecting', function(_, _, deferrals)
@@ -348,7 +332,7 @@ AddEventHandler('playerConnecting', function(_, _, deferrals)
         return deferrals.done('No license identifier — restart FiveM and reconnect.')
     end
 
-    local ban, notice = connectingBan(src, license)
+    local ban, notice = Store.connectingBan(src, license)
     if ban then return deferrals.done(notice) end
     deferrals.done()
 end)
@@ -362,15 +346,18 @@ AddEventHandler('playerDropped', function()
     local src = source
     loadCooldown[src] = nil
     local session = sessions[src]
-    if not session then return end
-    refreshPosition(session)
-    addPlaytime(session)
-    Core.emitHook('playerDropped', src, session.charId)
-    Player.save(src)
-    -- only when this src still owns the character: a fast reconnect may have re-bound it already
-    if byCharId[session.charId] == src then byCharId[session.charId] = nil end
-    if byAccountId[session.accountId] == src then byAccountId[session.accountId] = nil end
-    sessions[src] = nil
+    if session then releaseSession(src, session) end
+end)
+
+-- core_db dropped a queued write of core's (§56.3.5, `key` = the row key): the session re-sends that row next save
+Core.on('dbWriteFailed', function(owner, _, tbl, _, key)
+    if owner ~= Core.name then return end
+    local src
+    if tbl == 'characters' then src = byCharId[key]
+    elseif tbl == 'accounts' then src = byAccountId[key]
+    elseif tbl == 'character_money' and type(key) == 'table' then src = byCharId[key.character_id] end
+    local session = src and sessions[src]
+    if session then Store.writeFailed(session, tbl, key) end
 end)
 
 -- == API (DESIGN §4.2) — every function returns nil/false without a loaded session ==========================
@@ -398,15 +385,22 @@ function Player.getData(src, path)
     return type(value) == 'table' and Utils.deepCopy(value) or value
 end
 
+-- the stored identity of the character (DESIGN §56.6: read-only columns) — setData never rewrites them
+local READ_ONLY_KEYS <const> = { id = true, accountId = true, createdAt = true, updatedAt = true }
+
+--- Sets a dot path of the character and QUEUES its top-level key at once (a column, the money rows, or the
+--- plugin `data` map; `faction` is session-only). Never yields.
 function Player.setData(src, path, value)
     local session = sessions[src]
     if not session then return false end
+    local top = type(path) == 'string' and path:match('^[^%.]+') or nil
+    if not top or READ_ONLY_KEYS[top] then return false end
     local node, key = resolvePath(session.data, path, true)
     if not node or key == nil then return false end
-    if type(value) == 'table' then value = Utils.jsonSafe(value) end
+    value = Utils.jsonSafe(value)   -- every value (a vector3 too): what is stored is what JSON can carry
     node[key] = value
     touch(session)
-    local top = path:match('^[^%.]+')
+    persistChar(session, top)
     if top == 'name' and type(session.data.name) == 'string' then session.name = session.data.name end
     if REPLICATED[top] then replicate(src, top) end
     local changed = session.data[top]
@@ -415,21 +409,33 @@ function Player.setData(src, path, value)
     return true
 end
 
+--- One chunk of sessions: playtime accounted, then everything dirty queued in table order (§56.8 rule 6).
+--- The playerSaved hook fires for every session that wrote something. Never yields.
+local function saveSessions(list, srcs)
+    for i = 1, #list do addPlaytime(list[i]) end
+    local wrote = Store.flush(list)
+    for i = 1, #list do
+        if wrote[i] then Core.emitHook('playerSaved', srcs[i]) end
+    end
+end
+
+--- Queues the session's dirty state (never yields: safe in onResourceStop). True for a live session.
 function Player.save(src)
     local session = sessions[src]
     if not session then return false end
-    addPlaytime(session)
-    Core.DB.set('characters', session.charId, session.data)
-    Core.DB.set('accounts', session.accountId, session.account)
-    session.dirty = false
-    Core.emitHook('playerSaved', src)
+    saveSessions({ session }, { src })
     return true
 end
 
+--- Every session, position included (core's stop, txAdmin's shutdown). Queued, never yields; internal (export-blocked).
 function Player.saveAll()
-    local count = 0
-    for src in pairs(sessions) do if Player.save(src) then count = count + 1 end end
-    return count
+    local list, srcs = {}, {}
+    for src, session in pairs(sessions) do
+        refreshPosition(session)
+        list[#list + 1], srcs[#srcs + 1] = session, src
+    end
+    saveSessions(list, srcs)
+    return #list
 end
 
 function Player.getPlayers()
@@ -516,6 +522,7 @@ function Player.setCoords(src, coords, heading, opts)
     local dir = Utils.isNumber(heading) and heading + 0.0 or (stored.heading or 0.0) + 0.0
     session.data.position = { x = target.x, y = target.y, z = target.z, heading = dir }
     touch(session)
+    persistChar(session, 'position')
     local flags = nil   -- only sent when something differs from the plain faded teleport
     if vehicle ~= 0 or opts.fade == false then
         flags = { withVehicle = vehicle ~= 0, fade = opts.fade ~= false }
@@ -538,6 +545,7 @@ function Player.setModel(src, model, appearance)
     session.data.model = model
     if type(appearance) == 'table' then session.data.appearance = Utils.jsonSafe(appearance) end
     touch(session)
+    persistChar(session, 'model', 'appearance')
     TriggerClientEvent('core:client:setModel', src, model, session.data.appearance or {})
     -- the hook setData emits (§22): a plugin mirroring the look (inventory clothing) learns of a creator save
     Core.emitHook('playerDataChanged', src, 'model', model)
@@ -572,9 +580,7 @@ function Player.setGroup(src, group)
     end
     session.account.group = group
     touch(session)
-    if not Core.DB.update('accounts', session.accountId, { group = group }) then
-        Log.warn('could not persist the group change for [%d]', src)
-    end
+    persistAccount(session, 'group')   -- queued patch of accounts.perm_group
     replicate(src, 'group')
     Log.audit('player', src, 'group set to %s', group)
     Core.emitHook('permsChanged', src, 'group')   -- staff sets and rights caches refresh on it (§44, §51)
@@ -602,22 +608,30 @@ function Player.setReplicated(src, key, value)
     return true
 end
 
---- Writes one field of the live account document and persists it (§22); 'group' goes through setGroup.
+--- Writes one field of the live account and QUEUES it (§22): 'group' goes through setGroup, `permissions`,
+--- `tempPermissions`, `banned`, `name` (…) are columns, any other key lands in `accounts.data`.
 function Player.setAccountData(src, key, value)
     local session = sessions[src]
     if not session then return false end
     if not Utils.isString(key, 64) then return false end
     if key == 'group' then return Player.setGroup(src, value) end
-    -- engine-sourced (loadSession stamps them; getters.lua indexes them for findAccountsByIdentifier)
-    if key == 'id' or key == 'license' or key == 'identifiers' then return false end
-    if type(value) == 'table' then value = Utils.jsonSafe(value) end
+    -- engine-sourced (loadSession stamps them into account_identifiers) or the row's own identity
+    if Store.ACCOUNT_RESERVED[key] then return false end
+    value = Utils.jsonSafe(value)
     session.account[key] = value
     touch(session)
-    if not Core.DB.update('accounts', session.accountId, { [key] = value }) then
-        Log.warn('could not persist the account field %s for [%d]', key, src)
-    end
+    persistAccount(session, key)
     if key == 'permissions' or key == 'tempPermissions' then Core.emitHook('permsChanged', src, 'grants') end
     return true
+end
+
+--- The live account's raw `key` (a deep copy), nil without a session. Never yields: Core.Perms reads the account
+--- grants through it on a permission check (§48 notes). Internal — blocked in server/api.lua's export list.
+function Player.getAccountData(src, key)
+    local session = sessions[src]
+    if not session or type(key) ~= 'string' then return nil end
+    local value = session.account[key]
+    return type(value) == 'table' and Utils.deepCopy(value) or value
 end
 
 --- One targeted core:client:playerState event carrying only the field that changed (§17).
@@ -663,13 +677,18 @@ function Player.getAccount(src)
     return session and accountView(session.account) or nil
 end
 
---- The same view by account id: the live document while its player is online, else the stored one.
+--- The same view by account id: the live session while its player is online, else the stored row (one awaited
+--- query with the identifiers — it yields). nil for an unknown id and on a read error (logged).
 function Player.getAccountById(accountId)
     if not (Utils.isString(accountId, 64) or math.type(accountId) == 'integer') then return nil end
     local session = byAccountId[accountId] and sessions[byAccountId[accountId]]
     if session then return accountView(session.account) end
-    local doc = Core.DB.get('accounts', accountId)
-    return type(doc) == 'table' and accountView(doc) or nil
+    local account, err = Store.readAccount(accountId)
+    if account == nil then
+        Log.warn('Player.getAccountById(%s): the account cannot be read (%s)', tostring(accountId), tostring(err))
+        return nil
+    end
+    return account and accountView(account) or nil
 end
 
 function Player.setHealth(src, hp)
@@ -705,22 +724,15 @@ function Player.ban(src, reason, seconds, by)
         -- §47: Bans.add collects identifiers + tokens, flags the account, audits and drops the player
         local ok, ban, err = pcall(bans.add, { target = src, reason = text, duration = duration, by = by })
         if ok and ban then return true end
-        Log.warn('Player.ban: Bans.add refused [%d]: %s', src, tostring(ok and err or ban))
+        Log.warn('Player.ban: Bans.add refused [%d]: %s — kicked instead', src, tostring(ok and err or ban))
+        Player.kick(src, text)   -- the offence must not go on while the ban could not be recorded
         return false
     end
-    -- pre-§47 fallback (no server/bans.lua): the license-only record the connect path reads back
-    local license = Player.getLicense(src) or identifierOf(src, 'license')
-    if not license then return false end
-    local expiry = duration > 0 and os.time() + duration or 0
-    if type(by) == 'number' then by = by == 0 and 'console' or Player.getName(by) or tostring(by) end
-    local id = Core.DB.create('bans', {
-        license = license, reason = text, by = Utils.sanitize(by or 'console', 64), ['until'] = expiry,
-    })
-    local session = sessions[src]
-    if session then session.account.banned = true; touch(session); Player.save(src) end
-    Log.audit('player', src, 'banned %s: %s', expiry == 0 and 'permanently' or ('for %d s'):format(duration), text)
-    DropPlayer(src, banNotice({ id = id, reason = text, ['until'] = expiry }))
-    return true
+    -- no Core.Bans (server/bans.lua did not load): nothing can record the ban (there is no legacy ban row any
+    -- more, DESIGN §56.8) — the player is kicked so the offence does not continue, and false says no ban exists
+    Log.error('Player.ban: Core.Bans is not loaded, [%d] is only kicked (reason: %s)', src, text)
+    Player.kick(src, text)
+    return false
 end
 
 function Player.notify(src, message, kind, duration)
@@ -747,12 +759,13 @@ function Player.respawn(src, coords, heading)
     return true
 end
 
---- Builds the session for an already-connected player (core restart; DESIGN §4.2 step 2).
-function Player.loadSession(src)
-    return loadSession(src, false) ~= nil
+--- Builds the session for an already-connected player (core restart; DESIGN §4.2 step 2). Yields (two reads);
+--- server/main.lua calls it once the migrations applied, with sync = false after its one Core.DB.flush().
+function Player.loadSession(src, sync)
+    return loadSession(src, false, sync) ~= nil
 end
 
---- Loads a session for every connected player that has none yet (called by server/main.lua).
+--- Loads a session for every connected player that has none yet (yields; internal like loadSession).
 function Player.loadAllConnected()
     local players = GetPlayers()
     for i = 1, #players do
@@ -832,6 +845,7 @@ Net.on('core:server:died', {}, function(src)
     end
     stats.deaths = (stats.deaths or 0) + 1
     touch(session)
+    persistChar(session, 'stats')
     replicate(src, 'dead')
     Core.emitHook('playerDied', src)
 end, { cooldown = 2000, requireLoaded = true })
@@ -849,27 +863,30 @@ end, { cooldown = 1000, requireLoaded = true })
 local AUTOSAVE_CHUNK <const> = 25
 local AUTOSAVE_CHUNK_MS <const> = 250
 
---- One autosave pass (position + playtime, then the dirty sessions). It yields between chunks, so the srcs are
---- snapshotted first and a session that left meanwhile is skipped (playerDropped saved it).
+--- One autosave pass: per chunk, position and playtime of every session, then ONE queued pass over the chunk
+--- (characters, money rows, accounts — §56.8 rule 6). It yields between chunks, so the srcs are snapshotted
+--- first and a session that left meanwhile is skipped (playerDropped saved it).
 local function autosaveTick()
     local order, count = {}, 0
     for src in pairs(sessions) do count = count + 1; order[count] = src end
-    for i = 1, count do
-        if i > 1 and (i - 1) % AUTOSAVE_CHUNK == 0 then
+    for first = 1, count, AUTOSAVE_CHUNK do
+        if first > 1 then
             Wait(AUTOSAVE_CHUNK_MS)
             if not autosaveRunning then return end
         end
-        local src = order[i]
-        local session = sessions[src]
-        if session then
-            refreshPosition(session)
-            addPlaytime(session)
-            if session.dirty then Player.save(src) end
+        local list, srcs = {}, {}
+        for i = first, math.min(count, first + AUTOSAVE_CHUNK - 1) do
+            local session = sessions[order[i]]
+            if session then
+                refreshPosition(session)
+                list[#list + 1], srcs[#srcs + 1] = session, order[i]
+            end
         end
+        saveSessions(list, srcs)
     end
 end
 
---- Starts the autosave thread (idempotent; server/main.lua calls this on start).
+--- Starts the autosave thread (idempotent; server/main.lua calls it once the migrations applied).
 function Player.startAutosave()
     if autosaveRunning then return end
     autosaveRunning = true
@@ -887,12 +904,7 @@ function Player.stopAutosave()
     autosaveRunning = false
 end
 
-AddEventHandler('onResourceStart', function(resource)
-    if resource ~= Core.name then return end
-    Player.loadAllConnected()
-    Player.startAutosave()
-end)
-
+-- start-up (session restore + autosave) is server/main.lua's, after Core.DB.awaitMigrations (§56.1)
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= Core.name then return end
     autosaveRunning = false -- synchronous only; server/main.lua owns the final saveAll (§4.9)

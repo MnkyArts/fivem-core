@@ -144,7 +144,8 @@ do
     stubs.loadImport(env)
     stubs.loadFile(env, 'shared/config.lua')
     for _, file in ipairs({ 'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua',
-        'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/buckets.lua', 'server/player.lua' }) do
+        'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/buckets.lua', 'server/player_store.lua',
+        'server/player.lua' }) do
         if stubs.readFile(stubs.root .. '/' .. file) then stubs.loadFile(env, file) end
     end
     local Core = env.Core

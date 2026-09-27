@@ -973,8 +973,9 @@ function X.onBucket(e)
     return follow(pr, pr.node, false, true) == true
 end
 
---- Core stops (RV4 F5 / F6, RV6 F13): every live clone's pose + bucket goes into its node — persisted and flushed —
---- before the pre-stop hooks run and the clones are deleted (the store's own stop writer has run already).
+--- Core stops (RV4 F5 / F6, RV6 F13): every live clone's pose + bucket goes into its node — persisted (queued: the
+--- store's writes never yield; core_db commits them after core is gone, §56.1) — before the pre-stop hooks run and
+--- the clones are deleted (the store's own stop writer has run already).
 function X.followAll()
     for _, pr in pairs(P) do
         local node, e = pr.node, pr.entity
@@ -989,7 +990,6 @@ function X.followAll()
         end
     end
     local ok, err = pcall(store.flush)
-    if ok then ok, err = pcall(Core.DB.flush) end
     if not ok then Log.error('scene: the stop flush failed: %s', tostring(err)) end
 end
 

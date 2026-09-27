@@ -1,10 +1,12 @@
 fx_version 'cerulean'
 game 'gta5'
-node_version '22'   -- server-side Node runtime for server/db_pg.js (DESIGN §33); FXServer ships 16 (default) and 22
 -- Direct native functions for core's own Lua, client and server (DESIGN §30.4): a native call skips the
 -- generated Lua wrapper and the generic invoke context. UNDER EVALUATION (PLAN.md N8) — remove this one
 -- line, `refresh`, `restart core` to go back; core's Lua is written to behave the same either way.
 use_experimental_fxv2_oal 'yes'
+
+-- DESIGN §56: the relational database runs in its own resource; `ensure core` starts it first
+dependency 'core_db'
 
 author 'MnkyArts'
 description 'Framework core: shared APIs (player, money, factions, vehicles, interactions, markers, UI) for GTA-Online-style RP servers'
@@ -29,9 +31,11 @@ client_scripts {
 }
 
 server_scripts {
-    'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/db_pg.js', 'server/db_pg.lua',
+    'server/api.lua', 'shared/hooks.lua', 'server/db.lua',
     'server/audit.lua', 'server/bans_identity.lua', 'server/bans.lua',
-    'server/notify.lua', 'server/perms.lua', 'server/buckets.lua', 'server/player.lua', 'server/playergrid.lua',
+    -- server/player_store.lua hands its table to server/player.lua (one-shot global): keep them adjacent
+    'server/notify.lua', 'server/perms.lua', 'server/buckets.lua', 'server/player_store.lua', 'server/player.lua',
+    'server/playergrid.lua',
     'server/money.lua', 'server/factions.lua', 'server/vehicles.lua', 'server/vehicles_park.lua', 'server/vehicles_fleet.lua',
     'server/getters.lua', 'server/globals.lua', 'server/settings.lua', 'server/adminapi.lua', 'server/adminapi_dispatch.lua', 'server/services.lua', 'server/worldsync.lua', 'server/doors.lua',
     'server/environment.lua', 'server/cron.lua',

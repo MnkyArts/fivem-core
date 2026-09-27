@@ -4,8 +4,12 @@
 --- changes (DESIGN §8 budget: ~1 write every TimeScale-scaled minute, not once per tick).
 --- Weather is GlobalState['core:weather']; per-player overrides are targeted events instead of
 --- global state, so one player's fog never touches anybody else's bag.
---- The clock, the weather and the cycle position are persisted in DB document 'world'/'state',
---- so a core restart resumes the world instead of snapping back to Config.World.StartTime.
+--- The clock, the weather and the cycle position are persisted in the row `world_state` id 1 (DESIGN §56.6),
+--- so a core restart resumes the world instead of snapping back to Config.World.StartTime. The row is read ONCE at
+--- start (awaited, in onResourceStart); writes are queued saves (never yield): at once for every explicit change
+--- (setTime, freezeTime, setWeather) and every weather-cycle step, at most once per real minute for the running
+--- clock, and once more when core stops. A READ ERROR at start runs the config defaults and never writes the row
+--- until a background re-read works (the stored world is then adopted) or an explicit change is made (it wins).
 --- No GTA natives here: GetGameTimer (shared) for the tick delta, os.* is server-only and unused.
 
 local Log = Core.Log
@@ -18,8 +22,9 @@ local MAX_TRANSITION <const> = 300.0
 local TICK_MS <const> = 1000
 local MAX_SRC <const> = 4096
 local SECONDS_PER_DAY <const> = 86400
-local DOC_COLLECTION <const> = 'world'   -- persisted world state (DESIGN §4.1 document store)
-local DOC_ID <const> = 'state'
+local TABLE <const> = 'world_state'      -- one row, id = 1 (DESIGN §56.6)
+local SAVE_EVERY_MS <const> = 60000      -- the running clock: one queued save per real minute at most
+local RETRY_MS <const> = 15000           -- re-read of a row that could not be read at start
 
 --- Weather types are a closed set (Config.World.Weathers, DESIGN §28): a client only ever
 --- receives a string that was in this table, so no arbitrary string reaches the natives.
@@ -46,6 +51,10 @@ local lastMinute = -1           -- last published h * 60 + m
 local cycleIndex = 0            -- Config.World.WeatherCycle position
 local cycleMinutesLeft = 0      -- in-game minutes until the next cycle entry
 local running = false
+local persistBlocked = false    -- the row could not be READ at start: never overwrite it blindly
+local explicitChanges = 0       -- counts setTime / freezeTime / setWeather (an explicit change beats a late read)
+local changedDuringRead = nil   -- { time?, frozen?, weather? } while the start read is out (nil otherwise)
+local lastSaveAt = 0            -- GetGameTimer() of the last queued save
 
 --- h, m, s for the current `daySeconds` (integers, always in range).
 local function timeParts()
@@ -71,31 +80,33 @@ local function toTransition(value, fallback)
     return value + 0.0
 end
 
---- The whole world state in one small document (collection 'world', id 'state'), rewritten on
---- every publish. DB.set only touches memory + a dirty flag; server/db.lua's own 5 s timer does
---- the KVP write. Without this, every core restart snaps the clock back to Config.World.StartTime
---- and replays the weather cycle from its first entry.
+--- The whole world state as one queued save of the row (never yields; the queue coalesces a burst). Skipped while
+--- the row could not be read: a blind write would replace the stored world with the defaults.
 local function persistState()
-    local db = rawget(Core, 'DB')
-    if type(db) ~= 'table' or type(db.set) ~= 'function' then return end
-    local ok, err = pcall(db.set, DOC_COLLECTION, DOC_ID, {
-        id = DOC_ID,
-        daySeconds = math.floor(daySeconds),
+    -- while the start read is out nothing is written either: the read waits for the queue (`sync`) and would read
+    -- back the defaults instead of the stored world
+    if persistBlocked or changedDuringRead then return end
+    lastSaveAt = GetGameTimer()
+    local ok, err = Core.DB.save(TABLE, {
+        id = 1,
+        day_seconds = math.floor(daySeconds) % SECONDS_PER_DAY,
         weather = weather,
         frozen = frozen,
-        cycleIndex = cycleIndex,
-        cycleMinutesLeft = cycleMinutesLeft,
+        cycle_index = math.floor(cycleIndex),
+        cycle_minutes_left = math.max(0, math.floor(cycleMinutesLeft)),
     })
-    if not ok then Log.debug('World: could not persist the world state (%s)', tostring(err)) end
+    if not ok then Log.warn('World: could not queue the world state (%s)', tostring(err)) end
 end
 
---- The persisted document, or nil when there is none (first boot, DB unavailable, bad shape).
-local function loadState()
-    local db = rawget(Core, 'DB')
-    if type(db) ~= 'table' or type(db.get) ~= 'function' then return nil end
-    local ok, doc = pcall(db.get, DOC_COLLECTION, DOC_ID)
-    if not ok or type(doc) ~= 'table' then return nil end
-    return doc
+--- setTime / freezeTime / setWeather: the caller's world is the truth now, even over a row that could not be read.
+--- `field` = 'time' | 'frozen' | 'weather': during the start read only that field is kept over the stored row.
+local function explicitChange(field)
+    explicitChanges = explicitChanges + 1
+    if changedDuringRead then changedDuringRead[field] = true end
+    if persistBlocked then
+        persistBlocked = false
+        Log.info('World: an explicit change replaces the world state that could not be read')
+    end
 end
 
 --- Write GlobalState['core:time'] and fire the timeChanged hook. Called on a minute change,
@@ -104,14 +115,12 @@ local function publishTime()
     local h, m, s = timeParts()
     GlobalState['core:time'] = { h = h, m = m, s = s, frozen = frozen }
     lastMinute = h * 60 + m
-    persistState()
     Core.emitHook('timeChanged', h, m)
 end
 
 --- Write GlobalState['core:weather'] and fire the weatherChanged hook.
 local function publishWeather()
     GlobalState['core:weather'] = { type = weather, transition = weatherTransition }
-    persistState()
     Core.emitHook('weatherChanged', weather)
 end
 
@@ -139,7 +148,9 @@ function World.setTime(hour, minute, second)
         return false
     end
     daySeconds = h * 3600 + m * 60 + s
+    explicitChange('time')
     publishTime()
+    persistState()
     return true
 end
 
@@ -156,7 +167,9 @@ function World.freezeTime(value)
         return false
     end
     frozen = value
+    explicitChange('frozen')
     publishTime()
+    persistState()
     return true
 end
 
@@ -168,15 +181,22 @@ end
 -- Weather
 --------------------------------------------------------------------------------
 
+--- The weather change itself (the cycle uses it too; only World.setWeather counts as an explicit change).
+local function applyWeather(weatherType, transitionSec)
+    weather = weatherType
+    weatherTransition = toTransition(transitionSec, DEFAULT_TRANSITION)
+    publishWeather()
+end
+
 --- Global weather change; `weatherType` must be one of Config.World.Weathers.
 function World.setWeather(weatherType, transitionSec)
     if type(weatherType) ~= 'string' or not WEATHERS[weatherType] then
         Log.error('World.setWeather: unknown weather %s', tostring(weatherType))
         return false
     end
-    weather = weatherType
-    weatherTransition = toTransition(transitionSec, DEFAULT_TRANSITION)
-    publishWeather()
+    explicitChange('weather')
+    applyWeather(weatherType, transitionSec)
+    persistState()
     return true
 end
 
@@ -341,7 +361,7 @@ local function nextCycleEntry()
         local entry = cycle[cycleIndex]
         if type(entry) == 'table' and type(entry.type) == 'string' and WEATHERS[entry.type] then
             cycleMinutesLeft = math.max(1, math.floor(tonumber(entry.minutes) or 60))
-            World.setWeather(entry.type, toTransition(entry.transition, DEFAULT_TRANSITION))
+            applyWeather(entry.type, toTransition(entry.transition, DEFAULT_TRANSITION))
             return true
         end
     end
@@ -351,10 +371,12 @@ end
 
 --- `minutes` = in-game minutes since the last publish: the cycle runs on world time, so a
 --- 60-minute entry lasts one in-game hour (2 real minutes at the default TimeScale of 30).
+--- True when the cycle moved on to its next entry.
 local function tickWeatherCycle(minutes)
-    if cycleMinutesLeft <= 0 then return end
+    if cycleMinutesLeft <= 0 then return false end
     cycleMinutesLeft = cycleMinutesLeft - minutes
-    if cycleMinutesLeft <= 0 then nextCycleEntry() end
+    if cycleMinutesLeft <= 0 then return nextCycleEntry() end
+    return false
 end
 
 --- Resume the weather cycle where the last run left off. False when there is no cycle or the
@@ -362,7 +384,7 @@ end
 local function restoreCycle(stored)
     local cycle = worldCfg.WeatherCycle
     if type(cycle) ~= 'table' or #cycle == 0 then return false end
-    local index, left = tonumber(stored.cycleIndex), tonumber(stored.cycleMinutesLeft)
+    local index, left = tonumber(stored.cycle_index), tonumber(stored.cycle_minutes_left)
     if not index or not left or index % 1 ~= 0 or index < 1 or index > #cycle or left <= 0 then
         return false
     end
@@ -390,17 +412,65 @@ local function startClock()
                     -- whole day's worth of minutes: only a small forward step counts as elapsed.
                     local delta = minute - lastMinute
                     local advanced = (delta > 0 and delta < 60) and delta or 1
-                    -- cycle first, publish second: publishTime persists the world state, and it
-                    -- must carry the cycle counter of THIS minute, not the previous one.
-                    tickWeatherCycle(advanced)
+                    -- cycle first, then the save: it must carry the cycle counter of THIS minute. A cycle step
+                    -- is saved at once, the running clock once per SAVE_EVERY_MS (a crash loses at most that).
+                    local cycled = tickWeatherCycle(advanced)
                     publishTime()
+                    if cycled or GetGameTimer() - lastSaveAt >= SAVE_EVERY_MS then persistState() end
                 end
             end
         end
     end)
 end
 
--- Boot: the persisted state wins, the config is the fallback for whatever it does not carry.
+--- The stored row over the current state (time, frozen, weather, cycle position). True when the cycle resumed.
+local function adopt(stored)
+    local seconds = tonumber(stored.day_seconds)
+    if seconds and seconds >= 0 and seconds < SECONDS_PER_DAY then
+        daySeconds = math.floor(seconds)
+        frozen = stored.frozen == true
+    end
+    if type(stored.weather) == 'string' and WEATHERS[stored.weather] then
+        weather = stored.weather
+        return restoreCycle(stored)
+    end
+    return false
+end
+
+--- A row that could not be read at start is read again in the background until it answers (the stored world is
+--- adopted then) or an explicit change made it moot. Nothing is written meanwhile.
+local function retryRead()
+    -- one thread per failed start read; it ends with the first answer or an explicit change
+    -- fxlint-disable-next-line P004
+    CreateThread(function()
+        while running and persistBlocked do
+            Wait(RETRY_MS)
+            if not (running and persistBlocked) then return end
+            local before = explicitChanges
+            local row, err = Core.DB.first(TABLE, { id = 1 }, { sync = true })
+            if not persistBlocked or explicitChanges ~= before then return end
+            if row ~= nil or err == nil then
+                persistBlocked = false
+                if row then
+                    adopt(row)
+                    weatherTransition = DEFAULT_TRANSITION
+                    publishTime()
+                    publishWeather()
+                end
+                persistState()
+                Log.info('World: the world state could be read again%s', row and ' and was adopted' or '')
+                return
+            end
+            Log.warn('World: the world state still cannot be read (%s)', tostring(err))
+        end
+    end)
+end
+
+local booted = false
+
+-- Boot: the stored row wins, the config is the fallback for whatever it does not carry. The read yields (the
+-- handler runs in its own thread): a field changed explicitly meanwhile (time / freeze / weather) is re-applied
+-- over the adopted row, the rest (clock, cycle position) still comes from it.
 AddEventHandler('onResourceStart', function(resource)
     if resource ~= Core.name then return end
     local startTime = type(worldCfg.StartTime) == 'table' and worldCfg.StartTime or nil
@@ -412,29 +482,38 @@ AddEventHandler('onResourceStart', function(resource)
     frozen = false
     weatherTransition = 0.0     -- first publish: players join straight into the current weather
 
-    local stored, resumed = loadState(), false
-    if stored then
-        local seconds = tonumber(stored.daySeconds)
-        if seconds and seconds >= 0 and seconds < SECONDS_PER_DAY then
-            daySeconds = math.floor(seconds)
-            frozen = stored.frozen == true
-        end
-        if type(stored.weather) == 'string' and WEATHERS[stored.weather] then
-            weather = stored.weather
-            resumed = restoreCycle(stored)
-        end
+    changedDuringRead = {}
+    local row, err = Core.DB.first(TABLE, { id = 1 }, { sync = true })
+    local changed = changedDuringRead
+    changedDuringRead = nil
+    local resumed = false
+    if row then
+        local kept = { daySeconds = daySeconds, frozen = frozen, weather = weather, transition = weatherTransition }
+        resumed = adopt(row)
+        if changed.time then daySeconds = kept.daySeconds end
+        if changed.frozen then frozen = kept.frozen end
+        if changed.weather then weather, weatherTransition = kept.weather, kept.transition end
+    elseif err ~= nil and next(changed) == nil then
+        persistBlocked = true
+        Log.error('World: the world state could not be read (%s) — running the config defaults; the stored row '
+            .. 'is kept until it can be read or the world is changed explicitly', tostring(err))
     end
     publishTime()
     publishWeather()
     if not resumed then
         nextCycleEntry()        -- fresh start; a no-op when no cycle is configured (manual weather)
     end
+    booted = true
+    persistState()              -- the resumed (or first) world; skipped while the row could not be read
     startClock()
+    if persistBlocked then retryRead() end     -- after startClock: it runs while `running`
 end)
 
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= Core.name then return end
     running = false             -- synchronous: the clock thread exits on its next wake
+    -- the clock since the last save: queued, core_db commits it after core is gone (§56.1)
+    if booted then persistState() end
 end)
 
 -- end of file

@@ -2,19 +2,26 @@
     core/tests/scene_server_harness.lua — the harness of tests/scene_server_tests.lua (Core.Scene server,
     DESIGN §55.3/§55.4/§55.12/§55.14/§55.18). Not a suite: `local H = dofile(here .. '/scene_server_harness.lua')`.
 
-    A core server VM with the real api, hooks, db (KVP), the real shared/scene_codec.lua + shared/scene_motion.lua +
-    lib/clock, and the real server/scene_kinds.lua → scene_store.lua → scene.lua. R.index / R.interest / R.flush
-    are recording fakes (INTERFACES §4): every call lands in H.log in order; the fake index also keeps a working cell
-    map (roots by tier and pose) so cellsNear / nodesIn answer like the real one. Core.Perms and Core.Player are
-    stand-ins driven by H.perms / H.unloaded; R.interest.allows answers H.allows[src].
+    A core server VM with the real api, hooks, db (core's migrations; Core.DB = the lib over the Postgres test
+    bridge, DESIGN §56.10.2), the real shared/scene_codec.lua + shared/scene_motion.lua + lib/clock, and the real
+    server/scene_kinds.lua → scene_store.lua → scene.lua. R.index / R.interest / R.flush are recording fakes
+    (INTERFACES §4): every call lands in H.log in order; the fake index also keeps a working cell map (roots by tier
+    and pose) so cellsNear / nodesIn answer like the real one. Core.Perms and Core.Player are stand-ins driven by
+    H.perms / H.unloaded; R.interest.allows answers H.allows[src].
+
+    The stored side (§55.18 / §56.6) through SQL: H.row(id) (the raw scene_nodes row), H.doc(id) (its doc with the
+    columns folded in — what the old document store held), H.counter() / H.setCounter(v) (core_counters
+    'scene_nodes'), H.putRow(row) (a hand-made row), H.recordDb(env) + H.writeCount(log, id) (the core_db export
+    calls of a VM and the queued writes per node), H.xmin(id) (the row version: changes with every committed write).
 ]]
 
 local here = (arg and arg[0] or 'tests/scene_server_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
 -- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test stubs
 local stubs = dofile(here .. '/stubs.lua')
 
-local H = { stubs = stubs, name = 'scene server', passed = 0, failed = 0, log = {}, perms = {}, unloaded = {},
-    allows = {} }
+local bridge = stubs.bridge
+local H = { stubs = stubs, bridge = bridge, name = 'scene server', passed = 0, failed = 0, log = {}, perms = {},
+    unloaded = {}, allows = {} }
 
 function H.check(cond, label)
     if cond then H.passed = H.passed + 1 else H.failed = H.failed + 1; print(('FAIL  [%s] %s'):format(H.name,
@@ -158,13 +165,15 @@ local function fakeFlush()
         stats = function() return { flushMsP50 = 1.5, flushMsP99 = 4, bytesPerSecond = 1234 } end }
 end
 
---- A core server VM with the scene server files loaded. opts = { keepKvp (a restart over the same KVP store),
---- maps (load server/maps_types.lua: the §52 model validator), config = fn(Config) before the scene files }.
+--- A core server VM with the scene server files loaded. opts = { keepDb (a restart over the same database; the old
+--- name keepKvp still works), maps (load server/maps_types.lua: the §52 model validator), config = fn(Config) before
+--- the scene files, beforeStore = fn(env, Core, R), noStart (no tick after onResourceStart: the store's start thread
+--- has not run — nothing is loaded yet) }.
 function H.newServer(opts)
     opts = opts or {}
     stubs.newWorld()
     stubs.clear()
-    if not opts.keepKvp then stubs.resetServer() end
+    if not (opts.keepDb or opts.keepKvp) then stubs.resetServer() end
     stubs.tick(1000)
     H.log, H.perms, H.unloaded, H.allows = {}, {}, {}, {}
     local env = stubs.newEnv('server', 'core')
@@ -191,8 +200,89 @@ function H.newServer(opts)
     stubs.loadFile(env, 'server/scene_store.lua')
     stubs.loadFile(env, 'server/scene.lua')
     env.TriggerEvent('onResourceStart', 'core')
-    stubs.tick(0)
+    if not opts.noStart then stubs.tick(0) end
     return env, Core, R
+end
+
+--------------------------------------------------------------------------------
+-- the stored side (§55.18 / §56.6): scene_nodes rows and the core_counters row, read and written through SQL
+--------------------------------------------------------------------------------
+
+local ROW_SQL <const> = 'SELECT id, kind, owner, parent, bucket, doc FROM scene_nodes WHERE id = $1'
+
+local function sql(text, params)
+    local rows, err = bridge.sql(text, params)
+    if not rows then error('scene harness: ' .. tostring(err), 2) end
+    return rows
+end
+H.sql = sql
+
+--- The raw scene_nodes row of node `id` ({ id, kind, owner, parent?, bucket, doc }) or nil.
+function H.row(id) return sql(ROW_SQL, { id })[1] end
+
+--- The stored document of node `id` the way the old document store held it: doc + the columns, or nil.
+function H.doc(id)
+    local r = H.row(id)
+    if not r then return nil end
+    local d = {}
+    for k, v in pairs(type(r.doc) == 'table' and r.doc or {}) do d[k] = v end
+    d.id, d.kind, d.owner, d.parent, d.bucket = r.id, r.kind, r.owner, r.parent, r.bucket
+    return d
+end
+
+--- The row version (xmin): it changes with every committed write of the row; nil without a row.
+function H.xmin(id)
+    local r = sql('SELECT xmin::text AS x FROM scene_nodes WHERE id = $1', { id })[1]
+    return r and r.x
+end
+
+function H.counter()
+    local r = sql("SELECT value FROM core_counters WHERE name = 'scene_nodes'")[1]
+    return r and r.value
+end
+
+function H.setCounter(value)
+    sql("INSERT INTO core_counters (name, value) VALUES ('scene_nodes', $1) "
+        .. 'ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value', { value })
+end
+
+--- A hand-made row (legacy / fixture): { id, kind, owner, parent? (nil = NULL), bucket? (0), doc }.
+function H.putRow(row)
+    sql('INSERT INTO scene_nodes (id, kind, owner, parent, bucket, doc) '
+        .. 'VALUES ($1, $2, $3, NULLIF($4, 0), $5, $6::jsonb)',
+        { row.id, row.kind, row.owner, row.parent or 0, row.bucket or 0, stubs.json.encode(row.doc or {}) })
+end
+
+--- Records every core_db export call `env` makes from now on: the returned log gets { fn, args } per call.
+function H.recordDb(env)
+    local inner, log = rawget(env.exports, 'core_db'), {}
+    rawset(env.exports, 'core_db', setmetatable({ synchronous = true }, { __index = function(t, name)
+        local f = inner[name]
+        if type(f) ~= 'function' then return f end
+        local wrapped = function(_, ...)
+            log[#log + 1] = { fn = name, args = table.pack(...) }
+            return f(inner, ...)
+        end
+        rawset(t, name, wrapped)
+        return wrapped
+    end }))
+    return log
+end
+
+--- Queued writes in a recorded log: of node `id` (save + remove entries on scene_nodes) or, for id 'counter', of
+--- the core_counters row.
+function H.writeCount(log, id)
+    local n = 0
+    for _, c in ipairs(log) do
+        for _, e in ipairs(c.fn == 'enqueue' and type(c.args[1]) == 'table' and c.args[1] or {}) do
+            if id == 'counter' then
+                if e.table == 'core_counters' then n = n + 1 end
+            elseif e.table == 'scene_nodes' and ((e.t == 'save' and e.row and e.row.id == id) or e.key == id) then
+                n = n + 1
+            end
+        end
+    end
+    return n
 end
 
 --- A recording stand-in for phase C's R.promote: beforeChange / refuses / onInteract / ours / stats.

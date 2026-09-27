@@ -14,8 +14,8 @@ reads input and asks.
 `DESIGN.md` next to this file is the binding contract; this README is its front door and every `§` points into it.
 
 **Still not in core, deliberately** — write these as plugins: inventory/items, jobs, character creator,
-garages, housing, voice, radial menu, nametags. (Wave 2 added needs, chat, time/weather, doors, weapons,
-Discord webhooks and a MySQL adapter — see "Wave 2 APIs".)
+garages, housing, voice, radial menu, nametags. (Wave 2 added needs, chat, time/weather, doors, weapons and
+Discord webhooks — see "Wave 2 APIs".)
 
 ## Install
 
@@ -38,9 +38,9 @@ set sv_stateBagStrictMode true                    # only the server may write st
 ```
 
 `core` calls `exports.spawnmanager:setAutoSpawn(false)` on start and spawns the player itself from the character
-document, so leaving `basic-gamemode` on means two spawns fighting. `spawnmanager` itself stays loaded.
+row, so leaving `basic-gamemode` on means two spawns fighting. `spawnmanager` itself stays loaded.
 `Core.Perms.has` checks `IsPlayerAceAllowed` first and falls back to the account/character grants and the
-player's group (collection `perm_groups`, seeded once from `Config.Perms.Groups/Weights/Inherits`: `user`, `helper`,
+player's group (table `perm_groups`, seeded once from `Config.Perms.Groups/Weights/Inherits`: `user`, `helper`,
 `mod`, `admin`, `senior`, `owner`), so `/setgroup <player> admin` also works without an ACE line.
 Every bag key core uses is written server-side and only read on the client (§8), so strict mode costs nothing
 and stops a client forging `cash`, `faction` or a vehicle's `locked`.
@@ -66,7 +66,6 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 | `Config.Chat.Format` | `nil` | optional custom format, e.g. `'{tag}{name}: {msg}'`; unset preserves separate name/message styling |
 | `Config.World.TimeScale` | `30` | game seconds per real second — `30` is a 48-minute day, `1` is real time, `0` freezes the clock |
 | `Config.Locale` | `'en'` | `'de'` ships too; adds `<resource>/locales/<lang>.json` lookups for `Core.Locale.t` (§26) |
-| `Config.DB.Adapter` | `'kvp'` | `'postgres'` is the production backend (setup under "Where data lives"); `'mysql'` switches to the oxmysql adapter — **untested**, see "DB tools" below |
 | `Config.Vehicles.AutoPark` · `.AutoParkIdleMs` · `.AutoParkRadius` · `.AutoParkSweepMs` | `true` · `30000` · `50` · `10000` | a persisted car that stands still with nobody inside and nobody of its bucket within the radius for the idle time is **parked**: it becomes a `Core.Scene` node (no networked entity) until someone gets in or damages it (DESIGN §4.6 notes). `false` parks nothing on its own — only an explicit `Core.Vehicles.park` does |
 | `Config.Vehicles.MaxParked` | `20000` | the most parked cars at once; past it the longest-unused one that is not promoted is garaged (its node removed, `stored = true`) and the hook `vehicleAutoStored (vehId, 'max_parked')` fires |
 | `Config.Interiors.Enabled` | `true` | master switch for the §36 IPL loader (`false` loads nothing — only for debugging map issues) |
@@ -81,7 +80,7 @@ The admin-platform keys (§41–§53, 2026-09-26):
 
 | key | default | why you would change it |
 |---|---|---|
-| `Config.Perms.Groups` · `.Weights` · `.Inherits` | six groups, weights `user 0` `helper 100` `mod 200` `admin 300` `senior 400` `owner 1000`, each inheriting the one below | only the **seed** of the `perm_groups` collection (§44): read into an empty collection on the first start; afterwards edit groups with `Core.Perms.saveGroup` (the admin panel), not here |
+| `Config.Perms.Groups` · `.Weights` · `.Inherits` | six groups, weights `user 0` `helper 100` `mod 200` `admin 300` `senior 400` `owner 1000`, each inheriting the one below | only the **seed** of the `perm_groups` table (§44): read into an empty table on the first start; afterwards edit groups with `Core.Perms.saveGroup` (the admin panel), not here |
 | `Config.Admin.RequireDuty` | `true` | admin actions, pages and tabs need the actor on duty (`Core.Admin.setDuty`); an action may override it with `duty = false` |
 | `Config.Admin.Scope` | `{ helper = 1, mod = 5, admin = 50, senior = 200, owner = 2000 }` | the most players one admin action may target, per group (1 for unlisted groups; the console has no cap) |
 | `Config.Admin.StaffPerm` | `'core.admin.staff'` | who counts as staff (may go on duty, gets echoes and the admin snapshot, uses the full §49 selector grammar) |
@@ -132,17 +131,24 @@ TypeScript is pinned to `^5.9.3` in `core/ui/package.json` on purpose — a bare
 TS 7, which `vue-tsc` 3.3.x cannot load. `npm run typecheck` in `core/ui` (or in a plugin's `ui/`) runs
 `vue-tsc --noEmit`.
 
-### Where data lives
+### Database (Core.DB, DESIGN §56)
 
-Collections (`accounts`, `characters`, `factions`, `vehicles`, `bans`, `audit`, `settings`, `perm_groups`, `maps`,
-`map_elements`, `map_versions`, `map_journal`) live in `Core.DB` — an in-memory document store backed by the server's KVP file, flushed every 5 s and on stop, so no database is needed to run.
-`Core.DB.setAdapter({ loadAll, put, remove, flush })` is the seam for MySQL/Redis; nothing else changes (§4.1).
+Every table (`accounts`, `characters`, `character_money`, `factions`, `faction_members`, `vehicles`, `bans` +
+its link tables, `audit_log`, `settings`, `globals`, `perm_groups`, `doors`, `world_state`, `maps` +
+`map_elements`/`map_versions`/`map_journal`, `scene_nodes`, `core_counters`) lives in Postgres, behind a
+separate resource, **`core_db`**: connection pool, write-behind queue, migration runner and catalog-validated
+table helpers (JS/Node 22, bundled `pg`). Postgres is required — there is no KVP or MySQL fallback and no
+in-memory document store any more.
 
-#### Postgres
+`core`'s manifest declares `dependency 'core_db'`, so `ensure core` starts `core_db` first — nothing extra to
+`ensure` yourself; it just needs to sit next to `core` in `[local]`. `Core.DB` is a server-only **lib**
+(`lib/db/server.lua`, compiled into every VM by `import.lua`): every resource calls `core_db` directly, one
+export hop, no load on core's VM for a plugin's own queries.
 
-The recommended production backend (§33). Every document lands in one `core_documents` table
-(`collection`, `id`, `data jsonb`, `updated_at`), written through on each change; KVP stays the
-zero-setup default, so none of this is needed to run core.
+`core_db` **survives `restart core` and every plugin restart** — a stopping resource's final writes are
+queued synchronously and committed after it is gone, so a `restart core` loses nothing. **Never `restart
+core_db` on a live server**: that stops `core` and every plugin in the same tick, and the queue's last flush
+dies with `core_db`'s Node environment. Restart `core` instead — `core_db` keeps running underneath it.
 
 ```bash
 docker run -d --name core-postgres --restart unless-stopped -e POSTGRES_USER=core -e POSTGRES_PASSWORD=<choose> -e POSTGRES_DB=core -p 127.0.0.1:5432:5432 -v core-pgdata:/var/lib/postgresql/data postgres:16-alpine
@@ -153,31 +159,86 @@ exec core_pg.cfg   # in server.cfg; core_pg.cfg holds one line and never leaves 
 set core_pg_url "postgres://core:<password>@127.0.0.1:5432/core"
 ```
 
-Nothing to install on the server: the `pg` driver is bundled into `server/db_pg.js` (committed). Only when you
-change `server/pg/index.js` or upgrade the driver, rebuild it from the UI toolchain:
+Nothing to install on the server: `pg` is bundled into the committed `core_db/dist/core_db.js`. Only when you
+change `core_db/src/*.js` or upgrade the driver, rebuild it:
 
 ```bash
-cd resources/core/ui && npm run build:server   # esbuild → server/db_pg.js (first line: fxlint-disable-file)
+cd resources && npm run build -w core_db-build   # esbuild → core_db/dist/core_db.js
 ```
 
-Do not put a `package.json` or `node_modules` into the resource folder: FXServer's Node sandbox refuses to read
+Do not put a `package.json` or `node_modules` into a resource folder: FXServer's Node sandbox refuses to read
 modules behind the symlinked resource path, and the server's `yarn` builder would run on every start.
 
-Migrating an existing KVP server, in this order (§33.4):
+**Convars** (read once at `core_db` start; `core_pg_url` is the only required one):
 
-1. on the running server: `/dbexport` — writes `data/export-<timestamp>.json`
-2. load it straight into Postgres, outside the server: `CORE_PG_URL="postgres://…" node scripts/pg-import.js data/export-<timestamp>.json --replace`
-3. set `Config.DB.Adapter = 'postgres'` in `shared/config.lua`, then `refresh` and `restart core` — every session
-   (players who are online included) reloads from Postgres and finds its data already there
-4. verify: `docker exec core-postgres psql -U core -d core -c "SELECT collection, count(*) FROM core_documents GROUP BY 1"`
+| convar | default | meaning |
+|---|---|---|
+| `core_pg_url` | — (required) | the Postgres URL; a secret, never logged. Empty → one error line, every call answers `unavailable` |
+| `core_db_pool_size` | `10` | max connections of the main pool (the queue's flush and the migration runner share their own 2-connection system pool) |
+| `core_db_flush_ms` | `250` | write-behind queue flush interval (≥ 50 ms outside test mode) |
+| `core_db_statement_timeout_ms` | `10000` | per-statement timeout (migrations run with `SET LOCAL statement_timeout = 0`) |
+| `core_db_lock_timeout_ms` | half the statement timeout, ≤ 5000 | how long a flush waits for a row/table lock before it retries later |
+| `core_db_migration_lock_timeout_ms` | `30000` | the same, inside a migration |
+| `core_db_tx_per_owner` | `4` | open transactions/streams per resource before one more answers `tx_limit` |
+| `core_db_slow_ms` | `250` | slow-query log threshold (`slow query <ms> ms (<owner>): <first 160 chars>`) |
 
-Order matters: `/dbimport … replace` from the console also works, but only while **no player is connected** —
-a session that loaded from the empty database before the import is autosaved over the imported rows.
+**Status:** `/dbstatus` (console) prints health, pool, queue counters and applied migrations per owner.
+`Core.on('dbStatus', function(healthy, reason) … end)` fires on every health flip (a connection-class
+failure and its recovery); `Core.on('dbWriteFailed', function(owner, kind, table, err, key) … end)` fires once
+per dropped queued write.
 
-`server/db_pg.js` owns the pool (max 4, 10 s statement timeout) and refuses every resource but core;
-`server/db_pg.lua` is the adapter. An empty `core_pg_url` logs one error line and leaves core on KVP, and a
-backend that stops answering degrades the affected collection (empty reads, refused writes) instead of
-overwriting it. `CORE_PG_URL="…" node tests/pg_smoke.js` round-trips a document through a real server.
+**Backups:** `pg_dump -Fc`, restored with `pg_restore`:
+
+```bash
+docker exec core-postgres pg_dump -U core -Fc core > backup.dump
+pg_restore -d core -U core --clean backup.dump
+```
+
+`/dbexport` and `/dbimport` are gone — there is no document store left to export.
+
+**Legacy data:** core's own migrations import the pre-§56 document store once (`sql/0002_core_legacy_import.sql`)
+and rename the old `core_documents` table to **`legacy_documents`**; nothing writes it again. It stays around
+so a plugin that has not migrated its own collections yet still finds them. Once every plugin has migrated and
+the data was checked in game, drop it by hand: `DROP TABLE legacy_documents;`.
+
+#### Persisting data from a plugin (§56.9)
+
+```
+my_plugin/sql/0001_init.sql        -- CREATE TABLE my_plugin_things (...); indexes; FKs; triggers
+my_plugin/server/db.lua            -- the FIRST server file, at file scope:
+                                    --   Core.DB.migrate({ 'sql/0001_init.sql' })
+my_plugin/server/main.lua          -- Core.onReady(function()
+                                    --     local rows = Core.DB.select('my_plugin_things', { character_id = charId })
+                                    --     Core.DB.save('my_plugin_things', { id = id, character_id = charId, data = t })
+                                    -- end)
+```
+
+- Keep `sql/` out of `files {}` — clients never need it. Migration files are **immutable once applied**: a
+  schema change is always a new numbered file, never an edit of an old one.
+- Two classes of call: **awaited** (`query single scalar execute batch transaction stream nextId flush` and the
+  table helpers `insert insertMany select first count update delete upsert`) yield and must run in a coroutine
+  (a thread, an event handler, a command, a callback, `Core.onReady`'s body) — they answer `result` or `nil,
+  err` (a failed read is never mistaken for an empty one). **Queued** (`save patch remove append enqueue`) and
+  `migrate` never yield, are safe at file scope and in `onResourceStop`, and answer `true` or `false, err`;
+  their write lands within one flush interval (default 250 ms), coalesced with any other pending write of the
+  same row.
+- Rule of thumb: hot per-player/per-entity state → `save`/`patch` (they coalesce into bulk statements); logs
+  and histories → `append`; a rare action whose caller needs the row or the id it got → awaited
+  `insert`/`upsert`/`transaction`.
+- `Core.on('dbStatus', fn(healthy, reason))` and `Core.on('dbWriteFailed', fn(owner, kind, table, err, key))`
+  are the two local hooks — react to a degraded database or a dropped write instead of assuming every queued
+  write landed.
+- `templates/plugin` ships a worked `sql/0001_init.sql` with the `Core.DB.migrate` line already in its first
+  server file — copy its shape for a new table.
+
+#### In-game checklist (database — not run yet)
+
+77. **Survives a restart:** as a character, change your cash and walk somewhere, then `restart core` while
+    online → after the reload your money and your position are exactly what they were (no rollback to the
+    last autosave), and `Core.on('dbStatus')` never fired `healthy = false` during the restart.
+78. **`/dbstatus` is healthy:** from the console, `/dbstatus` reports `healthy = true`, a sane pool and queue
+    (no growing `pending`/`dropped`), and every owner's migrations `state = 'applied'` — `core`'s own two
+    (`sql/0001_core_schema.sql`, `sql/0002_core_legacy_import.sql`) included.
 
 ## Writing a plugin
 
@@ -383,7 +444,7 @@ network time (±5–20 ms)
 
 | namespace | functions |
 |---|---|
-| `Core.DB` §4.1 | `create(coll, doc)` `get` `set` `update(coll, id, partial)` `delete` `find(coll, match)` `findOne` `all` `count` `flush()` `setAdapter(a)` |
+| `Core.DB` §56 | server-only lib, no export hop. Awaited (yield, coroutine only): `query single scalar execute batch transaction stream nextId flush awaitMigrations status` + table helpers `insert insertMany select first count update delete upsert`. Queued (never yield, safe at file scope): `save patch remove append enqueue` + `migrate(list)`. Plus `isHealthy() NULL op(name, v, v2) json(v) errorCode(err)` |
 | `Core.Player` §4.2 | `isLoaded(src)` `getInfo` `getData(src, path)` `setData(src, path, v)` `save` `saveAll` `getPlayers` `forEach` `count` |
 | | `getSrcByCharId` `getName` `getLicense` `getPed` `getCoords` `setCoords(src, coords, heading?, { withVehicle?, fade?, bucket?, moveRiders? })` `setModel` `setBucket` `getBucket` |
 | | `getAccount(src)` `getAccountById(id)` — read-only account view (§48) · `getGroup(src)` · `findAccountsByIdentifier(identifier)` (the §47 index) · `getStates(src)` — sticky frozen/invincible/visible/controls · `resolveTargets(actor, selector, opts?)` (§49) |
@@ -1375,25 +1436,25 @@ Core.Locale.t('greeting', { name = 'Liam' })   -- your locales/en.json first, th
 itself, so a missing translation degrades instead of erroring; `setLanguage`, `has`, `getLanguage` and
 `all` round it out. List `'locales/*.json'` in your `files {}` and use `{{var}}`, not `%s`.
 
-### DB tools (§22, §27)
+### DB tools (§56)
+
+`Core.DB` is documented in full under "Database (Core.DB, DESIGN §56)" above — table helpers, raw SQL, queued
+writes and migrations. Quick reference for counters and schema changes:
 
 | function | purpose |
 |---|---|
-| `Core.DB.nextId(name) -> integer` | a persistent counter, for human-readable ids |
-| `Core.DB.migrate(collection, version, fn(doc) -> doc)` | register at start; runs once per collection, documents carry `_v` |
-| `Core.DB.export(path?) -> path` · `import(path, mode = 'merge'\|'replace') -> count` | JSON under `core/data/` |
+| `Core.DB.nextId(name) -> integer \| nil, err` | atomic counter (`core_counters`), for human-readable ids. Awaited |
+| `Core.DB.migrate(list)` | queued, never yields; register `{ 'sql/000n_x.sql', ... }` at file scope in your first server file |
 
-`Config.DB.Adapter = 'mysql'` swaps the KVP store for `server/db_mysql.lua` (oxmysql, table
-`core_documents`), falling back to KVP with an error line when oxmysql is not started. **That adapter has
-never run against a real database** — it follows oxmysql's documented `query_async`/`execute` shape and is
-untested. Verify the export names against the version you deploy, and take a `/dbexport` before switching.
+There is no MySQL adapter and no document export/import any more (§56.5.6): back up with `pg_dump` instead
+(see "Database" above).
 
 ### New commands
 
 | command | perm | what it does |
 |---|---|---|
 | `/weapon <player> <WEAPON_NAME> [ammo]` · `/weapons clear <player>` | `core.admin` | give a weapon (persisted in the loadout) · wipe a loadout — staff commands (duty, audit, ranks; registered by `server/admin.lua`) |
-| `/dbexport` · `/dbimport <file> [replace]` | console only | writes `data/export-<timestamp>.json` · reads one back; `replace` wipes each collection first |
+| `/dbstatus` | console only | `core_db` health, pool, queue counters and applied migrations per owner (§56) |
 | `/uiplugins` · `/uidev <res> <origin\|off>` · `/uiinspect` | client; the last two need `Config.UI.Dev.Enabled` | the UI platform's diagnostics — see "Knowing whether a plugin is up" |
 
 ### Tooling (§27)
@@ -1522,6 +1583,9 @@ Read the server side with `fxserver logs --errors --resource <name>`, the client
 | `was built for core UI API n, this core provides m` | the plugin and core disagree on `API_VERSION`: rebuild the plugin against this core's `@core/ui`, or update core |
 | the cursor is stuck | `ESC` posts `ui_close`; a 500 ms watchdog also drops focus when nothing is open, and `restart core` always releases it. A page whose plugin failed or whose component crashed is closed by the shell for exactly this reason |
 | everything vanished after `restart core` | registrations that were not inside `Core.onReady` — only `onReady` is replayed on a core restart |
+| `Core.DB.*` answers `nil, 'unavailable'` / `false, 'unavailable'` | `core_db` is not started or the connection dropped — check `/dbstatus` and `core_pg_url` in `core_pg.cfg`; never `restart core_db` to fix it, `restart core` instead (§56) |
+| `Core.DB.*` answers `nil, 'not_in_coroutine'` | an awaited call ran at file scope or outside a coroutine — move it into `Core.onReady`, a handler, a command or a callback |
+| `Core.DB.migrate` never finishes / `migrations_failed: <why>` | a bad migration file for that resource; fix the SQL and call `Core.DB.migrate` again — `/dbstatus` shows the stuck owner and its state |
 
 For anything inside the CEF itself, open **NUI DevTools**: the `nui_devtools` console command, or
 `http://localhost:13172` in a browser on the same machine. That is where a cross-origin `import()` failure,
@@ -1779,7 +1843,7 @@ Core.Settings.onChange('shop.', function(key, new, old) end)    -- after persist
 with an actor the property's `edit` permission (default `core.admin`) is required, and every change is audited
 (`settings.set`). `list(viewerSrc?)` is what the admin panel's Settings page shows (filtered by `view`, default
 `core.settings.view`; secrets masked). `replicate = true` keys reach clients: `Core.Settings.get(key)` there, and
-the client hook `settingChanged (key, new, old)`. Overrides live in the `settings` collection and survive the owner
+the client hook `settingChanged (key, new, old)`. Overrides live in the `settings` table and survive the owner
 stopping. Core defines `maps.limits.*` + `maps.journalMax` + `maps.journalMaxOps`, `audit.retentionDays` +
 `audit.maxRows` + `audit.logMaxRows` and `bans.tokenMatches` + `bans.enrichTokens` + `bans.enrichIdentifiers` +
 `bans.failClosed` itself.
@@ -1806,8 +1870,8 @@ Core.Audit.record({ actor = src, action = 'shop.refund', source = 'api', targets
 local page = Core.Audit.query({ actionPrefix = 'ban.', limit = 50 })   -- { rows, next }; pass next as `before`
 ```
 
-Append-only, newest first (collection `audit`, a lean in-memory index — no scan per query). `record` never yields
-and never throws; `actor` is a src, `0` (console) or `'system'`, a bare number in `targets` is a player src. Filters:
+Append-only, newest first (table `audit_log`, a lean in-memory index — no scan per query). `record` is queued
+(§56): never yields, never throws; `actor` is a src, `0` (console) or `'system'`, a bare number in `targets` is a player src. Filters:
 `action`, `actionPrefix`, `actorAccount`, `target = { type, id }` (a player's rows are also found by `{ type =
 'account', id }`), `resource`, `result`, `from`/`to`, `text`, `limit` (≤ 200), `before`. A filter key that is present
 but unusable matches nothing. Every `Core.Log.audit` line also lands here as `core.<category>`. Retention: settings
@@ -1822,7 +1886,7 @@ The view permission `core.audit.view` is the consumer's check.
 permanent), by = src|0, evidence?, source? }) -> ban, err` collects the online player's identifiers AND hardware
 tokens, flags the account, audits `ban.add` and kicks — the target and every other online player the ban would
 refuse. A player `by` must outrank every account holding a banned identifier and every such online player (else
-`nil, 'rank'`). `remove(banId, by, reason)` revokes (the document stays),
+`nil, 'rank'`). `remove(banId, by, reason)` revokes (the row stays, for history),
 `get`, `list({ active?, text?, accountId?, limit?, before? })`, `check(identifiers, tokens)`, `forAccount(id)`,
 `sweep()`. `Core.Player.ban` delegates to it. Ban ids are `B<n>`; the reject text reads "You are banned until …
 Reason: … (ban B12)".

@@ -1185,8 +1185,8 @@ do
     check(PM.get(id) == nil and node.bucket == 5 and node.pos.x == -800.0 and info and info.bucket == 5,
         'he walks off: demoted IN bucket 5, where the car stands (RV6 F13)')
     stubs.tick(1100)
-    local doc = Core.DB.get('scene_nodes', 'n' .. id)
-    check(doc and doc.bucket == 5 and doc.pos and doc.pos.x == -800.0, 'persisted in bucket 5')
+    local doc = H.doc(id)
+    check(doc and doc.bucket == 5 and doc.pos and doc.pos.x == -800.0, 'persisted in bucket 5 (the bucket column)')
     local id2, n2 = vehicle(Core, R, at(0, 40), { persist = true })
     Scene.promote(id2)
     local e2 = clone(R, id2)
@@ -1200,9 +1200,9 @@ do
     env.TriggerEvent('onResourceStop', 'core')
     check(seen and seen.bucket == 9 and seen.x == P0.x + 50,
         "core stop: the pre-stop hooks see the clone's pose + bucket")
-    local doc2 = Core.DB.get('scene_nodes', 'n' .. id2)
+    local doc2 = H.doc(id2)
     check(doc2 and doc2.bucket == 9 and doc2.pos and doc2.pos.x == P0.x + 50,
-        'and it is persisted (R.store.flush + Core.DB.flush after the store\'s own stop writer)')
+        'and it is persisted (R.store.flush queues it after the store\'s own stop writer; nothing yields)')
 end
 
 --------------------------------------------------------------------------------

@@ -117,23 +117,32 @@ function Registry.getOwned(owner)
     return byOwner[owner]
 end
 
--- Not reachable through the export: core's own plumbing. A plugin replacing a remover, the DB adapter or
--- the session/autosave machinery would take the whole server down with it when it stops.
+-- Not reachable through the export: core's own plumbing. A plugin replacing a remover or the session/autosave
+-- machinery would take the whole server down with it when it stops.
 -- PlayerGrid (§22.1) is core's own spatial index; plugins reach it through Player.getInRange/getClosest.
 -- MapsRuntime is the internal table the four server/maps*.lua files share (activation, apply, journal).
 -- BanIdentity (§47) is the bans module's internal identity/account resolution helper (server/bans_identity.lua).
+-- DB (§56.1): Core.DB is a LIB that runs in every VM against core_db, which takes the INVOKING resource as the
+-- owner of each call — reached through this export it would run inside core's VM and act as core, so the
+-- whole namespace is refused (import.lua never forwards a DB call either).
 local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true, UIForms = true,
-    MapsRuntime = true, BanIdentity = true, SceneRuntime = true, SceneCodec = true, SceneMotion = true }
+    MapsRuntime = true, BanIdentity = true, SceneRuntime = true, SceneCodec = true, SceneMotion = true,
+    DB = true }
 local INTERNAL_FUNCTIONS <const> = {
-    ['DB.setAdapter'] = true,
     ['Player.loadSession'] = true,
     ['Player.loadAllConnected'] = true,
     ['Player.startAutosave'] = true,
-    ['Player.stopAutosave'] = true, ['DB.markDegraded'] = true,
+    ['Player.stopAutosave'] = true,
+    -- §56: one pass over EVERY session in one tick (core's stop / shutdown path) — never a plugin's to trigger
+    ['Player.saveAll'] = true,
+    -- §48 notes: the raw live account (license, grants, other plugins' account keys) is Core.Perms' read path only
+    ['Player.getAccountData'] = true,
     -- §47: the playerConnecting path only — it enriches the matching ban and counts a hit
     ['Bans.checkConnecting'] = true,
     -- §55.6: the teleport prefetch is Player.setCoords' own (it subscribes a destination window for any src)
     ['Scene.prefetch'] = true,
+    -- §45/§56: whether the stored overrides are in memory — server/audit.lua's prune guard, not a plugin API
+    ['Settings.isLoaded'] = true,
 }
 
 --- Look up an API function. Dotted sub-names ('menu.open') are stored flat on the namespace (§2.2);

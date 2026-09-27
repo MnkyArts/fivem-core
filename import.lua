@@ -30,8 +30,12 @@ local LIB_MODULES <const> = {
     Utils = 'utils', Math = 'math', Validate = 'validate', Log = 'log', Callback = 'callback',
     Net = 'net', Commands = 'commands', Keys = 'keys', Streaming = 'streaming', Anim = 'anim',
     Player = 'player', UI = 'ui', Locale = 'locale', Audio = 'audio', Geometry = 'geometry',
-    Schema = 'schema', Clock = 'clock', Scene = 'scene',
+    Schema = 'schema', Clock = 'clock', Scene = 'scene', DB = 'db',
 }
+
+-- Libs that exist on the SERVER only and own every name (DESIGN §56.1): absent (nil) on the client,
+-- and never given the export proxy, so no Core.DB.* call is ever forwarded to core.
+local SERVER_ONLY_LIBS <const> = { DB = true }
 
 -- the one nesting level the proxy understands: Core.UI.menu.open -> call('UI', 'menu.open')
 local SUB_NAMESPACES <const> = {
@@ -182,7 +186,9 @@ local function createLib(name, dir)
     loadingLibs[name] = nil
     if not ok then error(err, 0) end
     rawset(Core, name, ns)
-    if not isCore then
+    if SERVER_ONLY_LIBS[name] then
+        return ns                  -- the lib is the whole namespace: no proxy fallback (DESIGN §56.1)
+    elseif not isCore then
         attachProxy(ns, name) -- adds the Core.Player(src) __call on the server as well
     elseif isServer and name == 'Player' and getmetatable(ns) == nil then
         setmetatable(ns, { __call = playerHandle })
@@ -231,7 +237,10 @@ setmetatable(Core, {
         if type(key) ~= 'string' then return nil end
         if key == 'Config' then return resolveConfig() end
         local dir = LIB_MODULES[key]
-        if dir then return createLib(key, dir) end
+        if dir then
+            if SERVER_ONLY_LIBS[key] and not isServer then return nil end
+            return createLib(key, dir)
+        end
         -- inside core the module files assign the real tables; a missing API stays nil
         -- so a typo fails loudly at call time instead of hopping through an export.
         if isCore or not key:find('^%u') then return nil end

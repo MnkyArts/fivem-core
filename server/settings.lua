@@ -15,10 +15,14 @@
     'settings'); their definitions go when the owner stops, their overrides stay in the DB and apply
     again on the next define. Watchers are owner-tracked too (kind 'settingsWatch').
 
-    Storage: collection `settings`, one document per OVERRIDE, doc id = the key with '.' -> ':' (Core.DB
-    ids refuse dots), `{ key, value, updatedAt, by }`. Loaded once, behind the same async barrier as
-    server/globals.lua (§22): the load yields on postgres/mysql and every caller arriving meanwhile
-    waits on it. `get`/`set` therefore belong in a thread, a handler or an export call — as always.
+    Storage: table `settings` (§56.6), one row per OVERRIDE: `key` (dotted), `value` jsonb (any JSON value,
+    `false` and tables included), `updated_by` jsonb (the `by` table), `updated_at`. Loaded once with ONE
+    select, behind the same barrier as server/globals.lua (§22): the load yields and every caller arriving
+    meanwhile waits on it; a failed load (driven by the DB error) leaves `get` on config/default and makes
+    `set`/`reset` answer 'unavailable' until a retry (≥ 10 s later) succeeds. `set` is an awaited upsert and
+    `reset` an awaited delete (the caller learns 'persist' when the write failed; memory changes only after
+    the write committed; writes of one key never overlap). `get`/`set` therefore belong in a thread, a
+    handler or an export call — as always.
 
     Replication: `replicate = true` keys are mirrored to GlobalState['cs:<key>'] and the sorted key list
     to GlobalState['cs:keys'] (the client's seed, client/settings.lua). Writes go through one paced
@@ -35,8 +39,9 @@ local Log = Core.Log
 local Utils = Core.Utils
 local Schema = Core.Schema
 local Registry = Core.Registry
+local DB = Core.DB
 
-local COLLECTION <const> = 'settings'
+local TABLE <const> = 'settings'
 local KIND <const> = 'settings'
 local WATCH_KIND <const> = 'settingsWatch'
 local STATE_PREFIX <const> = 'cs:'
@@ -46,7 +51,7 @@ local DEFAULT_VIEW <const> = 'core.settings.view'
 local MASK <const> = '••••'
 local ID_PATTERN <const> = '^[%a_][%w_]*$'
 local ID_MAX <const> = 32
-local KEY_MAX <const> = 64                   -- also the Core.DB document id limit
+local KEY_MAX <const> = 64
 local PERM_PATTERN <const> = '^[%w_%.%-:]+$'
 local PERM_MAX <const> = 64
 local MAX_PROPERTIES <const> = 128
@@ -69,8 +74,13 @@ local nextWatch = 0
 local running = {}       -- [key] = { [owner] = depth }: onChange handlers in flight (recursion guard)
 
 local loaded = false
-local loading            -- the promise the first loader parks while Core.DB.all is out
+local loading            -- the promise the first loader parks while the select is out
 local failedAt = nil     -- os.time() of the last failed load (retry throttle)
+local served = false     -- a value was answered (get/inspect/list) before the overrides loaded
+local retrying = false   -- the retry thread is waiting (after a failed load)
+local stopped = false    -- core is stopping: the retry thread ends
+local writing = {}       -- [key] = promise while a set/reset of that key is being written
+local late = {}          -- snapshot / afterLoad / scheduleRetry: defined below the loader that calls them
 
 local publishQueue = {}  -- [key] = true: the drain writes the CURRENT effective value
 local published = {}     -- [key] = { value } last value written to GlobalState
@@ -108,10 +118,6 @@ local function toActor(v)
     return math.tointeger(v)
 end
 
-local function docId(key)
-    return (key:gsub('%.', ':'))
-end
-
 local function copy(v)
     if type(v) == 'table' then return Utils.deepCopy(v) end
     return v
@@ -139,37 +145,60 @@ end
 -- Overrides: load once (async barrier, DESIGN §22) and resolve
 --------------------------------------------------------------------------------
 
---- Loads every stored override. Returns true once they are in memory. A failed read (degraded
---- collection) leaves `loaded` false — get() then answers config/default, set() refuses — and is
---- retried at most every LOAD_RETRY_S seconds.
-local function ensureLoaded()
+--- Loads every stored override (ONE select; `sync` = after this core's own queued writes). Returns true
+--- once they are in memory. A failed read (`nil, err` — never "no overrides") leaves `loaded` false and
+--- memory untouched — get() then answers config/default, set() refuses — and is retried by the next
+--- caller at most every LOAD_RETRY_S seconds (`force` skips that throttle), by a retry thread and on the
+--- `dbStatus` hook. A call outside a coroutine ('not_in_coroutine') is not a failure: the next caller in a
+--- thread loads. A load that lands after values were answered without the overrides republishes and
+--- dispatches what changed (afterLoad).
+local function ensureLoaded(force)
     if loaded then return true end
     if loading then
         local ok, err = pcall(Citizen.Await, loading)
-        if not ok then Log.error('settings: waiting for the %s load failed: %s', COLLECTION, tostring(err)) end
+        if not ok then Log.error('settings: waiting for the %s load failed: %s', TABLE, tostring(err)) end
         return loaded
     end
-    if failedAt and os.time() - failedAt < LOAD_RETRY_S then return false end
+    if not force and failedAt and os.time() - failedAt < LOAD_RETRY_S then return false end
     local barrier = promise.new()
     loading = barrier
-    local ok, docs = pcall(Core.DB.all, COLLECTION)
-    if not ok or type(docs) ~= 'table' or Core.DB.isDegraded(COLLECTION) then
-        Log.error('settings: could not read %s (%s); overrides are not applied until it loads',
-            COLLECTION, ok and 'degraded' or tostring(docs))
-        failedAt = os.time()
-    else
-        for i = 1, #docs do
-            local doc = docs[i]
-            -- a set() that ran while the load was out already holds the newer value
-            if type(doc) == 'table' and isKey(doc.key) and doc.value ~= nil and overrides[doc.key] == nil then
-                overrides[doc.key] = { value = doc.value, updatedAt = doc.updatedAt, by = doc.by }
+    local ok, rows, err = pcall(DB.select, TABLE, nil, { sync = true })
+    if not ok then rows, err = nil, rows end
+    local before = nil
+    if type(rows) == 'table' then
+        if served then before = late.snapshot() end     -- what was answered so far (config/default)
+        for i = 1, #rows do
+            local row = rows[i]
+            -- a JSON null value is no override (the old store skipped value-less documents too)
+            if type(row) == 'table' and isKey(row.key) and row.value ~= nil and overrides[row.key] == nil then
+                overrides[row.key] = { value = row.value, updatedAt = row.updated_at, by = row.updated_by }
             end
         end
         loaded, failedAt = true, nil
+    elseif err ~= 'not_in_coroutine' then
+        Log.error('settings: could not read %s (%s); overrides are not applied until it loads', TABLE, tostring(err))
+        failedAt = os.time()
+        late.scheduleRetry()
     end
     loading = nil
     barrier:resolve(true)
+    if loaded then late.afterLoad(before) end
     return loaded
+end
+
+--- After a failed load: one thread retries every LOAD_RETRY_S seconds until the overrides are in (the
+--- `dbStatus` hook retries at once when the database comes back).
+function late.scheduleRetry()
+    if retrying or stopped then return end
+    retrying = true
+    CreateThread(function()
+        while not loaded and not stopped do
+            Wait(LOAD_RETRY_S * 1000)
+            if loaded or stopped then break end
+            ensureLoaded(true)
+        end
+        retrying = false
+    end)
 end
 
 --- Effective value and its source. Internal tables — callers copy. A stored override that no longer
@@ -300,6 +329,31 @@ local function dispatch(key, new, old)
             end
         end
     end)
+end
+
+--- Every defined key's effective value as answered BEFORE the overrides loaded (config/default).
+function late.snapshot()
+    local out = {}
+    for key in pairs(defs) do out[key] = { value = copy((resolve(key))) } end
+    return out
+end
+
+--- Once the overrides are in: every replicated key is queued (the drain skips unchanged values), and when
+--- values were answered without them (`before`, a late load after a failed one) every key whose effective
+--- value differs is dispatched to the watchers — a module that read a default during the outage (bans'
+--- tokenMatches) hears the stored value.
+function late.afterLoad(before)
+    served = false
+    for key, def in pairs(defs) do
+        if def.replicate then queuePublish(key) end
+    end
+    if not before then return end
+    for key, was in pairs(before) do
+        if defs[key] then
+            local now = resolve(key)
+            if not deepEqual(was.value, now) then dispatch(key, now, was.value) end
+        end
+    end
 end
 
 --- Who wrote an override (stored with it).
@@ -452,14 +506,21 @@ end)
 --- Undefined keys answer nil. May yield once, while the overrides load on an async backend.
 function Settings.get(key)
     if type(key) ~= 'string' or not defs[key] then return nil end
-    ensureLoaded()
+    if not ensureLoaded() then served = true end   -- a config/default answer: a later load dispatches changes
     return copy((resolve(key)))
+end
+
+--- (internal, block-listed in server/api.lua) Are the stored overrides in memory? False while the first
+--- load is out or failed — every value answered meanwhile is config/default. server/audit.lua never prunes
+--- with limits read in that state.
+function Settings.isLoaded()
+    return loaded
 end
 
 --- Every layer of one key. Secret values are masked here too: `get` is the only way to read one.
 function Settings.inspect(key)
     if type(key) ~= 'string' or not defs[key] then return nil end
-    ensureLoaded()
+    if not ensureLoaded() then served = true end
     local def = defs[key]
     if not def then return nil end
     local value, source = resolve(key)
@@ -520,43 +581,102 @@ local function changed(def, old)
     return new
 end
 
+--- Runs `fn` holding the write slot of one key: writes of a key never overlap, so two awaited writes can
+--- never commit in another order than memory saw them. Waits (a coroutine) while another write of the key
+--- is out. `fn` runs under pcall so the slot is always released. Returns fn's results, or false, 'persist'
+--- when it would have to wait and cannot yield, or when fn raised.
+local function withSlot(key, fn)
+    while writing[key] do
+        if not coroutine.isyieldable() then return false, 'persist' end
+        Citizen.Await(writing[key])
+    end
+    local slot = promise.new()
+    writing[key] = slot
+    local ok, result, err = pcall(fn)
+    writing[key] = nil
+    slot:resolve(true)
+    if not ok then
+        Log.error('settings: writing %s failed: %s', key, tostring(result))
+        return false, 'persist'
+    end
+    return result, err
+end
+
+--- A write that TIMED OUT may still commit inside core_db after the slot would be freed, and then land
+--- after a newer write of the key. Still holding the slot, write what memory holds again (the override
+--- memory kept, or its absence), so the table converges on memory; logged when that fails too.
+local function reassert(key)
+    local entry = overrides[key]
+    local ok, err
+    if entry then
+        ok, err = DB.upsert(TABLE, { key = key, value = entry.value, updated_by = entry.by, updated_at = entry.updatedAt },
+            'key', { returning = false })
+    else
+        ok, err = DB.delete(TABLE, { key = key })
+    end
+    if ok == nil or ok == false then
+        Log.error('settings: %s may differ in the database until its next write (%s)', key, tostring(err))
+    end
+end
+
 --- Stores an override. With `actorSrc` the actor needs the property's `edit` permission
---- (default 'core.admin'); without one it is a trusted server-side call.
+--- (default 'core.admin'); without one it is a trusted server-side call. Awaited: the override is in
+--- memory (and watchers run) only once the upsert committed; 'persist' when it failed. A value the field
+--- normalises to nil (an optional field set to nil) is a reset: the value falls back to config/default.
 ---@return boolean ok, string|nil err
 function Settings.set(key, value, actorSrc, reason)
     local def, actor, err, normalized = admit(key, actorSrc, reason, true, value)
     if not def then return false, err end
-    local old = copy((resolve(key)))
-    local previous = overrides[key]
-    local entry = { value = normalized, updatedAt = os.time(), by = actorInfo(actor, Registry.getCaller()) }
-    overrides[key] = entry
-    local stored = Core.DB.set(COLLECTION, docId(key), {
-        key = key, value = normalized, updatedAt = entry.updatedAt, by = entry.by,
-    })
-    if not stored then
-        overrides[key] = previous
-        return false, 'persist'
-    end
+    if normalized == nil then return Settings.reset(key, actorSrc, reason) end
+    local by = actorInfo(actor, Registry.getCaller())
+    local old
+    local ok, writeErr = withSlot(key, function()
+        if defs[key] ~= def then return false, 'unknown' end   -- the owner stopped while this write waited
+        old = copy((resolve(key)))
+        local entry = { value = normalized, updatedAt = os.time(), by = by }
+        local stored, dbErr = DB.upsert(TABLE, {
+            key = key, value = normalized, updated_by = by, updated_at = entry.updatedAt,
+        }, 'key', { returning = false })
+        if not stored then
+            Log.warn('settings: could not store %s (%s)', key, tostring(dbErr))
+            if DB.errorCode(dbErr) == 'timeout' then reassert(key) end
+            return false, 'persist'
+        end
+        overrides[key] = entry
+        return true
+    end)
+    if not ok then return false, writeErr end
     local new = changed(def, old)
     audit(def, 'set', actor, reason, old, new, 'ok')
     return true
 end
 
---- Deletes the override (the value falls back to config/default). True when there was none.
+--- Deletes the override (the value falls back to config/default). True when there was none. Awaited:
+--- 'persist' when the delete failed (the override then stays).
 ---@return boolean ok, string|nil err
 function Settings.reset(key, actorSrc, reason)
     local def, actor, err = admit(key, actorSrc, reason, false)
     if not def then return false, err end
-    local previous = overrides[key]
-    if previous == nil then return true end
-    local old = copy((resolve(key)))
-    overrides[key] = nil
-    if not Core.DB.delete(COLLECTION, docId(key)) and Core.DB.isDegraded(COLLECTION) then
-        overrides[key] = previous
-        return false, 'persist'
+    if overrides[key] == nil then return true end
+    local old
+    local outcome, writeErr = withSlot(key, function()
+        if defs[key] ~= def then return false, 'unknown' end   -- the owner stopped while this write waited
+        if overrides[key] == nil then return 'none' end         -- a reset that held the slot first did it
+        old = copy((resolve(key)))
+        local removed, dbErr = DB.delete(TABLE, { key = key })
+        if removed == nil then
+            Log.warn('settings: could not delete %s (%s)', key, tostring(dbErr))
+            if DB.errorCode(dbErr) == 'timeout' then reassert(key) end
+            return false, 'persist'
+        end
+        overrides[key] = nil
+        return 'done'
+    end)
+    if not outcome then return false, writeErr end
+    if outcome == 'done' then
+        local new = changed(def, old)
+        audit(def, 'reset', actor, reason, old, new, 'ok')
     end
-    local new = changed(def, old)
-    audit(def, 'reset', actor, reason, old, new, 'ok')
     return true
 end
 
@@ -590,7 +710,7 @@ function Settings.list(viewerSrc)
         viewer = toActor(viewerSrc)
         if not viewer then return {} end
     end
-    ensureLoaded()
+    if not ensureLoaded() then served = true end
     local memo = {}
     local function allowed(perm)
         if viewer == nil then return true end
@@ -725,8 +845,8 @@ end
 -- Lifecycle
 --------------------------------------------------------------------------------
 
--- Load the overrides as soon as every core file ran (the DB adapter is chosen at file scope before this
--- file), so the first get() rarely waits and a broken backend shows up in the console at start.
+-- Load the overrides as soon as every core file ran (the select waits for core's migrations inside core_db),
+-- so the first get() rarely waits and a broken database shows up in the console at start.
 AddEventHandler('onResourceStart', function(resource)
     if resource ~= Core.name then return end
     -- once per core start (the handler returns for every other resource), and the thread ends after the load
@@ -734,9 +854,22 @@ AddEventHandler('onResourceStart', function(resource)
     CreateThread(function() ensureLoaded() end)
 end)
 
+-- The database is back (core_db's health flipped to healthy, §56.2.5): a load that failed retries at once,
+-- without waiting for the retry thread or the next caller.
+Core.on('dbStatus', function(healthy)
+    if healthy ~= true or loaded or not failedAt or stopped then return end
+    -- one short thread per recovery; a later load joins the barrier
+    -- fxlint-disable-next-line P004
+    CreateThread(function()
+        Wait(0)   -- never inside core_db's own callback (the event may fire while a statement is answered)
+        if not loaded and not stopped then ensureLoaded(true) end
+    end)
+end)
+
 -- Synchronous teardown: the mirrored keys go with core (a restart publishes them again).
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= Core.name then return end
+    stopped = true
     for key in pairs(published) do
         GlobalState[STATE_PREFIX .. key] = nil
     end

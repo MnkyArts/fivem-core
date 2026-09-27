@@ -41,9 +41,15 @@ import.lua              plugin-side loader: `Core` global, lazy libs, ONE export
 shared/config.lua       every tunable (Config.*); plugins read core's copy as Core.Config
 shared/ui_manifest.lua  UIManifest.API_VERSION / dirOk / validate — the plugin manifest rules, both VMs (§38.4)
 lib/<module>/{shared,client,server}.lua   pure libs compiled INTO each plugin VM (no export hop)
-server/*.lua            stateful modules (api, db, db_pg, player, playergrid, money, factions, vehicles, doors, ui, …)
-server/audit.lua        Core.Audit (§46): append-only trail + lean in-memory index, three retention pools; server/bans.lua
-                        = Core.Bans (§47: identifier + token index; Bans.checkConnecting is internal, block-listed)
+server/*.lua            stateful modules (api, player, playergrid, money, factions, vehicles, doors, ui, …)
+server/db.lua           registers core's own migrations (sql/0001_core_schema.sql, sql/0002_core_legacy_import.sql)
+                        and `/dbstatus` — nothing else (§56.6, §56.11)
+server/player_store.lua row ↔ session mapping, loads, creates, queued writes, the connect-time ban gate (§56.12) —
+                        hands over to server/player.lua through the one-shot global CorePlayerStore (keep the two
+                        adjacent in the manifest)
+server/audit.lua        Core.Audit (§46): append-only trail in `audit_log` (queued appends, SQL queries), three retention
+                        pools; server/bans.lua = Core.Bans (§47: one indexed connect query over ban_identifiers/ban_tokens;
+                        Bans.checkConnecting is internal, block-listed)
 server/bans_identity.lua internal Core.BanIdentity (§47): identity reads, online holder index, rank check — loads RIGHT
                         before bans.lua (which errors otherwise); block-listed in api.lua
 server/buckets.lua      Core.Buckets (§50); server/settings.lua = Core.Settings (§45) + core's maps/audit sections
@@ -82,7 +88,11 @@ lib/clock/shared.lua    Core.Clock (§55.2): one u32 ms timeline — server GetG
 lib/scene/              shared.lua (kind-id / tier / stable-paint helpers, every VM) + client.lua (Scene.handle / on /
                         off in the CALLER's VM); the rest of Core.Scene is proxied
 lib/schema/shared.lua   Core.Schema (§43): the field vocabulary of settings, admin args and map elements; pure, every VM
-server/pg/index.js      Node source of the Postgres bridge → bundled into server/db_pg.js (committed)
+lib/db/server.lua       Core.DB (§56.5): the relational database lib — SERVER ONLY (no lib/db/shared.lua; the client
+                        never sees Core.DB), compiled into every server VM, one export hop into the core_db resource
+sql/                    core's own migrations, immutable once applied (§56.6/§56.7): 0001_core_schema.sql (the
+                        schema) → 0002_core_legacy_import.sql (imports core_documents once, renames it
+                        legacy_documents)
 ui/                     Vite 7 + Vue 3.5 + Tailwind v4 shell, Storybook 10, the SDK, the browser suites
 ui/sdk/                 npm workspace package `@core/ui` (§38.7): src/contract.ts, src/index.ts (the facade),
                         src/client.d.ts (generated kit tags), src/dev/ (dev host + mock), vite/index.mjs = coreUI(),
@@ -102,8 +112,15 @@ ui/tests/               unit/ (node --test over the runtime, type stripping; ui/
                         {shell,kit,runtime}-regression.js, run-browser-suites.mjs, bench.mjs → BENCH.md
 html/                   the built SHELL (COMMITTED); a plugin's own frontend is its committed <plugin>/ui/dist
 templates/plugin/       scaffold used by scripts/new-plugin.sh <name>, ui/ included
-tests/                  offline suites: run_tests.lua (libs/loader), server_tests.lua, client_ui_tests.lua
-                        (focus stack, discovery, requests, patches, feeds), client_chat_tests.lua, pg_smoke.js;
+tests/                  offline suites: run_tests.lua (libs/loader), server_tests.lua (a thin driver: requires
+                        server_harness.lua + the per-suite files under server/*.lua — same command, same counts),
+                        client_ui_tests.lua (focus stack, discovery, requests, patches, feeds), client_chat_tests.lua,
+                        db_tests.lua (§56.10.3: the Core.DB lib over the bridge — marshalling, every awaited/queued
+                        call, transaction/stream, migrate, removed-name errors); pgbridge.lua (the Lua side of the
+                        DB test bridge, §56.10.2: bridge.start/install/reset/recreate/sql/fail/stop) + tests/server/
+                        (the per-suite files server_harness.lua requires: api, chat, db, factions, globals,
+                        legacy_commands, money, perms, player, player_admin, playergrid, stats, ui, ui_plugins,
+                        vehicles, world);
                         §41–§53: raycast, schema, settings, perms, buckets, audit, bans, targets, admin_api,
                         registry_caller, client_registry_caller, client_adminstate, callback, maps, maps_store,
                         client_maps, chat_hook (<name>_tests.lua, each on its own); admin_harness.lua and
@@ -112,7 +129,8 @@ tests/                  offline suites: run_tests.lua (libs/loader), server_test
                         client_scene_mat, client_scene_kinds, scene_attach, scene_parked; scene_server_harness.lua and
                         client_scene_harness.lua are
                         harnesses; scene_bench.lua is the server benchmark (by hand, not in check.sh)
-scripts/                check.sh (offline gate), new-plugin.sh, pg-import.js, build-font-gfx.sh + font-to-gfx.java
+scripts/                check.sh (offline gate), new-plugin.sh, test-db.sh (up/down the throwaway CORE_TEST_PG_URL
+                        database, §56.10.1), build-font-gfx.sh + font-to-gfx.java
                         (Barlow -> stream/barlow_condensed.gfx), build-hint-gfx.sh + hint-to-gfx.java + hint.as
                         (the world-prompt key hint -> stream/core_hint.gfx); FFDec is build-time only, never shipped
 stream/                 barlow_condensed{,_bold}.gfx — Scaleform GFx font libraries (600/700) for the native
@@ -121,7 +139,10 @@ stream/                 barlow_condensed{,_bold}.gfx — Scaleform GFx font libr
 data/                   runtime files (exports); ignored except .gitkeep
 ```
 
-Neighbours in `resources/`: `core_example` (the reference plugin — copy its patterns), the npm workspace root
+Neighbours in `resources/`: `core_db` (§56 — the separate resource `Core.DB` talks to: pool, write-behind queue,
+migration runner, table helpers; own `README.md`, own git repo; its committed `dist/core_db.js` is built with
+`npm run build -w core_db-build` from `resources/`; `core` declares `dependency 'core_db'`, so `ensure core`
+starts it first); `core_example` (the reference plugin — copy its patterns), the npm workspace root
 `package.json` (`core/ui`, `core/ui/sdk`, every `*/ui`; scripts `build:ui`, `check:ui`), `.luarc.json`;
 `scene_probe` (DEV-ONLY in-game probes for §55.24 — standalone, its own never-focused `ui_page`, never in server.cfg;
 Liam runs `/sprobe <n>` in the order of its README; offline suite `tests/probe_tests.lua`); `research/entity-streaming/`
@@ -161,8 +182,11 @@ hold the entity). The inventory's scoped drops (inventory DESIGN §3.4.1) are th
 
 **Ownership.** Everything a plugin registers through core (markers, blips, labels, interactions, pages, doors,
 hide reasons, …) is tracked by `Core.Registry` under the calling resource and removed when it stops. New
-registries follow that pattern. Internal names are blocked through the export (`Registry`, `DB.setAdapter`,
-`DB.markDegraded`, `Player.loadSession/loadAllConnected/startAutosave/stopAutosave`).
+registries follow that pattern. Internal names are blocked through the export: `Registry`, the whole `DB`
+namespace (§56.1 — reached through the export it would run inside core's VM and act as core, so it is refused
+entirely), `Player.loadSession/loadAllConnected/startAutosave/stopAutosave/getAccountData/saveAll`,
+`Settings.isLoaded`, `Bans.checkConnecting` (`server/api.lua`'s `INTERNAL_NAMESPACES`/`INTERNAL_FUNCTIONS` are
+the exact, current lists).
 
 **Secrets.** Only convars (`core_pg_url` in `core_pg.cfg`, `core_webhook_*`), never a file in the resource,
 never logged, never printed by a tool. `server.cfg`, `sv_licenseKey` and `rcon_password` are never shown.
@@ -191,8 +215,8 @@ a modal that is hidden is cancelled.
 
 **Server files.** No `package.json` or `node_modules` inside a resource: FXServer's Node sandbox refuses to
 read modules behind the symlinked resource path and the server's `yarn` builder would run on every start.
-Node code is bundled (`npm run build:server` in `core/ui` → `server/db_pg.js`, first line
-`// fxlint-disable-file`).
+Node code now lives only in `core_db` (bundled: `npm run build -w core_db-build` from `resources/` → the
+committed `core_db/dist/core_db.js`, first line `// fxlint-disable-file`); core itself ships no Node code.
 
 **Manifest edits.** After adding a file to `fxmanifest.lua`: `refresh` on the server console, then
 `restart core`, then `ensure core_example` (a dependant is stopped by the restart).
@@ -203,14 +227,16 @@ Node code is bundled (`npm run build:server` in `core/ui` → `server/db_pg.js`,
    `dependency 'core'` and `shared_scripts { '@core/import.lua', 'shared/config.lua' }`. That gives the
    global `Core` in every VM; wait for `Core.onReady(fn)` (server and client) or `Core.onPlayerLoaded(fn)`.
 2. Libs run in *your* VM: `Core.Utils`, `Math`, `Validate`, `Log`, `Callback`, `Net`, `Commands`, `Keys`,
-   `Streaming`, `Anim`, `Player` (client), `UI.on/off` (client), `Locale`, `Audio`. Everything stateful goes
-   through the proxy: `Core.Player(src)`, `Core.Money`, `Core.Factions`, `Core.Vehicles`, `Core.Doors`,
+   `Streaming`, `Anim`, `Player` (client), `UI.on/off` (client), `Locale`, `Audio`, and (server only) `Core.DB`
+   — the relational database lib, no export hop (§56). Everything else stateful goes through the proxy:
+   `Core.Player(src)`, `Core.Money`, `Core.Factions`, `Core.Vehicles`, `Core.Doors`,
    `Core.Markers/Blips/TextLabels/Interactions.addGlobal/addFor`, `Core.UI.menu.open(src, …)`,
-   `Core.UI.hide/show`, `Core.Chat`, `Core.Http`, `Core.Cron`, `Core.Stats`, `Core.Weapons`, `Core.DB`
-   (documents), `Core.Perms`. Signatures: README "API cheat sheet" and `types/core.lua`.
+   `Core.UI.hide/show`, `Core.Chat`, `Core.Http`, `Core.Cron`, `Core.Stats`, `Core.Weapons`, `Core.Perms`.
+   Signatures: README "API cheat sheet" and `types/core.lua`.
 3. Server rules: register events with `Core.Net.on(name, schema, handler, opts)` (schema, cooldown, distance
    and permission are declarative in `opts`), commands with `Core.Commands.register`, RPC with `Core.Callback.register`.
-   Persist with `Core.DB` collections, never your own files. Money only through `Core.Money`.
+   Persist with your own tables, migrated at file scope with `Core.DB.migrate({ 'sql/0001_init.sql' })` (§56.9)
+   — never your own files, never a second database. Money only through `Core.Money`.
 4. Client rules: interactions/markers through core's APIs (one scan loop for everyone), text UI through
    `Core.UI.textUI` (owner-tagged), keys through core's key mapping helpers.
 5. UI plugin (§38): `ui/src/index.ts` default-exports `defineUIPlugin({ pages, setup })`, `ui/vite.config.ts`
@@ -237,14 +263,16 @@ interaction, door, cron, locale, a compiled page).
 
 | what | command | expect |
 |---|---|---|
-| the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
+| the whole offline gate (11 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
+| the test database (prerequisite for the two DB rows below) | `scripts/test-db.sh up` (creates the role/database `core_test`/`core_test` in the `core-postgres` container, idempotent; `CORE_TEST_PG_URL` overrides the URL, default `postgres://core_test:core_test@127.0.0.1:5432/core_test`) | `test-db: ready (...)`; a suite that needs it and cannot reach it fails with "the test database is unreachable — run scripts/test-db.sh up" |
 | libs and loader (suite `clock` included) | `lua5.4 tests/run_tests.lua` | `468 passed, 0 failed` |
 | development services | `lua5.4 tests/{geometry,client_zones,client_actions,context_streaming,hooks,ui_forms}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 190, 36, 74, 122, 94, 98 passed; 0 failed |
-| admin platform (§41–§53) | `lua5.4 tests/{raycast,schema,settings,perms,buckets,audit,bans,targets,admin_api,registry_caller,client_registry_caller,client_adminstate,callback,maps,maps_store,client_maps,chat_hook}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 100, 338, 149, 241, 48, 140, 193, 154, 349, 26, 31, 34, 34, 442, 200, 291, 52 passed; 0 failed (maps / maps_store / client_maps as rewritten by phase D, DESIGN §55.21.1; maps_regions_tests.lua is deleted) |
-| scene streaming (§55) | `lua5.4 tests/{scene_codec,scene_motion,scene_server,scene_index,scene_interest,scene_audio,scene_voice,scene_promote,client_scene_cache,client_scene_mat,client_scene_kinds,scene_attach,scene_parked}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 262, 328, 1061, 851, 582, 241, 290, 424, 636, 661, 600, 283, 583 passed; 0 failed |
+| admin platform (§41–§53) | `lua5.4 tests/{raycast,schema,settings,perms,buckets,audit,bans,targets,admin_api,registry_caller,client_registry_caller,client_adminstate,callback,maps,maps_store,client_maps,chat_hook}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 100, 338, 218, 272, 48, 198, 286, 154, 349, 26, 31, 34, 34, 443, 267, 291, 52 passed; 0 failed (settings / perms / audit / bans / maps / maps_store re-baselined onto the DB bridge, §56.8 note 10) |
+| scene streaming (§55) | `lua5.4 tests/{scene_codec,scene_motion,scene_server,scene_index,scene_interest,scene_audio,scene_voice,scene_promote,client_scene_cache,client_scene_mat,client_scene_kinds,scene_attach,scene_parked}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 262, 328, 1100, 851, 582, 241, 290, 424, 636, 661, 600, 283, 604 passed; 0 failed (scene_server / scene_parked re-baselined onto the DB bridge) |
 | scene benchmark (by hand) | `lua5.4 tests/scene_bench.lua [players] [nodes] [seconds] [nogc]` (defaults 2000 50000 30; `nogc` = a join storm's heap growth) | a result table, exit 0 — compare with DESIGN §55.7 notes (p50 1.50 / p99 7.55 ms per tick) |
 | the scene probes, offline | `cd ../scene_probe && lua5.4 tests/probe_tests.lua`; `fxlint resources/scene_probe` | `scene_probe: 134 passed, 0 failed`; `0 error(s), 0 warning(s), 0 info(s)` |
-| server modules | `lua5.4 tests/server_tests.lua` | `1166 passed, 0 failed` |
+| the DB lib over the bridge (§56.10.3: marshalling, every awaited/queued call, transaction/stream, migrate, removed-name errors) | `lua5.4 tests/db_tests.lua` (needs the test database) | `db: 273 passed, 0 failed` |
+| server modules | `lua5.4 tests/server_tests.lua` (a thin driver over `server_harness.lua` + `tests/server/*.lua`; needs the test database) | `1568 passed, 0 failed` |
 | client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed, §41 input modes + hide policy + plain ids, §54 HUD hiding + key capture) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 795 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
 | runtime + SDK units (the §55.16 audio engine's `audio-*.test.ts` included) | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 377`, `# fail 0` |
@@ -257,14 +285,14 @@ interaction, door, cron, locale, a compiled page).
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
 | the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 312/312`, `PASS 240/240` (shell, kit, runtime — section 15 of the runtime suite drives the real Web Audio engine) |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
-| Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
+| core_db (pool, catalog, sqlgen, helpers, tx, migrations, queue) | `node --test core_db/tests/*.test.mjs` (from `resources/`; or `node --test ../core_db/tests/*.test.mjs` from `core/`; globs, never a directory; needs the test database) | `# pass 81`, `# fail 0` |
 | benchmarks | `node ui/tests/bench.mjs` | rewrites `ui/tests/BENCH.md` (never hand-edit it) |
 | live | `fxserver logs --errors --resource core`, `fxclient logs --errors` | nothing new |
 
 In-game diagnostics that exist for a reason: `/uiplugins` (every UI plugin's state — the first thing to look
 at when a page stays blank), `/uidev <res> <origin|off>` and `/uiinspect` (both need `Config.UI.Dev.Enabled`),
 `/uiblur diag` / `/uiblur test` (game blur state and hook recipes), `/doorfind` (door models, registered
-doors), `/dbexport` and `/dbimport` (console), `/id`, `/scene` and `/scene debug` (Core.Scene counters and the overlay:
+doors), `/dbstatus` (console: `core_db` health, pool, queue and migrations, §56), `/id`, `/scene` and `/scene debug` (Core.Scene counters and the overlay:
 the nearest nodes with their state — `Config.Scene.Debug`, ACE `core.admin` or staff on duty), `/audio` and
 `/audiodebug` (world-audio preferences, the audio engine's voices, decoders and drift). Server side:
 `Core.Scene.stats()` (flush ms p50 / p99, bytes per second, every module's counters). Inside the CEF: `nui_devtools` /
@@ -293,11 +321,14 @@ the nearest nodes with their state — `Config.Scene.Debug`, ACE `core.admin` or
 
 ## 7. Database
 
-`Core.DB` is a document store (collections of JSON documents, cached in memory, written through). Adapters:
-`kvp` (zero setup), `postgres` (production: `core_documents` with `jsonb`, DESIGN §33), `mysql` (oxmysql,
-untested). Switching backends: `/dbexport` → `scripts/pg-import.js … --replace` → set the adapter → `refresh`
-+ `restart core`. `/dbimport` is only safe with no player online. Schema changes are `DB.migrate` functions,
-never manual edits of live rows.
+Relational Postgres behind a separate resource, `core_db` (§56) — no document store, no KVP, no MySQL adapter.
+`Core.DB` (`lib/db/server.lua`, server only) has two call classes: **awaited** (`query single scalar execute
+batch transaction stream nextId flush` + the table helpers `insert insertMany select first count update delete
+upsert`) yield and answer `result | nil, err`; **queued** (`save patch remove append enqueue`) and `migrate`
+never yield and answer `true | false, err`, landing within one flush interval, coalesced per row. Schema
+changes are new numbered migration files only (`sql/000n_*.sql`, run with `Core.DB.migrate({ ... })` at file
+scope) — immutable once applied, never edited in place. Back up with `pg_dump -Fc` / `pg_restore`; never
+`restart core_db` on a live server (it stops core and every plugin with it) — restart `core` instead.
 
 ## 8. Gotchas we already paid for
 
@@ -349,14 +380,31 @@ never manual edits of live rows.
 - `<CoreSchemaForm :errors>` takes `Core.Schema.checkAll`'s map AS IS: `{ name = code }` with nested paths PREFIXED to
   the code (`{ list = '2.pos.min' }`, array rows 1-based) — not `{ ['list.2.pos'] = 'min' }` (flat path keys work
   too). The form's own check is advisory; the server's errors always win.
-- `Core.DB` document ids are `[%w_%-:]` ≤ 64 — a dot is refused. Keys with dots map to `:` (settings
-  `inventory.maxWeight` → document `inventory:maxWeight`); compound ids use `:` (`<mapId>:<elementId>`). Core.DB also
-  overwrites a document's top-level `updatedAt` with seconds, so a millisecond stamp needs another field (`rev`).
+- **Awaited `Core.DB` calls yield** — re-check state after one (a session, a record, a cached flag) instead of
+  trusting what you read before the call: another handler may have run in between (inventory's `Access.live`,
+  maps' generation counter are the worked examples).
+- An **empty Lua table crosses msgpack as `[]`**: a `jsonb` column that must stay an object on an empty write
+  needs `Core.DB.json({})` cast `$n::jsonb` explicitly in raw SQL — the table helpers know each column's type
+  and do this for you, but a raw `query`/`execute` does not.
+- A raw queued `Core.DB.enqueue(sql, params)` (no `key`) is a **coalescing barrier**: every entry queued before
+  it must flush before it and every entry queued after it waits behind it. A **keyed** one (`enqueue(sql,
+  params, key)`) instead replaces the owner's older entry with that same key and runs at the newer position.
+- Migration SQL **never qualifies a table with `public.`**: the test bridges run every suite in its own
+  Postgres schema (`search_path = t_<pid>, public`), so a hard-coded `public.` breaks isolation and points at
+  the wrong table under test.
+- A plugin's legacy-collection import must **RAISE** while `core_documents` still exists for it (a plugin that
+  has not migrated its own collections yet) — it must never silently skip and leave the plugin starting on an
+  empty table (§56.7).
+- `Core.Vehicles.setData`/`getData` are one **atomic SQL** `UPDATE`/`SELECT` on `vehicles.meta` — never read
+  the record into memory, change `meta` there and write the whole record back: that races a concurrent
+  `setData` and can drop its change.
+- A **queued** write (`save`/`patch`/`append`) to a row with a foreign key is validated at enqueue time but
+  applied later: if the referenced row is gone by the time the flush commits, the whole entry is **dropped**
+  (`core:hook:dbWriteFailed`) — validate the reference yourself before queuing a write that depends on it
+  (vehicles' `characterExists` check before persisting a car).
 - A private hand-off between server files (Core.Admin → adminapi_dispatch.lua, bans_identity.lua → bans.lua, the four
   `server/maps*.lua` files, client/adminstate.lua before its readers) makes their manifest ORDER load-bearing: a
   file that asserts its predecessor errors at start when moved.
-- `tests/stubs.lua`'s JSON decoder used to read `false` back as nil (fixed 2026-09-26): a suite that round-trips a
-  boolean through the KVP stub must test `false` explicitly.
 - The Registry caller is PER COROUTINE (DESIGN §2.3 note): inside a coroutine `getCaller()` is that coroutine's own
   entry or `'core'` — a thread started from a plugin's export call does NOT inherit the plugin. A test that simulates
   a plugin must set the caller inside the calling thread (`withCaller`), not on the main thread before it.

@@ -1,6 +1,7 @@
 --- core/server/vehicles.lua — Core.Vehicles (server).
---- Server-owned vehicle spawning, ownership/keys, lock state, and the `vehicles` document
---- records. DESIGN §4.6 (API), §5 (vehicleLock / vehicleProps net events), §8 (state bags).
+--- Server-owned vehicle spawning, ownership/keys, lock state, and the `vehicles` records. DESIGN §4.6 (API), §8
+--- (state bags). Since the §56 port (the files' size) the record reads (getRecord / getRecords / deleteRecord) are
+--- server/vehicles_park.lua's, the §5 net events (vehicleLock, vehicleProps, core:vehicles:mine) vehicles_fleet.lua's.
 --- Parking (§55.21.4: park, the scene hooks, AutoPark, getInfoByRecord, the parked branches of spawnRecord /
 --- restoreRecord / store / delete / deleteRecord) is server/vehicles_park.lua, which loads RIGHT AFTER this file
 --- and takes the live maps and helpers once through the one-shot global `CoreVehiclesPark` (P); server/
@@ -10,6 +11,12 @@
 --- its native range (colour / mod indexes, healths 0..1000, fuel 0..100, dirt 0..15) and props.plate = the plate.
 --- Records: spawnRecord answers 'already_spawned' only while the record's car is live (an out record with nothing
 --- in the world is spawned: review RV6 F2); restoreRecord refuses a `destroyed` record (§55.21.4 notes, D-C).
+--- Database (DESIGN §56.6 `vehicles`, port notes in §4.6): records are rows read by key / index (fromRow is the one
+--- column ↔ field mapping); persist is an awaited insert (a plate collision of a core-chosen plate retries with a new
+--- one), deleteRecord an awaited delete, every other change a QUEUED patch of only the changed columns (write) —
+--- never `meta`, whose keys Vehicles.setData writes atomically (server/getters.lua). `recs` mirrors the columns the
+--- park / fleet code needs (owner, plate, model, parked, stored, destroyed, locked, keys, meta.vehType / keyMode) of
+--- every WORLD record (parked, or its car live), so the scene hooks, the lock key and the stop paths never await.
 --- Natives (fxref + natives_cfx.json, server / CFX forms): CreateVehicleServerSetter, DoesEntityExist, DeleteEntity,
 --- NetworkGetNetworkIdFromEntity, NetworkGetEntityFromNetworkId, GetEntityType, GetEntityModel, GetEntityCoords,
 --- GetEntityHeading, GetEntityRoutingBucket, GetVehicleNumberPlateText, GetVehicleType, SetVehicleNumberPlateText,
@@ -22,7 +29,6 @@ Core.Vehicles = Vehicles
 local Validate = Core.Validate
 local Utils = Core.Utils
 local Log = Core.Log
-local Net = Core.Net
 
 local ENTITY_TYPE_VEHICLE <const> = 2
 local LOCK_LOCKED <const> = 2
@@ -35,9 +41,17 @@ local PROPS_MAX_KEY_LEN <const> = 32
 local PROPS_MAX_STRING <const> = 32
 local PROPS_MAX_MAP_ENTRIES <const> = 64
 local PROPS_MAX_MAP_INDEX <const> = 64
-local PROPS_DISTANCE <const> = 10.0
-local COLLECTION <const> = 'vehicles'
-local RECORDS_COOLDOWN_MS <const> = 1000
+local TABLE <const> = 'vehicles'
+local PLATE_BATCH <const>, PLATE_ROUNDS <const> = 16, 64   -- ≤ 1024 random candidates, one indexed query per batch
+local PERSIST_TRIES <const> = 3                           -- a core-chosen plate that collides at the insert: re-plated
+local RECENT_MS <const> = 60000                           -- a record written this recently is read with sync = true
+local PLATES_SQL <const> = 'SELECT plate FROM vehicles WHERE plate = ANY($1::text[])'
+-- record field -> column (§56.8 rule 5: the one mapping). `meta` is written by persist only, never patched.
+local COLUMN <const> = { ownerCharId = 'owner_character_id', model = 'model', modelName = 'model_name', plate = 'plate',
+    props = 'props', stored = 'stored', destroyed = 'destroyed', parked = 'parked', locked = 'locked', keys = 'keys',
+    position = 'position', lastUsedAt = 'last_used_at' }
+local MIRRORED <const> = { ownerCharId = true, model = true, modelName = true, plate = true, stored = true,
+    destroyed = true, parked = true, locked = true, keys = true }
 local MODEL_NAME <const> = '^[%w_%-]+$'   -- a model name the scene's vehicle kind takes (§55.21.4 node fields)
 
 -- The native ranges of the props keys (fxref: SET_VEHICLE_COLOURS / _EXTRA_COLOURS / interior / dashboard paint
@@ -54,28 +68,15 @@ local MOD_INDEX_MIN <const>, MOD_INDEX_MAX <const> = -1, 254
 local XENON_MAX <const>, XENON_STOCK <const> = 12, 255
 
 local SPAWN_SCHEMA <const> = {
-    model = 'any',
-    coords = 'vector3',
-    heading = 'number?',
-    type = { 'string', max = 16, optional = true },
-    plate = { 'string', max = PLATE_MAX, optional = true },
-    ownerSrc = 'src?',
-    ownerCharId = 'id?',
-    keys = { 'array', of = 'id', max = 32, optional = true },
-    props = 'table?',
-    keyMode = { 'enum', 'virtual', 'item', optional = true },
-    locked = 'boolean?',
-    persistent = 'boolean?',
+    model = 'any', coords = 'vector3', heading = 'number?', type = { 'string', max = 16, optional = true },
+    plate = { 'string', max = PLATE_MAX, optional = true }, ownerSrc = 'src?', ownerCharId = 'id?',
+    keys = { 'array', of = 'id', max = 32, optional = true }, props = 'table?',
+    keyMode = { 'enum', 'virtual', 'item', optional = true }, locked = 'boolean?', persistent = 'boolean?',
     bucket = { 'integer', min = 0, max = 65535, optional = true },
 }
 
-local ADOPT_SCHEMA <const> = {
-    ownerSrc = 'src?',
-    ownerCharId = 'id?',
-    keyMode = { 'enum', 'virtual', 'item', optional = true },
-    locked = 'boolean?',
-    props = 'table?',
-}
+local ADOPT_SCHEMA <const> = { ownerSrc = 'src?', ownerCharId = 'id?',
+    keyMode = { 'enum', 'virtual', 'item', optional = true }, locked = 'boolean?', props = 'table?' }
 
 local spawned = {}      -- [netId] = info (live, includes the entity handle)
 local byEntity = {}     -- [entity handle] = netId
@@ -83,8 +84,145 @@ local usedPlates = {}   -- [plate] = netId
 local byVehId = {}      -- [vehId] = netId of the record's live vehicle (a parked car's adopted clone included)
 local clones = {}       -- [nodeId] = netId: the adopted clone of a promoted parked car (server/vehicles_park.lua)
 local rest = {}         -- [netId] = AutoPark's rest stamp (server/vehicles_park.lua)
+local recs = {}         -- [vehId] = the mirror of a WORLD record (parked, or its car live): MIRRORED fields + id, meta
+local spawning = {}     -- [vehId] = true while spawnFromRecord makes its car (a second spawnRecord waits for nothing)
 -- The maps above are shared with server/vehicles_park.lua (P): they are cleared in place, never replaced.
-local P = { spawned = spawned, byVehId = byVehId, clones = clones, rest = rest }
+local P = { spawned = spawned, byVehId = byVehId, clones = clones, rest = rest, recs = recs, spawning = spawning }
+
+--------------------------------------------------------------------------------
+-- Records: rows of `vehicles` (DESIGN §56.6), queued patches, the mirror of the world records
+--------------------------------------------------------------------------------
+
+local DB = Core.DB
+local writeSeq = 0                                  -- +1 per queued write of this module
+local recentAt, recentCur, recentPrev = 0, {}, {}   -- vehId -> writeSeq of its last write (2 generations, RECENT_MS)
+
+local function rotateRecent()
+    local now = GetGameTimer()
+    if now - recentAt < RECENT_MS then return end
+    recentPrev = now - recentAt < 2 * RECENT_MS and recentCur or {}
+    recentCur, recentAt = {}, now
+end
+
+--- The writeSeq of this module's last write of `vehId` within the last RECENT_MS (at least), or nil.
+local function lastWrite(vehId)
+    rotateRecent()
+    return recentCur[vehId] or recentPrev[vehId]
+end
+
+--- This module changed `vehId` now (a queued write, the delete): a read that began before never refreshes the mirror.
+local function markWrite(vehId)
+    writeSeq = writeSeq + 1
+    rotateRecent()
+    recentCur[vehId] = writeSeq
+end
+
+local function copyList(t)
+    local out = {}
+    for i = 1, type(t) == 'table' and #t or 0 do out[i] = t[i] end
+    return out
+end
+
+--- keys { [charId] = true } -> the record's sorted list.
+local function keyList(keys)
+    local out = {}
+    for charId in pairs(keys or {}) do out[#out + 1] = charId end
+    table.sort(out)
+    return out
+end
+
+--- The record of a row (SQL NULL columns are absent keys): ownerCharId / parked false when NULL, keys a list.
+local function fromRow(row)
+    return {
+        id = row.id, ownerCharId = row.owner_character_id or false, model = row.model, modelName = row.model_name,
+        plate = row.plate, props = type(row.props) == 'table' and row.props or {}, stored = row.stored == true,
+        destroyed = row.destroyed == true, parked = math.tointeger(row.parked) or false, locked = row.locked,
+        keys = type(row.keys) == 'table' and row.keys or {}, position = row.position,
+        meta = type(row.meta) == 'table' and row.meta or {}, lastUsedAt = row.last_used_at,
+        createdAt = row.created_at, updatedAt = row.updated_at,
+    }
+end
+
+--- The mirror entry of a record (created or refreshed from it) -> the entry.
+local function mirrorOf(rec)
+    local e = recs[rec.id]
+    if not e then
+        e = { id = rec.id }
+        recs[rec.id] = e
+    end
+    for k in pairs(MIRRORED) do e[k] = rec[k] end
+    e.keys = copyList(rec.keys)
+    local meta = type(rec.meta) == 'table' and rec.meta or {}
+    e.meta = { vehType = meta.vehType, keyMode = meta.keyMode }
+    return e
+end
+
+--- A record leaves the mirror once it is neither parked nor its car live.
+local function settle(vehId)
+    local e = recs[vehId]
+    if e and not e.parked and not byVehId[vehId] then recs[vehId] = nil end
+end
+
+--- Queues ONE patch of exactly `changes` (record fields; an absent field stays as it is, false ownerCharId / parked =
+--- NULL) and updates the mirror. Never yields. -> true | false (core_db refused it: nothing changed).
+local function write(vehId, changes)
+    local cols = {}
+    for k, v in pairs(changes) do
+        local col = COLUMN[k]
+        if not col then error('vehicles: no column for ' .. tostring(k), 2) end
+        if v == false and (k == 'ownerCharId' or k == 'parked') then v = DB.NULL end
+        cols[col] = v
+    end
+    local ok, err = DB.patch(TABLE, vehId, cols)
+    if not ok then
+        Log.error('vehicles: the write of record %s was refused (%s)', tostring(vehId), tostring(err))
+        return false
+    end
+    markWrite(vehId)
+    local e = recs[vehId]
+    if e then
+        for k, v in pairs(changes) do
+            if MIRRORED[k] then e[k] = k == 'keys' and copyList(v) or v end
+        end
+    end
+    settle(vehId)
+    return true
+end
+
+--- A row an awaited read returned; `start` = writeSeq when the read began. A write of ours since then wins (the
+--- mirror's fields are laid over the record); otherwise the row refreshes the mirror (a parked record joins it).
+--- -> record, stale (a write of ours raced the read and no mirror entry holds it: the row is out of date)
+local function fromRead(row, start)
+    local rec = fromRow(row)
+    local e = recs[rec.id]
+    if (lastWrite(rec.id) or 0) > start then
+        if not e then return rec, true end
+        for k in pairs(MIRRORED) do rec[k] = e[k] end
+        rec.keys = copyList(e.keys)
+    elseif e or rec.parked then
+        mirrorOf(rec)
+        settle(rec.id)
+    end
+    return rec, false
+end
+
+--- The record `vehId` (AWAITED: a coroutine only; read-your-writes when this module wrote it lately; read once more,
+--- with sync, when a write of ours raced it) -> record | nil (no such record) | nil, err (the read failed — never
+--- "no record").
+local function readRecord(vehId, again)
+    local start = writeSeq
+    local row, err = DB.first(TABLE, { id = vehId }, { sync = again or lastWrite(vehId) ~= nil })
+    if err ~= nil then return nil, err end
+    local raced = (lastWrite(vehId) or 0) > start
+    if not row then
+        if raced and not again then return readRecord(vehId, true) end
+        if not raced and not byVehId[vehId] then recs[vehId] = nil end
+        return nil
+    end
+    local rec, stale = fromRead(row, start)
+    if stale and not again then return readRecord(vehId, true) end
+    return rec
+end
 
 --- Resolves a **tracked** netId to a live entity handle (0 when untracked or gone).
 --- Deliberately no NetworkGetEntityFromNetworkId fallback: the exported API acts only on an entity core
@@ -107,19 +245,22 @@ local function forget(netId)
     if info.parked and clones[info.parked] == netId then clones[info.parked] = nil end
     spawned[netId], rest[netId] = nil, nil
     Core.Registry.untrack('vehicle', netId)
+    if info.vehId then settle(info.vehId) end
     return true
 end
 
 --- Normalises a persistent plate. Hyphens support real registration layouts such as LS-48291.
 --- A plate is globally unique across **stored and live** Core.Vehicles records, not only within the
---- current process. `recordId` is used solely by spawnRecord when restoring that same record.
+--- current process (the live cars in memory, the records by the UNIQUE plate index — one indexed read, awaited;
+--- the live map is checked again after it, so no yield separates the check from the caller's track()).
+--- `recordId` is used solely by spawnRecord when restoring that same record: its plate is its own under the UNIQUE
+--- index, so only the live map is asked (no read). -> taken? | nil, err (read failed)
 local function plateTaken(plate, recordId)
     if usedPlates[plate] then return true end
-    local records = Core.DB.find(COLLECTION, { plate = plate })
-    for i = 1, #records do
-        if records[i].id ~= recordId then return true end
-    end
-    return false
+    if recordId then return false end
+    local row, err = DB.first(TABLE, { plate = plate }, { columns = { 'id' } })
+    if err ~= nil then return nil, err end
+    return usedPlates[plate] ~= nil or (row ~= nil and row.id ~= recordId)
 end
 
 local function normalizePlate(plate, recordId)
@@ -127,17 +268,44 @@ local function normalizePlate(plate, recordId)
     plate = Utils.trim(plate):upper()
     if #plate < 1 or #plate > PLATE_MAX then return nil, 'bad_plate' end
     if not plate:match('^[%w %-]+$') then return nil, 'bad_plate' end
-    if plateTaken(plate, recordId) then return nil, 'plate_taken' end
+    local taken, err = plateTaken(plate, recordId)
+    if taken == nil then
+        Log.error('vehicles: the plate check failed (%s)', tostring(err))
+        return nil, 'db'
+    end
+    if taken then return nil, 'plate_taken' end
     return plate
 end
 
-local function randomPlate(recordId)
-    for _ = 1, 1000 do
-        local plate = (Config.Vehicles.PlatePrefix or 'LS') .. Utils.randomString(5, PLATE_ALPHABET)
-        plate = plate:sub(1, PLATE_MAX):upper()
-        if not plateTaken(plate, recordId) then return plate end
+--- A free random plate: batches of PLATE_BATCH candidates, ONE indexed query per batch (plate = ANY), never a scan;
+--- the live map is checked again after the read. A FAILED read is accepted (a candidate not live): the UNIQUE index
+--- and persist's re-plate still guard the records, and a spawn never fails because the database is slow or down.
+--- -> plate | nil, 'plate_exhausted'
+local function randomPlate()
+    local prefix = Config.Vehicles.PlatePrefix or 'LS'
+    for _ = 1, PLATE_ROUNDS do
+        local batch, seen = {}, {}
+        for _ = 1, PLATE_BATCH do
+            local plate = (prefix .. Utils.randomString(5, PLATE_ALPHABET)):sub(1, PLATE_MAX):upper()
+            if not usedPlates[plate] and not seen[plate] then
+                seen[plate] = true
+                batch[#batch + 1] = plate
+            end
+        end
+        if #batch > 0 then
+            local rows, err = DB.query(PLATES_SQL, { batch })
+            if not rows then
+                Log.warn('vehicles: the plate check failed (%s); a random plate is taken unchecked', tostring(err))
+                rows = {}
+            end
+            local taken = {}
+            for i = 1, #rows do taken[rows[i].plate] = true end
+            for i = 1, #batch do
+                if not taken[batch[i]] and not usedPlates[batch[i]] then return batch[i] end
+            end
+        end
     end
-    return nil
+    return nil, 'plate_exhausted'
 end
 
 local function charIdOf(src)
@@ -305,23 +473,35 @@ local function spawn(opts, restoreRecordId)
     local vehType = opts.type or 'automobile'
     local coords = opts.coords
     local heading = (opts.heading or 0.0) + 0.0
+
+    -- the plate BEFORE the entity (a slow or failed read never strands one), held in usedPlates across the yields;
+    -- an explicitly requested plate must be honoured or refused, never silently replaced
+    local plate
+    if opts.plate ~= nil then
+        plate, err = normalizePlate(opts.plate, restoreRecordId)
+    else
+        plate, err = randomPlate()
+    end
+    if not plate then return nil, err end
+    local hold = {}
+    usedPlates[plate] = hold
+    local function fail(why, entity)
+        if usedPlates[plate] == hold then usedPlates[plate] = nil end
+        if entity and entity ~= 0 and DoesEntityExist(entity) then DeleteEntity(entity) end
+        return nil, why
+    end
+
     local entity = CreateVehicleServerSetter(model, vehType, coords.x, coords.y, coords.z, heading)
-    if entity == 0 then return nil, 'create_failed' end
+    if entity == 0 then return fail('create_failed') end
 
     local deadline = GetGameTimer() + (Config.Vehicles.SpawnTimeoutMs or 5000)
     while not DoesEntityExist(entity) do
-        if GetGameTimer() >= deadline then
-            if DoesEntityExist(entity) then DeleteEntity(entity) end
-            return nil, 'spawn_timeout'
-        end
+        if GetGameTimer() >= deadline then return fail('spawn_timeout', entity) end
         Wait(50)
     end
 
     local netId = NetworkGetNetworkIdFromEntity(entity)
-    if netId == 0 then
-        DeleteEntity(entity)
-        return nil, 'no_netid'
-    end
+    if netId == 0 then return fail('no_netid', entity) end
 
     local ownerCharId = opts.ownerCharId or (opts.ownerSrc and charIdOf(opts.ownerSrc)) or nil
     local keyMode = opts.keyMode or 'virtual'
@@ -330,22 +510,6 @@ local function spawn(opts, restoreRecordId)
         for i = 1, #opts.keys do keys[opts.keys[i]] = true end
     end
     if ownerCharId and keyMode == 'virtual' then keys[ownerCharId] = true end
-
-    -- an explicitly requested plate must be honoured or refused, never silently replaced
-    local plate
-    if opts.plate ~= nil then
-        plate, err = normalizePlate(opts.plate, restoreRecordId)
-        if not plate then
-            DeleteEntity(entity)
-            return nil, err
-        end
-    else
-        plate = randomPlate(restoreRecordId)
-        if not plate then
-            DeleteEntity(entity)
-            return nil, 'plate_exhausted'
-        end
-    end
     SetVehicleNumberPlateText(entity, plate)
 
     local name = opts.model
@@ -355,6 +519,7 @@ local function spawn(opts, restoreRecordId)
         vehId = nil, spawnedBy = owner, createdAt = os.time(),
         vehType = vehType, props = opts.props and cleanProps(opts.props, plate) or nil,
         modelName = type(name) == 'string' and name:find(MODEL_NAME) and name:lower() or nil,
+        plateFixed = opts.plate ~= nil,          -- asked for: never re-plated by persist (else a collision re-plates)
     }
     track(info)
     writeState(entity, info)
@@ -411,6 +576,7 @@ function Vehicles.setLocked(netId, locked)
     info.locked = locked
     Entity(entity).state:set('locked', locked, true)
     SetVehicleDoorsLocked(entity, locked and LOCK_LOCKED or LOCK_UNLOCKED)
+    if info.vehId then write(info.vehId, { locked = locked }) end      -- the record follows (queued)
     return true
 end
 
@@ -419,9 +585,11 @@ function Vehicles.isLocked(netId)
     return info ~= nil and info.locked == true
 end
 
+--- The keys bag, and the record's keys of a persisted car (queued): a key given or taken back is never only live.
 local function syncKeys(info)
     local entity = entityOf(info.netId)
     if entity ~= 0 then Entity(entity).state:set('keys', info.keys, true) end
+    if info.vehId then write(info.vehId, { keys = keyList(info.keys) }) end
 end
 
 function Vehicles.giveKeys(netId, charId)
@@ -451,10 +619,19 @@ function Vehicles.hasKeys(src, netId)
     return info.keys[charId] == true
 end
 
+--- A new owner must be an existing character (an online session's, else one awaited read): false otherwise.
 function Vehicles.setOwner(netId, charId)
     local info = spawned[netId]
     if not info then return false end
     if charId ~= nil and not Validate.value('id', charId) then return false end
+    if charId ~= nil and charId ~= info.ownerCharId then
+        local known, err = P.characterExists(charId)
+        if not known then
+            Log.warn('vehicles: setOwner(%s): no character %s (%s)', tostring(netId), charId, tostring(err or 'none'))
+            return false
+        end
+        if spawned[netId] ~= info then return false end       -- (the read yielded: the car may be gone)
+    end
     local previous = info.ownerCharId
     if previous and previous ~= charId then info.keys[previous] = nil end -- virtual keys follow ownership
     info.ownerCharId = charId
@@ -466,7 +643,7 @@ function Vehicles.setOwner(netId, charId)
         state:set('keys', info.keys, true)
         if charId then SetEntityOrphanMode(entity, ORPHAN_KEEP_ENTITY) end
     end
-    if info.vehId then Core.DB.update(COLLECTION, info.vehId, { ownerCharId = charId or false }) end
+    if info.vehId then write(info.vehId, { ownerCharId = charId or false, keys = keyList(info.keys) }) end
     return true
 end
 
@@ -491,31 +668,58 @@ function Vehicles.list()
     return list
 end
 
---- Creates the `vehicles` document for an already spawned vehicle. Returns vehId | nil.
+--- A live car whose core-chosen plate collided at the insert gets a new random plate (entity, bag, props, map).
+local function replate(info)
+    local plate = randomPlate()
+    local entity = entityOf(info.netId)
+    if not plate or entity == 0 or spawned[info.netId] ~= info then return false end
+    if usedPlates[info.plate] == info.netId then usedPlates[info.plate] = nil end
+    info.plate, usedPlates[plate] = plate, info.netId
+    if info.props then info.props.plate = plate end
+    SetVehicleNumberPlateText(entity, plate)
+    Entity(entity).state:set('plate', plate, true)
+    return true
+end
+
+--- Creates the `vehicles` record of an already spawned vehicle (one awaited insert — it yields; the UNIQUE plate
+--- index is the final guard: a core-chosen plate that collides is replaced and the insert retried, a plate the
+--- caller asked for fails the persist). Returns vehId | nil.
 function Vehicles.persist(netId)
     local info = spawned[netId]
     if not info then return nil end
+    if info.persisting then                               -- a concurrent persist of the same car: its result
+        local deadline = GetGameTimer() + 30000
+        while info.persisting and GetGameTimer() < deadline do Wait(50) end
+        return info.vehId
+    end
     if info.vehId then return info.vehId end
     local entity = entityOf(netId)
     if entity == 0 then return nil end
-    local vehId = Core.DB.create(COLLECTION, {
-        ownerCharId = info.ownerCharId or false, model = info.model, modelName = info.modelName, plate = info.plate,
-        props = info.props or {}, stored = false, position = positionOf(entity),
-        meta = { vehType = info.vehType, keyMode = info.keyMode },
-    })
-    if not vehId then return nil end
-    setVehId(info, vehId)
+    info.persisting = true
+    local vehId, done, err
+    for _ = 1, PERSIST_TRIES do
+        vehId = Utils.uuid()
+        done, err = DB.insert(TABLE, {
+            id = vehId, owner_character_id = info.ownerCharId or nil, model = info.model, model_name = info.modelName,
+            plate = info.plate, props = info.props or {}, stored = false, position = positionOf(entity),
+            keys = keyList(info.keys), locked = info.locked == true,
+            meta = { vehType = info.vehType, keyMode = info.keyMode },
+        }, { returning = false })
+        if done or DB.errorCode(err) ~= '23505' or not tostring(err):find('vehicles_plate_key', 1, true)
+            or info.plateFixed or not replate(info) then break end
+        Log.warn('vehicles: plate collision at persist; netId %s re-plated as %s', tostring(netId), info.plate)
+    end
+    info.persisting = nil
+    if not done then
+        Log.error('vehicles: persist of netId %s failed (%s)', tostring(netId), tostring(err))
+        return nil
+    end
+    if spawned[netId] == info then setVehId(info, vehId) else info.vehId = vehId end
+    mirrorOf({ id = vehId, ownerCharId = info.ownerCharId or false, model = info.model, modelName = info.modelName,
+        plate = info.plate, stored = false, destroyed = false, parked = false, locked = info.locked == true,
+        keys = keyList(info.keys), meta = { vehType = info.vehType, keyMode = info.keyMode } })
+    settle(vehId)
     return vehId
-end
-
-function Vehicles.getRecords(charId)
-    if not Validate.value('id', charId) then return {} end
-    return Core.DB.find(COLLECTION, { ownerCharId = charId })
-end
-
-function Vehicles.getRecord(vehId)
-    if not Validate.value('id', vehId) then return nil end
-    return Core.DB.get(COLLECTION, vehId)
 end
 
 --- The record's keys as spawn's `keys` option (an array of charIds ≤ 32; anything else: none).
@@ -529,52 +733,31 @@ local function recordKeys(record)
 end
 
 local function spawnFromRecord(record, coords, heading, ownerSrc, bucket)
-    if byVehId[record.id] then return nil, 'already_spawned' end
-    local netId, err = spawn({
+    if byVehId[record.id] or spawning[record.id] then return nil, 'already_spawned' end
+    spawning[record.id] = true                        -- spawn yields: a second spawnRecord meanwhile is refused
+    local ok, netId, err = pcall(spawn, {
         model = record.modelName or record.model, coords = coords, heading = heading or 0.0,
         type = record.meta and record.meta.vehType or nil, keyMode = record.meta and record.meta.keyMode or nil,
         plate = record.plate, ownerCharId = record.ownerCharId or nil, ownerSrc = ownerSrc,
         props = record.props, persistent = true, keys = recordKeys(record), locked = record.locked == true,
         bucket = bucket,
     }, record.id)
+    spawning[record.id] = nil
+    if not ok then error(netId, 0) end
     if not netId then return nil, err end
-    setVehId(spawned[netId], record.id)
-    local patch = { stored = false }
-    if record.destroyed == true then patch.destroyed = false end     -- the domain brought a wreck back
-    Core.DB.update(COLLECTION, record.id, patch)
-    return netId
-end
-
---- Spawns a record at a garage exit: a garaged one, or an out one with nothing in the world (no live car, no parked
---- node — review RV6 F2: never 'already_spawned' for ever). Returns netId | nil, err.
-function Vehicles.spawnRecord(vehId, coords, heading, ownerSrc)
-    local record = Vehicles.getRecord(vehId)
-    if not record then return nil, 'no_record' end
-    if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
-    return spawnFromRecord(record, coords, heading, ownerSrc)
-end
-
---- Restores an out-of-garage record into the world at its saved position (and bucket), e.g. after a server
---- restart. Unlike spawnRecord this refuses stored vehicles, so boot recovery can never duplicate something
---- deliberately parked in a garage, and a `destroyed` record (a wrecked clone, §55.21.4 notes): only a domain's
---- spawnRecord brings a wreck back.
-function Vehicles.restoreRecord(vehId, coords, heading, ownerSrc)
-    local record = Vehicles.getRecord(vehId)
-    if not record then return nil, 'no_record' end
-    if record.stored ~= false then return nil, 'record_stored' end
-    if record.destroyed == true then return nil, 'destroyed' end
-    local bucket
-    if coords == nil and type(record.position) == 'table' then
-        local p = record.position
-        if type(p.x) == 'number' and type(p.y) == 'number' and type(p.z) == 'number' then
-            coords = vector3(p.x, p.y, p.z)
-            heading = heading == nil and p.heading or heading
-            bucket = math.tointeger(p.bucket)
-            if bucket and (bucket < 1 or bucket > 65535) then bucket = nil end
-        end
+    -- never live AND parked: a node that names the record appeared while the car was made (the park paths refuse a
+    -- record while it spawns — P.spawning — so this is the back-out of last resort)
+    local now = recs[record.id]
+    if now and now.parked and P.parkedNode and P.parkedNode(now) then
+        Vehicles.delete(netId)
+        return nil, 'parked'
     end
-    if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
-    return spawnFromRecord(record, coords, heading, ownerSrc, bucket)
+    setVehId(spawned[netId], record.id)
+    local e = recs[record.id] or mirrorOf(record)
+    local patch = { stored = false }
+    if e.destroyed == true or record.destroyed == true then patch.destroyed = false end   -- a wreck brought back
+    write(record.id, patch)
+    return netId
 end
 
 --- Promotes one existing networked GTA vehicle (for example a validated, hotwired ambient car) into a
@@ -603,9 +786,12 @@ function Vehicles.adopt(netId, opts)
     if keyMode ~= 'virtual' and keyMode ~= 'item' then return nil, 'bad_key_mode' end
 
     local rawPlate = Utils.trim(GetVehicleNumberPlateText(entity) or '')
-    local plate = normalizePlate(rawPlate)
-    if not plate then plate = randomPlate() end
-    if not plate then return nil, 'plate_exhausted' end
+    local plate, plateErr = normalizePlate(rawPlate)
+    if not plate then plate, plateErr = randomPlate() end
+    if not plate then return nil, plateErr end
+    -- the plate reads yielded: the entity may have gone or been adopted meanwhile
+    if spawned[netId] then return nil, 'already_tracked' end
+    if not DoesEntityExist(entity) or NetworkGetEntityFromNetworkId(netId) ~= entity then return nil, 'no_vehicle' end
     SetVehicleNumberPlateText(entity, plate)
 
     local keys = {}
@@ -632,15 +818,16 @@ function Vehicles.adopt(netId, opts)
 end
 
 --- Saves the last known position/props, then removes the entity from the world.
+--- (An unpersisted vehicle is persisted first: an awaited insert.) The record write is queued.
 function Vehicles.store(netId)
     local info = spawned[netId]
     if not info then return false end
     local vehId = info.vehId or Vehicles.persist(netId)
-    if not vehId then return false end
-    local patch = { stored = true, props = info.props or {} }
+    if not vehId or spawned[netId] ~= info then return false end
+    local patch = { stored = true, props = info.props or {}, keys = keyList(info.keys), locked = info.locked == true }
     local entity = entityOf(netId)
     if entity ~= 0 then patch.position = positionOf(entity) end
-    Core.DB.update(COLLECTION, vehId, patch)
+    if not write(vehId, patch) then return false end
     Vehicles.delete(netId)
     return true
 end
@@ -665,71 +852,9 @@ function Vehicles.saveProps(netId, props)
     elseif entity ~= 0 then
         Entity(entity).state:set('coreProps', info.props, true)
     end
-    if info.vehId then Core.DB.update(COLLECTION, info.vehId, { props = info.props }) end
+    if info.vehId then write(info.vehId, { props = info.props }) end    -- queued; ≤ 1 per 5 s per driver
     return true
 end
-
-function Vehicles.deleteRecord(vehId)
-    if not Validate.value('id', vehId) then return false end
-    return Core.DB.delete(COLLECTION, vehId) == true
-end
-
---- Distance resolver for the wrapper's `distance` check: the vehicle's own position.
-local function vehicleCoords(_, netId)
-    local entity = entityOf(netId)
-    if entity == 0 then return nil end
-    return GetEntityCoords(entity)
-end
-
---- Toggles the lock of a core vehicle the player holds keys for (DESIGN §5).
-Net.on('core:server:vehicleLock', { 'netId' }, function(src, netId)
-    local entity = entityOf(netId)
-    if entity == 0 or GetEntityType(entity) ~= ENTITY_TYPE_VEHICLE then return end
-    if Entity(entity).state.coreVeh ~= true then return end
-    if not Vehicles.hasKeys(src, netId) then
-        Core.Notify.send(src, Config.Texts.no_keys, 'error')
-        return
-    end
-    local locked = not Vehicles.isLocked(netId)
-    if not Vehicles.setLocked(netId, locked) then return end
-    Core.Notify.send(src, locked and Config.Texts.locked or Config.Texts.unlocked, 'info')
-end, {
-    cooldown = 500,
-    requireLoaded = true,
-    distance = { coords = vehicleCoords, max = Config.Vehicles.LockDistance },
-})
-
---- Owner's client reports the vehicle's mod/colour props so they survive a respawn.
---- A ped sitting in the vehicle is inside PROPS_DISTANCE of it by definition (DESIGN §5).
-Net.on('core:server:vehicleProps', { 'netId', { 'table', max = PROPS_MAX_KEYS } }, function(src, netId, props)
-    local entity = entityOf(netId)
-    if entity == 0 or GetEntityType(entity) ~= ENTITY_TYPE_VEHICLE then return end
-    if Entity(entity).state.coreVeh ~= true then return end
-    if not Vehicles.hasKeys(src, netId) then return end
-    Vehicles.saveProps(netId, props)
-end, {
-    cooldown = 5000,
-    requireLoaded = true,
-    distance = { coords = vehicleCoords, max = PROPS_DISTANCE },
-})
-
---- DESIGN §5.2: the player's own persisted vehicle records. Throttled per src because
---- it scans (and deep-copies) the whole `vehicles` collection.
-local recordsCooldown = {}
-
-Core.Callback.register('core:vehicles:mine', function(src)
-    local now = GetGameTimer()
-    if now < (recordsCooldown[src] or 0) then return {} end
-    recordsCooldown[src] = now + RECORDS_COOLDOWN_MS
-    local charId = charIdOf(src)
-    if not charId then return {} end
-    return Vehicles.getRecords(charId)
-end)
-
-AddEventHandler('playerDropped', function()
-    local src = source
-    recordsCooldown[src] = nil
-end)
 
 --- The world lost the entity (culled, deleted elsewhere): drop our book-keeping. A parked car's clone also tells
 --- the domain (vehicleDeleted): its node lives on, the scene demotes it.
@@ -751,6 +876,7 @@ AddEventHandler('onResourceStop', function(resource)
     -- at their pose — review RV4 F14 / RV6 F2), so the boot has nothing to spawn. Without it (or when a node was
     -- refused) a live persistent vehicle remains logically `stored = false` at its final position (the boot check
     -- re-parks it); a vehicle explicitly garaged earlier has no live entity here and remains `stored = true`.
+    -- Every record write here is QUEUED (core_db commits it after core is gone, §56.1): nothing awaits, no flush.
     P.stopped = true
     if P.beforeStop then
         local ok, err = pcall(P.beforeStop)
@@ -759,19 +885,22 @@ AddEventHandler('onResourceStop', function(resource)
     for _, info in pairs(spawned) do
         local entity = info.entity
         if info.vehId then
-            local patch = { stored = false, props = info.props or {} }
+            local patch = { stored = false, props = info.props or {}, keys = keyList(info.keys),
+                locked = info.locked == true }
             if entity and DoesEntityExist(entity) then patch.position = positionOf(entity) end
-            Core.DB.update(COLLECTION, info.vehId, patch)
+            write(info.vehId, patch)
         end
         if entity and DoesEntityExist(entity) then DeleteEntity(entity) end
     end
-    for _, t in ipairs({ spawned, byEntity, usedPlates, byVehId, clones, rest }) do clear(t) end
-    Core.DB.flush()
+    for _, t in ipairs({ spawned, byEntity, usedPlates, byVehId, clones, rest, recs, spawning }) do clear(t) end
 end)
 
 -- The one-shot hand-off to server/vehicles_park.lua (it adds its helpers and passes P on to
 -- server/vehicles_fleet.lua, which clears the global).
 P.entityOf, P.forget, P.track, P.writeState, P.publicInfo = entityOf, forget, track, writeState, publicInfo
 P.validateProps, P.cleanProps, P.positionOf = validateProps, cleanProps, positionOf
+P.write, P.readRecord, P.fromRow, P.fromRead, P.mirrorOf = write, readRecord, fromRow, fromRead, mirrorOf
+P.settle, P.markWrite, P.lastWrite, P.writeSeq = settle, markWrite, lastWrite, function() return writeSeq end
+P.spawnFromRecord, P.charIdOf, P.keyList = spawnFromRecord, charIdOf, keyList
 -- fxlint-disable-next-line C003 -- one-shot hand-off to server/vehicles_park.lua (then vehicles_fleet.lua clears it)
 CoreVehiclesPark = P

@@ -3,8 +3,12 @@
 
     The identity half of server/bans.lua (split off to keep bans.lua < 900 lines; loads right before it):
       BanIdentity.isKey(v)                          a storable identifier/token ('type:value', never 'ip:')
+      BanIdentity.key(v) -> key | nil               the same in canonical form: LOWER-CASED (the engine's
+                                                    identifiers and tokens are lower-case hex; an admin may type
+                                                    'DISCORD:…' or paste upper-case hex) — every stored/matched key
       BanIdentity.collect(src) -> ids, tokens       every identifier (no ip:, <= 32) and token (<= 64) of a player
-      BanIdentity.holders(ids, tokens, targetSrc?, tokenMatches) -> accounts, srcs, unreadable
+      BanIdentity.account(accountId) -> { id, name, identifiers } | false | nil, err   the stored account (yields)
+      BanIdentity.holders(ids, tokens, targetSrc?, tokenMatches) -> accounts, srcs, unreadable   (yields)
       BanIdentity.outranksAll(actorSrc, accounts, srcs) -> bool
       BanIdentity.playerApi() / BanIdentity.info(src)  Core.Player / Player.getInfo without ever throwing
 
@@ -12,9 +16,12 @@
     `online[src]` / `onlineByKey[key]` and dropped at playerDropped; a core restart seeds it from GetPlayers().
     So "who online holds this identifier/token" is a lookup, never a walk over the players.
 
-    Accounts: Player.findAccountsByIdentifier (server/getters.lua, an in-memory index) when present, else a
-    one-off non-copying scan of `accounts` (offline bans are rare admin actions). `unreadable` is true when
-    that lookup failed or `accounts` is degraded: bans.lua then refuses a player actor (review R2-11).
+    Accounts (DESIGN §56.8): the holders of an identifier come from Player.findAccountsByIdentifier
+    (server/getters.lua: one indexed query per identifier), their `id, perm_group, name` from ONE query by id
+    list; the offline account of a ban target (license + account_identifiers) from one query by id. These reads
+    are awaited — offline bans are rare admin actions and their callers (commands, callbacks, threads) can yield.
+    `unreadable` is true when a lookup failed or Player.findAccountsByIdentifier is missing: bans.lua then refuses
+    a player actor (review R2-11). Nothing is ever scanned.
 
     Natives: GetNumPlayerIdentifiers, GetPlayerIdentifier, GetNumPlayerTokens, GetPlayerToken (server).
 ]]
@@ -36,6 +43,13 @@ function Identity.isKey(value)
 end
 local isKey = Identity.isKey
 
+function Identity.key(value)
+    if type(value) ~= 'string' then return nil end
+    value = value:lower()
+    return isKey(value) and value or nil
+end
+local keyOf = Identity.key
+
 function Identity.playerApi()
     local player = rawget(Core, 'Player')
     return type(player) == 'table' and player or nil
@@ -56,13 +70,13 @@ function Identity.collect(src)
     local ids, tokens = {}, {}
     local count = math.tointeger(tonumber(GetNumPlayerIdentifiers(src)) or 0) or 0
     for i = 0, math.min(count, MAX_IDENTIFIERS) - 1 do
-        local value = GetPlayerIdentifier(src, i)
-        if isKey(value) then ids[#ids + 1] = value end
+        local value = keyOf(GetPlayerIdentifier(src, i))
+        if value then ids[#ids + 1] = value end
     end
     count = math.tointeger(tonumber(GetNumPlayerTokens(src)) or 0) or 0
     for i = 0, math.min(count, MAX_TOKENS) - 1 do
-        local value = GetPlayerToken(src, i)
-        if isKey(value) then tokens[#tokens + 1] = value end
+        local value = keyOf(GetPlayerToken(src, i))
+        if value then tokens[#tokens + 1] = value end
     end
     return ids, tokens
 end
@@ -100,41 +114,80 @@ local function trackOnline(src)
     online[src] = keys
 end
 
---- Every account holding one of `ids` — Player.findAccountsByIdentifier (player.lua's in-memory index), else a
---- one-off scan of `accounts` read in place (offline bans are rare admin actions) — and every connected src
---- the ban would refuse: one identifier, or at least bans.tokenMatches distinct tokens.
-function Identity.holders(ids, tokens, targetSrc, tokenMatches)
-    local accounts, seen = {}, {}
-    local function add(doc)
-        if type(doc) == 'table' and type(doc.id) == 'string' and not seen[doc.id] then
-            seen[doc.id] = true
-            accounts[#accounts + 1] = { id = doc.id, group = doc.group, name = doc.name }
-        end
+local HOLDERS_SQL <const> = 'SELECT id, perm_group, name FROM accounts WHERE id = ANY($1::text[])'
+local ACCOUNT_SQL <const> = [[
+SELECT a.id, a.name, a.license,
+       ARRAY(SELECT i.identifier FROM account_identifiers i WHERE i.account_id = a.id ORDER BY i.kind) AS identifiers
+FROM accounts a
+WHERE a.id = $1]]
+
+--- The stored account behind an offline ban target: its license first, then every account_identifiers entry
+--- (read with { sync = true }: identifiers a join queued a moment ago count). false = no such account;
+--- nil, err = the read failed. Yields.
+function Identity.account(accountId)
+    local rows, err = Core.DB.query(ACCOUNT_SQL, { accountId }, { sync = true })
+    if not rows then return nil, err end
+    local row = rows[1]
+    if not row then return false end
+    local stored = {}
+    local license = keyOf(row.license)
+    stored[1] = license
+    for _, value in ipairs(type(row.identifiers) == 'table' and row.identifiers or {}) do
+        local key = keyOf(value)
+        if key and key ~= license then stored[#stored + 1] = key end
     end
-    local player, unreadable = playerApi(), false
+    return { id = row.id, name = row.name, identifiers = stored }
+end
+
+--- Account ids holding one of `ids` (Player.findAccountsByIdentifier, in discovery order) → ids, unreadable.
+local function holderIds(ids)
+    local out, seen = {}, {}
+    local player = playerApi()
     local lookup = player and rawget(player, 'findAccountsByIdentifier')
-    if #ids > 0 and type(lookup) == 'function' then
-        for i = 1, #ids do
-            local ok, list = pcall(lookup, ids[i])
-            unreadable = unreadable or not ok or type(list) ~= 'table'
-            for j = 1, (ok and type(list) == 'table') and #list or 0 do
-                if not seen[list[j]] then add(Core.DB.get('accounts', list[j])) end
+    if type(lookup) ~= 'function' then return out, true end   -- nobody can answer: never assume "nobody"
+    local unreadable = false
+    for i = 1, #ids do
+        local ok, list = pcall(lookup, ids[i])
+        if not ok or type(list) ~= 'table' then
+            unreadable = true
+        else
+            for j = 1, #list do
+                local id = list[j]
+                if type(id) == 'string' and not seen[id] then
+                    seen[id] = true
+                    out[#out + 1] = id
+                end
             end
         end
-    elseif #ids > 0 then
-        local want = {}
-        for i = 1, #ids do want[ids[i]] = true end
-        Core.DB.find('accounts', function(doc)
-            local hit = type(doc.license) == 'string' and want[doc.license] == true
-            for _, value in pairs(type(doc.identifiers) == 'table' and doc.identifiers or {}) do
-                if hit then break end
-                hit = want[value] == true
-            end
-            if hit then add(doc) end
-            return false
-        end)
     end
-    unreadable = unreadable or (#ids > 0 and Core.DB.isDegraded('accounts'))
+    return out, unreadable
+end
+
+--- Every account holding one of `ids` ({ id, group, name }, discovery order: the holder ids, then ONE query for
+--- their rows) and every connected src the ban would refuse: one identifier, or at least bans.tokenMatches
+--- distinct tokens. Yields when `ids` is not empty.
+function Identity.holders(ids, tokens, targetSrc, tokenMatches)
+    local accounts, unreadable = {}, false
+    if #ids > 0 then
+        local found
+        found, unreadable = holderIds(ids)
+        if found[1] then
+            local rows, err = Core.DB.query(HOLDERS_SQL, { found })
+            local byId = {}
+            if rows then
+                for i = 1, #rows do byId[rows[i].id] = rows[i] end
+            else
+                unreadable = true   -- the ids stay listed (the ban still names them); their rank is unknown
+                Core.Log.error('bans: the accounts holding a banned identifier cannot be read (%s)', tostring(err))
+            end
+            for i = 1, #found do
+                local row = byId[found[i]]
+                if row or not rows then
+                    accounts[#accounts + 1] = { id = found[i], group = row and row.perm_group, name = row and row.name }
+                end
+            end
+        end
+    end
     local srcs, hitBy, tokenCount = {}, {}, {}
     if targetSrc then hitBy[targetSrc] = true end
     for i = 1, #ids do

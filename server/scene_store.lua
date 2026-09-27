@@ -30,13 +30,15 @@
     descriptors are rebased by the index's movers sweep (Motion.needsRebase / rebase); finished plans come back
     here through settle.
 
-    Persistence: collection `scene_nodes`, one document per persistent node ('n<id>'); the id counter in
-    `scene_meta:counter`. Writes are coalesced (one thread, only while something is dirty, <= 1 write per node
-    per second, a final write on core stop). A motion is stored rebased (Motion.rebase at the write: periodic
-    phases folded in, a finished plan an ended tween) without t0, its time phase in `mphase`; Clock-valued fields
+    Persistence (§56.6): table `scene_nodes`, one row per persistent node (columns id, kind, owner, parent — NULL for
+    a root —, bucket + `doc` jsonb = the rest); the id counter = row core_counters('scene_nodes') (the next id).
+    Writes are coalesced (one thread, only while something is dirty, <= 1 write per node per second, a final write
+    on core stop) and QUEUED (Core.DB.save / remove: never yield; core_db commits them after core is gone). A motion
+    is stored rebased (Motion.rebase at the write) without t0, its time phase in `mphase`; Clock-valued fields
     (kind.clock) as phases in `clk`; both re-anchored at load. Player / net attachments and 'dr' are transient.
-    Loaded once behind a promise barrier (the first caller loads, everyone else waits; a failed load is retried
-    at most every 10 s and leaves no half state); undefined kinds load as placeholders.
+    Loaded once behind a promise barrier (the first caller loads — the counter with sync = true, then the rows
+    through Core.DB.stream — everyone else waits; a failed read fails the load, retried at most every 10 s, never
+    an empty world, no half state); undefined kinds load as placeholders.
 
     Natives: GetPlayerPed, GetEntityCoords, GetEntityHeading, GetEntityRotation, GetEntityModel,
     NetworkGetEntityFromNetworkId, DoesEntityExist (all server / CFX forms, fxref 2026-09-26/27). CreateThread, Wait,
@@ -62,7 +64,10 @@ local type, pairs, next, pcall, tostring = type, pairs, next, pcall, tostring
 local toint, huge, rad, cos, sin = math.tointeger, math.huge, math.rad, math.cos, math.sin
 
 local LISTEN_KIND <const>, INTERACT_KIND <const> = 'sceneListener', 'sceneInteract'
-local C_NODES <const>, C_META <const> = 'scene_nodes', 'scene_meta'
+local T_NODES <const>, T_COUNTERS <const>, COUNTER <const> = 'scene_nodes', 'core_counters', 'scene_nodes'
+local LOAD_SQL <const> = 'SELECT id, kind, owner, parent, bucket, doc FROM scene_nodes ORDER BY id'
+local COUNTER_SQL <const> = 'SELECT value FROM core_counters WHERE name = $1'
+local LOAD_BATCH <const> = 1000
 local ID_MAX <const> = 0x7FFFFFFF
 local MAX_DEPTH <const> = 4
 local LOAD_RETRY_MS <const> = 10000
@@ -449,10 +454,11 @@ function store.hookStats()
 end
 
 --------------------------------------------------------------------------------
--- Persistence (§55.18): collection scene_nodes (document 'n<id>'), counter scene_meta:counter
+-- Persistence (§55.18, §56.6): table scene_nodes (columns + doc jsonb), counter core_counters('scene_nodes')
 --------------------------------------------------------------------------------
 
 local dirty, dirtyCount, counterDirty, flushing = {}, 0, false, false
+local rowFailed = {}                -- [id] = true: its row could not be built (logged once; it stays dirty)
 
 --- Clock-valued field paths (kind.clock: 't0', 'anim.t0', …) leave as phases: holder, key per path.
 local function clockSlot(fields, path)
@@ -489,7 +495,9 @@ local function motionIn(m, phase, now)
     return ok and rebased(norm, now) or nil
 end
 
-local function docOf(node, now)
+--- The node's scene_nodes row: kind / owner / parent / bucket are COLUMNS (a root's parent an explicit NULL, so a
+--- detach overwrites the old one), everything else is `doc` (v = 1: the document shape, kept from the legacy rows).
+local function rowOf(node, now)
     local fields, clk = Utils.deepCopy(node.fields), nil
     for _, path in ipairs(node.k and node.k.clock or EMPTY) do
         local holder, key = clockSlot(fields, path)
@@ -501,33 +509,61 @@ local function docOf(node, now)
     local x, y, z, rx, ry, rz = pose(node, now)
     local derived = node.parent ~= nil or node.attach ~= nil
     local motion, mphase = motionOut(node.motion, now)
-    return { v = 1, kind = node.kind, owner = node.owner, bucket = node.bucket,
+    local doc = { v = 1,
         pos = derived and { x = x, y = y, z = z } or v3(node.pos),
         rot = derived and { x = rx, y = ry, z = rz } or v3(node.rot),
-        parent = node.parent, offset = v3(node.offset), offrot = v3(node.offrot), bone = node.bone,
+        offset = v3(node.offset), offrot = v3(node.offrot), bone = node.bone,
         rotOrder = node.rotOrder, motion = motion, mphase = mphase, fields = fields, clk = clk,
         audience = V.audienceData(node.audience),
         radius = node.fixedRadius, global = node.global or nil,
         interact = node.interact and Utils.deepCopy(node.interact),
         authority = node.authority and Utils.deepCopy(node.authority), allowChildren = node.allowChildren }
+    return { id = node.id, kind = node.kind, owner = node.owner, parent = node.parent or Core.DB.NULL,
+        bucket = node.bucket, doc = doc }
 end
 
---- Writes every dirty document (a node that is gone or no longer persistent is deleted) and the counter.
+local function keepDirty(id) if not dirty[id] then dirty[id], dirtyCount = true, dirtyCount + 1 end end
+
+--- Queues every dirty row (Core.DB.save; a node that is gone or no longer persistent: Core.DB.remove) and the
+--- counter. Never yields (queued writes only), so it runs in stop handlers too. While core_db is not started the
+--- rest stays dirty and the coalescing thread tries again a second later; a refused row (a bug) is logged. A row
+--- that cannot be BUILT (rowOf throws) costs only that node: it stays dirty, logged once (review R3a #6).
 local function writeDirty()
     local DB, now, list = Core.DB, R.now(), dirty
     dirty, dirtyCount = {}, 0
+    local down, refused, lastErr = false, 0, nil
     for id in pairs(list) do
-        local node = nodes[id]
-        if node and node.persist then
-            DB.set(C_NODES, 'n' .. id, docOf(node, now))
-        else
-            DB.delete(C_NODES, 'n' .. id)
+        local node, ok, err = nodes[id], false, 'unavailable'
+        if not down and node and node.persist then
+            local built, row = pcall(rowOf, node, now)
+            if built then
+                rowFailed[id] = nil
+                ok, err = DB.save(T_NODES, row)
+            else
+                if not rowFailed[id] then
+                    rowFailed[id] = true
+                    Log.error('scene: node %d could not be persisted (%s); it stays dirty', id, tostring(row))
+                end
+                ok, err = true, nil
+                keepDirty(id)
+            end
+        elseif not down then
+            rowFailed[id] = nil
+            ok, err = DB.remove(T_NODES, id)
+        end
+        if not ok and (down or DB.errorCode(err) == 'unavailable') then
+            down = true                                             -- core_db is not started: the rest stays dirty
+            keepDirty(id)
+        elseif not ok then
+            refused, lastErr = refused + 1, err
         end
     end
-    if counterDirty then
-        counterDirty = false
-        DB.set(C_META, 'counter', { value = nextId })
+    if counterDirty and not down then
+        local ok, err = DB.save(T_COUNTERS, { name = COUNTER, value = nextId })
+        counterDirty = not ok and DB.errorCode(err) == 'unavailable'
+        if not ok and not counterDirty then refused, lastErr = refused + 1, err end
     end
+    if refused > 0 then Log.error('scene: %d persistent write(s) refused: %s', refused, tostring(lastErr)) end
 end
 store.flush = writeDirty
 
@@ -677,7 +713,8 @@ local function depsFor(kind, fields)
     return nil
 end
 
---- A stored document -> a linked node (parents are linked before their children), or nil.
+--- A stored document (a row's doc with its columns folded in) -> a linked node (parents are linked before their
+--- children), or nil.
 local function nodeFromDoc(id, doc, now)
     if type(doc.kind) ~= 'string' or type(doc.owner) ~= 'string' then return nil end
     local k = K.get(doc.kind)
@@ -711,18 +748,34 @@ local function nodeFromDoc(id, doc, now)
     return node
 end
 
+--- Reads the counter (sync = true: whatever the last core queued at its stop has committed first) and every row
+--- (streamed, ascending id) -> docs by id, ids ascending, the stored counter | nil, err. Nothing is linked yet.
+local function readAll()
+    local DB = Core.DB
+    local stored, err = DB.scalar(COUNTER_SQL, { COUNTER }, { sync = true })
+    if err then return nil, err end
+    local docs, ids = {}, {}
+    local total
+    total, err = DB.stream(LOAD_SQL, {}, function(rows)
+        for i = 1, #rows do
+            local row = rows[i]
+            local id = toId(row.id)
+            if id and not docs[id] then
+                local doc = type(row.doc) == 'table' and row.doc or {}
+                doc.kind, doc.owner, doc.parent, doc.bucket = row.kind, row.owner, row.parent, row.bucket -- columns
+                docs[id], ids[#ids + 1] = doc, id
+            end
+        end
+    end, { batch = LOAD_BATCH })
+    if not total then return nil, err end
+    return docs, ids, toint(stored)
+end
+
 local function loadAll()
-    local DB, now = Core.DB, R.now()
-    local docs = {}
-    DB.find(C_NODES, function(doc)
-        local id = toId(type(doc.id) == 'string' and tonumber(doc.id:match('^n(%d+)$')))
-        if id then docs[id] = Utils.deepCopy(doc) end
-        return false
-    end)
-    if DB.isDegraded(C_NODES) then return false end
-    local ids, maxId = {}, 0
-    for id in pairs(docs) do ids[#ids + 1] = id if id > maxId then maxId = id end end
-    table.sort(ids)
+    local docs, ids, stored = readAll()
+    if not docs then return false, ids end
+    local now = R.now()                                             -- after the reads: they may have yielded
+    local maxId = ids[#ids] or 0
     local made = {}
     for _ = 1, MAX_DEPTH + 2 do                                    -- parents first: at most depth + 1 passes
         for i = 1, #ids do
@@ -749,36 +802,36 @@ local function loadAll()
         end
     end
     for i = 1, #order do R.index.put(order[i]) end
-    local meta = DB.get(C_META, 'counter')
-    local stored = meta and toint(meta.value) or 1
-    nextId = math.max(stored, maxId + 1, 1)
+    nextId = math.max(stored or 1, maxId + 1, 1)
     if nextId > ID_MAX then nextId = 1 end
     Log.debug('scene: loaded %d persistent node(s)', #ids)
     return true
 end
 
---- The load barrier (§22): the first caller loads (Core.DB may yield on postgres), everyone else waits. A failed
---- load is retried at most every LOAD_RETRY_MS (the start thread keeps trying).
+--- The load barrier (§22): the first caller that can yield loads (the reads are awaited: a plugin's export call or
+--- other non-yieldable code gets false and never starts or fails a load), everyone else waits. A failed load (never
+--- an empty world, §56.8 rule 4) is retried at most every LOAD_RETRY_MS (the start thread keeps trying).
 local function ensureLoaded()
     if loaded then return true end
     if loadBarrier then
         pcall(Citizen.Await, loadBarrier)
         return loaded
     end
+    if not coroutine.isyieldable() then return false end
     if failedAt and R.diff(R.now(), failedAt) < LOAD_RETRY_MS then return false end
     local barrier = promise.new()
     loadBarrier = barrier
-    local ok, res = pcall(loadAll)
+    local ok, res, err = pcall(loadAll)
     if ok and res then
         loaded = true
     else
-        for _, t in ipairs({ nodes, kidsOf, dependents, byKind, byOwner, ownerCount }) do
+        for _, t in ipairs({ nodes, kidsOf, dependents, byKind, byOwner, ownerCount, globalByOwner }) do
             for k in pairs(t) do t[k] = nil end                     -- a half load is dropped; the retry starts clean
         end
         count, persistCount, globalCount = 0, 0, 0
         failedAt = R.now()
         Log.error('scene: persistent nodes could not be loaded (%s); Core.Scene waits for the database',
-            ok and 'collection degraded' or tostring(res))
+            tostring(ok and err or res))
     end
     loadBarrier = nil
     barrier:resolve(loaded)
@@ -791,12 +844,16 @@ CreateThread(function()
     while not ensureLoaded() do Wait(LOAD_RETRY_MS) end
 end)
 
+--- Core stops: what is still dirty is QUEUED now (never yields; core_db commits it after core is gone, §56.1).
 AddEventHandler('onResourceStop', function(res)
     if res ~= Core.name then return end
     if dirtyCount > 0 or counterDirty then
         local ok, err = pcall(writeDirty)
         if not ok then Log.error('scene: final persist failed: %s', tostring(err)) end
-        Core.DB.flush()                                              -- db.lua's own stop flush already ran
+        if dirtyCount > 0 or counterDirty then
+            Log.error('scene: %d persistent node write(s) lost at the stop (core_db not started or a row that '
+                .. 'could not be built)', dirtyCount)
+        end
     end
 end)
 

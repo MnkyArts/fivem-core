@@ -2,8 +2,9 @@
     core/tests/maps_harness.lua — the shared harness of tests/maps_tests.lua and tests/maps_store_tests.lua
     (Core.Maps, DESIGN §52.1, §52.2, §55.21.1). Not a suite: `local H = dofile(here .. '/maps_harness.lua')`.
 
-    A core server VM with the real api, hooks, db (KVP or a given adapter), settings, buckets and the four map
-    files; Audit, Cron and Player are recording stand-ins. Core.Scene is a RECORDING FAKE by default (the real lib
+    A core server VM with the real api, hooks, settings, buckets and the four map files over the Postgres test
+    bridge (DESIGN §56.10: core_db's real code against the throwaway test database); Audit, Cron and Player are
+    recording stand-ins. Core.Scene is a RECORDING FAKE by default (the real lib
     part, lib/scene/shared.lua — PAINTS, paintOf, tierOf — behind it): spawn / set / move / remove (with its
     `fade` flag) / get / defineKind / batch, every call in H.log in order with the Registry caller it ran as (a
     batch is logged as op 'batch' before its calls: H.slices() splits the log per worker slice), the live nodes in
@@ -14,14 +15,26 @@
     scene_store → scene; no-op R.index / R.interest / R.flush, a recording R.promote: H.promoteLog). The recorded
     state lives on H and is replaced by every newServer(): H.audits, H.cronJobs, H.log, H.nodes, H.kinds,
     H.population, H.lockdown, H.cap, H.refuseIf.
+
+    The database side: the VM's `exports.core_db` is wrapped. Queued writes (save / patch / remove / append /
+    enqueue) are HELD until the VM next awaits core_db (any awaited export — not isHealthy / migrate, which never
+    yield —, H.release, H.sql, H.sync, H.fail, newServer, finish) and then sent as ONE enqueue — one flush, one transaction — the way FiveM commits everything one Lua
+    execution slice queued (§56.3.3); a refused slice is a failure (H.dbErrors). Every statement text the VM sends
+    is logged in H.sqlLog ({ fn, sql, key? }; a helper call as 'crud <op> <table> [columns]', a queued row write as
+    '<save|patch|remove|append> <table>', a queued statement as its text). H.sql(sql, params) =
+    bridge.sql after releasing the held writes; H.fail(pattern, err) / H.unfail() = bridge.fail / unfail (held
+    writes released first); H.sync() = Core.DB.flush() of the current VM (waits out a retry after a failed flush).
 ]]
 
 local here = (arg and arg[0] or 'tests/maps_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
 -- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test stubs
 local stubs = dofile(here .. '/stubs.lua')
 
-local H = { stubs = stubs, name = 'maps', passed = 0, failed = 0, audits = {}, cronJobs = {}, log = {}, nodes = {},
-    kinds = {}, refuse = {}, promoteLog = {}, population = {}, lockdown = {}, sceneLoaded = true, filters = {} }
+local bridge = stubs.bridge
+local H = { stubs = stubs, bridge = bridge, name = 'maps', passed = 0, failed = 0, audits = {}, cronJobs = {}, log = {},
+    nodes = {}, kinds = {}, refuse = {}, promoteLog = {}, population = {}, lockdown = {}, sceneLoaded = true,
+    filters = {}, sqlLog = {}, dbErrors = {} }
+local releases = {}           -- the held-write release function of every VM newServer built
 
 --- H.refuseIf(op, fn(def | id) -> err | nil): the fake refuses `op` whenever fn answers an error code.
 function H.refuseIf(op, fn) H.filters[op] = fn end
@@ -230,22 +243,128 @@ local function loadRealScene(env)
     }
 end
 
---- A core server VM with the map system started. opts = { keepKvp (a restart over the same KVP store),
---- adapter = fn(env) -> DB adapter, sceneLoaded = false (the fake Scene store has not loaded), refuse = the fake's
---- H.refuse from the start, scene = 'real' }.
+--- Every statement text a VM sends, for H.sqlLog.
+local function logStatements(fn, ...)
+    local args = table.pack(...)
+    local function add(sql) H.sqlLog[#H.sqlLog + 1] = { fn = fn, sql = tostring(sql) } end
+    if fn == 'query' then
+        add(args[1])
+    elseif fn == 'txQuery' then
+        add(args[2])
+    elseif fn == 'batch' then
+        for _, st in ipairs(type(args[1]) == 'table' and args[1] or {}) do add(st.sql) end
+    elseif fn == 'crud' then
+        local cols = type(args[3]) == 'table' and type(args[3].columns) == 'table' and args[3].columns or nil
+        add(('crud %s %s%s'):format(tostring(args[1]), tostring(args[2]), cols and (' ' .. table.concat(cols, ',')) or ''))
+    end
+end
+
+local SYNC_EXPORTS <const> = { isHealthy = true, migrate = true }
+
+--- Wraps a VM's exports.core_db: queued entries are held and sent as ONE enqueue (one transaction) when the VM
+--- next talks to core_db; every statement is logged. Returns the release function.
+local function wrapDb(env)
+    local target = rawget(env.exports, 'core_db')
+    local held = {}
+    local function release()
+        if #held == 0 then return end
+        local list = held
+        held = {}
+        local ret = target:enqueue(list)
+        if type(ret) == 'table' and ret.error ~= nil then
+            H.dbErrors[#H.dbErrors + 1] = tostring(ret.error)
+            print(('FAIL  [%s] core_db refused a queued slice: %s'):format(H.name, tostring(ret.error)))
+        end
+    end
+    local proxy = setmetatable({ synchronous = true }, { __index = function(t, fn)
+        local f
+        if fn == 'enqueue' then
+            f = function(_, entries)
+                for i = 1, #entries do
+                    local e = entries[i]
+                    held[#held + 1] = e
+                    H.sqlLog[#H.sqlLog + 1] = { fn = 'enqueue', key = e.key,
+                        sql = e.t == 'sql' and tostring(e.sql) or ('%s %s'):format(tostring(e.t), tostring(e.table)) }
+                end
+                return { seq = 0 }
+            end
+        elseif SYNC_EXPORTS[fn] then            -- answered at once in FiveM too: no yield, no flush point
+            f = function(_, ...) return target[fn](target, ...) end
+        else
+            f = function(_, ...)
+                release()
+                logStatements(fn, ...)
+                return target[fn](target, ...)
+            end
+        end
+        rawset(t, fn, f)
+        return f
+    end })
+    rawset(env.exports, 'core_db', proxy)
+    return release
+end
+
+--- Sends every VM's held writes (one transaction per VM).
+function H.release()
+    for i = 1, #releases do releases[i]() end
+end
+
+--- A direct query as the invoker `tests` (after the held writes) -> rows | nil, err.
+function H.sql(sql, params)
+    H.release()
+    return bridge.sql(sql, params)
+end
+
+--- The first row of H.sql, or nil.
+function H.row(sql, params)
+    local rows = H.sql(sql, params)
+    return rows and rows[1]
+end
+
+--- Statements matching `pattern` answer `err` until H.unfail() (bridge.fail; held writes go out first).
+function H.fail(pattern, err)
+    H.release()
+    return bridge.fail(pattern, err)
+end
+
+function H.unfail() return bridge.unfail() end
+
+--- Core.DB.flush() in the current VM: every queued write committed (after a failed flush: its retry).
+function H.sync()
+    return H.core.DB.flush()
+end
+
+--- The logged statements (since index `from`, default 1) whose text finds `pattern` (a Lua pattern).
+function H.statements(pattern, from)
+    local out = {}
+    for i = from or 1, #H.sqlLog do
+        if H.sqlLog[i].sql:find(pattern) then out[#out + 1] = H.sqlLog[i].sql end
+    end
+    return out
+end
+
+--- A core server VM with the map system started. opts = { keepDb (a restart over the same database; the old name
+--- keepKvp works too), loadBatch
+--- (R.loadBatch at start; the harness default 10000 loads without a tick — a small one makes the load yield per
+--- batch), sceneLoaded = false (the fake Scene store has not loaded), refuse = the fake's H.refuse from the start,
+--- scene = 'real' }.
 function H.newServer(opts)
     opts = opts or {}
+    H.release()
+    releases = {}
     stubs.newWorld()
     stubs.clear()
-    if not opts.keepKvp then stubs.resetServer() end
+    if not (opts.keepDb or opts.keepKvp) then stubs.resetServer() end   -- keepKvp: the old name
     stubs.tick(1000)
     H.audits, H.cronJobs, H.population, H.lockdown = {}, {}, {}, {}
     H.log, H.nodes, H.kinds, H.refuse, H.promoteLog, H.onSpawn = {}, {}, {}, opts.refuse or {}, {}, nil
     H.filters, H.cap, H.batchErrors = {}, nil, nil
+    H.sqlLog = {}
     H.sceneLoaded = opts.sceneLoaded ~= false
     local real = opts.scene == 'real'
     local env = stubs.newEnv('server', 'core')
     installNatives(env)
+    releases[#releases + 1] = wrapDb(env)
     stubs.loadImport(env)
     stubs.loadFile(env, 'shared/config.lua')
     if real then
@@ -256,7 +375,7 @@ function H.newServer(opts)
     stubs.loadFile(env, 'shared/hooks.lua')
     stubs.loadFile(env, 'server/db.lua')
     local Core = env.Core
-    if opts.adapter then Core.DB.setAdapter(opts.adapter(env)) end
+    H.core = Core
     Core.Audit = { record = function(row) H.audits[#H.audits + 1] = row return #H.audits end }
     Core.Cron = { every = function(ms, fn)
         H.cronJobs[#H.cronJobs + 1] = { ms = ms, fn = fn }
@@ -275,6 +394,7 @@ function H.newServer(opts)
     stubs.loadFile(env, 'server/maps_runtime.lua')
     stubs.loadFile(env, 'server/maps.lua')
     stubs.loadFile(env, 'server/maps_apply.lua')
+    Core.MapsRuntime.loadBatch = opts.loadBatch or 10000
     if real then loadRealScene(env) end
     env.TriggerEvent('onResourceStart', 'core')
     if real then stubs.tick(500) end              -- the scene store loads, the maps waiter projects
@@ -343,11 +463,15 @@ function H.lastAudit(action)
     for i = #H.audits, 1, -1 do if H.audits[i].action == action then return H.audits[i] end end
 end
 
---- Prints the summary line and exits 1 on any failure or uncaught thread/handler error.
+--- Prints the summary line and exits 1 on any failure, uncaught thread/handler error, refused queued slice or
+--- bridge callback error.
 function H.finish()
+    H.release()
     print(('%s: %d passed, %d failed'):format(H.name, H.passed, H.failed))
     for i = 1, #stubs.failures do print('  uncaught: ' .. stubs.failures[i]) end
-    if H.failed > 0 or #stubs.failures > 0 then os.exit(1) end
+    for i = 1, #H.dbErrors do print('  refused slice: ' .. H.dbErrors[i]) end
+    for i = 1, #bridge.errors do print('  bridge: ' .. bridge.errors[i]) end
+    if H.failed > 0 or #stubs.failures > 0 or #H.dbErrors > 0 or #bridge.errors > 0 then os.exit(1) end
 end
 
 return H

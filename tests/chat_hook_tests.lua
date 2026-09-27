@@ -37,8 +37,9 @@ end
 
 -- the same server VM as server_tests.lua's chat suite (manifest order, missing files skipped)
 local SERVER_FILES <const> = {
-    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua',
-    'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/player.lua', 'server/playergrid.lua',
+    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua',
+    'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/player_store.lua', 'server/player.lua',
+    'server/playergrid.lua',
     'server/money.lua', 'server/factions.lua', 'server/vehicles.lua', 'server/chat.lua',
 }
 

@@ -7,7 +7,7 @@
 ---
 --- Functions are marked `(server)` / `(client)` in their description; an unmarked function
 --- exists on both sides. Everything except the libs (Utils, Math, Validate, Log, Callback,
---- Net, Commands, Keys, Streaming, Anim, Player, UI, Locale, Audio, Geometry, Schema) is reached
+--- Net, Commands, Keys, Streaming, Anim, Player, UI, Locale, Audio, Geometry, Schema, and the server-only DB) is reached
 --- through the export proxy of DESIGN §2.2, so it must be called from a coroutine (thread, event
 --- handler, command) and after `Core.onReady`.
 ---
@@ -35,6 +35,8 @@
 ---| '"vehicleDeleted"'     # (server) (netId) — also when a parked car's clone parks again (§4.6 notes)
 ---| '"vehicleAutoStored"'  # (server) (vehId, reason) — core garaged a parked car itself ('max_parked': over Config.Vehicles.MaxParked)
 ---| '"audit"'              # (server) (category, src, message) — from Core.Log.audit
+---| '"dbStatus"'           # (server) (healthy, reason) — core_db's connection health flipped (DESIGN §56.2.5)
+---| '"dbWriteFailed"'      # (server) (owner, kind, table, err, key) — a queued write was dropped (DESIGN §56.3.5)
 ---| '"doorLocked"'         # (server) (doorId, src|nil)
 ---| '"doorUnlocked"'       # (server) (doorId, src|nil)
 ---| '"timeChanged"'        # (server) (hour, minute)
@@ -66,7 +68,6 @@
 ---@alias CoreInputFieldType 'text'|'number'|'select'|'checkbox'|'textarea'|'password'|'slider'|'multiselect'|'multi-select'|'date'|'time'|'color'
 ---@alias CoreMoneyAccount '"cash"' | '"bank"' | string
 ---@alias CorePermScope '"account"' | '"character"'
----@alias CoreDBImportMode '"merge"' | '"replace"'
 ---@alias CoreFactionPerm '"invite"' | '"kick"' | '"manage_ranks"' | '"bank"' | '"manage"'
 ---@alias CoreCommandParamType '"string"' | '"integer"' | '"number"' | '"player"' | '"rest"' | '"boolean"' | '"target"' | '"targets"'
 ---@alias CoreWorldKind '"marker"' | '"label"' | '"blip"' | '"interaction"'
@@ -559,12 +560,6 @@
 ---@field interval integer|nil ms, for `Core.Cron.every`
 ---@field expr string|nil cron expression, for `Core.Cron.schedule`
 
----A storage backend for `Core.DB.setAdapter` (DESIGN §4.1).
----@class CoreDBAdapter
----@field loadAll fun(collection: string): table<string, string> id → json string
----@field put fun(collection: string, id: string, json: string)
----@field remove fun(collection: string, id: string)
----@field flush fun()
 
 --------------------------------------------------------------------------------
 -- Option tables — commands, keys, net (DESIGN §3.6–§3.8)
@@ -631,7 +626,6 @@
 ---@field Interiors table Enabled + one boolean per IPL group (base, casino, tuner, …; §36)
 ---@field Hud { ShowHealth: boolean, ShowArmour: boolean, ShowStats: boolean, ShowVoice: boolean, ShowSpeed: boolean, ShowStreet: boolean, Anchor: CoreHudAnchor, Scale: number } the vitals HUD (§39.5); ShowSpeed/ShowStreet are opt-in
 ---@field UI table NotifyDurationMs, MaxNotifyPerSecond, HudEnabled, ModalTimeoutMs, CancelKey
----@field DB { KeyPrefix: string, FlushIntervalMs: integer, Adapter: string }
 ---@field Admin { CarDefaultModel: string, RequireDuty: boolean, Scope: table<string, integer>, StaffPerm: string, LegacyCommands: boolean } §51: RequireDuty (true), Scope = max player targets per run by group (helper 1 … owner 2000; 1 for unlisted), StaffPerm ('core.admin.staff'), LegacyCommands (true; false = core's /tp /bring /kick /ban /setcash … are not registered, §4.8)
 ---@field Buckets { Range: integer[] } §50: the Core.Buckets allocation range, default { 10000, 60000 }
 ---@field Maps { MaxMarkers: integer } §55.21.1: the editor view's preview budget (64); map content streams as Core.Scene nodes
@@ -1375,7 +1369,8 @@ function Core.Player.setData(src, path, value) end
 ---@param src integer
 ---@return boolean saved
 function Core.Player.save(src) end
----(server) Persists every dirty session.
+---(server, internal) One pass over EVERY session in one tick (core's stop/shutdown path); blocked through the
+---export — never a plugin's to trigger (§56.12).
 ---@return integer saved
 function Core.Player.saveAll() end
 ---(server) Every loaded player's src.
@@ -1452,6 +1447,12 @@ function Core.Player.setReplicated(src, key, value) end
 ---@param value any
 ---@return boolean ok
 function Core.Player.setAccountData(src, key, value) end
+---(server, internal) The live account's raw `key` (a deep copy), nil without a session. Never yields:
+---`Core.Perms` reads the account grants through it on a permission check. Blocked through the export.
+---@param src integer
+---@param key string
+---@return any
+function Core.Player.getAccountData(src, key) end
 ---(server) Read-only copy of the live account (§48; no permissions list); nil without a session.
 ---@param src integer
 ---@return CoreAccountView|nil
@@ -2216,30 +2217,35 @@ function Core.Vehicles.list() end
 ---@param netId integer
 ---@return string|nil vehId
 function Core.Vehicles.persist(netId) end
----(server)
+---(server) One indexed read, read-your-writes. Awaited. `{}` and `err` when the read failed — never mistake
+---that for "no cars".
 ---@param charId string
 ---@return CoreVehicleRecord[]
+---@return string|nil err set only on a failed read
 function Core.Vehicles.getRecords(charId) end
----(server)
+---(server) Awaited.
 ---@param vehId string
 ---@return CoreVehicleRecord|nil
+---@return string|nil err set only on a failed read (never for "no such record")
 function Core.Vehicles.getRecord(vehId) end
----(server) Spawns a stored vehicle from its record. Yields. A PARKED record is promoted where it stands instead
----(coords / heading / ownerSrc unused): the clone's netId after a bounded wait (SpawnTimeoutMs + 6 s).
+---(server) Spawns a stored vehicle from its record. Awaited (one record read, then yields). A PARKED record is
+---promoted where it stands instead (coords / heading / ownerSrc unused): the clone's netId after a bounded wait
+---(SpawnTimeoutMs + 6 s).
 ---@param vehId string
 ---@param coords vector3
 ---@param heading? number
 ---@param ownerSrc? integer client the props are applied on
 ---@return integer|nil netId
----@return string|nil err 'already_spawned' | 'spawn_timeout' | 'promote_failed' | …
+---@return string|nil err 'already_spawned' | 'spawn_timeout' | 'promote_failed' | 'db' (the record read failed) | …
 function Core.Vehicles.spawnRecord(vehId, coords, heading, ownerSrc) end
----(server) Restores one out-of-garage record at its saved or supplied world position. Yields.
+---(server) Restores one out-of-garage record at its saved or supplied world position. Awaited (one record read,
+---then yields).
 ---@param vehId string
 ---@param coords? vector3 defaults to record.position
 ---@param heading? number defaults to record.position.heading
 ---@param ownerSrc? integer client that should receive the direct property replay
 ---@return integer|nil netId
----@return string|nil err 'parked' (a parked record is in the world as a scene node already) | 'destroyed' (a wreck: spawnRecord brings it back) | …
+---@return string|nil err 'parked' (a parked record is in the world as a scene node already) | 'destroyed' (a wreck: spawnRecord brings it back) | 'db' (the record read failed) | …
 function Core.Vehicles.restoreRecord(vehId, coords, heading, ownerSrc) end
 ---(server) Promotes an existing network vehicle into a tracked, server-owned persistent vehicle.
 ---Trusted server-resource API only; no client event exposes it.
@@ -2265,9 +2271,11 @@ function Core.Vehicles.store(target) end
 ---@return string|nil err 'unavailable' 'bad_target' 'missing' 'not_persisted' 'no_record' 'record_stored' 'destroyed' 'occupied' 'busy' 'gone' 'no_entity' 'bad_coords' 'db' | a Scene error
 function Core.Vehicles.park(target) end
 ---(server) A record's vehicle whether it is live, parked or garaged: getInfo's fields (netId only while a vehicle is
----live — a promoted parked car's clone included) + parked (node id), stored, position, destroyed (a wreck).
+---live — a promoted parked car's clone included) + parked (node id), stored, position, destroyed (a wreck). A
+---record without a live car is read (awaited); nil, err when that failed.
 ---@param vehId string
 ---@return (CoreVehicleInfo|{ stored: boolean, position: table, destroyed: boolean })|nil
+---@return string|nil err 'db' when the record read failed
 function Core.Vehicles.getInfoByRecord(vehId) end
 ---(server) `saveProps(netId, props)` accepts a validated props table (the client route is
 ---`core:server:vehicleProps`). (client) `saveProps(veh)` sends the vehicle's current props.
@@ -2297,13 +2305,16 @@ function Core.Vehicles.getPassengers(netId) end
 ---@param maxDist? number default 20.0
 ---@return integer|nil netId
 function Core.Vehicles.getClosestToPlayer(src, maxDist) end
----(server) Writes one key of the persistence record's `meta` table (nil removes it).
+---(server) Writes one key of the persistence record's `meta` table (nil removes it). One atomic SQL UPDATE on
+---`vehicles.meta` — awaited, it yields. Never write `meta` from a cached record (a concurrent `setData` would
+---race it); returns true when the record exists and was written.
 ---@param target integer|string a netId or a vehId
 ---@param key string
 ---@param value any
 ---@return boolean ok
 function Core.Vehicles.setData(target, key, value) end
----(server) One key of the record's `meta`, or the whole copied table when `key` is nil.
+---(server) One key of the record's `meta`, or the whole copied table when `key` is nil. One awaited SELECT — it
+---yields.
 ---@param target integer|string a netId or a vehId
 ---@param key? string
 ---@return any
@@ -2683,84 +2694,219 @@ function Core.Cron.remove(id) end
 function Core.Cron.list() end
 
 --------------------------------------------------------------------------------
--- Core.DB (server/db.lua §4.1, §22) — (server) only, documents are deep copies
+-- Core.DB (lib/db/server.lua, DESIGN §56) — (server) only, a LIB in every server VM that calls the
+-- `core_db` resource directly. AWAITED calls yield (coroutine only) and answer `result` or `nil, err`
+-- (a failed read is never an empty result); QUEUED calls never yield and commit within one flush.
 --------------------------------------------------------------------------------
 
 ---@class Core.DB
+---@field NULL table sentinel for SQL NULL in params, values and where maps
 Core.DB = {}
 
----(server) Inserts a document; assigns `id` (uuid) and `createdAt` when absent.
----@param collection string
----@param doc table
----@return string|nil id
-function Core.DB.create(collection, doc) end
----(server)
----@param collection string
----@param id string
----@return table|nil doc a deep copy
-function Core.DB.get(collection, id) end
----(server) Replaces the whole document (`doc.id` is forced to `id`); creates it when missing.
----@param collection string
----@param id string
----@param doc table
+---@class CoreDBOpts
+---@field timeout? number ms (default 30000)
+---@field sync? boolean read your own queued writes first
+
+---@class CoreDBSelectOpts: CoreDBOpts
+---@field columns? string[]
+---@field orderBy? string 'col [ASC|DESC] [NULLS FIRST|LAST], …' (columns are checked)
+---@field limit? integer
+---@field offset? integer
+
+---@class CoreDBStreamOpts: CoreDBOpts
+---@field batch? integer rows per fn call (default 500, max 10000)
+
+---@class CoreDBTx transaction handle: the awaited raw-SQL calls and table helpers on one connection
+---@field query fun(sql: string, params?: any[]): table[]|nil, string?
+---@field single fun(sql: string, params?: any[]): table|nil, string?
+---@field scalar fun(sql: string, params?: any[]): any, string?
+---@field execute fun(sql: string, params?: any[]): integer|nil, string?
+---@field insert fun(tbl: string, values: table, opts?: table): table|boolean|nil, string?
+---@field select fun(tbl: string, where?: table, opts?: CoreDBSelectOpts): table[]|nil, string?
+---@field first fun(tbl: string, where?: table, opts?: CoreDBSelectOpts): table|nil, string?
+---@field count fun(tbl: string, where?: table): integer|nil, string?
+---@field update fun(tbl: string, set: table, where: table): integer|nil, string?
+---@field delete fun(tbl: string, where: table): integer|nil, string?
+---@field upsert fun(tbl: string, values: table, conflict: string|string[], opts?: table): table|boolean|nil, string?
+
+---(server, awaited) Rows of one statement (`$1 … $n` placeholders).
+---@param sql string
+---@param params? any[] `Core.DB.NULL` for NULL; `Core.DB.json(t)` + `$n::jsonb` for jsonb
+---@param opts? CoreDBOpts
+---@return table[]|nil rows
+---@return string|nil err
+function Core.DB.query(sql, params, opts) end
+---(server, awaited) The first row, or (nil, nil) when there is none.
+---@param sql string
+---@param params? any[]
+---@param opts? CoreDBOpts
+---@return table|nil row
+---@return string|nil err
+function Core.DB.single(sql, params, opts) end
+---(server, awaited) The first column of the first row (one-column queries).
+---@param sql string
+---@param params? any[]
+---@param opts? CoreDBOpts
+---@return any value
+---@return string|nil err
+function Core.DB.scalar(sql, params, opts) end
+---(server, awaited) Affected row count of an INSERT/UPDATE/DELETE.
+---@param sql string
+---@param params? any[]
+---@param opts? CoreDBOpts
+---@return integer|nil rowCount
+---@return string|nil err
+function Core.DB.execute(sql, params, opts) end
+---(server, awaited) Several statements in ONE transaction and one hop.
+---@param statements table[] `{ { sql, params }, … }`
+---@param opts? { rows?: boolean, timeout?: number }
+---@return table[]|nil results `{ rowCount, rows? }` per statement
+---@return string|nil err
+function Core.DB.batch(statements, opts) end
+---(server, awaited) Runs `fn(tx)` on one connection; commits when it returns, rolls back when it returns
+---false, throws or a statement failed.
+---@param fn fun(tx: CoreDBTx): any
+---@param opts? { timeout?: number } the transaction deadline in ms (default 10000, max 60000)
 ---@return boolean ok
-function Core.DB.set(collection, id, doc) end
----(server) Shallow merge of top-level keys (a nested table value replaces the old one).
----@param collection string
----@param id string
----@param partial table
----@return boolean ok false when the document does not exist
-function Core.DB.update(collection, id, partial) end
----(server)
----@param collection string
----@param id string
----@return boolean removed
-function Core.DB.delete(collection, id) end
----(server) Every matching document, as deep copies.
----@param collection string
----@param match fun(doc: table): boolean|table a predicate, or a table of top-level equalities
----@return table[]
-function Core.DB.find(collection, match) end
----(server)
----@param collection string
----@param match fun(doc: table): boolean|table
----@return table|nil
-function Core.DB.findOne(collection, match) end
----(server)
----@param collection string
----@return table[]
-function Core.DB.all(collection) end
----(server)
----@param collection string
----@return integer
-function Core.DB.count(collection) end
----(server) Pushes pending writes to storage now.
-function Core.DB.flush() end
----(server) Replaces the storage backend; loaded collections are re-read from it.
----@param newAdapter CoreDBAdapter
----@return boolean ok
-function Core.DB.setAdapter(newAdapter) end
----(server) Persistent counter, document `counters`/<name>.
+---@return any resultOrErr
+function Core.DB.transaction(fn, opts) end
+---(server, awaited) Server-side cursor: `fn(rows)` per batch, one batch per tick; `fn` returning false stops.
+---@param sql string
+---@param params? any[]
+---@param fn fun(rows: table[]): boolean|nil
+---@param opts? CoreDBStreamOpts
+---@return integer|nil total
+---@return string|nil err
+function Core.DB.stream(sql, params, fn, opts) end
+---(server, awaited) An atomic counter (`core_counters`).
 ---@param name string
----@return integer next
+---@return integer|nil next
+---@return string|nil err
 function Core.DB.nextId(name) end
----(server) Registers a migration. `fn(doc)` may mutate the document or return a new one; it
----runs once per document whose `_v` is lower than `version`, on first load. Register it before
----the collection is first used.
----@param collection string
----@param version integer
----@param fn fun(doc: table): table|nil
+---(server, awaited) Waits until everything queued before the call was committed.
+---@param timeoutMs? number
+---@return boolean ok false, 'dropped:<n>' when queued entries were dropped
+---@return string|nil err
+function Core.DB.flush(timeoutMs) end
+---(server, awaited) Inserts one row; answers it (RETURNING *) or true with `opts.returning = false`.
+---@param tbl string
+---@param values table column → value (nil = default, `Core.DB.NULL` = NULL)
+---@param opts? { returning?: string[]|false, timeout?: number }
+---@return table|boolean|nil row
+---@return string|nil err
+function Core.DB.insert(tbl, values, opts) end
+---(server, awaited) Inserts many rows in one statement.
+---@param tbl string
+---@param rows table[]
+---@return integer|nil count
+---@return string|nil err
+function Core.DB.insertMany(tbl, rows) end
+---(server, awaited) `where`: `{ col = v }`, `{ col = { a, b } }` (ANY), `{ col = Core.DB.NULL }`, `{ col = Core.DB.op('>=', v) }`.
+---@param tbl string
+---@param where? table
+---@param opts? CoreDBSelectOpts
+---@return table[]|nil rows
+---@return string|nil err
+function Core.DB.select(tbl, where, opts) end
+---(server, awaited) The first matching row, or (nil, nil).
+---@param tbl string
+---@param where? table
+---@param opts? CoreDBSelectOpts
+---@return table|nil row
+---@return string|nil err
+function Core.DB.first(tbl, where, opts) end
+---(server, awaited)
+---@param tbl string
+---@param where? table
+---@param opts? CoreDBOpts
+---@return integer|nil count
+---@return string|nil err
+function Core.DB.count(tbl, where, opts) end
+---(server, awaited) `where` must be non-empty.
+---@param tbl string
+---@param set table
+---@param where table
+---@return integer|nil rowCount
+---@return string|nil err
+function Core.DB.update(tbl, set, where) end
+---(server, awaited) `where` must be non-empty.
+---@param tbl string
+---@param where table
+---@return integer|nil rowCount
+---@return string|nil err
+function Core.DB.delete(tbl, where) end
+---(server, awaited) INSERT … ON CONFLICT (conflict) DO UPDATE SET (opts.update or every other given column).
+---@param tbl string
+---@param values table
+---@param conflict string|string[]
+---@param opts? { update?: string[], returning?: string[]|false }
+---@return table|boolean|nil row
+---@return string|nil err
+function Core.DB.upsert(tbl, values, conflict, opts) end
+---(server, queued) Upsert by primary key (full row); coalesced per row; never yields.
+---@param tbl string
+---@param row table
 ---@return boolean ok
-function Core.DB.migrate(collection, version, fn) end
----(server) Dumps every collection to JSON inside the resource.
----@param path? string default 'data/export-<timestamp>.json'
----@return string|nil path
-function Core.DB.export(path) end
----(server) Reads an export back in.
----@param path string
----@param mode? CoreDBImportMode 'merge' (default) keeps unknown documents
----@return integer written
-function Core.DB.import(path, mode) end
+---@return string|nil err validation only
+function Core.DB.save(tbl, row) end
+---(server, queued) UPDATE of `changes` for the row with primary key `key` (value, or `{ col = v }` for a composite key).
+---@param tbl string
+---@param key any
+---@param changes table
+---@return boolean ok
+---@return string|nil err
+function Core.DB.patch(tbl, key, changes) end
+---(server, queued) DELETE by primary key.
+---@param tbl string
+---@param key any
+---@return boolean ok
+---@return string|nil err
+function Core.DB.remove(tbl, key) end
+---(server, queued) Plain INSERT (logs, histories); never coalesced.
+---@param tbl string
+---@param row table
+---@return boolean ok
+---@return string|nil err
+function Core.DB.append(tbl, row) end
+---(server, queued) One raw statement in queue order; `key` makes a newer statement with the same key replace it.
+---@param sql string
+---@param params? any[]
+---@param key? string|number
+---@return boolean ok
+---@return string|nil err
+function Core.DB.enqueue(sql, params, key) end
+---(server) Registers the calling resource's migrations (file scope, non-blocking): `'sql/0001_init.sql'` paths
+---in the resource, or `{ version, name?, sql | file }`. The resource's later queries wait for them.
+---@param list (string|table)[]
+---@return boolean ok
+---@return string|nil err
+function Core.DB.migrate(list) end
+---(server, awaited) Waits until the calling resource's migrations are applied.
+---@param timeoutMs? number default 60000
+---@return boolean ok
+---@return string|nil err
+function Core.DB.awaitMigrations(timeoutMs) end
+---(server, awaited) Health, pool, queue counters, applied migrations per owner.
+---@return table|nil status
+---@return string|nil err
+function Core.DB.status() end
+---(server) Last known connection health (synchronous, no yield).
+---@return boolean
+function Core.DB.isHealthy() end
+---(server) A WHERE condition: `= <> < <= > >= like ilike not_like in not_in between is_null not_null contains overlaps`.
+---@param name string
+---@param value any
+---@param value2? any
+---@return table condition
+function Core.DB.op(name, value, value2) end
+---(server) JSON text for a `$n::jsonb` raw param.
+---@param value any
+---@return string
+function Core.DB.json(value) end
+---(server) The SQLSTATE ('23505') or the leading word ('timeout', 'unavailable', 'invalid', …) of an error.
+---@param err string|nil
+---@return string|nil
+function Core.DB.errorCode(err) end
 
 --------------------------------------------------------------------------------
 -- Core.Money (server/money.lua §4.3) — (server) only, integer amounts
@@ -3035,7 +3181,7 @@ function Core.Factions.removeRank(src, rank) end
 ---@return boolean ok
 ---@return string|nil err
 function Core.Factions.setOwner(src, targetCharId) end
----(server) Perm `manage`.
+---(server) Perm `manage`. Yields (one awaited UPDATE, §56).
 ---@param src integer
 ---@param changes { name?: string, tag?: string, color?: string }
 ---@return boolean ok
@@ -3950,6 +4096,10 @@ function Core.Settings.onChange(prefix, fn) end
 ---@param handle integer
 ---@return boolean removed
 function Core.Settings.offChange(handle) end
+---(server, internal) Are the stored overrides in memory? False while the first load is out or failed — every
+---value answered meanwhile is config/default. Blocked through the export.
+---@return boolean
+function Core.Settings.isLoaded() end
 -- Core's own sections: maps.limits.{elements,perModel,uniqueModels,networked,networkedTotal,opsPerApply},
 -- maps.journalMax, maps.journalMaxOps (§52); audit.retentionDays, audit.maxRows, audit.logMaxRows (§46);
 -- bans.tokenMatches, bans.enrichTokens, bans.enrichIdentifiers, bans.failClosed (§47).
@@ -4018,18 +4168,19 @@ function Core.Settings.offChange(handle) end
 ---@class Core.Audit
 Core.Audit = {}
 
----(server) Appends one row (append-only). Never yields, never throws.
+---(server) Appends one row (queued, §56). Never yields, never throws; the row id is assigned when the queue
+---commits.
 ---@param row CoreAuditInput
----@return string|nil id nil when refused (bad action, DB refused)
+---@return true|nil ok nil when refused (bad action, the queue refused it)
 function Core.Audit.record(row) end
 ---(server) The Core.Log.audit mirror: actor 'system', action 'core.<category>', target the player src.
 ---Not re-posted to the 'audit' webhook (webhook.lua already posts the hook line). Gameplay categories (not admin,
 ---perms, player, native, settings, maps, bans) land in the 'log' pool (`audit.logMaxRows`) and are capped at 20 rows
----per category per second (the rest counted into the next row's `ctx.suppressed`).
+---per category per second (the rest counted into the next row's `ctx.suppressed`). Queued (§56); never yields.
 ---@param category string
 ---@param src? integer
 ---@param message? string
----@return string|nil id
+---@return true|nil ok
 function Core.Audit.recordLog(category, src, message) end
 ---(server) Newest first; one walk over the in-memory index, one DB.get per returned row. A filter key that is
 ---present but unusable matches nothing (a bad filter never widens the result). The view permission
@@ -4086,13 +4237,15 @@ function Core.Bans.add(opts) end
 ---@return boolean ok
 ---@return string|nil err 'invalid'|'not_found'|'already_revoked'|'db'
 function Core.Bans.remove(banId, by, reason) end
----(server)
+---(server) Awaited.
 ---@param banId string
 ---@return CoreBan|nil
+---@return string|nil err 'db' when the row could not be read
 function Core.Bans.get(banId) end
----(server) Newest first. `active = false` lists every ban (history included). Cursor '<createdAt>/<id>'.
+---(server) Newest first. `active = false` lists every ban (history included). Cursor '<createdAt>/<id>'. Awaited.
 ---@param opts? { active?: boolean, text?: string, accountId?: string, limit?: integer, before?: string }
----@return { rows: CoreBan[], next: string|nil }
+---@return { rows: CoreBan[], next: string|nil }|nil
+---@return string|nil err 'db' when bans cannot be read
 function Core.Bans.list(opts) end
 ---(server) The best active ban (permanent first, then the latest expiry): one identifier overlap, or at least
 ---`bans.tokenMatches` distinct tokens in one ban.
@@ -4102,10 +4255,12 @@ function Core.Bans.list(opts) end
 ---@return 'unavailable'|nil why while the bans collection cannot be read
 function Core.Bans.check(identifiers, tokens) end
 ---(server) Every ban of one account (its `accountId` or listed in `accountIds`), history included, newest first.
+---Awaited.
 ---@param accountId string
----@return CoreBan[]
+---@return CoreBan[]|nil
+---@return string|nil err 'db' when bans cannot be read
 function Core.Bans.forAccount(accountId) end
----(server) Drops expired bans from the index (also daily at 04:40 and at start).
+---(server) Drops expired bans from the index. Runs once at start and every 60 s (§56.12 SWEEP_MS).
 ---@return integer expired
 function Core.Bans.sweep() end
 -- Bans.checkConnecting(src) -> ban, message | nil | nil, 'unavailable' is internal (blocked in the export; the

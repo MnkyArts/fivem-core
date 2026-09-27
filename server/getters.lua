@@ -18,6 +18,8 @@
     Also here: `Player.resolveTargets` (§49, the target selector grammar behind the `target` /
     `targets` command params), `Player.getHealth/getArmour` (§17) and the §5.2 callback
     'core:player:getInfo' (moved out of server/player.lua, which only keeps the session state).
+    Database (DESIGN §56): `Player.findAccountsByIdentifier` and `Vehicles.setData/getData` are ONE awaited
+    statement each and therefore yield — call them from a thread, event handler, command or callback.
     Natives: GetPlayerPed, GetEntityCoords, GetEntityHealth, GetPedArmour, GetPlayerName (server).
 ]]
 
@@ -25,6 +27,7 @@ local Player = Core.Player
 local Vehicles = Core.Vehicles
 local Validate = Core.Validate
 local Utils = Core.Utils
+local DB = Core.DB                   -- the lib (DESIGN §56.5): every call below is one awaited statement
 local PlayerGrid = Core.PlayerGrid   -- server/playergrid.lua loads before this file (manifest order)
 
 -- Reusable candidate buffers (§22.1): neither getter yields, and each one has its own array, so a
@@ -39,7 +42,6 @@ local DRIVER_SEAT <const> = -1
 -- GTA's highest passenger seat index; GetVehicleMaxNumberOfPassengers is apiset client, so the
 -- server scans the whole range and skips empty seats (GetPedInVehicleSeat returns 0 for those).
 local MAX_SEAT_INDEX <const> = 15
-local VEHICLE_COLLECTION <const> = 'vehicles'   -- mirrors COLLECTION in server/vehicles.lua
 local MAX_META_KEY <const> = 64
 
 --- vector3 from a vector3 or a { x, y, z } / { [1], [2], [3] } table; nil when unusable.
@@ -244,127 +246,35 @@ Core.Callback.register('core:player:getInfo', function(src)
 end)
 
 -- ---------------------------------------------------------------------------
--- Identifier → account index (§47: offline bans, Bans.resolveTarget)
+-- Identifier → accounts (§47: offline bans, Bans.resolveTarget)
 -- ---------------------------------------------------------------------------
--- idIndex[identifier] = accountId, or { [accountId] = true } when several accounts share it. Built once, on
--- the first query, by a predicate walk over `accounts` that copies nothing (DB.find hands the predicate the
--- stored document); every join / session load adds the account's current identifiers afterwards. Entries go
--- stale only when an identifier is replaced, so a query re-checks each candidate against the account itself.
--- The identifiers are engine-sourced: Player.setAccountData refuses to write them. Accounts written without a
--- join (/dbimport, a migration, a direct DB write) are caught on a MISS: when the collection's document count
--- differs from the build's, or the build is older than INDEX_STALE_MS, the index is rebuilt once and re-asked.
+-- One indexed query (DESIGN §56.8 rule 9): account_identifiers (the latest identifier of every kind an account
+-- connected with, upserted at each join by server/player_store.lua) plus the license column itself. No
+-- in-memory index, no rebuilds, no whole-table read.
 
 local IDENTIFIER_MAX <const> = 128
-local INDEX_WAIT_MS <const> = 10000
-local INDEX_STALE_MS <const> = 300000
-local idIndex = nil
-local idIndexBuilding = false
-local idIndexCount, idIndexAt = 0, 0   -- documents walked by the last build, and when it finished
-
-local function indexOne(index, identifier, accountId)
-    if type(identifier) ~= 'string' or identifier == '' or identifier:sub(1, 3) == 'ip:' then return end
-    local entry = index[identifier]
-    if entry == nil then
-        index[identifier] = accountId
-    elseif type(entry) == 'table' then
-        entry[accountId] = true
-    elseif entry ~= accountId then
-        index[identifier] = { [entry] = true, [accountId] = true }
-    end
-end
-
-local function indexAccount(index, accountId, license, identifiers)
-    if accountId == nil then return end
-    indexOne(index, license, accountId)
-    if type(identifiers) == 'table' then
-        for _, identifier in pairs(identifiers) do indexOne(index, identifier, accountId) end
-    end
-end
-
---- The index, built on first use. A second caller during the build (the first read of `accounts` may yield
---- on an asynchronous backend) waits for it, bounded.
-local function ensureIdIndex()
-    if idIndex then return idIndex end
-    if idIndexBuilding then
-        local deadline = GetGameTimer() + INDEX_WAIT_MS
-        while not idIndex and GetGameTimer() < deadline do Wait(50) end
-        return idIndex
-    end
-    local isDegraded = Core.DB.isDegraded
-    local function degraded() return Utils.isCallable(isDegraded) and isDegraded('accounts') == true end
-    if degraded() then return nil end   -- R2-11: a degraded collection reads EMPTY; never index that
-    idIndexBuilding = true
-    local built, walked = {}, 0
-    local ok, err = pcall(Core.DB.find, 'accounts', function(doc)
-        walked = walked + 1
-        indexAccount(built, doc.id, doc.license, doc.identifiers)
-        return false
-    end)
-    idIndexBuilding = false
-    if not ok or degraded() then
-        Core.Log.error('account identifier index not cached: accounts unreadable (%s)',
-            ok and 'degraded' or tostring(err))
-        return nil
-    end
-    local players = Player.getPlayers()   -- sessions stamped while the read yielded
-    for i = 1, #players do
-        local account = Player.getAccount(players[i])
-        if account then indexAccount(built, account.id, nil, account.identifiers) end
-    end
-    idIndex, idIndexCount, idIndexAt = built, walked, GetGameTimer()
-    return idIndex
-end
-
---- A join or a session load (core restart) adds the account's current identifiers.
-local function indexSession(src)
-    if not idIndex then return end   -- not built yet: the build reads the documents anyway
-    local account = Player.getAccount(src)
-    if account then indexAccount(idIndex, account.id, nil, account.identifiers) end
-end
-AddEventHandler('playerJoining', function()
-    local src = source
-    indexSession(src)
-end)
-Core.on('playerLoaded', indexSession)
-
---- True while the account (live or stored) still carries the identifier.
-local function accountHolds(accountId, identifier)
-    local account = Player.getAccountById(accountId)
-    if not account then return false end
-    for _, value in pairs(type(account.identifiers) == 'table' and account.identifiers or {}) do
-        if value == identifier then return true end
-    end
-    local doc = identifier:sub(1, 8) == 'license:' and Core.DB.get('accounts', accountId) or nil
-    return doc ~= nil and doc.license == identifier   -- an old document may carry the license alone
-end
+local ACCOUNTS_BY_IDENTIFIER_SQL <const> = [[
+SELECT account_id AS id FROM account_identifiers WHERE identifier = $1
+UNION
+SELECT id FROM accounts WHERE license = $1]]
 
 --- Player.findAccountsByIdentifier(identifier) -> array of accountIds (sorted; empty when none). Any
---- `type:value` identifier ('license:…', 'discord:…', …); 'ip:' is never indexed. May yield on the first call.
---- nil, 'unavailable' while `accounts` cannot be read (degraded, or a concurrent build timed out) — a caller
---- that decides on rank (Bans, offline bans) must then refuse rather than assume nobody holds it (R2-11).
+--- `type:value` identifier ('license:…', 'discord:…', …); 'ip:' is never stored. Yields (one awaited query,
+--- { sync = true }: identifiers queued by a join a moment ago count). nil, 'unavailable' when the query fails —
+--- a caller that decides on rank (Bans, offline bans) must then refuse rather than assume nobody holds it (R2-11).
 function Player.findAccountsByIdentifier(identifier)
     local out = {}
     if type(identifier) ~= 'string' or #identifier < 3 or #identifier > IDENTIFIER_MAX
-        or not identifier:find(':', 1, true) then
+        or not identifier:find(':', 1, true) or identifier:sub(1, 3) == 'ip:' then
         return out
     end
-    for attempt = 1, 2 do
-        local index = ensureIdIndex()
-        if not index then return nil, 'unavailable' end
-        local entry = index[identifier]
-        if type(entry) == 'table' then
-            for accountId in pairs(entry) do
-                if accountHolds(accountId, identifier) then out[#out + 1] = accountId end
-            end
-        elseif entry ~= nil and accountHolds(entry, identifier) then
-            out[1] = entry
-        end
-        -- a miss on an index that may have missed out-of-join writes: rebuild once and ask again
-        if #out > 0 or attempt == 2 or idIndexBuilding
-            or (Core.DB.count('accounts') == idIndexCount and GetGameTimer() - idIndexAt < INDEX_STALE_MS) then
-            break
-        end
-        idIndex = nil
+    local rows, err = DB.query(ACCOUNTS_BY_IDENTIFIER_SQL, { identifier }, { sync = true })
+    if not rows then
+        Core.Log.error('findAccountsByIdentifier: the accounts cannot be read (%s)', tostring(err))
+        return nil, 'unavailable'
+    end
+    for i = 1, #rows do
+        if rows[i].id ~= nil then out[#out + 1] = rows[i].id end
     end
     table.sort(out, function(a, b) return tostring(a) < tostring(b) end)
     return out
@@ -439,31 +349,55 @@ local function recordIdOf(target)
     return Validate.value('id', target) and target or nil
 end
 
---- Write one key of the record's `meta` table (nil removes it). Persisted through Core.DB,
---- so it survives restarts — for live, replicated flags use the vehicle's state bag instead.
+-- ONE statement each (DESIGN §56.8 rule 2): the read-modify-write happens inside Postgres, so two writers of
+-- different keys never lose each other's key. An old `[]` meta (the empty Lua table of the document store)
+-- counts as the empty object.
+local SET_META_SQL <const> = [[
+UPDATE vehicles SET meta = jsonb_set(CASE WHEN jsonb_typeof(meta) = 'object' THEN meta ELSE '{}'::jsonb END,
+    ARRAY[$2::text], $3::jsonb)
+WHERE id = $1]]
+local DELETE_META_SQL <const> = [[
+UPDATE vehicles SET meta = CASE WHEN jsonb_typeof(meta) = 'object' THEN meta - $2::text ELSE '{}'::jsonb END
+WHERE id = $1]]
+local GET_META_SQL <const> = 'SELECT meta FROM vehicles WHERE id = $1'
+
+--- Write one key of the record's `meta` table (nil removes it). Persisted at once (one awaited UPDATE — it
+--- yields), so it survives restarts — for live, replicated flags use the vehicle's state bag instead.
+--- Returns true when the record exists and was written.
 function Vehicles.setData(target, key, value)
     local vehId = recordIdOf(target)
     if not vehId then return false end
     if type(key) ~= 'string' or #key < 1 or #key > MAX_META_KEY then return false end
+    -- core's own meta keys (set by persist): server/vehicles.lua mirrors them for its never-yielding paths (§4.6 notes)
+    if key == 'keyMode' or key == 'vehType' then return false end
     local kind = type(value)
     if kind == 'function' or kind == 'thread' or kind == 'userdata' then return false end
-    local record = Core.DB.get(VEHICLE_COLLECTION, vehId)
-    if not record then return false end
-    local meta = type(record.meta) == 'table' and record.meta or {}
-    meta[key] = value
-    -- DB.update runs jsonSafe over the patch, so a vector3 inside `value` is stored as { x, y, z }.
-    return Core.DB.update(VEHICLE_COLLECTION, vehId, { meta = meta })
+    local count, err
+    if value == nil then
+        count, err = DB.execute(DELETE_META_SQL, { vehId, key })
+    else
+        -- jsonSafe: a vector3 inside `value` is stored as { x, y, z }
+        local ok, text = pcall(DB.json, Utils.jsonSafe(value))
+        if not ok or type(text) ~= 'string' then return false end
+        count, err = DB.execute(SET_META_SQL, { vehId, key, text })
+    end
+    if not count then
+        Core.Log.error('Vehicles.setData(%s, %s): %s', vehId, key, tostring(err))
+        return false
+    end
+    return count > 0
 end
 
---- One key of the record's `meta`, or the whole (copied) meta table when `key` is nil.
+--- One key of the record's `meta`, or the whole meta table when `key` is nil (one awaited SELECT — it yields).
 function Vehicles.getData(target, key)
     local vehId = recordIdOf(target)
     if not vehId then return nil end
-    local record = Core.DB.get(VEHICLE_COLLECTION, vehId)
-    local meta = record and record.meta
+    if key ~= nil and type(key) ~= 'string' then return nil end
+    local row, err = DB.single(GET_META_SQL, { vehId })
+    if err ~= nil then Core.Log.error('Vehicles.getData(%s): %s', vehId, tostring(err)) end
+    local meta = row and row.meta
     if type(meta) ~= 'table' then return nil end
     if key == nil then return meta end
-    if type(key) ~= 'string' then return nil end
     return meta[key]
 end
 

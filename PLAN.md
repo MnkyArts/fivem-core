@@ -915,3 +915,31 @@ scene_attach 283 · scene_parked 583 · server 1166 — all 0 failed; node units
 the fade band, the clock (p95 11.5 ms), the alpha slots, the pools, the ≈ 80 networked-object ceiling per client, AAC
 and the submixes are settled (DESIGN §55.24); P2 (contexts), P6 (fixed) and P8's https stream row are to be re-run.
 Open: the README in-game checklist steps 55–76.
+## Relational database (DESIGN §56) — 2026-09-27
+
+Liam: "everything is in one table — unperformant and bad practice; make it a high-performance database plugins can
+easily add to." Decisions (Liam, 2026-09-27): a separate `core_db` resource owns pool/queue/migrations; the document
+API is replaced (Postgres only, KVP/MySQL adapters removed); DB suites run against a throwaway test database.
+Contract: DESIGN §56. Schema + legacy import written and verified by the orchestrator on a copy of the real data
+(`sql/0001_core_schema.sql`, `sql/0002_core_legacy_import.sql`: 482/482 documents).
+
+| Run | Model | Owns | Status |
+|---|---|---|---|
+| A1 | opus | `resources/core_db/**` (pool, catalog, sqlgen, queue, migrate, tx, bundle, node tests, `tests/bridge.mjs`), `resources/package.json` workspaces | done |
+| A2 | opus | `lib/db/server.lua`, `import.lua` (`DB` lib, server only), `tests/pgbridge.lua`, `tests/stubs.lua` wiring, `tests/db_tests.lua`, `tests/fixtures/dbfixture/`, `scripts/test-db.sh` | done — db 253/0, all suites unchanged |
+| A3 | sonnet | `tests/server_tests.lua` → `tests/server_harness.lua` + `tests/server/*.lua` (behaviour-neutral split) | done — 1166/0, byte-identical output |
+| W1a | opus | `server/db.lua` (migrations + `/dbstatus`), deletions (db_pg*, pg/, db_mysql, pg-import, pg_smoke), manifest, config, api block list, `player.lua`, `getters.lua`, `money.lua`, `main.lua`, their suites + `admin_harness.lua`, check.sh, CI | done |
+| W1b | opus | `audit.lua`, `settings.lua`, `globals.lua` + audit/settings/globals suites | done |
+| W1c | opus | `bans.lua`, `bans_identity.lua`, `perms.lua` + bans/perms suites | done |
+| W2a | opus | `factions.lua`, `doors.lua`, `environment.lua` + factions suite | done |
+| W2b | opus | `vehicles.lua`, `vehicles_park.lua`, `vehicles_fleet.lua` + vehicles suite, `scene_parked_tests.lua`, `scene_attach_tests.lua` | done |
+| W2c | opus | `maps.lua`, `maps_apply.lua` + maps harness/suites | done |
+| W2d | opus | `scene_store.lua`, scene_promote DB bits + scene server/promote/interest suites | done |
+| W3a | opus | `resources/inventory/**` (sql/, containers, drops, vehprops, harness) | done |
+| W3b | opus | `resources/smartphone/**`, `resources/admin/**` (sql/, reports, sanctions, mutes, prefs) | done |
+| Reviews R1–R4, R2a/R2b, R3a/R3b | opus | findings fixed by the original runs | done |
+| W4 | sonnet | docs, template, skill | done |
+
+Shared brief for every port run: session scratchpad `db/PORT_BRIEF.md` (a digest of §56.8 + the test bridge).
+
+Final gate 2026-09-27: every suite green (see AGENTS §5), core_db node tests, fxlint core 0/0.

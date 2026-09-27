@@ -8,13 +8,16 @@
     server VM per suite (import.lua, shared/config.lua, then the server modules in manifest order).
     Covers: the seed, inheritance + cycles, weights and canTarget, define-once / never-overwrite and
     `removed`, temporary grants (expiry, pruning on load, the timer), explain/effective, hook emission,
-    saveGroup/deleteGroup rules and audit rows, the degraded-collection fallback, callback options.
+    saveGroup/deleteGroup rules and audit rows, the unreadable-table fallback, callback options. The groups and
+    grants live in the Postgres test database (DESIGN §56.10: tests/pgbridge.lua); `perm_groups.removed` is a text[]
+    there and reads back here as a set. Perms.has never touches the database (suite `no yield`).
     Exit code is 1 when anything fails.
 ]]
 
 local here = (arg and arg[0] or 'tests/perms_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
 -- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test stubs
 local stubs = dofile(here .. '/stubs.lua')
+local bridge = stubs.bridge
 
 local passed, failed, suiteName = 0, 0, '?'
 
@@ -63,11 +66,52 @@ end
 
 -- manifest order (server_tests.lua's list, up to the modules Perms needs)
 local SERVER_FILES <const> = {
-    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua',
-    'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/player.lua', 'server/playergrid.lua',
+    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua',
+    'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/player_store.lua', 'server/player.lua',
+    'server/playergrid.lua',
 }
 
---- A fresh core VM. The KVP store survives (a second newServer() is a core restart).
+--- A perm_groups row with `removed` as a { [perm] = true } set (the old document shape), or nil.
+local function storedGroup(DB, name)
+    local row = DB.first('perm_groups', { name = name })
+    if not row then return nil end
+    local set = {}
+    for _, perm in ipairs(row.removed or {}) do set[perm] = true end
+    row.removed = set
+    return row
+end
+
+--- The stored grants of an account: { permissions, tempPermissions } (the accounts columns), or nil.
+local function storedAccount(DB, accountId)
+    local row = DB.first('accounts', { id = accountId })
+    if not row then return nil end
+    return { permissions = row.permissions or {}, tempPermissions = row.temp_permissions or {}, group = row.perm_group }
+end
+
+--- A perm_groups row written straight to the table (the way an older core or an admin tool left it).
+local function putGroup(DB, row)
+    row.label = row.label or row.name
+    assert(DB.insert('perm_groups', row), 'insert perm_groups ' .. row.name)
+end
+
+--- Wraps env's exports.core_db: every call is logged (lib/db/server.lua reads the raw `synchronous` field).
+local function spyDB(env)
+    local real = rawget(env.exports, 'core_db')
+    local log = {}
+    rawset(env.exports, 'core_db', setmetatable({ synchronous = rawget(real, 'synchronous') }, {
+        __index = function(t, fnName)
+            local fn = function(_, ...)
+                log[#log + 1] = fnName
+                return real[fnName](real, ...)
+            end
+            rawset(t, fnName, fn)
+            return fn
+        end,
+    }))
+    return log, function() rawset(env.exports, 'core_db', real) end
+end
+
+--- A fresh core VM. The test database survives (a second newServer() is a core restart).
 local function newServer()
     stubs.newWorld()
     stubs.clear()
@@ -133,13 +177,14 @@ local function suiteSeed()
     eq(groups[3].inherits[1], 'helper', 'inherits come from Config.Perms.Inherits')
     check(lastHook(hooks, 'load') ~= nil, 'the load emits permsChanged(nil, load)')
 
-    local stored = DB.get('perm_groups', 'owner')
+    local stored = storedGroup(DB, 'owner')
     check(has(stored.perms, 'core.perms.manage'), "core.perms.manage was added to owner once (define default)")
-    check(has(DB.get('perm_groups', 'admin').perms, 'core.audit.view'), 'core.audit.view default: admin')
-    check(has(DB.get('perm_groups', 'admin').perms, 'core.settings.view'), 'core.settings.view default: admin')
-    check(has(DB.get('perm_groups', 'helper').perms, 'core.admin.staff'), 'the staff perm default: helper')
-    check(not has(DB.get('perm_groups', 'mod').perms, 'core.admin.staff'), 'mod inherits it instead of listing it')
-    eq(type(stored.removed), 'table', 'every document carries a removed map')
+    check(has(storedGroup(DB, 'admin').perms, 'core.audit.view'), 'core.audit.view default: admin')
+    check(has(storedGroup(DB, 'admin').perms, 'core.settings.view'), 'core.settings.view default: admin')
+    check(has(storedGroup(DB, 'helper').perms, 'core.admin.staff'), 'the staff perm default: helper')
+    check(not has(storedGroup(DB, 'mod').perms, 'core.admin.staff'), 'mod inherits it instead of listing it')
+    eq(type(stored.removed), 'table', 'every row carries a removed list')
+    eq(stored.color, nil, 'no colour is NULL')
 
     local cat = P.catalogue()
     local byPerm = {}
@@ -150,7 +195,7 @@ local function suiteSeed()
     check(byPerm['core.admin'] ~= nil, 'the legacy rank perms are catalogued')
 
     -- a restart reads the collection back instead of seeding again
-    DB.update('perm_groups', 'mod', { label = 'Moderator', weight = 250 })
+    DB.update('perm_groups', { label = 'Moderator', weight = 250 }, { name = 'mod' })
     DB.flush()
     local _, Core2 = newServer()
     local again = Core2.Perms.groups()
@@ -159,7 +204,7 @@ local function suiteSeed()
     for i = 1, #again do if again[i].name == 'mod' then mod = again[i] end end
     eq(mod.label, 'Moderator', 'the document is the source of truth after the seed')
     eq(mod.weight, 250, 'weights are read from the document')
-    local owner = Core2.DB.get('perm_groups', 'owner')
+    local owner = storedGroup(Core2.DB, 'owner')
     local count = 0
     for i = 1, #owner.perms do if owner.perms[i] == 'core.perms.manage' then count = count + 1 end end
     eq(count, 1, 'a restart never adds a default twice')
@@ -173,19 +218,19 @@ local function suiteInheritance()
     local env, Core = newServer()
     local P, DB = Core.Perms, Core.DB
 
-    -- stored documents written before the first read: a cycle and a diamond
-    DB.set('perm_groups', 'user', { name = 'user', weight = 0, perms = {}, inherits = {} })
-    DB.set('perm_groups', 'ring_a', { name = 'ring_a', weight = 10, perms = { 'ring.a' }, inherits = { 'ring_b' } })
-    DB.set('perm_groups', 'ring_b', { name = 'ring_b', weight = 11, perms = { 'ring.b' }, inherits = { 'ring_a' } })
-    DB.set('perm_groups', 'base', { name = 'base', weight = 1, perms = { 'base.x' } })
-    DB.set('perm_groups', 'left', { name = 'left', weight = 2, perms = { 'left.x' }, inherits = { 'base' } })
-    DB.set('perm_groups', 'right', { name = 'right', weight = 3, perms = { 'right.x' }, inherits = { 'base' } })
-    DB.set('perm_groups', 'top', { name = 'top', weight = 4, perms = {}, inherits = { 'left', 'right', 'ghost' } })
-    DB.set('perm_groups', 'admin', { name = 'admin', weight = 300, perms = { 'core.admin', 'admin.only' } })
-    DB.set('perm_groups', 'deputy', { name = 'deputy', weight = 250, perms = { 'core.admin' } })
+    -- stored rows written before the first read: a cycle and a diamond
+    putGroup(DB, { name = 'user', weight = 0, perms = {}, inherits = {} })
+    putGroup(DB, { name = 'ring_a', weight = 10, perms = { 'ring.a' }, inherits = { 'ring_b' } })
+    putGroup(DB, { name = 'ring_b', weight = 11, perms = { 'ring.b' }, inherits = { 'ring_a' } })
+    putGroup(DB, { name = 'base', weight = 1, perms = { 'base.x' } })
+    putGroup(DB, { name = 'left', weight = 2, perms = { 'left.x' }, inherits = { 'base' } })
+    putGroup(DB, { name = 'right', weight = 3, perms = { 'right.x' }, inherits = { 'base' } })
+    putGroup(DB, { name = 'top', weight = 4, perms = {}, inherits = { 'left', 'right', 'ghost' } })
+    putGroup(DB, { name = 'admin', weight = 300, perms = { 'core.admin', 'admin.only' } })
+    putGroup(DB, { name = 'deputy', weight = 250, perms = { 'core.admin' } })
 
-    eq(P.groupExists('ring_a'), true, 'groupExists reads the collection')
-    eq(P.groupExists('mod'), false, 'a seed group that is not in the collection does not exist')
+    eq(P.groupExists('ring_a'), true, 'groupExists reads the table')
+    eq(P.groupExists('mod'), false, 'a seed group that is not in the table does not exist')
     eq(P.groupExists(42), false, 'groupExists refuses a non-string')
     eq(P.groupExists('bad name'), false, 'groupExists refuses an invalid name')
 
@@ -269,7 +314,7 @@ local function suiteDefine()
 
     eq(select(2, Registry.withCaller('plugin_a', P.define, 'plugin.fly', { label = 'Fly', default = 'mod',
         description = 'Noclip', category = 'plugin' })), true, 'a plugin defines a perm')
-    check(has(DB.get('perm_groups', 'mod').perms, 'plugin.fly'), 'the default group got the grant')
+    check(has(storedGroup(DB, 'mod').perms, 'plugin.fly'), 'the default group got the grant')
     local hook = lastHook(hooks, 'define')
     eq(hook and hook.detail, 'plugin.fly', 'permsChanged(nil, define, perm)')
     eq(hook and hook.src, nil, 'with src nil (a group changed)')
@@ -287,31 +332,33 @@ local function suiteDefine()
 
     -- the owner takes it out: remembered, never re-added (not by a redefine, not after a restart)
     local modPerms = {}
-    for _, perm in ipairs(DB.get('perm_groups', 'mod').perms) do
+    for _, perm in ipairs(storedGroup(DB, 'mod').perms) do
         if perm ~= 'plugin.fly' then modPerms[#modPerms + 1] = perm end
     end
     eq(P.saveGroup('mod', { perms = modPerms }), true, 'the owner removes the perm from mod')
-    eq(DB.get('perm_groups', 'mod').removed['plugin.fly'], true, 'removed[perm] is stored')
+    eq(storedGroup(DB, 'mod').removed['plugin.fly'], true, 'removed[perm] is stored')
+    local raw = bridge.sql("SELECT removed FROM perm_groups WHERE name = 'mod'")
+    check(raw and raw[1] and has(raw[1].removed, 'plugin.fly'), 'removed is a text[] column holding the perm')
     eq(P.has(1, 'plugin.fly'), false, 'the removal is effective at once')
     Registry.withCaller('plugin_a', P.define, 'plugin.fly', { label = 'Fly', default = 'mod' })
-    check(not has(DB.get('perm_groups', 'mod').perms, 'plugin.fly'), 'a redefine does not re-add it')
+    check(not has(storedGroup(DB, 'mod').perms, 'plugin.fly'), 'a redefine does not re-add it')
     DB.flush()
     local _, Core2 = newServer()
     Core2.Perms.groups()
     Core2.Registry.withCaller('plugin_a', Core2.Perms.define, 'plugin.fly', { label = 'Fly', default = 'mod' })
-    check(not has(Core2.DB.get('perm_groups', 'mod').perms, 'plugin.fly'), 'nor does a restart')
+    check(not has(storedGroup(Core2.DB, 'mod').perms, 'plugin.fly'), 'nor does a restart')
 
     -- adding it back clears the flag
     modPerms[#modPerms + 1] = 'plugin.fly'
     eq(Core2.Perms.saveGroup('mod', { perms = modPerms }), true, 'the owner adds it back')
-    eq(Core2.DB.get('perm_groups', 'mod').removed['plugin.fly'], nil, 'removed is cleared')
+    eq(storedGroup(Core2.DB, 'mod').removed['plugin.fly'], nil, 'removed is cleared')
 
     -- a group created by an owner is composed by them: an earlier define default is not added later
     Core2.Perms.define('vip.perk', { default = 'vip' })
     eq(Core2.Perms.saveGroup('vip', { label = 'VIP', weight = 50, perms = { 'vip.chat' } }), true, 'create vip')
-    eq(Core2.DB.get('perm_groups', 'vip').removed['vip.perk'], true, 'the pending default is marked removed')
+    eq(storedGroup(Core2.DB, 'vip').removed['vip.perk'], true, 'the pending default is marked removed')
     Core2.Perms.define('vip.later', { default = 'vip' })
-    check(has(Core2.DB.get('perm_groups', 'vip').perms, 'vip.later'), 'a define after creation applies once')
+    check(has(storedGroup(Core2.DB, 'vip').perms, 'vip.later'), 'a define after creation applies once')
 
     -- a stopped owner's definitions leave the catalogue; the grant stays in the document
     stubs.triggerOn(env, 'onResourceStop', 0, 'plugin_a')
@@ -342,7 +389,7 @@ local function suiteTemporary()
     local why = P.explain(1, 'tmp.a')
     eq(why.via, 'account', 'explain: via account')
     eq(why.expiresAt, T + 60, 'explain carries expiresAt')
-    local account = DB.get('accounts', accountId)
+    local account = storedAccount(DB, accountId)
     eq(account.tempPermissions['tmp.a'], T + 60, 'stored as tempPermissions[perm] = expiresAt')
     check(not has(account.permissions or {}, 'tmp.a'), 'the permissions array stays plain strings')
     eq(lastHook(hooks, 'grant').detail, 'tmp.a', 'permsChanged(src, grant, perm)')
@@ -362,17 +409,17 @@ local function suiteTemporary()
     eq(expired and expired.src, 1, 'permsChanged(src, expired)')
     stubs.osTime = T + 61
     stubs.tick(30000)
-    eq(DB.get('accounts', accountId).tempPermissions['tmp.a'], nil, 'the re-armed timer pruned the next one')
+    eq(storedAccount(DB, accountId).tempPermissions['tmp.a'], nil, 'the re-armed timer pruned the next one')
     eq(P.has(1, 'tmp.a'), false, 'and it is gone')
 
     -- a permanent grant replaces a temporary one; revoke removes both kinds
     P.grant(1, 'tmp.b', 'account', { expiresAt = T + 600 })
     eq(P.grant(1, 'tmp.b'), true, 'a permanent grant over a temporary one')
-    account = DB.get('accounts', accountId)
+    account = storedAccount(DB, accountId)
     check(has(account.permissions, 'tmp.b'), 'it is in the permissions array')
     eq(account.tempPermissions['tmp.b'], nil, 'and the temporary entry is gone')
     eq(P.grant(1, 'tmp.b', 'account', { expiresAt = T + 900 }), true, 'a temporary grant of a permanent perm')
-    eq(DB.get('accounts', accountId).tempPermissions['tmp.b'], nil, 'changes nothing')
+    eq(storedAccount(DB, accountId).tempPermissions['tmp.b'], nil, 'changes nothing')
     P.grant(1, 'tmp.d', 'account', { expiresAt = T + 900 })
     eq(P.revoke(1, 'tmp.d'), true, 'revoke removes a temporary grant')
     eq(P.revoke(1, 'tmp.d'), false, 'a second revoke is false')
@@ -388,7 +435,7 @@ local function suiteTemporary()
     local env2, Core2 = newServer()
     joinAs(env2, Core2, 1, 'user')
     eq(Core2.Perms.has(1, 'tmp.e'), false, 'an entry that expired while offline is ignored')
-    eq(Core2.DB.get('accounts', accountId).tempPermissions['tmp.e'], nil, 'and pruned from the account on load')
+    eq(storedAccount(Core2.DB, accountId).tempPermissions['tmp.e'], nil, 'and pruned from the account on load')
     eq(Core2.Perms.has(1, 'live.c'), true, 'a running character entry still counts')
     eq(Core2.Player.getData(1, 'tempPermissions')['old.c'], nil, 'an expired character entry is pruned')
     stubs.osTime = nil
@@ -455,7 +502,7 @@ local function suiteManage()
     eq(rows[#rows].result, 'denied', 'the denial is audited')
     eq(rows[#rows].action, 'perms.saveGroup', 'audit action')
     eq(rows[#rows].targets[1].id, 'vip', 'audit target group')
-    eq(DB.get('perm_groups', 'vip'), nil, 'nothing was written')
+    eq(storedGroup(DB, 'vip'), nil, 'nothing was written')
 
     eq(select(2, P.saveGroup('bad name', {})), 'invalid_name', 'invalid name')
     eq(select(2, P.saveGroup('vip', 'x')), 'invalid_patch', 'invalid patch')
@@ -470,7 +517,7 @@ local function suiteManage()
     P.grant(2, 'vip.chat')
     eq(P.saveGroup('vip', { label = 'VIP', weight = 50, color = '#ffaa00', inherits = { 'user' },
         perms = { 'vip.chat', 'vip.chat' } }, 2), true, 'the owner creates a group with a perm it holds')
-    local vip = DB.get('perm_groups', 'vip')
+    local vip = storedGroup(DB, 'vip')
     eq(vip.weight, 50, 'weight stored')
     eq(vip.color, '#ffaa00', 'colour stored')
     eq(#vip.perms, 1, 'perms are deduplicated')
@@ -510,7 +557,7 @@ local function suiteManage()
     eq(select(2, P.deleteGroup('vip', 2)), 'in_use', 'a group with an online member stays')
     stubs.dropPlayer(env, 4)
     eq(P.deleteGroup('vip', 2), true, 'deleted once nobody online is in it')
-    eq(DB.get('perm_groups', 'vip'), nil, 'the document is gone')
+    eq(storedGroup(DB, 'vip'), nil, 'the row is gone')
     eq(P.groupExists('vip'), false, 'groupExists follows')
     eq(rows[#rows].action, 'perms.deleteGroup', 'the delete is audited')
     eq(lastHook(hooks, 'deleteGroup').detail, 'vip', 'permsChanged(nil, deleteGroup, name)')
@@ -539,7 +586,7 @@ local function suiteManage()
     -- an out-of-band grant write announced as permsChanged(src, 'grants') drops the cache (L2)
     eq(P.has(1, 'oob.perm'), false, 'not held yet (and cached)')
     local list = {}
-    local account = DB.get('accounts', Core.Player.getInfo(1).accountId)
+    local account = storedAccount(DB, Core.Player.getInfo(1).accountId)
     for _, perm in ipairs(account.permissions or {}) do list[#list + 1] = perm end
     list[#list + 1] = 'oob.perm'
     Core.Player.setAccountData(1, 'permissions', list)
@@ -550,47 +597,96 @@ local function suiteManage()
     check(printed('perms.saveGroup mod: denied') ~= nil, 'and falls back to the console audit line')
 end
 
---- An unreadable collection: the config seed answers, nothing is seeded over it, the load is retried.
+--- An unreadable table: the config seed answers, nothing is seeded over it, the load is retried.
 local function suiteFallback()
     suite('fallback')
     stubs.resetServer()
     local env, Core = newServer()
     local P, DB = Core.Perms, Core.DB
-    local broken = true
-    local writes = {}
-    DB.setAdapter({
-        loadAll = function(collection)
-            if broken and collection == 'perm_groups' then return nil, 'offline' end
-            local out = {}
-            for key, value in pairs(stubs.kvp) do
-                local id = key:match('^doc:' .. collection .. ':(.+)$')
-                if id then out[id] = value end
-            end
-            return out
-        end,
-        put = function(collection, id, encoded)
-            writes[#writes + 1] = collection .. ':' .. id
-            stubs.kvp['doc:' .. collection .. ':' .. id] = encoded
-        end,
-        remove = function(collection, id) stubs.kvp['doc:' .. collection .. ':' .. id] = nil end,
-        flush = function() end,
-    })
+    bridge.fail('^SELECT name, label, weight', 'XX000 simulated failure')   -- only the group load fails
     joinAs(env, Core, 1, 'mod')
-    eq(P.has(1, 'core.mod'), true, 'the config seed answers while the collection is unreadable')
+    eq(P.has(1, 'core.mod'), true, 'the config seed answers while the table is unreadable')
     eq(P.has(1, 'core.helper'), true, 'including inheritance')
-    local seeded = false
-    for i = 1, #writes do if writes[i]:find('^perm_groups:') then seeded = true end end
-    eq(seeded, false, 'nothing is seeded over an unreadable collection')
+    eq(DB.count('perm_groups'), 0, 'nothing is seeded over an unreadable table')
     check(printed('perm_groups could not be loaded') ~= nil, 'the failure is logged')
-    eq(select(2, P.saveGroup('vip', {})), 'not_ready', 'group edits wait for the collection')
+    eq(select(2, P.saveGroup('vip', {})), 'not_ready', 'group edits wait for the table')
 
-    broken = false
+    bridge.unfail()
     eq(P.groupExists('mod'), true, 'within the retry window the seed still answers')
+    eq(DB.count('perm_groups'), 0, 'and nothing was read or written yet')
     stubs.tick(30001)
     P.groups()
-    for i = 1, #writes do if writes[i]:find('^perm_groups:') then seeded = true end end
-    eq(seeded, true, 'after the retry window the collection is read (and seeded)')
+    eq(DB.count('perm_groups'), 6, 'after the retry window the table is read (and seeded)')
     eq(P.saveGroup('vip', {}), true, 'and edits work')
+    eq(#stubs.failures, 0, 'no thread errored')
+
+    -- a failed WRITE of saveGroup / deleteGroup is reported, and the memory keeps the stored state
+    bridge.fail('^INSERT INTO "perm_groups"', 'XX000 simulated failure')
+    eq(select(2, P.saveGroup('vip', { label = 'Very' })), 'save_failed', 'a failed upsert answers save_failed')
+    bridge.unfail()
+    eq(storedGroup(DB, 'vip').label, 'vip', 'the row is unchanged')
+    local label
+    for _, group in ipairs(P.groups()) do if group.name == 'vip' then label = group.label end end
+    eq(label, 'vip', 'and so is the cached group')
+    bridge.fail('^DELETE FROM "perm_groups"', 'XX000 simulated failure')
+    eq(select(2, P.deleteGroup('vip')), 'save_failed', 'a failed delete answers save_failed')
+    bridge.unfail()
+    eq(P.groupExists('vip'), true, 'the group stays')
+end
+
+--- Perms.has never yields and never reads the database (DESIGN §56.8 rule 2): account grants come from the live
+--- session (Player.getAccountData), character grants from Player.getData, groups from memory.
+local function suiteNoYield()
+    suite('no yield')
+    stubs.resetServer()
+    local env, Core = newServer()
+    local P = Core.Perms
+    joinAs(env, Core, 1, 'mod')
+    eq(P.grant(1, 'acc.perm'), true, 'an account grant')
+    eq(P.grant(1, 'char.perm', 'character'), true, 'a character grant')
+    Core.emitHook('permsChanged', 1, 'grants')   -- drop the caches: the next checks rebuild them from the session
+    local log, restore = spyDB(env)
+    bridge.fail('.', 'XX000 simulated failure')   -- any statement would fail now
+    local answers = {}
+    local co = coroutine.create(function()
+        answers[1] = P.has(1, 'acc.perm')
+        answers[2] = P.has(1, 'char.perm')
+        answers[3] = P.has(1, 'core.mod')
+        answers[4] = P.has(1, 'core.admin')
+        answers[5] = P.explain(1, 'acc.perm').via
+        answers[6] = P.getWeight(1)
+        answers[7] = P.canTarget(1, 99)
+    end)
+    local ok, err = coroutine.resume(co)
+    check(ok, 'the checks ran', tostring(err))
+    eq(coroutine.status(co), 'dead', 'the checks finished without yielding')
+    eq(answers[1], true, 'account grant from the live session')
+    eq(answers[2], true, 'character grant from the session data')
+    eq(answers[3], true, 'group chain from memory')
+    eq(answers[4], false, 'and nothing more')
+    eq(answers[5], 'account', 'explain agrees')
+    eq(answers[6], 200, 'getWeight from memory')
+    eq(answers[7], true, 'canTarget from memory')
+    eq(P.has(1, 'acc.perm'), true, 'outside a coroutine as well (main chunk)')
+    eq(#log, 0, 'not one core_db call was made')
+    bridge.unfail()
+    restore()
+
+    -- the account read path: a deep copy of the live account, internal to core
+    local grants = Core.Player.getAccountData(1, 'permissions')
+    check(has(grants, 'acc.perm'), 'Player.getAccountData reads the live account')
+    grants[#grants + 1] = 'forged.perm'
+    eq(P.has(1, 'forged.perm'), false, 'it hands out a copy')
+    eq(Core.Player.getAccountData(99, 'permissions'), nil, 'nil without a session')
+    local called, blocked = pcall(stubs.exports.core.call, 'plugin', 'Player', 'getAccountData', 1, 'permissions')
+    eq(called, false, 'Player.getAccountData is not reachable through the export')
+    eq(blocked, 'core: Player.getAccountData is internal', 'it is block-listed')
+
+    -- a colour cleared by saveGroup is NULL in the row
+    eq(P.saveGroup('mod', { color = '#112233' }), true, 'set a colour')
+    eq(storedGroup(Core.DB, 'mod').color, '#112233', 'stored')
+    eq(P.saveGroup('mod', { color = '' }), true, 'clear it')
+    eq(storedGroup(Core.DB, 'mod').color, nil, 'the column is NULL again')
     eq(#stubs.failures, 0, 'no thread errored')
 end
 
@@ -679,7 +775,8 @@ end
 local SUITES <const> = {
     { 'seed', suiteSeed }, { 'inheritance', suiteInheritance }, { 'weights', suiteWeights },
     { 'define', suiteDefine }, { 'temporary', suiteTemporary }, { 'explain', suiteExplain },
-    { 'manage', suiteManage }, { 'fallback', suiteFallback }, { 'callback opts', suiteCallbackOpts },
+    { 'manage', suiteManage }, { 'fallback', suiteFallback }, { 'no yield', suiteNoYield },
+    { 'callback opts', suiteCallbackOpts },
 }
 
 for i = 1, #SUITES do

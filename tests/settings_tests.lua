@@ -1,8 +1,11 @@
--- Offline contract for Core.Settings (DESIGN §45): define/ownership, layers, validation, persistence,
--- permissions, audit, onChange + recursion guard, replication and the client read side.
+-- Offline contract for Core.Settings (DESIGN §45, storage §56): define/ownership, layers, validation,
+-- persistence (the `settings` table over the Postgres test bridge, §56.10.2), permissions, audit, onChange +
+-- recursion guard, replication and the client read side. A "restart" is a new core VM over the same database.
+--     scripts/test-db.sh up   (once)      lua5.4 tests/settings_tests.lua
 local here = (arg and arg[0] or 'tests/settings_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
 -- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test stubs
 local stubs = dofile(here .. '/stubs.lua')
+local bridge = stubs.bridge
 
 local passed, failed = 0, 0
 local function check(value, message)
@@ -26,8 +29,17 @@ end
 local grants = {}        -- [src] = { [perm] = true }
 local audits = {}        -- every Core.Audit.record call
 
---- A core server VM: import, config, api, db, stand-ins for Perms/Player/Audit, then settings.lua.
-local function newServer(adapter)
+local CORE_MIGRATIONS <const> = { 'sql/0001_core_schema.sql', 'sql/0002_core_legacy_import.sql' }
+
+--- The stored override row of `key` (value, updated_by, updated_at), or nil.
+local function storedRow(key)
+    local rows = bridge.sql('SELECT value, updated_by, updated_at FROM settings WHERE key = $1', { key })
+    return rows and rows[1]
+end
+
+--- A core server VM: import, config, api, core's migrations (server/db.lua registers them in the resource),
+--- stand-ins for Perms/Player/Audit, then settings.lua. `before(env, Core)` runs right before settings.lua.
+local function newServer(before)
     stubs.newWorld()
     stubs.clear()
     stubs.tick(1000)
@@ -35,9 +47,10 @@ local function newServer(adapter)
     stubs.loadImport(env)
     stubs.loadFile(env, 'shared/config.lua')
     stubs.loadFile(env, 'server/api.lua')
-    stubs.loadFile(env, 'server/db.lua')
     local Core = env.Core
-    if adapter then Core.DB.setAdapter(adapter) end
+    local DB = Core.DB
+    assert(DB.migrate(CORE_MIGRATIONS))
+    assert(DB.awaitMigrations())
     Core.Perms = { has = function(src, perm)
         if src == 0 then return true end
         return grants[src] ~= nil and grants[src][perm] == true
@@ -47,6 +60,7 @@ local function newServer(adapter)
         getName = function(src) return 'Player' .. src end,
     }
     Core.Audit = { record = function(row) audits[#audits + 1] = row return #audits end }
+    if before then before(env, Core) end
     stubs.loadFile(env, 'server/settings.lua')
     return env, Core
 end
@@ -154,9 +168,13 @@ check(row.action == 'settings.set' and row.actor == 7 and row.reason == 'heavier
     'audit row: action, actor, reason, result')
 check(row.targets[1].type == 'setting' and row.targets[1].id == 'plug.maxWeight', 'audit target')
 check(row.changes[1].old == 30 and row.changes[1].new == 45 and row.ctx.op == 'set', 'audit change old/new')
-local stored = stubs.kvp['doc:settings:plug:maxWeight']
-check(stored ~= nil and stored:find('"value":45', 1, true) ~= nil, "persisted as settings/plug:maxWeight")
-check(stored and stored:find('acc7', 1, true) ~= nil, 'the writer is stored with the override')
+local stored = storedRow('plug.maxWeight')
+check(stored ~= nil and stored.value == 45, 'persisted as the settings row plug.maxWeight (dotted key)')
+check(stored and type(stored.updated_by) == 'table' and stored.updated_by.accountId == 'acc7'
+    and stored.updated_by.kind == 'player', 'the writer is stored with the override (updated_by)')
+check(stored and type(stored.updated_at) == 'number' and Settings.inspect('plug.maxWeight').updatedAt ~= nil,
+    'updated_at is stored and inspect reports updatedAt')
+eq(#(bridge.sql('SELECT key FROM settings') or {}), 1, 'only overrides are stored (never defaults or config)')
 
 ok, err = Settings.set('plug.guarded', 5, 7)
 check(ok == false and err == 'permission', "a property's own edit permission applies")
@@ -175,7 +193,7 @@ eq(Settings.inspect('plug.token').value, '••••', 'secret masked in inspe
 ok, err = Settings.reset('plug.maxWeight', 7, 'back')
 check(ok == true, 'reset: ' .. tostring(err))
 eq(Settings.get('plug.maxWeight'), 30, 'reset falls back to the default')
-eq(stubs.kvp['doc:settings:plug:maxWeight'], nil, 'reset deletes the document')
+eq(storedRow('plug.maxWeight'), nil, 'reset deletes the row')
 check(lastAudit().ctx.op == 'reset' and lastAudit().changes[1].new == 30, 'reset audited')
 local auditCount = #audits
 check(Settings.reset('plug.maxWeight') == true and #audits == auditCount, 'reset without override is a no-op')
@@ -284,7 +302,7 @@ eq(Core.Registry.getOwned('plug'), nil, 'nothing left tracked for the owner')
 stubs.tick(2000)
 eq(G['cs:plug.flag'], nil, 'replicated key cleared')
 eq(#G['cs:keys'], 0, 'index emptied')
-check(stubs.kvp['doc:settings:plug:maxWeight'] ~= nil, 'the override stays in the DB')
+check(storedRow('plug.maxWeight') ~= nil, 'the override stays in the DB')
 check(as('plug', 'define', plugDef) == true, 'the owner defines again')
 eq(Settings.get('plug.maxWeight'), 60, 'the stored override applies again')
 Settings.set('plug.maxWeight', 61)
@@ -309,46 +327,93 @@ local flagInfo = Settings.inspect('plug.flag')
 check(flagInfo.override == false and flagInfo.value == false and flagInfo.source == 'override',
     'a false override is a real value (inspect)')
 eq(Settings.get('plug.flag'), false, 'a false override is a real value (get)')
--- the stub JSON decoder reads `false` back as nil (tests/stubs.lua), so the restart round trip uses true
-Settings.set('plug.flag', true)
+eq(storedRow('plug.flag') and storedRow('plug.flag').value, false, 'a false override is stored as JSON false')
 
 --------------------------------------------------------------------------------
--- persistence round trip: a new core VM reads the KVP store back
+-- write failures: 'persist', memory and table unchanged; a nil value is a reset
+--------------------------------------------------------------------------------
+eq(Settings.get('plug.maxWeight'), 61, 'the valid override applies again')
+bridge.fail('INSERT INTO "settings"', 'XX000 simulated failure')
+local seenBeforeFail = #seen
+ok, err = Settings.set('plug.maxWeight', 55)
+check(ok == false and err == 'persist', 'a failed upsert answers persist')
+eq(Settings.get('plug.maxWeight'), 61, 'memory keeps the old value when the write failed')
+eq(storedRow('plug.maxWeight').value, 61, 'and the table too')
+eq(#seen, seenBeforeFail, 'no change event for a write that failed')
+check(printed('settings: could not store plug.maxWeight'), 'the failed write is logged')
+bridge.unfail()
+bridge.fail('DELETE FROM "settings"', 'XX000 simulated failure')
+ok, err = Settings.reset('plug.maxWeight')
+check(ok == false and err == 'persist', 'a failed delete answers persist')
+eq(Settings.get('plug.maxWeight'), 61, 'the override stays in memory')
+check(storedRow('plug.maxWeight') ~= nil, 'and in the table')
+bridge.unfail()
+eq(Settings.get('plug.guarded'), 14, 'plug.guarded holds an override')
+check(Settings.set('plug.guarded', nil) == true, 'a nil value on an optional field is accepted')
+eq(Settings.get('plug.guarded'), 0, 'and resets the key to its default')
+eq(storedRow('plug.guarded'), nil, 'the row is deleted')
+
+--------------------------------------------------------------------------------
+-- JSON round trips: false over a true default, arrays, tables, the empty table
+--------------------------------------------------------------------------------
+local rtDef = { id = 'rt', properties = {
+    ['rt.on'] = { type = 'boolean', default = true, order = 1 },
+    ['rt.list'] = { type = 'array', items = { type = 'integer' }, order = 2 },
+    ['rt.spot'] = { type = 'vector3', order = 3 },
+    ['rt.words'] = { type = 'array', items = { type = 'string' }, order = 4 },
+} }
+check(as('rtplug', 'define', rtDef) == true, 'a second section for the round trips')
+check(Settings.set('rt.on', false) == true, 'false over a true default')
+check(Settings.set('rt.list', { 3, 1, 2 }) == true, 'an array value')
+check(Settings.set('rt.spot', { x = 1.5, y = -2, z = 30.25 }) == true, 'a table value')
+check(Settings.set('rt.words', {}) == true, 'an empty table')
+eq(storedRow('rt.on').value, false, 'rt.on is stored as false')
+local storedList = storedRow('rt.list').value
+check(type(storedList) == 'table' and storedList[1] == 3 and storedList[3] == 2, 'rt.list is stored as a JSON array')
+
+--------------------------------------------------------------------------------
+-- persistence round trip: a new core VM over the same database
 --------------------------------------------------------------------------------
 env, Core = newServer()
 local Settings = Core.Settings -- a fresh core VM
 check(as('plug', 'define', plugDef) == true, 'define after a core restart')
+check(as('rtplug', 'define', rtDef) == true, 'the round-trip section after the restart')
 eq(Settings.get('plug.maxWeight'), 61, 'override survives a restart')
-eq(Settings.get('plug.flag'), true, 'boolean override survives a restart')
+eq(Settings.get('plug.flag'), false, 'a false override survives a restart')
 eq(Settings.get('plug.token'), 'sesame', 'secret override survives a restart')
+eq(Settings.get('plug.guarded'), 0, 'a reset key stays reset after a restart')
+eq(Settings.get('rt.on'), false, 'false over a true default survives a restart')
+local list = Settings.get('rt.list')
+check(type(list) == 'table' and #list == 3 and list[1] == 3 and list[2] == 1 and list[3] == 2,
+    'an array survives a restart in order')
+local spot = Settings.get('rt.spot')
+check(type(spot) == 'table' and spot.x == 1.5 and spot.y == -2 and spot.z == 30.25, 'a table survives a restart')
+local words = Settings.get('rt.words')
+check(type(words) == 'table' and next(words) == nil, 'an empty table survives a restart')
+local restored = Settings.inspect('plug.maxWeight')
+check(restored.by and restored.by.kind == 'resource' and restored.by.resource == 'core'
+    and type(restored.updatedAt) == 'number', 'the writer and time survive a restart (inspect)')
 stubs.tick(2000)
-eq(env.GlobalState['cs:plug.flag'], true, 'replicated override published after a restart')
+eq(env.GlobalState['cs:plug.flag'], false, 'replicated override published after a restart (false too)')
 stubs.triggerOn(env, 'onResourceStop', 0, 'core')
 eq(env.GlobalState['cs:plug.flag'], nil, 'core stop clears the mirrored keys')
 eq(env.GlobalState['cs:keys'], nil, 'core stop clears the index')
 
 --------------------------------------------------------------------------------
--- async backend: one load, every concurrent caller waits on the same barrier (DESIGN §22)
+-- a yielding load: one load, every concurrent caller waits on the same barrier (DESIGN §22)
 --------------------------------------------------------------------------------
 local loads = 0
-local asyncAdapter = {
-    loadAll = function(collection)
-        loads = loads + 1
-        local p = env.promise.new()
-        env.SetTimeout(50, function() p:resolve(true) end)
-        env.Citizen.Await(p)
-        local out = {}
-        local prefix = 'doc:' .. collection .. ':'
-        for key, value in pairs(stubs.kvp) do
-            if key:sub(1, #prefix) == prefix then out[key:sub(#prefix + 1)] = value end
+env, Core = newServer(function(vm, C)
+    local DB = C.DB
+    local realSelect = DB.select
+    DB.select = function(tbl, ...)
+        if tbl == 'settings' then
+            loads = loads + 1
+            vm.Wait(50)                          -- the round trip yields in game
         end
-        return out
-    end,
-    put = function(collection, id, encoded) stubs.kvp['doc:' .. collection .. ':' .. id] = encoded end,
-    remove = function(collection, id) stubs.kvp['doc:' .. collection .. ':' .. id] = nil end,
-    flush = function() end,
-}
-env, Core = newServer(asyncAdapter)
+        return realSelect(tbl, ...)
+    end
+end)
 local Settings = Core.Settings -- a fresh core VM
 check(as('plug', 'define', plugDef) == true, 'define does not need the overrides')
 local got = {}
@@ -357,23 +422,143 @@ env.CreateThread(function() got[2] = Settings.get('plug.maxWeight') end)
 env.CreateThread(function() got[3] = { Settings.set('plug.maxWeight', 70) } end)
 eq(got[1], nil, 'callers park while the load is out')
 stubs.tick(100)
-local settingsLoads = loads
 check(got[1] == 61 and got[2] == 61, 'both readers see the stored override after the one load')
 check(got[3] and got[3][1] == true, 'a writer arriving during the load waits and then writes')
 eq(Settings.get('plug.maxWeight'), 70, 'the write landed after the load')
-check(settingsLoads == 1 and loads == 1, 'the settings collection was loaded exactly once')
+eq(storedRow('plug.maxWeight').value, 70, 'and in the table')
+eq(loads, 1, 'the settings table was loaded exactly once')
 
-local brokenAdapter = {
-    loadAll = function() return nil, 'down' end,
-    put = function() end, remove = function() end, flush = function() end,
-}
-env, Core = newServer(brokenAdapter)
+-- two writes of one key while the first is out: they never overlap, so the table ends on the later one
+local DB = Core.DB
+local realUpsert = DB.upsert
+local order = {}
+DB.upsert = function(tbl, values, ...)
+    order[#order + 1] = tostring(values.value)
+    if values.value == 71 then env.Wait(50) end   -- the first round trip is slow
+    return realUpsert(tbl, values, ...)
+end
+local w = {}
+env.CreateThread(function() w[1] = Settings.set('plug.maxWeight', 71) end)
+env.CreateThread(function() w[2] = Settings.set('plug.maxWeight', 72) end)
+eq(#order, 1, 'the second write of a key waits while the first is out')
+eq(Settings.get('plug.maxWeight'), 70, 'memory changes only once a write committed')
+stubs.tick(100)
+check(w[1] == true and w[2] == true, 'both writes succeed')
+eq(table.concat(order, ','), '71,72', 'in call order')
+eq(Settings.get('plug.maxWeight'), 72, 'memory holds the later write')
+eq(storedRow('plug.maxWeight').value, 72, 'and so does the table')
+DB.upsert = realUpsert
+
+-- a write that TIMES OUT may still commit later: the slot re-writes what memory holds before it is freed
+do
+    local calls = {}
+    DB.upsert = function(tbl, values, ...)
+        calls[#calls + 1] = tostring(values.value)
+        local stored = realUpsert(tbl, values, ...)          -- core_db commits it after all ...
+        if #calls == 1 then return nil, 'timeout' end        -- ... but the Lua deadline answered first
+        return stored
+    end
+    local okT, errT = Settings.set('plug.maxWeight', 80)
+    check(okT == false and errT == 'persist', 'a timed-out upsert answers persist')
+    eq(Settings.get('plug.maxWeight'), 72, 'memory keeps the committed value')
+    eq(table.concat(calls, ','), '80,72', 'the slot re-writes the value memory holds')
+    eq(storedRow('plug.maxWeight').value, 72, 'so the table converges on memory')
+    DB.upsert = realUpsert
+    local realDelete = DB.delete
+    DB.delete = function(tbl, where, ...)
+        realDelete(tbl, where, ...)                          -- the delete lands ...
+        return nil, 'timeout'                                -- ... after the deadline
+    end
+    okT, errT = Settings.reset('plug.maxWeight')
+    check(okT == false and errT == 'persist', 'a timed-out delete answers persist')
+    eq(Settings.get('plug.maxWeight'), 72, 'the override stays in memory')
+    eq(storedRow('plug.maxWeight') and storedRow('plug.maxWeight').value, 72, 'and is written back to the table')
+    DB.delete = realDelete
+end
+check(Settings.set('plug.flag', true) == true, 'a replicated override for the outage below')
+
+-- the prune guard of server/audit.lua reads this; plugins never reach it
+eq(Settings.isLoaded(), true, 'isLoaded once the overrides are in')
+do
+    local okE, errE = pcall(as, 'plug', 'isLoaded')
+    check(not okE and tostring(errE):find('internal', 1, true) ~= nil, 'Settings.isLoaded is block-listed for plugins')
+end
+
+--------------------------------------------------------------------------------
+-- a failed load: config/default, no writes, memory and table untouched, retried later — and a late load
+-- republishes the replicated keys and tells the watchers what changed against what was answered
+--------------------------------------------------------------------------------
+stubs.osTime = 1790000000
+bridge.fail('SELECT %* FROM "settings"', 'XX000 simulated failure')
+env, Core = newServer()
 local Settings = Core.Settings -- a fresh core VM
 as('plug', 'define', plugDef)
-eq(Settings.get('plug.maxWeight'), 30, 'an unreadable collection answers config/default')
+local lateHeard = {}
+as('plug', 'onChange', 'plug.', function(key, new, old)
+    lateHeard[key] = { new = new, old = old }
+end)
+eq(Settings.get('plug.maxWeight'), 30, 'an unreadable table answers config/default')
+eq(Settings.isLoaded(), false, 'isLoaded is false after a failed load')
+stubs.tick(2000)
+eq(env.GlobalState['cs:plug.flag'], false, 'during the outage the default is replicated')
 ok, err = Settings.set('plug.maxWeight', 40)
 check(ok == false and err == 'unavailable', 'no writes while the overrides could not be read')
+ok, err = Settings.reset('plug.maxWeight')
+check(ok == false and err == 'unavailable', 'no resets either')
 check(printed('settings: could not read settings'), 'the failed load is logged')
+eq(Settings.inspect('plug.maxWeight').override, nil, 'memory holds no override after the failed load')
+bridge.unfail()
+eq(storedRow('plug.maxWeight').value, 72, 'the stored override was never overwritten')
+eq(Settings.get('plug.maxWeight'), 30, 'within 10 s of the failure the load is not retried')
+stubs.osTime = 1790000000 + 11
+eq(Settings.get('plug.maxWeight'), 72, 'after 10 s the next caller loads and the override applies')
+eq(Settings.isLoaded(), true, 'isLoaded after the late load')
+stubs.tick(2000)
+eq(env.GlobalState['cs:plug.flag'], true, 'the late load republishes the replicated override')
+check(lateHeard['plug.maxWeight'] and lateHeard['plug.maxWeight'].new == 72 and lateHeard['plug.maxWeight'].old == 30,
+    'watchers hear every key whose value changed against what was answered (new, old)')
+check(lateHeard['plug.flag'] and lateHeard['plug.flag'].new == true and lateHeard['plug.flag'].old == false,
+    'a replicated key too')
+eq(lateHeard['plug.broken'], nil, 'a key without an override is not dispatched')
+check(Settings.set('plug.maxWeight', 42) == true, 'writes work again after the retry')
+eq(storedRow('plug.maxWeight').value, 42, 'and reach the table')
+
+-- the retry thread: after a failed load it retries every 10 s by itself (no caller needed)
+do
+    bridge.fail('SELECT %* FROM "settings"', 'XX000 simulated failure')
+    local envR, CoreR = newServer()
+    local SR = CoreR.Settings
+    as('plug', 'define', plugDef)
+    eq(SR.get('plug.maxWeight'), 30, 'retry thread: the failed load answers the default')
+    bridge.unfail()
+    stubs.tick(5000)
+    eq(SR.isLoaded(), false, 'no retry before 10 s')
+    stubs.tick(6000)
+    eq(SR.isLoaded(), true, 'the retry thread loaded the overrides without any caller')
+    eq(SR.get('plug.maxWeight'), 42, 'and the stored override applies')
+    stubs.triggerOn(envR, 'onResourceStop', 0, 'core')
+end
+
+-- the dbStatus hook: the database is back, the load retries at once
+do
+    bridge.fail('SELECT %* FROM "settings"', 'XX000 simulated failure')
+    local envD, CoreD = newServer()
+    local SD = CoreD.Settings
+    as('plug', 'define', plugDef)
+    local heardD = {}
+    as('plug', 'onChange', 'plug.maxWeight', function(_, new) heardD[#heardD + 1] = new end)
+    eq(SD.get('plug.maxWeight'), 30, 'dbStatus: the failed load answers the default')
+    bridge.unfail()
+    stubs.triggerOn(envD, 'core:hook:dbStatus', 0, false, 'still down')
+    stubs.tick(10)
+    eq(SD.isLoaded(), false, 'an unhealthy status does not load')
+    stubs.triggerOn(envD, 'core:hook:dbStatus', 0, true, 'back')
+    stubs.tick(10)
+    eq(SD.isLoaded(), true, 'a healthy status reloads at once')
+    eq(heardD[1], 42, 'and the watcher hears the stored value')
+    stubs.triggerOn(envD, 'onResourceStop', 0, 'core')
+end
+stubs.osTime = nil
 stubs.resetServer()
 
 --------------------------------------------------------------------------------

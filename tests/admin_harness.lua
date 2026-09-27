@@ -66,8 +66,9 @@ end
 
 -- manifest order, audit.lua included (real rows), getters.lua for resolveTargets, security.lua last
 local SERVER_FILES <const> = {
-    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua',
-    'server/audit.lua', 'server/notify.lua', 'server/perms.lua', 'server/buckets.lua', 'server/player.lua',
+    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua',
+    'server/audit.lua', 'server/notify.lua', 'server/perms.lua', 'server/buckets.lua', 'server/player_store.lua',
+    'server/player.lua',
     'server/playergrid.lua', 'server/money.lua', 'server/factions.lua', 'server/vehicles.lua', 'server/getters.lua',
     'server/adminapi.lua', 'server/adminapi_dispatch.lua', 'server/security.lua',
 }

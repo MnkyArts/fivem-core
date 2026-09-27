@@ -1,6 +1,7 @@
 --[[
     core/tests/scene_parked_tests.lua — parked vehicles (DESIGN §55.21.4): server/vehicles.lua +
-    server/vehicles_park.lua on a core server VM (the real api, hooks, db (KVP), player, playergrid) with a
+    server/vehicles_park.lua on a core server VM (the real api, hooks, db (the Postgres test bridge, DESIGN §56.10),
+    player, playergrid) with a
     recording fake Core.Scene (spawn / get / set / move / remove / promote / demote / on / list / stats; set and move
     demote a promoted node first, like R.promote.beforeChange) and drivers for the promote worker and the demotion
     (clone with state sn, the promoted / demoted hooks). A client VM in the same world answers core:vehicles:props
@@ -10,13 +11,74 @@
 
     Covers park (netId / vehId, the owner's props, refusals, the caller), promotion → adoption, demotion → the
     record, spawnRecord / restoreRecord / store / delete / deleteRecord on parked records, getInfoByRecord,
-    AutoPark (rest, radius, occupants, slices, the worker's re-check), the boot check and core stop.
+    AutoPark (rest, radius, occupants, slices, the worker's re-check), the boot check and core stop; the §56 port
+    (section 22): the boot's ONE world read in last_used_at order, a failed read that changes nothing, meta kept.
+    Records written behind core's back go in by SQL (putRecord / bridge.sql); the mirror of the world records
+    (server/vehicles.lua) learns such a change at the next read of that record (V.getRecord).
 ]]
 
 local here = (arg and arg[0] or 'tests/scene_parked_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
--- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test stubs
-local stubs = dofile(here .. '/stubs.lua')
+-- the real-stack harness of sections 14 / 20 — and the ONE stubs instance (one test-database bridge per process)
+-- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test files
+local RH = dofile(here .. '/scene_server_harness.lua')
+local stubs = RH.stubs
 local v3 = stubs.vector3
+local bridge = stubs.bridge
+
+--- A direct query (as the invoker `tests`); raises on an error.
+local function sql(text, params)
+    local rows, err = bridge.sql(text, params)
+    if not rows then error('scene parked: ' .. tostring(err), 2) end
+    return rows
+end
+
+--- A record written behind core's back (fixtures, a previous server): record fields -> one INSERT of the given
+--- columns (absent = the column default; parked false = NULL; lastUsedAt in Unix seconds).
+local function putRecord(id, t)
+    local cols, vals, params = { 'id' }, { '$1' }, { id }
+    local function add(col, v, cast)
+        if v == nil then return end
+        params[#params + 1] = v
+        cols[#cols + 1] = col
+        vals[#vals + 1] = (cast == 'ts' and 'to_timestamp($%d)' or ('$%d' .. (cast or ''))):format(#params)
+    end
+    add('owner_character_id', t.ownerCharId or nil)
+    add('model', t.model or 1234)
+    add('model_name', t.modelName)
+    add('plate', t.plate or id:upper():sub(1, 8))
+    add('props', t.props and stubs.json.encode(t.props), '::jsonb')
+    add('stored', t.stored)
+    add('destroyed', t.destroyed)
+    add('parked', t.parked or nil)
+    add('locked', t.locked)
+    add('keys', t.keys, '::text[]')
+    add('position', t.position and stubs.json.encode(t.position), '::jsonb')
+    add('meta', t.meta and stubs.json.encode(t.meta), '::jsonb')
+    add('last_used_at', t.lastUsedAt, 'ts')
+    sql(('INSERT INTO vehicles (%s) VALUES (%s)'):format(table.concat(cols, ', '), table.concat(vals, ', ')), params)
+end
+
+--- A character row (the vehicles owner FK) for a fixture charId.
+local function ensureChar(id)
+    sql('INSERT INTO accounts (id, license) VALUES ($1, $2) ON CONFLICT DO NOTHING', { 'acc-' .. id, 'license:' .. id })
+    sql('INSERT INTO characters (id, account_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', { id, 'acc-' .. id })
+end
+
+--- Records every core_db export call `env` makes from now on -> the live log { { fn, args } }.
+local function recordDb(env)
+    local inner, log = rawget(env.exports, 'core_db'), {}
+    rawset(env.exports, 'core_db', setmetatable({ synchronous = true }, { __index = function(t, name)
+        local f = inner[name]
+        if type(f) ~= 'function' then return f end
+        local wrapped = function(_, ...)
+            log[#log + 1] = { fn = name, args = table.pack(...) }
+            return f(inner, ...)
+        end
+        rawset(t, name, wrapped)
+        return wrapped
+    end }))
+    return log
+end
 
 local passed, failed = 0, 0
 local function check(cond, label)
@@ -206,16 +268,17 @@ end
 --------------------------------------------------------------------------------
 
 local SERVER_FILES <const> = {
-    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua',
-    'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/player.lua', 'server/playergrid.lua',
-    'server/money.lua', 'server/factions.lua', 'server/vehicles.lua', 'server/vehicles_park.lua',
-    'server/vehicles_fleet.lua',
+    'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua',
+    'server/globals.lua', 'server/notify.lua', 'server/perms.lua', 'server/player_store.lua', 'server/player.lua',
+    'server/playergrid.lua', 'server/money.lua', 'server/factions.lua', 'server/vehicles.lua',
+    'server/vehicles_park.lua', 'server/vehicles_fleet.lua', 'server/getters.lua',
 }
 
 local W                                             -- the world knobs: rot, vel, owner (entity -> src)
 local hooks                                         -- { spawned = { {netId, info} }, deleted = { netId } }
 
---- opts = { keepKvp, config = fn(Config), before = fn(env, Core, S) (records / nodes before the boot check),
+--- opts = { keepDb (the same database: a core restart), config = fn(Config), before = fn(env, Core, S) (records /
+---          nodes before the boot check),
 ---          noScene (no Core.Scene), client (a client VM too), adopt (R.promote.adopt = the fake S.adopt: the
 ---          engine's hand-off of a live car) }
 local function newServer(opts)
@@ -223,7 +286,7 @@ local function newServer(opts)
     stubs.newWorld()
     stubs.clear()
     for i = #stubs.failures, 1, -1 do stubs.failures[i] = nil end
-    if not opts.keepKvp then stubs.resetServer() end
+    if not opts.keepDb then stubs.resetServer() end
     stubs.tick(1000)
     W = { rot = {}, vel = {}, owner = {} }
     local env = stubs.newEnv('server', 'core')
@@ -465,7 +528,7 @@ do
     eq(r6[2], 'fields', "Scene.spawn's refusal is passed on")
     eq(type(r6[3]) == 'table' and r6[3].plate, 'pattern', 'with its detail')
     eq(V.exists(n6), true, 'the vehicle stays in the world')
-    eq(V.getRecord(vehId6).parked, nil, 'and is not parked')
+    eq(V.getRecord(vehId6).parked, false, 'and is not parked')
 
     -- park(vehId): the parked record answers its node; a live vehicle parks; a stored record is refused;
     -- an out record without a live vehicle parks at its saved position
@@ -477,7 +540,8 @@ do
     check(math.type(id7) == 'integer' and not V.exists(n7), 'park(vehId) of a live vehicle parks it')
     V.store(vehId7)
     eq(errOf(V.park(vehId7)), 'record_stored', 'a garaged record is refused')
-    local outId = Core.DB.create('vehicles', { ownerCharId = charId, model = env.GetHashKey('blista'),
+    local outId = 'out1'
+    putRecord(outId, { ownerCharId = charId, model = env.GetHashKey('blista'),
         plate = 'OUT1', props = { colorPrimary = 4 }, stored = false, locked = true, keys = { 'friend-2' },
         position = { x = 10.0, y = 20.0, z = 30.0, heading = 45.0, bucket = 3 }, meta = { vehType = 'bike' } })
     local idOut = V.park(outId)
@@ -493,14 +557,16 @@ do
     -- a live car whose record still names a node (it outlived a restore): the old node goes once it parks
     local n8, _, vehId8 = persisted(Core, v3(680.0, 500.0, 20.0))
     local old8 = V.park(n8)
-    Core.DB.update('vehicles', vehId8, { parked = false })
+    sql('UPDATE vehicles SET parked = NULL WHERE id = $1', { vehId8 })        -- (behind core's back)
     local live8 = V.restoreRecord(vehId8)
-    Core.DB.update('vehicles', vehId8, { parked = old8 })
+    sql('UPDATE vehicles SET parked = $2 WHERE id = $1', { vehId8, old8 })
+    V.getRecord(vehId8)                                                       -- (the mirror learns it at a read)
     local new8 = V.park(live8)
     check(math.type(new8) == 'integer' and new8 ~= old8, 'the live car parks as a new node')
     eq(S.nodes[old8], nil, 'the stale node is removed')
     eq(V.getRecord(vehId8).parked, new8, 'the record names the new one')
-    local bad = Core.DB.create('vehicles', { model = 1, plate = 'BAD1', stored = false, position = { x = 'x' } })
+    local bad = 'bad1'
+    putRecord(bad, { model = 1, plate = 'BAD1', stored = false, position = { x = 'x' } })
     eq(errOf(V.park(bad)), 'bad_coords', 'an out record without a usable position')
     eq(#stubs.failures, 0, 'section 1: no uncaught error')
     teardown(env)
@@ -564,7 +630,8 @@ do
     local n2 = persisted(Core, v3(530.0, 500.0, 20.0))
     local vehId2 = V.getInfo(n2).vehId
     local node2 = V.park(n2)
-    Core.DB.delete('vehicles', vehId2)
+    sql('DELETE FROM vehicles WHERE id = $1', { vehId2 })                    -- (behind core's back)
+    V.getRecord(vehId2)
     local c2 = S.promoteNow(node2)
     eq(V.getInfo(c2), nil, 'a stale node (record gone) is not adopted')
     stubs.tick(0)
@@ -572,14 +639,16 @@ do
     local n2b = persisted(Core, v3(535.0, 500.0, 20.0))
     local vehId2b = V.getInfo(n2b).vehId
     local node2b = V.park(n2b)
-    Core.DB.update('vehicles', vehId2b, { parked = node2b + 1000 })  -- the record parks another node now
+    sql('UPDATE vehicles SET parked = $2 WHERE id = $1', { vehId2b, node2b + 1000 })  -- it parks another node now
+    V.getRecord(vehId2b)
     eq(V.getInfo((S.promoteNow(node2b))), nil, 'a node its record does not name is not adopted')
     stubs.tick(0)
     eq(S.nodes[node2b], nil, 'and removed')
     local n2c = persisted(Core, v3(537.0, 500.0, 20.0))
     local vehId2c = V.getInfo(n2c).vehId
     local node2c = V.park(n2c)
-    Core.DB.update('vehicles', vehId2c, { stored = true })            -- garaged behind the node's back
+    sql('UPDATE vehicles SET stored = true WHERE id = $1', { vehId2c })      -- garaged behind the node's back
+    V.getRecord(vehId2c)
     eq(V.getInfo((S.promoteNow(node2c))), nil, 'the node of a garaged record is not adopted')
 
     -- 3. while promoted: lock, props, keys change; the demotion carries them into the record and the node
@@ -845,36 +914,36 @@ do
     local f, ef, vehF = persisted(Core, v3(900.0, 900.0, 20.0), nil)   -- in another bucket, player-free
     stubs.entities[ef].bucket = 9
     stubs.tick(25000)
-    eq(V.getRecord(vehA).parked, nil, 'not before AutoParkIdleMs')
+    eq(V.getRecord(vehA).parked, false, 'not before AutoParkIdleMs')
     stubs.tick(20000)
-    check(V.getRecord(vehA).parked ~= nil, 'a vehicle at rest, far from everyone, is parked')
+    check(V.getRecord(vehA).parked ~= false, 'a vehicle at rest, far from everyone, is parked')
     eq(V.exists(a), false, 'its entity is gone')
     eq(S.last('spawn') ~= nil and S.last('spawn').caller, 'core', 'as core')
-    eq(V.getRecord(vehB).parked, nil, 'a player within the radius keeps it live')
-    eq(V.getRecord(vehC).parked, nil, 'an occupied vehicle stays live')
-    eq(V.getRecord(vehD).parked, nil, 'a moving vehicle stays live')
+    eq(V.getRecord(vehB).parked, false, 'a player within the radius keeps it live')
+    eq(V.getRecord(vehC).parked, false, 'an occupied vehicle stays live')
+    eq(V.getRecord(vehD).parked, false, 'a moving vehicle stays live')
     eq(V.getInfo(loose) ~= nil, true, 'a vehicle without a record is never parked')
-    check(V.getRecord(vehF).parked ~= nil, 'a vehicle in another bucket is parked (the player is in bucket 0)')
+    check(V.getRecord(vehF).parked ~= false, 'a vehicle in another bucket is parked (the player is in bucket 0)')
     -- the moving one stops: a whole idle period later it is parked
     W.vel[ed] = nil
     stubs.tick(25000)
-    eq(V.getRecord(vehD).parked, nil, 'a fresh rest stamp once it stopped')
+    eq(V.getRecord(vehD).parked, false, 'a fresh rest stamp once it stopped')
     stubs.tick(20000)
-    check(V.getRecord(vehD).parked ~= nil, 'then parked')
+    check(V.getRecord(vehD).parked ~= false, 'then parked')
     -- the player walks away from B; C is vacated
     stubs.coords[ped] = v3(-1000.0, -1000.0, 0.0)
     stubs.vehicleSeats[ec] = nil
     stubs.tick(45000)
-    check(V.getRecord(vehB).parked ~= nil, 'B once the player left')
-    check(V.getRecord(vehC).parked ~= nil, 'C once vacated')
+    check(V.getRecord(vehB).parked ~= false, 'B once the player left')
+    check(V.getRecord(vehC).parked ~= false, 'C once vacated')
     -- a vehicle pushed a little (> 1 m) between two sweeps is not at rest
     local _, eg, vehG = persisted(Core, v3(1000.0, 1000.0, 20.0))
     stubs.tick(20000)
     stubs.coords[eg] = v3(1003.0, 1000.0, 20.0)
     stubs.tick(20000)
-    eq(V.getRecord(vehG).parked, nil, 'a moved vehicle starts its rest again')
+    eq(V.getRecord(vehG).parked, false, 'a moved vehicle starts its rest again')
     stubs.tick(35000)
-    check(V.getRecord(vehG).parked ~= nil, 'and is parked a period later')
+    check(V.getRecord(vehG).parked ~= false, 'and is parked a period later')
     -- clones are the scene's business: a promoted parked car is never auto-parked
     local node = V.getRecord(vehA).parked
     local clone = S.promoteNow(node)
@@ -891,9 +960,9 @@ do
         stubs.tick(500)
     end
     eq(propsRequests(), asked + 1, 'the worker asks the owner client')
-    eq(V.getRecord(vehH).parked, nil, 'and waits for the answer')
+    eq(V.getRecord(vehH).parked, false, 'and waits for the answer')
     answerProps(env, 1, { colorPrimary = 21, fuelLevel = 42.0 })
-    check(V.getRecord(vehH).parked ~= nil, 'and parks after the answer')
+    check(V.getRecord(vehH).parked ~= false, 'and parks after the answer')
     eq(V.getRecord(vehH).props.fuelLevel, 42.0, "with the owner's wear")
     eq(V.getRecord(vehH).props.colorPrimary, nil, 'never its colour (RV4 F1)')
     -- a refused park waits a whole idle period before it is tried again (logged once)
@@ -906,12 +975,12 @@ do
     eq(S.count('spawn'), spawns + 1, 'no retry within the idle period')
     S.spawnAnswer = nil
     stubs.tick(35000)
-    check(V.getRecord(vehK).parked ~= nil, 'parked once the scene accepts it')
+    check(V.getRecord(vehK).parked ~= false, 'parked once the scene accepts it')
     -- AutoPark off: nothing is parked
     Core.Config.Vehicles.AutoPark = false
     local m, _, vehM = persisted(Core, v3(1300.0, 1300.0, 20.0))
     stubs.tick(90000)
-    eq(V.getRecord(vehM).parked, nil, 'AutoPark = false parks nothing')
+    eq(V.getRecord(vehM).parked, false, 'AutoPark = false parks nothing')
     eq(V.exists(m), true, 'the vehicle stays')
     eq(#stubs.failures, 0, 'section 7: no uncaught error')
     teardown(env)
@@ -945,8 +1014,8 @@ do
     stubs.tick(500)                                           -- the next slice queued the other one
     stubs.coords[ped] = otherPos                              -- and now somebody walks up to it
     stubs.tick(2500)                                          -- the first park ends (timeout), the worker goes on
-    check(V.getRecord(first == x1 and veh1 or veh2).parked ~= nil, 'the first one is parked')
-    eq(V.getRecord(otherVeh).parked, nil, 'the queued one is skipped: somebody is near it now')
+    check(V.getRecord(first == x1 and veh1 or veh2).parked ~= false, 'the first one is parked')
+    eq(V.getRecord(otherVeh).parked, false, 'the queued one is skipped: somebody is near it now')
     eq(propsRequests(), asked + 1, 'its park never started')
     eq(#stubs.failures, 0, 'section 7a: no uncaught error')
     teardown(env)
@@ -993,11 +1062,10 @@ end
 do
     local POS = { x = 50.0, y = 60.0, z = 7.0, heading = 180.0, bucket = 4 }
     local env, Core, S = newServer({ config = function(Config) Config.Vehicles.AutoPark = false end,
-        before = function(_, Core2, S2)
-            local DB = Core2.DB
+        before = function(_, _, S2)
             local function rec(id, t)
-                t.model, t.plate, t.position = t.model or 1234, t.plate or id:upper():sub(1, 8), t.position or POS
-                DB.set('vehicles', id, t)
+                t.position = t.position or POS
+                putRecord(id, t)
             end
             local function node(id, owner, fields)
                 S2.nodes[id] = { id = id, kind = 'vehicle', owner = owner, bucket = 0, pos = { x = 1.0, y = 2.0,
@@ -1289,8 +1357,7 @@ end
 -- onResourceStop handler orders: a promoted parked car's clone hands its final pose to its persistent node
 --------------------------------------------------------------------------------
 -- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test files
-local RH = dofile(here .. '/scene_server_harness.lua')
-local hs = RH.stubs
+local hs = RH.stubs                               -- (= stubs: RH was loaded at the top)
 local RS = { wear = {}, vel = {}, owner = {} }   -- the real stack's world knobs: per-entity wear / velocity / owner
 
 --- A core server VM on the REAL scene stack (tests/scene_server_harness.lua: store + API real, index / interest /
@@ -1302,6 +1369,7 @@ local function realStack(promoteFirst, opts)
     opts = opts or {}
     RS.wear, RS.vel, RS.owner = {}, {}, {}
     local env, Core = RH.newServer({ config = opts.config })
+    for _, id in ipairs({ 'char-1', 'char-3', 'char-9' }) do ensureChar(id) end   -- (the vehicles owner FK)
     local function w(e) return RS.wear[e] or {} end
     env.GetEntityVelocity = function(e) local v = RS.vel[e] return hs.vector3(v and v[1] or 0.0, 0.0, 0.0) end
     env.NetworkGetEntityOwner = function(e) return RS.owner[e] or -1 end
@@ -1348,7 +1416,7 @@ do
         hs.coords[e] = hs.vector3(300.0, 310.0, 11.0)                        -- driven away and left there
         hs.entities[e].rot = { x = 0.0, y = 0.0, z = 33.0 }
         env.TriggerEvent('onResourceStop', 'core')
-        return Scene.get(nodeId), V.getRecord(vehId), Core.DB.get('scene_nodes', 'n' .. nodeId), e, clone
+        return Scene.get(nodeId), V.getRecord(vehId), RH.doc(nodeId), e, clone
     end
     for _, first in ipairs({ true, false }) do
         local label = first and 'scene_promote.lua stops first' or 'vehicles.lua stops first'
@@ -1412,16 +1480,16 @@ do
     rec = V.getRecord(vehId2)
     check(S.nodes[node2] ~= nil, 'a lost clone keeps its node')
     eq(rec.parked, node2, 'the record stays parked')
-    eq(rec.destroyed, nil, 'not destroyed')
+    eq(rec.destroyed, false, 'not destroyed')
     eq(rec.position.x, 1500.0, "at the clone's last known pose (not the old spot)")
     eq(rec.props.bodyHealth, 420.0, 'with the last known damage')
     eq(rec.props.colorPrimary, 4, 'and its own colour')
     eq(#stubs.failures, 0, 'section 15: no uncaught error')
     teardown(env)
-    -- the boot never re-parks a wreck (the same KVP, a new core)
-    local env2, Core2, S2 = newServer({ keepKvp = true, config = function(Config) Config.Vehicles.AutoPark = false end,
-        before = function(_, C2)
-            C2.DB.set('vehicles', 'wreck1', { model = 1234, plate = 'WRECK1', stored = false, parked = false,
+    -- the boot never re-parks a wreck (the same database, a new core)
+    local env2, Core2, S2 = newServer({ keepDb = true, config = function(Config) Config.Vehicles.AutoPark = false end,
+        before = function()
+            putRecord('wreck1', { model = 1234, plate = 'WRECK1', stored = false, parked = false,
                 destroyed = true, position = { x = 5.0, y = 6.0, z = 7.0, heading = 0.0 } })
         end })
     stubs.tick(100)
@@ -1453,6 +1521,7 @@ do
     eq(V.removeKeys(vehId, charId), true, 'removeKeys(vehId): even the owner key can be taken')
     local keys = V.getInfoByRecord(vehId).keys
     eq(keys['friend-4'], true, 'the record has the new key')
+    ensureChar('char-new')                                            -- (the vehicles owner FK)
     eq(V.setOwner(vehId, 'char-new'), true, 'setOwner(vehId)')
     local rec = V.getRecord(vehId)
     eq(rec.ownerCharId, 'char-new', 'the record owner')
@@ -1538,19 +1607,18 @@ do
     check(S.nodes[nodes[3]] ~= nil, 'the promoted car keeps its node')
     eq(#stubs.failures, 0, 'section 17: no uncaught error')
     teardown(env)
-    -- the boot rebuilds the order (updatedAt) and stores the excess of a lowered cap
+    -- the boot rebuilds the order (last_used_at) and stores the excess of a lowered cap
     local env2, Core2 = newServer({ config = function(Config)
         Config.Vehicles.MaxParked, Config.Vehicles.AutoPark = 1, false
-    end, before = function(_, C2, S2)
+    end, before = function(_, _, S2)
         for i, vehId in ipairs({ 'new1', 'old1', 'mid1' }) do
-            stubs.osTime = ({ new1 = 3000, old1 = 1000, mid1 = 2000 })[vehId]   -- Core.DB stamps updatedAt
-            C2.DB.set('vehicles', vehId, { model = 1234, plate = 'P' .. i, stored = false, parked = 900 + i,
-                position = { x = 1.0 * i, y = 0.0, z = 0.0, heading = 0.0 } })
+            putRecord(vehId, { model = 1234, plate = 'P' .. i, stored = false, parked = 900 + i,
+                position = { x = 1.0 * i, y = 0.0, z = 0.0, heading = 0.0 },
+                lastUsedAt = ({ new1 = 3000, old1 = 1000, mid1 = 2000 })[vehId] })   -- the LRU order (last_used_at)
             S2.nodes[900 + i] = { id = 900 + i, kind = 'vehicle', owner = 'core', bucket = 0,
                 pos = { x = 1.0 * i, y = 0.0, z = 0.0 }, rot = { x = 0.0, y = 0.0, z = 0.0 }, persist = true,
                 fields = { model = 1234, vehId = vehId }, authority = { mode = 'local' } }
         end
-        stubs.osTime = nil
     end })
     stubs.tick(100)
     local V2 = Core2.Vehicles
@@ -1559,7 +1627,7 @@ do
         if V2.getRecord(vehId).stored == false then parkedNow = parkedNow + 1 end
     end
     eq(parkedNow, 1, 'a lowered MaxParked stores the excess at boot')
-    eq(V2.getRecord('old1').stored, true, 'the longest unused first (updatedAt order) ...')
+    eq(V2.getRecord('old1').stored, true, 'the longest unused first (last_used_at order) ...')
     eq(V2.getRecord('mid1').stored, true, '... then the next')
     eq(V2.getRecord('new1').stored, false, 'the most recently used stays parked')
     eq(#stubs.failures, 0, 'section 17 (boot): no uncaught error')
@@ -1572,15 +1640,14 @@ end
 do
     local POS = { x = 70.0, y = 80.0, z = 9.0, heading = 90.0 }
     local env, Core, S = newServer({ config = function(Config) Config.Vehicles.AutoPark = false end,
-        before = function(_, C2, S2)
-            local DB = C2.DB
-            DB.set('vehicles', 'limbo1', { model = 1234, plate = 'LIMBO1', stored = false, position = POS,
+        before = function(_, _, S2)
+            putRecord('limbo1', { model = 1234, plate = 'LIMBO1', stored = false, position = POS,
                 props = { colorPrimary = 3 } })                                   -- a stop without the scene / a crash
-            DB.set('vehicles', 'limbo2', { model = 1234, plate = 'LIMBO2', stored = false, parked = false,
+            putRecord('limbo2', { model = 1234, plate = 'LIMBO2', stored = false, parked = false,
                 position = POS })                                                 -- a deleted clone
-            DB.set('vehicles', 'nopos', { model = 1234, plate = 'NOPOS', stored = false })
-            DB.set('vehicles', 'garage1', { model = 1234, plate = 'GARAGE1', stored = true, position = POS })
-            DB.set('vehicles', 'oldpol', { model = 1234, plate = 'OLDPOL', stored = false, parked = 50,
+            putRecord('nopos', { model = 1234, plate = 'NOPOS', stored = false })
+            putRecord('garage1', { model = 1234, plate = 'GARAGE1', stored = true, position = POS })
+            putRecord('oldpol', { model = 1234, plate = 'OLDPOL', stored = false, parked = 50,
                 position = POS })
             S2.nodes[50] = { id = 50, kind = 'vehicle', owner = 'core', bucket = 3, pos = { x = 1.0, y = 2.0, z = 3.0 },
                 rot = { x = 0.0, y = 0.0, z = 45.0 }, persist = true, fields = { model = 1234, vehId = 'oldpol',
@@ -1597,8 +1664,8 @@ do
     eq(n1 and n1.fields.props.colorPrimary, 3, '... with its props')
     eq(n1 and n1.authority and n1.authority.mode, 'local', '... and the parked policy')
     eq(type(V.getRecord('limbo2').parked), 'number', 'a deleted clone (parked = false) too')
-    eq(V.getRecord('nopos').parked, nil, 'a record without a usable position stays out (logged)')
-    eq(V.getRecord('garage1').parked, nil, 'a garaged record is left alone')
+    eq(V.getRecord('nopos').parked, false, 'a record without a usable position stays out (logged)')
+    eq(V.getRecord('garage1').parked, false, 'a garaged record is left alone')
     local old = V.getRecord('oldpol')
     check(old.parked ~= 50 and S.nodes[old.parked] ~= nil, 'D-B: a parked node of the old policy is re-spawned')
     local mig = S.nodes[old.parked]
@@ -1612,8 +1679,8 @@ do
 
     -- D-E: the scene refuses the re-park ('limit'): the stale mark goes (spawnRecord works meanwhile), backoff retry
     local env2, Core2, S2 = newServer({ config = function(Config) Config.Vehicles.AutoPark = false end,
-        before = function(_, C2, S3)
-            C2.DB.set('vehicles', 'capped', { model = 1234, plate = 'CAPPED', stored = false, parked = 77,
+        before = function(_, _, S3)
+            putRecord('capped', { model = 1234, plate = 'CAPPED', stored = false, parked = 77,
                 position = POS })
             S3.spawnAnswer, S3.loaded = { nil, 'limit' }, false
         end })
@@ -1927,6 +1994,113 @@ do
     eq(#stubs.failures, 0, 'section 21: no uncaught error')
     stubs.triggerOn(client, 'onClientResourceStop', 0, 'core')
     stubs.tick(2000)
+end
+
+--------------------------------------------------------------------------------
+-- 22. §56 port: the boot check reads the world records in ONE query in last_used_at order; a failed read changes
+-- nothing (no node removed, no mark dropped) and is retried; the scene hooks and the lock key never read; every LRU
+-- touch stamps last_used_at; no write of core's touches a plugin's meta key
+--------------------------------------------------------------------------------
+do
+    local log
+    local function node(S2, id, vehId)
+        S2.nodes[id] = { id = id, kind = 'vehicle', owner = 'core', bucket = 0,
+            pos = { x = 1.0 * id, y = 0.0, z = 0.0 }, rot = { x = 0.0, y = 0.0, z = 0.0 }, persist = true, fields = { model = 1234, vehId = vehId, props = {} },
+            authority = { mode = 'local' } }
+    end
+    local env, Core, S = newServer({ config = function(Config)
+        Config.Vehicles.MaxParked, Config.Vehicles.AutoPark = 3, false
+    end, before = function(env2, _, S2)
+        log = recordDb(env2)
+        putRecord('lru_new', { stored = false, parked = 901, lastUsedAt = 3000 })
+        putRecord('lru_old', { stored = false, parked = 902, lastUsedAt = 1000 })
+        putRecord('lru_mid', { stored = false, parked = 903, lastUsedAt = 2000 })
+        putRecord('lru_gar', { stored = true, lastUsedAt = 500 })               -- garaged: not part of the read
+        for i, vehId in ipairs({ 'lru_new', 'lru_old', 'lru_mid' }) do node(S2, 900 + i, vehId) end
+        S2.nextId = 950
+    end })
+    local V = Core.Vehicles
+    local world, reads = 0, 0
+    for _, c in ipairs(log) do
+        if c.fn == 'txQuery' and tostring(c.args[2]):find('FROM vehicles WHERE stored = false OR parked IS NOT NULL',
+            1, true) then world = world + 1 end
+        if c.fn == 'crud' and c.args[2] == 'vehicles' then reads = reads + 1 end
+        if c.fn == 'query' and tostring(c.args[1]):find('vehicles', 1, true) then reads = reads + 1 end
+    end
+    eq(world, 1, '§56: the boot check reads the world records in ONE (streamed) query')
+    eq(reads, 0, '... and no record one by one')
+    local stored = {}
+    Core.on('vehicleAutoStored', function(vehId) stored[#stored + 1] = vehId end)
+    player(env, 1)
+    local n4 = persisted(Core, v3(400.0, 100.0, 20.0))
+    check(math.type(V.park(n4)) == 'integer', 'a fourth car parks (MaxParked 3)')
+    eq(stored[1], 'lru_old', '... and the longest unused by last_used_at is stored')
+    -- the hooks and the lock key read nothing: the mirror answers
+    for i = #log, 1, -1 do log[i] = nil end
+    local clone = S.promoteNow(901)
+    check(V.getInfo(clone) ~= nil, 'a promotion adopts the clone')
+    S.demoteNow(901, { bodyHealth = 500.0 })
+    local hookReads = 0
+    for _, c in ipairs(log) do
+        if c.fn ~= 'enqueue' and c.fn ~= 'isHealthy' then hookReads = hookReads + 1 end
+    end
+    eq(hookReads, 0, 'promotion and demotion: queued writes only (no read, no await)')
+    local used = sql('SELECT extract(epoch FROM last_used_at)::bigint AS t FROM vehicles WHERE id = $1',
+        { 'lru_new' })[1].t
+    check(used > 3000, 'every LRU touch stamps last_used_at (' .. tostring(used) .. ')')
+    -- a plugin's meta key survives the parking writes (park, demotion, lock key, saveProps, store)
+    local n5, _, veh5 = persisted(Core, v3(500.0, 100.0, 20.0), { plate = 'META1' })
+    eq(V.setData(veh5, 'insurance', 'gold'), true, 'a plugin key in meta')
+    V.saveProps(n5, { colorPrimary = 3 })
+    local node5 = V.park(n5)
+    local c5 = S.promoteNow(node5)
+    V.saveProps(c5, { colorPrimary = 4 })
+    V.setLocked(c5, true)
+    S.demoteNow(node5, { dirtLevel = 3.0 })
+    stubs.tick(600)
+    stubs.triggerOn(env, 'core:server:parkedLock', 1, node5)
+    V.store(veh5)
+    eq(V.getData(veh5, 'insurance'), 'gold', "the plugin's meta key survived park, demotion, lock key and store")
+    eq(V.getData(veh5, 'vehType'), 'automobile', "... and core's own")
+    eq(#stubs.failures, 0, 'section 22: no uncaught error')
+    teardown(env)
+
+    -- a FAILED boot read changes nothing: no node removed, no mark dropped, nothing parked; retried with backoff
+    local POS = { x = 70.0, y = 80.0, z = 9.0, heading = 90.0 }
+    local env2, Core2, S2 = newServer({ config = function(Config) Config.Vehicles.AutoPark = false end,
+        before = function(_, _, S3)
+            putRecord('kept1', { stored = false, parked = 960, position = POS })
+            node(S3, 960, 'kept1')
+            putRecord('limbo9', { stored = false, position = POS })             -- would be parked
+            node(S3, 961, 'ghost9')                                               -- would be removed (no record)
+            S3.nextId = 970
+            bridge.fail('OR parked IS NOT NULL')
+        end })
+    bridge.unfail()
+    local function parkedIn(id)
+        local row = sql('SELECT parked FROM vehicles WHERE id = $1', { id })[1]
+        return row and row.parked
+    end
+    check(S2.nodes[960] ~= nil and S2.nodes[961] ~= nil, '§56: a failed boot read removes no node')
+    eq(S2.count('spawn'), 0, '... parks nothing')
+    eq(parkedIn('kept1'), 960, '... and drops no mark')
+    local warned = false
+    for _, line in ipairs(stubs.printed) do
+        if line:find('the parked vehicles could not be read', 1, true) then warned = true end
+    end
+    eq(warned, true, '... it is logged')
+    stubs.tick(10500)
+    eq(S2.nodes[961], nil, 'the retry (10 s later) runs the check: the orphan node goes')
+    check(S2.nodes[960] ~= nil and parkedIn('kept1') == 960, '... the parked record keeps its node')
+    check(math.type(parkedIn('limbo9')) == 'integer', '... and the out record is parked')
+    eq(Core2.Vehicles.getRecord('limbo9').parked, parkedIn('limbo9'), '... (the record API agrees)')
+    local removedApi = false
+    for _, line in ipairs(stubs.printed) do
+        if line:find('was removed (DESIGN §56)', 1, true) then removedApi = true end
+    end
+    eq(removedApi, false, 'no removed Core.DB name was called anywhere in this VM')
+    eq(#stubs.failures, 0, 'section 22 (failed read): no uncaught error')
+    teardown(env2)
 end
 
 -- @@SECTIONS@@

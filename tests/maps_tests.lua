@@ -199,7 +199,8 @@ do
     local spot = H.byUid(calls('spawn', 0), uid(6)).def.fields
     check(spot.t == 'garage:spot' and spot.k == 'point' and spot.f.slot == '3' and #spot.f.note == 64,
         'f: $field labels as strings <= 64')
-    check(stubs.kvp['doc:map_elements:' .. map.id .. ':1'] ~= nil, 'each element is its own document')
+    check(H.row('SELECT element_id FROM map_elements WHERE map_id = $1 AND element_id = 1', { map.id }) ~= nil,
+        'each element is its own row')
     eq(#Maps.elements(map.id), 6, 'elements() lists the working set')
     eq(Maps.elements(map.id)[1].id, '1', 'ascending ids')
     eq(Maps.get(map.id).counts.elements, 6, 'get() counts elements')
@@ -208,18 +209,20 @@ do
 
     reset()
     local before = node(uid(1))
-    local kvpBefore = stubs.kvp['doc:map_elements:' .. map.id .. ':2']
+    local rowBefore = H.row('SELECT xmin::text AS x FROM map_elements WHERE map_id = $1 AND element_id = 2', { map.id })
     ok = Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 5, y = 5, z = 5 } } } }, 1)
     check(ok, 'an update by numeric id')
     eq(H.trace(), 'move:' .. uid(1), 'one move, nothing else')
     check(node(uid(1)) == before and node(uid(1)).pos.x == 5.0, 'the same node, at its new position')
-    eq(stubs.kvp['doc:map_elements:' .. map.id .. ':2'], kvpBefore, 'untouched elements are not rewritten')
+    local rowAfter = H.row('SELECT xmin::text AS x FROM map_elements WHERE map_id = $1 AND element_id = 2', { map.id })
+    check(rowBefore and rowAfter and rowAfter.x == rowBefore.x, 'untouched elements are not rewritten (same row version)')
     reset()
     ok = Maps.apply(map.id, { { op = 'delete', id = '1' } }, 1)
     check(ok, 'a delete')
     eq(H.trace(), 'remove:' .. uid(1), 'one remove of that uid')
     eq(node(uid(1)), nil, 'its node is gone')
-    eq(stubs.kvp['doc:map_elements:' .. map.id .. ':1'], nil, 'its document is gone')
+    eq(H.row('SELECT element_id FROM map_elements WHERE map_id = $1 AND element_id = 1', { map.id }), nil,
+        'its row is gone')
 
     reset()
     local updated = Maps.update(map.id, { targetBucket = 5, name = 'Arena' }, 1)
@@ -357,7 +360,7 @@ do
     check(ep.colorPrimary == p and ep.colorSecondary == s and same(ep.customPrimary, { 0, 255, 0 }),
         'a set colour goes on top of the paint')
     Maps.closeDraft(map.id)
-    newServer({ keepKvp = true })
+    newServer({ keepDb = true })
     local restarted = node(uid, 4)
     check(restarted and restarted.fields.props.colorPrimary == p, 'after a restart: the same paint')
 end
@@ -687,7 +690,9 @@ do
     eq(#calls('remove', b2), 2, 'and empties its bucket')
     for i = 1, 22 do Maps.publish(map.id, 1, 'v' .. i) end
     eq(#Maps.versions(map.id), 20, 'the newest 20 versions are kept')
-    eq(stubs.kvp['doc:map_versions:' .. map.id .. ':v1'], nil, 'older snapshots are deleted')
+    eq(H.row('SELECT version FROM map_versions WHERE map_id = $1 AND version = 1', { map.id }), nil,
+        'older snapshots are deleted')
+    eq(H.row('SELECT count(*)::int AS n FROM map_versions WHERE map_id = $1', { map.id }).n, 20, 'twenty rows are left')
 end
 
 --------------------------------------------------------------------------------
@@ -908,7 +913,7 @@ do  -- openDraft, a first publish, the boot projection and a type refresh are sl
     H.shutdown(env)
 
     -- the boot projection after a restart: every active context, through the worker
-    local _, Core2 = newServer({ keepKvp = true, sceneLoaded = false })
+    local _, Core2 = newServer({ keepDb = true, sceneLoaded = false })
     local R2 = Core2.MapsRuntime
     eq(#calls('spawn'), 0, 'nothing before the scene store loaded')
     eq(R2.stats().pending, 2 * N, 'stats: the whole boot projection is pending (the published draft + the live map)')

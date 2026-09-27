@@ -22,6 +22,12 @@ local selfPath = debug.getinfo(1, 'S').source:sub(2)
 local testsDir = selfPath:match('^(.*)[/\\][^/\\]*$') or '.'
 stubs.root = testsDir .. '/..'            -- the resource directory (core/)
 
+-- The Postgres test bridge (DESIGN §56.10.2): every server VM gets `exports.core_db`; the Node
+-- process starts on the first call through it, so a suite that never reaches core_db needs no database.
+-- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test bridge
+local bridge = dofile(testsDir .. '/pgbridge.lua')
+stubs.bridge = bridge
+
 --------------------------------------------------------------------------------
 -- vector2 / vector3 / vector4 and the `type` override that knows about them
 --------------------------------------------------------------------------------
@@ -529,6 +535,7 @@ function stubs.resetServer()
     stubs.invokingResource, stubs.spawnFails, stubs.spawnDelayMs, stubs.osTime = nil, false, 0, nil
     nextEntity, nextNetId = 1000, 100
     findHandles, nextFindHandle = {}, 0
+    if bridge.running() then bridge.reset() end   -- the test database starts empty as well (§56.10.2)
 end
 
 --- Clears the client NUI harness between suites (messages, callbacks, focus).
@@ -821,6 +828,15 @@ function stubs.newEnv(side, resourceName)
 
     env._G, env._VERSION = env, _VERSION
     for i = 1, #STD do env[STD[i]] = _G[STD[i]] end
+    -- Every VM of a suite shares ONE Lua state here, and each VM's Core.Utils calls math.randomseed() without a
+    -- seed at lib load: inside one second that restarts the SAME sequence, so Utils.uuid() repeats across
+    -- "restarts" (23505 on a primary key). FiveM gives every resource its own state. An argument-less reseed is
+    -- a no-op in the stubs; an explicit seed (a deterministic test) still applies.
+    env.math = setmetatable({
+        randomseed = function(...)
+            if select('#', ...) > 0 then return math.randomseed(...) end
+        end,
+    }, { __index = math })
     env.type = xtype
     if isServer then                            -- client Lua has no io/os
         -- os.time()/os.date() pass through; stubs.osTime pins "now" when a test needs a fixed clock
@@ -1115,7 +1131,11 @@ function stubs.newEnv(side, resourceName)
     if not isServer then env.LocalPlayer = { state = stubs.playerState(env, 'local') } end
     rec.world.global = rec.world.global or newStateBag()
     env.GlobalState = rec.world.global
-    if isServer then installServerNatives(env, rec) end
+    if isServer then
+        installServerNatives(env, rec)
+        -- exports.core_db as this resource; core_db events reach the VMs of the current world only
+        bridge.install(env, resourceName, function() return rec.world == world end)
+    end
     return env
 end
 

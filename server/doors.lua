@@ -1,13 +1,17 @@
 --- core/server/doors.lua — Core.Doors (server).
---- Registered doors (collection `doors`), the permission chain, the `door:<id>` GlobalState
+--- Registered doors (table `doors`, DESIGN §56.6), the permission chain, the `door:<id>` GlobalState
 --- entries clients read, the `core:server:doorToggle` net event and the `core:doors:canUse`
---- callback. Contract: DESIGN.md §16 (API + wire), §4.1 (DB), §4.4 (Perms), §4.5 (factions),
+--- callback. Contract: DESIGN.md §16 (API + wire + §56 port notes), §4.4 (Perms), §4.5 (factions),
 --- §8 (state bags + hooks), §9 (budget).
 ---
---- Persistence: the whole door document is stored, so doors survive a restart even before the
---- plugin that owns them re-registers; `Doors.register` keeps the stored `locked` flag.
---- `Doors.unregister` drops the runtime door and its GlobalState key but keeps the document,
---- so a later re-register restores the lock state (use Core.DB.delete('doors', id) to forget it).
+--- Persistence: every door row is loaded ONCE at start (a small table, §56.8 rule 1) by a file-scope
+--- thread and restored as a runtime door, so doors survive a restart even before the plugin that owns
+--- them re-registers. `Doors.register` keeps the stored `locked` flag (read from memory, never a
+--- per-register query) and queues a save only when the door differs from its row; `setLocked` queues a
+--- patch of `locked`. Nothing here yields. A door registered before the load finished is merged when it
+--- lands (the stored lock wins unless setLocked changed it meanwhile) and saved then.
+--- `Doors.unregister` drops the runtime door and its GlobalState key but keeps the row, so a later
+--- re-register restores the lock state (Core.DB.remove('doors', id) forgets it from the next restart on).
 ---
 --- Natives: GetPlayerPed(playerSrc), GetEntityCoords(entity) — the server form takes one argument.
 
@@ -18,8 +22,10 @@ local Validate = Core.Validate
 local Utils = Core.Utils
 local Log = Core.Log
 local Net = Core.Net
+local DB = Core.DB
 
-local COLLECTION <const> = 'doors'
+local TABLE <const> = 'doors'
+local LOAD_BACKOFF_MS <const> = { 1000, 2000, 5000, 10000, 30000 }
 local DEFAULT_RADIUS <const> = 3.0
 local TOGGLE_DISTANCE <const> = 3.5
 local TOGGLE_COOLDOWN_MS <const> = 500
@@ -34,6 +40,11 @@ local CANUSE_DISTANCE <const> = 10.0
 local REMOVE <const> = {}               -- publish-queue sentinel: delete the key, don't write a value
 
 local doors = {}        -- [id] = { id, model, coords (vector3), locked, perms, autoLockMs, meta }
+local stored = {}       -- [id] = the door as its row holds it (loaded, then kept in step with every queued write)
+local loaded = false
+local running = true
+local unsaved = {}      -- [id] = true: registered before the load landed (merged and saved then)
+local lockTouched = {}  -- [id] = true: setLocked ran before the load landed (its state beats the stored one)
 local autoLockGen = {}  -- [id] = counter; a stale SetTimeout callback sees a newer value and returns
 local publishQueue = {} -- [id] = value | false | REMOVE; at most one pending write per door
 local draining = false
@@ -118,32 +129,83 @@ local function unpublish(id)
     scheduleRemoval(id)
 end
 
---- Whole-document write; DB.set runs Utils.jsonSafe itself, so the vector3 is fine here.
-local function persist(entry)
-    return Core.DB.set(COLLECTION, entry.id, {
-        id = entry.id,
-        model = entry.model,
-        coords = entry.coords,
-        locked = entry.locked,
-        perms = entry.perms,
-        autoLockMs = entry.autoLockMs,
-        meta = entry.meta,
-    }) == true
+--- Deep equality of plain values (perms lists, meta maps); `{}` equals `{}` whatever JSON made of it.
+local function same(a, b)
+    if a == b then return true end
+    if type(a) ~= 'table' or type(b) ~= 'table' then return false end
+    for key, value in pairs(a) do
+        if not same(value, b[key]) then return false end
+    end
+    for key in pairs(b) do
+        if a[key] == nil then return false end
+    end
+    return true
 end
 
---- Stored document -> runtime entry (coords come back as a { x, y, z } table).
-local function entryFromDoc(doc)
-    if type(doc) ~= 'table' or type(doc.id) ~= 'string' or type(doc.coords) ~= 'table' then return nil end
-    local model = math.floor(tonumber(doc.model) or 0)
+--- The door as its row holds it: what `stored` keeps and what a register is compared with.
+local function snapshotOf(entry)
+    return {
+        model = entry.model, x = entry.coords.x, y = entry.coords.y, z = entry.coords.z, locked = entry.locked,
+        perms = entry.perms, autoLockMs = entry.autoLockMs, meta = entry.meta,
+    }
+end
+
+local function sameAsStored(entry)
+    local snap = stored[entry.id]
+    if not snap then return false end
+    local c = entry.coords
+    return snap.model == entry.model and snap.x == c.x and snap.y == c.y and snap.z == c.z
+        and snap.locked == entry.locked and snap.autoLockMs == entry.autoLockMs
+        and same(snap.perms, entry.perms) and same(snap.meta, entry.meta)
+end
+
+--- Queues the whole row (upsert by id) unless it already holds exactly this door. Never yields.
+local function persist(entry)
+    if sameAsStored(entry) then return true end
+    local ok, err = DB.save(TABLE, {
+        id = entry.id,
+        model = entry.model,
+        coords = { x = entry.coords.x, y = entry.coords.y, z = entry.coords.z },
+        locked = entry.locked,
+        perms = entry.perms,
+        auto_lock_ms = entry.autoLockMs,
+        meta = entry.meta or DB.NULL,
+    })
+    if not ok then
+        Log.error('doors: the row of %s could not be queued (%s)', entry.id, tostring(err))
+        return false
+    end
+    stored[entry.id] = snapshotOf(entry)
+    return true
+end
+
+--- A lock change: one queued patch of `locked` (the whole row when it was never written). Never yields.
+local function persistLock(entry)
+    local snap = stored[entry.id]
+    if not snap then return persist(entry) end
+    if snap.locked == entry.locked then return true end
+    local ok, err = DB.patch(TABLE, entry.id, { locked = entry.locked })
+    if not ok then
+        Log.error('doors: the lock of %s could not be queued (%s)', entry.id, tostring(err))
+        return false
+    end
+    snap.locked = entry.locked
+    return true
+end
+
+--- Stored row -> runtime entry (coords come back as a { x, y, z } table; NULL columns are absent keys).
+local function entryFromRow(row)
+    if type(row) ~= 'table' or type(row.id) ~= 'string' or type(row.coords) ~= 'table' then return nil end
+    local model = math.floor(tonumber(row.model) or 0)
     if model == 0 then return nil end
     return {
-        id = doc.id,
+        id = row.id,
         model = model,
-        coords = Utils.tableToVector3(doc.coords),
-        locked = doc.locked == true,
-        perms = sanitizePerms(doc.perms),
-        autoLockMs = tonumber(doc.autoLockMs) or 0,
-        meta = type(doc.meta) == 'table' and doc.meta or nil,
+        coords = Utils.tableToVector3(row.coords),
+        locked = row.locked == true,
+        perms = sanitizePerms(row.perms),
+        autoLockMs = math.max(0, math.floor(tonumber(row.auto_lock_ms) or 0)),
+        meta = type(row.meta) == 'table' and row.meta or nil,
     }
 end
 
@@ -241,14 +303,14 @@ function Doors.register(opts)
         meta = type(opts.meta) == 'table' and Utils.deepCopy(opts.meta) or nil,
     }
 
-    -- persisted lock state wins: a restart (or a re-register) never re-opens a locked door
-    local stored = Core.DB.get(COLLECTION, id)
-    if type(stored) == 'table' and type(stored.locked) == 'boolean' then
-        entry.locked = stored.locked
-    end
+    -- persisted lock state wins: a restart (or a re-register) never re-opens a locked door. Memory, not a query:
+    -- the rows were loaded at start; before that the merge in loadDoors applies it.
+    local snap = stored[id]
+    if snap then entry.locked = snap.locked end
 
     doors[id] = entry
-    persist(entry)
+    lockTouched[id] = nil
+    if loaded then persist(entry) else unsaved[id] = true end
     publish(entry)
     scheduleAutoLock(entry)
     return id
@@ -297,7 +359,7 @@ function Doors.setLocked(id, locked, src)
 
     entry.locked = locked
     publish(entry)
-    persist(entry)
+    if loaded then persistLock(entry) else lockTouched[id] = true end
     scheduleAutoLock(entry)
     Core.emitHook(locked and 'doorLocked' or 'doorUnlocked', id, src)
     return true
@@ -404,22 +466,59 @@ end)
 -- Lifecycle: GlobalState is empty again after a core restart (DESIGN §8, §16)
 -- ---------------------------------------------------------------------------
 
---- Synchronous (no Wait): the restore only fills the publish queue, which the drain thread
---- then paces at PUBLISH_BATCH keys per PUBLISH_INTERVAL_MS.
-AddEventHandler('onResourceStart', function(resourceName)
-    if resourceName ~= Core.name then return end
-    local stored = Core.DB.all(COLLECTION)
+--- Every stored row becomes a runtime door (even one no plugin registers again, like before); a door that was
+--- registered before the rows landed takes the stored lock (unless setLocked changed it meanwhile) and is saved
+--- now. The restore only fills the publish queue, which the drain thread paces at PUBLISH_BATCH keys per
+--- PUBLISH_INTERVAL_MS.
+local function merge(rows)
     local restored = 0
-    for i = 1, #stored do
-        local entry = entryFromDoc(stored[i])
-        if entry and not doors[entry.id] then
-            doors[entry.id] = entry
-            publish(entry)
-            scheduleAutoLock(entry)
-            restored = restored + 1
+    for i = 1, #rows do
+        local entry = entryFromRow(rows[i])
+        if entry then
+            local id = entry.id
+            stored[id] = snapshotOf(entry)
+            local current = doors[id]
+            if not current then
+                doors[id] = entry
+                publish(entry)
+                scheduleAutoLock(entry)
+                restored = restored + 1
+            elseif unsaved[id] and not lockTouched[id] and current.locked ~= entry.locked then
+                current.locked = entry.locked
+                publish(current)
+                scheduleAutoLock(current)
+            end
         end
     end
-    if restored > 0 then Log.info('doors: restored %d door(s) from the store', restored) end
+    loaded = true
+    for id in pairs(unsaved) do
+        if doors[id] then persist(doors[id]) end
+    end
+    unsaved, lockTouched = {}, {}
+    if restored > 0 then Log.info('doors: restored %d door(s) from the database', restored) end
+end
+
+--- The load thread (file scope, one whole-table read of a small table; `sync` = after what a previous core
+--- run queued). A failed read is retried with backoff and never counts as "no doors".
+-- one thread per core start, and it ends with the load
+-- fxlint-disable-next-line P004
+CreateThread(function()
+    local attempt = 0
+    while running and not loaded do
+        local rows, err = DB.select(TABLE, nil, { sync = true })
+        if rows then
+            merge(rows)
+        else
+            attempt = attempt + 1
+            Log.error('doors: could not load the doors (%s) — retrying; lock changes wait in memory', tostring(err))
+            Wait(LOAD_BACKOFF_MS[math.min(attempt, #LOAD_BACKOFF_MS)])
+        end
+    end
+end)
+
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName ~= Core.name then return end
+    running = false
 end)
 
 -- end of file

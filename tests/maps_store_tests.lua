@@ -41,8 +41,10 @@ do
         Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = i, y = 0, z = 0 } } } }, 1)
     end
     eq(#Maps.journal(map.id, { limit = 200 }), 100, 'pruned to maps.journalMax')
-    eq(stubs.kvp['doc:map_journal:' .. map.id .. ':j1'], nil, 'the oldest rows are deleted')
-    check(stubs.kvp['doc:map_journal:' .. map.id .. ':j103'] ~= nil, 'the newest are kept')
+    eq(H.row('SELECT seq FROM map_journal WHERE map_id = $1 AND seq = 1', { map.id }), nil, 'the oldest rows are deleted')
+    check(H.row('SELECT seq FROM map_journal WHERE map_id = $1 AND seq = 103', { map.id }) ~= nil, 'the newest are kept')
+    eq(H.row('SELECT count(*)::int AS n FROM map_journal WHERE map_id = $1', { map.id }).n, 100,
+        'the table holds exactly maps.journalMax rows of the map')
 
     reset()
     local ok, applied = Maps.clear(map.id, 1)
@@ -118,11 +120,10 @@ do
     eq(#calls('remove', 0), 1, 'its published content leaves the world')
     eq(#calls('remove', eb), 1, 'its editor bucket is emptied')
     eq(Maps.get(dropped.id), nil, 'it is gone')
-    local left = 0
-    for key in pairs(stubs.kvp) do
-        if key:find(dropped.id .. ':', 1, true) or key == 'doc:maps:' .. dropped.id then left = left + 1 end
-    end
-    eq(left, 0, 'with its elements, versions and journal')
+    local left = H.row('SELECT (SELECT count(*) FROM maps WHERE id = $1) + (SELECT count(*) FROM map_elements '
+        .. 'WHERE map_id = $1) + (SELECT count(*) FROM map_versions WHERE map_id = $1) + (SELECT count(*) FROM '
+        .. 'map_journal WHERE map_id = $1) AS n', { dropped.id })
+    eq(left and left.n, 0, 'with its elements, versions and journal (the foreign keys cascade)')
     eq(lastAudit('maps.delete').targets[1].id, dropped.id, 'delete is audited')
 end
 
@@ -145,7 +146,7 @@ do
     local liveStamp = Maps.elements(live.id)[1].updatedAt
     local liveId, draftId = live.id, draft.id
 
-    _, Core = newServer({ keepKvp = true })
+    _, Core = newServer({ keepDb = true })
     Maps = Core.Maps
     eq(#Maps.list(), 2, 'both maps are loaded after a restart')
     eq(#calls('spawn', 0), 2, 'the active live map is shown again')
@@ -164,36 +165,17 @@ do
     eq(Maps.publish(draftId, 1), 2, 'publish after a restart')
     eq(H.trace(), 'move:' .. draftId .. ':1', 'only the edited element is moved (stamps survived the restart)')
 
-    local mapLoads = 0
-    local function asyncAdapter(env)
-        return {
-            loadAll = function(collection)
-                if collection == 'maps' then mapLoads = mapLoads + 1 end
-                local p = env.promise.new()
-                env.SetTimeout(50, function() p:resolve(true) end)
-                env.Citizen.Await(p)
-                local out = {}
-                local prefix = 'doc:' .. collection .. ':'
-                for key, value in pairs(stubs.kvp) do
-                    if key:sub(1, #prefix) == prefix then out[key:sub(#prefix + 1)] = value end
-                end
-                return out
-            end,
-            put = function(collection, id, encoded) stubs.kvp['doc:' .. collection .. ':' .. id] = encoded end,
-            remove = function(collection, id) stubs.kvp['doc:' .. collection .. ':' .. id] = nil end,
-            flush = function() end,
-        }
-    end
+    -- the element load streams one batch per server tick: callers arriving meanwhile park on the barrier
     local env
-    env, Core = newServer({ keepKvp = true, adapter = asyncAdapter })
+    env, Core = newServer({ keepDb = true, loadBatch = 1 })
     Maps = Core.Maps
     local got = {}
     env.CreateThread(function() got[1] = Maps.get(liveId) end)
     env.CreateThread(function() got[2] = Maps.list() end)
-    eq(got[1], nil, 'callers park while the collections load')
+    eq(got[1], nil, 'callers park while the tables load')
     stubs.tick(1000)
     check(got[1] and got[1].id == liveId and #got[2] == 2, 'every parked caller gets the loaded maps')
-    eq(mapLoads, 1, 'the maps collection was loaded exactly once')
+    eq(#H.statements('^crud select maps'), 1, 'the maps table was read exactly once')
     eq(#calls('spawn', 0), 3, 'and activated once')
 
     stubs.clear()
@@ -232,6 +214,7 @@ do
         if key == 'maps.journalMaxOps' then return 3 end
         return get(key)
     end
+    H.cronJobs[1].fn()                          -- the 10 s job re-reads the settings (applies never read them)
     local ops = {}
     for i = 1, 5 do
         Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = i, y = 0, z = 0 } } }, 1)
@@ -242,6 +225,7 @@ do
     local rows = Maps.journal(map.id)
     check(#rows == 1 and rows[1].count == 5, 'a row heavier than the cap is kept alone (the newest stays)')
     Core.Settings.get = get
+    H.cronJobs[1].fn()
 
     R.journalOpsTotal = 10
     local other = Maps.create({ name = 'J3', mode = 'live' }, 1)
@@ -590,5 +574,314 @@ do
     check(err == 'limit' and detail.limit == 'perMap' and detail.type == 'race:start', 'the per-type limit')
 end
 
+
+--------------------------------------------------------------------------------
+-- the database (DESIGN §56): rows and their columns, start-up reads metadata only, one transaction per commit,
+-- pruning by rows and by weight, rollback reads the snapshot, delete cascades, failed reads never look empty
+--------------------------------------------------------------------------------
+do
+    local env, Core = newServer()
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local expires = os.time() + 3600
+    local draft = Maps.create({ name = 'Rows', mode = 'draft', targetBucket = 7, meta = { description = 'd' },
+        limits = { elements = 50 }, expiresAt = expires }, 1)
+    check(draft and draft.id:find('^m%d+$'), 'a map id m<n> from the maps counter')
+    local mrow = H.row('SELECT * FROM maps WHERE id = $1', { draft.id })
+    check(mrow and mrow.mode == 'draft' and mrow.active == false and mrow.target_bucket == 7 and mrow.meta.description == 'd'
+        and mrow.limits.elements == 50 and mrow.expires_at == expires and mrow.created_by.accountId == 'acc1',
+        'create: the map row exists when create returns (columns mapped)')
+    Maps.apply(draft.id, { { op = 'create', type = 'core:vehicle', pos = { x = 1.5, y = 2, z = 3 }, fields = { model = 'adder' } },
+        { op = 'create', type = 'core:point', pos = { x = 4, y = 0, z = 0 }, cam = { x = 1, y = 2, z = 3 } } }, 1)
+    local els = Maps.elements(draft.id)
+    local erows = H.sql('SELECT element_id, type, author, rev, pos, fields, cam, layer FROM map_elements WHERE map_id = $1 '
+        .. 'ORDER BY element_id', { draft.id })
+    check(#erows == 2 and erows[1].author == 'acc1' and erows[1].rev == els[1].updatedAt and erows[1].pos.x == 1.5
+        and erows[1].fields.model == 'adder' and erows[1].cam == nil and erows[2].cam.z == 3 and erows[2].layer == 'default',
+        'element rows: author = by, rev = the ms stamp, pos / fields / cam jsonb')
+    eq(Maps.publish(draft.id, 1, 'first'), 1, 'publish v1')
+    local vrow = H.row('SELECT version, count, author, author_name, note, from_version, elements FROM map_versions '
+        .. 'WHERE map_id = $1', { draft.id })
+    check(vrow and vrow.count == 2 and vrow.author == 'acc1' and vrow.author_name == 'Player1' and vrow.note == 'first'
+        and vrow.from_version == nil and #vrow.elements == 2 and vrow.elements[1].by == 'acc1'
+        and vrow.elements[1].updatedAt == els[1].updatedAt, 'the version row: metadata columns and the snapshot')
+    local jrows = H.sql('SELECT seq, author, source, actor, count, w, clear, ops, ids FROM map_journal WHERE map_id = $1',
+        { draft.id })
+    check(#jrows == 1 and jrows[1].author == 'acc1' and jrows[1].source == 'api' and jrows[1].actor.name == 'Player1'
+        and jrows[1].count == 2 and jrows[1].w == 2 and jrows[1].clear == false and #jrows[1].ops == 2 and jrows[1].ids == nil,
+        'the journal row: author = by, weight, ops')
+    Maps.apply(draft.id, { { op = 'update', id = 1, set = { pos = { x = 9, y = 9, z = 9 } } } }, 1)
+    eq(Maps.publish(draft.id, 1), 2, 'publish v2 (the vehicle moved)')
+
+    -- a restart reads metadata only: never the journal's ops / ids, never every snapshot
+    H.fail('[%s,]ops[%s,].*FROM map_journal', '42501 the start-up must not read journal payloads')
+    H.fail('[%s,]ids[%s,].*FROM map_journal', '42501 the start-up must not read journal payloads')
+    H.fail('SELECT %* FROM "map_', '42501 no whole-row reads of map tables')
+    env, Core = newServer({ keepDb = true })
+    Maps, R = Core.Maps, Core.MapsRuntime
+    H.unfail()
+    local js, vs = H.statements('map_journal'), H.statements('map_versions')
+    check(Maps.get(draft.id) and #Maps.versions(draft.id) == 2 and #Maps.journal(draft.id) == 2,
+        'the restart loaded (the payload reads above would have failed it)')
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    check(#js == 1 and js[1]:find('SELECT map_id, seq, w FROM map_journal', 1, true) ~= nil, 'the journal load: (map_id, seq, w)')
+    check(#vs == 2 and vs[1]:find('from_version FROM map_versions ORDER', 1, true) ~= nil and not vs[1]:find('elements'),
+        'the version index: metadata columns only')
+    check(vs[2]:find('v.elements FROM map_versions v JOIN maps m', 1, true) ~= nil and vs[2]:find('m.published_version', 1, true)
+        ~= nil, 'snapshots: only the published one of each draft')
+    check(#H.statements('FROM map_elements') == 1 and H.statements('FROM map_elements')[1]:find('^DECLARE') ~= nil,
+        'elements: one streamed cursor')
+    check(#H.statements('^crud select maps') == 1, 'maps: one select')
+
+    -- rollback reads its snapshot (one query) and republishes exactly it
+    Maps.setActive(draft.id, true, 1)
+    local mark = #H.sqlLog
+    reset()
+    eq(Maps.rollback(draft.id, 1, 1), 3, 'rollback to v1 -> v3')
+    eq(#H.statements('^SELECT elements FROM map_versions WHERE map_id = %$1 AND version = %$2', mark + 1), 1,
+        'rollback read the snapshot with one query')
+    local v3 = H.row('SELECT elements, from_version FROM map_versions WHERE map_id = $1 AND version = 3', { draft.id })
+    check(v3 and v3.from_version == 1 and #v3.elements == 2 and v3.elements[1].pos.x == 1.5, 'v3 = the v1 snapshot, from 1')
+    check(node(draft.id .. ':1', 7) and node(draft.id .. ':1', 7).pos.x == 1.5, 'and the world shows it')
+    local list = Maps.versions(draft.id)
+    check(list[1].version == 3 and list[1].from == 1 and list[1].by == 'acc1' and list[1].byName == 'Player1'
+        and list[1].current == true, 'versions: by, byName, from (the camelCase shape)')
+    H.fail('^SELECT elements FROM map_versions', 'XX000 simulated failure')
+    local okRb, errRb = Maps.rollback(draft.id, 2, 1)
+    check(okRb == nil and errRb == 'db', 'a failed snapshot read is db, never version')
+    eq(select(2, Maps.rollback(draft.id, 99, 1)), 'version', 'an unknown version needs no query')
+    H.fail('FROM map_journal WHERE map_id', 'XX000 simulated failure')
+    local rowsJ, errJ = Maps.journal(draft.id)
+    check(rowsJ == nil and errJ ~= nil, 'a failed journal read answers nil, err (never an empty page)')
+    H.unfail()
+
+    -- one commit = one transaction: a lost connection on the journal insert leaves every row as it was
+    local live = Maps.create({ name = 'Tx', mode = 'live' }, 1)
+    Maps.apply(live.id, { { op = 'create', type = 'core:point', pos = { x = 1, y = 0, z = 0 } } }, 1)
+    H.release()
+    H.fail('INSERT INTO "map_journal"', '08006 simulated connection loss')
+    check(Maps.apply(live.id, { { op = 'update', id = 1, set = { pos = { x = 5, y = 0, z = 0 } } },
+        { op = 'create', type = 'core:point', pos = { x = 2, y = 0, z = 0 } } }, 1), 'the apply commits in memory')
+    H.release()                                  -- the flush of that slice runs (and fails)
+    local okU, errU = Maps.apply(live.id, { { op = 'create', type = 'core:point', pos = { x = 3, y = 0, z = 0 } } }, 1)
+    check(okU == nil and errU == 'db', 'while core_db reports the database unhealthy, applies answer db')
+    local tx = H.row('SELECT (SELECT pos FROM map_elements WHERE map_id = $1 AND element_id = 1) AS pos, '
+        .. '(SELECT count(*)::int FROM map_elements WHERE map_id = $1) AS els, (SELECT count(*)::int FROM map_journal '
+        .. 'WHERE map_id = $1) AS js, (SELECT journal_seq FROM maps WHERE id = $1) AS seq', { live.id })
+    check(tx and tx.pos.x == 1 and tx.els == 1 and tx.js == 1 and tx.seq == 1,
+        'nothing of the failed commit landed: element, new element, journal row and map row all unchanged')
+    H.unfail()
+    eq(H.sync(), true, 'the queue retries the whole transaction')
+    tx = H.row('SELECT (SELECT pos FROM map_elements WHERE map_id = $1 AND element_id = 1) AS pos, '
+        .. '(SELECT count(*)::int FROM map_elements WHERE map_id = $1) AS els, (SELECT count(*)::int FROM map_journal '
+        .. 'WHERE map_id = $1) AS js, (SELECT journal_seq FROM maps WHERE id = $1) AS seq', { live.id })
+    check(tx and tx.pos.x == 5 and tx.els == 2 and tx.js == 2 and tx.seq == 2, 'then all of it landed together')
+    check(Maps.apply(live.id, { { op = 'create', type = 'core:point', pos = { x = 3, y = 0, z = 0 } } }, 1),
+        'applies work again')
+
+    -- pruning: rows of the table follow the index (by rows, by weight, server-wide)
+    local get = Core.Settings.get
+    Core.Settings.get = function(key)
+        if key == 'maps.journalMax' then return 4 end
+        if key == 'maps.journalMaxOps' then return 6 end
+        return get(key)
+    end
+    H.cronJobs[1].fn()
+    for i = 1, 6 do Maps.apply(live.id, { { op = 'update', id = 1, set = { pos = { x = i, y = 1, z = 0 } } } }, 1) end
+    local seqs = H.sql('SELECT seq FROM map_journal WHERE map_id = $1 ORDER BY seq', { live.id })
+    check(#seqs == 4 and seqs[1].seq == 6 and seqs[4].seq == 9, 'by rows: the newest journalMax rows are left in the table')
+    local three = {}
+    for i = 1, 3 do three[i] = { op = 'create', type = 'core:point', pos = { x = i, y = 5, z = 0 } } end
+    Maps.apply(live.id, three, 1)
+    Maps.apply(live.id, three, 1)
+    seqs = H.sql('SELECT seq, w FROM map_journal WHERE map_id = $1 ORDER BY seq', { live.id })
+    check(#seqs == 2 and seqs[1].w == 3 and seqs[2].w == 3 and seqs[2].seq == 11, 'by weight: 6 ops = the last two rows')
+    Core.Settings.get = get
+    H.cronJobs[1].fn()
+    R.journalOpsTotal = 5
+    Maps.apply(live.id, { { op = 'update', id = 1, set = { pos = { x = 0, y = 0, z = 0 } } } }, 1)
+    local sum = H.row('SELECT COALESCE(sum(w), 0)::int AS w FROM map_journal')
+    check(sum and sum.w == R.state.journalTotal and sum.w <= 5, 'server-wide: the table weight equals the index total')
+    R.journalOpsTotal = 200000
+
+    -- delete: one queued statement, the foreign keys cascade
+    mark = #H.sqlLog
+    eq(Maps.delete(draft.id, 1), true, 'delete the draft')
+    eq(#H.statements('^DELETE FROM maps WHERE id = %$1', mark + 1), 1, 'one DELETE statement')
+    eq(#H.statements('^remove ', mark + 1), 0, 'no row-by-row removes')
+    local gone = H.row('SELECT (SELECT count(*)::int FROM map_elements WHERE map_id = $1) + (SELECT count(*)::int FROM '
+        .. 'map_versions WHERE map_id = $1) + (SELECT count(*)::int FROM map_journal WHERE map_id = $1) AS n', { draft.id })
+    eq(gone and gone.n, 0, 'elements, versions and journal cascaded')
+
+    -- a failed create changes nothing; a failed load is never "no maps"
+    H.fail('INSERT INTO "maps"', 'XX000 simulated failure')
+    local okC, errC = Maps.create({ name = 'Nope', mode = 'live' }, 1)
+    check(okC == nil and errC == 'db' and #Maps.list({ text = 'Nope' }) == 0, 'a failed insert: db, no map in memory')
+    H.unfail()
+    stubs.osTime = 5000000
+    H.fail('SELECT %* FROM "maps"', '08006 simulated connection loss')
+    env, Core = newServer({ keepDb = true })
+    Maps = Core.Maps
+    H.unfail()
+    check(#Maps.list() == 0 and Maps.get(live.id) == nil, 'a failed load: nothing is shown')
+    eq(select(2, Maps.create({ name = 'X', mode = 'live' }, 1)), 'unavailable', 'and nothing is written (unavailable)')
+    local got
+    env.CreateThread(function() got = Maps.list() end)
+    eq(got and #got, 0, 'the load is retried at most every 10 s')
+    stubs.osTime = 5000011
+    env.CreateThread(function() got = Maps.list() end)
+    check(got and #got == 1 and got[1].id == live.id, 'then it loads (the rows were never touched)')
+    stubs.osTime = nil
+end
+
+--------------------------------------------------------------------------------
+-- review R3a: nothing yields between a stale staging and its writes (item 3); the keyed journal prune (item 8)
+--------------------------------------------------------------------------------
+do
+    local env, Core = newServer()
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    local slow = {}                             -- models whose validation waits 100 ms (a validator's own DB read)
+    as('catalogue', 'setModelValidator', callable(function(_, model)
+        if slow[model] then env.Wait(100) end
+        return true
+    end))
+    local function veh(model, x) return { op = 'create', type = 'core:vehicle', pos = { x = x or 0, y = 0, z = 0 },
+        fields = { model = model } } end
+    local function count(sql, id) return H.row(sql, { id }).n end
+    local ROWS = 'SELECT (SELECT count(*) FROM maps WHERE id = $1) + (SELECT count(*) FROM map_elements WHERE map_id = $1)'
+        .. ' + (SELECT count(*) FROM map_versions WHERE map_id = $1) + (SELECT count(*) FROM map_journal WHERE map_id = $1)'
+        .. ' AS n'
+
+    -- the map row is persisted as a PATCH: a write after the delete does not bring the row back
+    local gone = Maps.create({ name = 'Gone', mode = 'live' }, 1)
+    local stale = R.state.maps[gone.id]
+    local mark = #H.sqlLog
+    Maps.delete(gone.id, 1)
+    R.persistMap(stale)
+    check(#H.statements('^patch maps', mark + 1) == 1 and #H.statements('^save maps', mark + 1) == 0,
+        'the map row is written with patch, never save')
+    eq(count(ROWS, gone.id), 0, 'a persist after the delete leaves the map deleted')
+
+    -- a validator yields, the map is deleted meanwhile: the apply answers not_found and writes nothing
+    local m = Maps.create({ name = 'Race', mode = 'live' }, 1)
+    slow.slow_a = true
+    local res
+    env.CreateThread(function() res = table.pack(Maps.apply(m.id, { veh('slow_a') }, 1)) end)
+    eq(res, nil, 'the apply waits in the model validator')
+    eq(Maps.delete(m.id, 1), true, 'the map is deleted meanwhile')
+    stubs.tick(200)
+    check(res and res[1] == nil and res[2] == 'not_found', 'the apply resumes: not_found')
+    eq(count(ROWS, m.id), 0, 'and nothing of it reached the database (no map row came back)')
+
+    -- two applies on one map: the one that waited re-stages on the other's result (no id is used twice)
+    local twin = Maps.create({ name = 'Twin', mode = 'live' }, 1)
+    Maps.apply(twin.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
+    slow.slow_b = true
+    local resA
+    env.CreateThread(function() resA = table.pack(Maps.apply(twin.id, { veh('slow_b', 3) }, 1)) end)
+    local okB, appliedB = Maps.apply(twin.id, { { op = 'create', type = 'core:point', pos = { x = 5, y = 0, z = 0 } } }, 1)
+    check(okB and appliedB.ops[1].id == '2', 'the other apply commits element 2 while the first waits')
+    stubs.tick(200)
+    check(resA and resA[1] == true and resA[2].ops[1].id == '3', 'the waiting apply re-staged: element 3, not a second 2')
+    local rows = H.sql('SELECT element_id, type FROM map_elements WHERE map_id = $1 ORDER BY element_id', { twin.id })
+    check(#rows == 3 and rows[2].type == 'core:point' and rows[3].type == 'core:vehicle', 'both elements are in the table')
+    eq(Maps.get(twin.id).journalSeq, 3, 'three journal rows')
+
+    -- its expect is checked again on the new state
+    local at3 = Maps.elements(twin.id)[3].updatedAt
+    slow.slow_c = true
+    local resC
+    env.CreateThread(function()
+        resC = table.pack(Maps.apply(twin.id, { { op = 'update', id = 3, set = { fields = { model = 'slow_c' } } } }, 1,
+            { expect = { [3] = at3 } }))
+    end)
+    check(Maps.apply(twin.id, { { op = 'update', id = 3, set = { pos = { x = 9, y = 9, z = 9 } } } }, 2),
+        'someone moves element 3 meanwhile')
+    stubs.tick(200)
+    check(resC and resC[1] == nil and resC[2] == 'conflict' and resC[3].id == '3', 'the waiting update: conflict (expect)')
+    local el3 = Maps.elements(twin.id)[3]
+    check(el3.fields.model == 'slow_b' and el3.pos.x == 9, 'element 3 keeps the move and its model')
+
+    -- a rollback whose validator yields while the draft is deleted
+    local d = Maps.create({ name = 'RbRace', mode = 'draft' }, 1)
+    Maps.apply(d.id, { veh('adder') }, 1)
+    eq(Maps.publish(d.id, 1), 1, 'v1')
+    slow.adder = true
+    as('catalogue', 'setModelValidator', callable(function(_, model)   -- a new validator: its cache is empty
+        if slow[model] then env.Wait(100) end
+        return true
+    end))
+    local resR
+    env.CreateThread(function() resR = table.pack(Maps.rollback(d.id, 1, 1)) end)
+    eq(resR, nil, 'the rollback waits in the validator')
+    Maps.delete(d.id, 1)
+    stubs.tick(200)
+    check(resR and resR[1] == nil and resR[2] == 'not_found', 'the rollback resumes: not_found')
+    eq(count(ROWS, d.id), 0, 'no version row, no map row')
+
+    -- the limits never wait for Core.Settings: an apply, a publish, setActive and openDraft read none
+    local get = Core.Settings.get
+    Core.Settings.get = function(key) error('Core.Settings.get(' .. tostring(key) .. ') during a map change') end
+    local lm = Maps.create({ name = 'NoSettings', mode = 'draft' }, 1)
+    check(Maps.apply(lm.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
+        and Maps.publish(lm.id, 1) == 1 and Maps.setActive(lm.id, true, 1) and Maps.openDraft(lm.id, 1) ~= nil,
+        'no map change reads Core.Settings (the settings as last read)')
+    Core.Settings.get = get
+    Maps.closeDraft(lm.id)
+    Core.Settings.set('maps.limits.opsPerApply', 1)
+    local two = { { op = 'create', type = 'core:point', pos = { x = 1, y = 0, z = 0 } },
+        { op = 'create', type = 'core:point', pos = { x = 2, y = 0, z = 0 } } }
+    eq(select(2, Maps.apply(lm.id, two, 1)), 'too_many_ops', 'a changed setting reaches the limits (onChange)')
+    Core.Settings.reset('maps.limits.opsPerApply')
+    check(Maps.apply(lm.id, two, 1), 'and its reset too')
+
+    -- item 8: the prune of a full journal is ONE keyed statement per map; the newer bound supersedes the older
+    Core.Settings.get = function(key)
+        if key == 'maps.journalMax' then return 2 end
+        return get(key)
+    end
+    H.cronJobs[1].fn()
+    local drops = 0
+    local handler = env.AddEventHandler('core:hook:dbWriteFailed', function(_, kind, tbl)
+        if kind == 'sql' and tbl == nil then drops = drops + 1 end
+    end)
+    H.fail('^DELETE FROM map_journal', 'XX000 simulated failure')
+    mark = #H.sqlLog
+    for i = 1, 3 do Maps.apply(lm.id, { { op = 'update', id = 1, set = { pos = { x = i, y = 0, z = 0 } } } }, 1) end
+    local prunes = H.sqlLog
+    local keyed = 0
+    for i = mark + 1, #prunes do
+        if prunes[i].sql:find('^DELETE FROM map_journal') and prunes[i].key == 'core:maps.prune:' .. lm.id then
+            keyed = keyed + 1
+        end
+    end
+    eq(keyed, 3, 'each apply queued its prune with the key core:maps.prune:<id>')
+    H.release()                                  -- the three applies = one slice = one flush
+    eq(drops, 1, 'core_db ran ONE prune statement for the three (the older twins were superseded)')
+    H.unfail()
+    Maps.apply(lm.id, { { op = 'update', id = 1, set = { pos = { x = 0, y = 0, z = 0 } } } }, 1)
+    local left = H.sql('SELECT seq FROM map_journal WHERE map_id = $1 ORDER BY seq', { lm.id })
+    local idx = R.state.journalIdx[lm.id]
+    check(#left == 2 and left[1].seq == idx.seq[idx.first] and left[2].seq == idx.seq[idx.last],
+        'the next prune covers the rows the failed one left: the table equals the index again')
+    Core.Settings.get = get
+    H.cronJobs[1].fn()
+    env.RemoveEventHandler(handler)
+
+    -- a clear is ONE statement; an edit, the clear and its undo in one slice still leave the undo in the table
+    local cm = Maps.create({ name = 'ClearUndo', mode = 'live' }, 1)
+    Maps.apply(cm.id, { { op = 'create', type = 'core:point', pos = { x = 1, y = 0, z = 0 } },
+        { op = 'create', type = 'core:point', pos = { x = 2, y = 0, z = 0 } } }, 1)
+    H.release()
+    mark = #H.sqlLog
+    Maps.apply(cm.id, { { op = 'update', id = 1, set = { pos = { x = 7, y = 0, z = 0 } } } }, 1)
+    local okClear, cleared = Maps.clear(cm.id, 1)
+    check(okClear and Maps.apply(cm.id, (Maps.invert(cleared)), 1), 'edit, clear and undo in one slice')
+    eq(#H.statements('^DELETE FROM map_elements WHERE map_id = %$1', mark + 1), 1, 'the clear is one statement')
+    eq(#H.statements('^remove map_elements', mark + 1), 0, 'no row-by-row removes')
+    rows = H.sql('SELECT element_id, pos FROM map_elements WHERE map_id = $1 ORDER BY element_id', { cm.id })
+    check(#rows == 2 and rows[1].pos.x == 7 and rows[2].pos.x == 2,
+        'the undo landed after the DELETE (a raw statement is a coalescing barrier): both elements are in the table')
+end
 
 H.finish()

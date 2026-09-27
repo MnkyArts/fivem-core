@@ -472,6 +472,8 @@ Anything else on `Core.Player` (client) falls through the proxy to `client/playe
 
 ### 4.1 `Core.DB` (`server/db.lua`) — document store
 
+> **Superseded by §56 (2026-09-27):** `Core.DB` is a relational SQL API over the `core_db` resource; the document store below is gone.
+
 Collections of JSON documents, in-memory with a KVP-backed adapter. Documents are plain tables with a
 string `id`; nested tables allowed; **no vectors** (call `Core.Utils.jsonSafe` first — `DB.create/set/update`
 do it for you). Every returned document is a **deep copy**.
@@ -620,6 +622,25 @@ character; on create/update/disband → `GlobalState['faction:' .. id] = { name,
 `Config.Factions.InviteTimeoutMs` (checked lazily on accept + a 30 s sweep). Callbacks registered by core
 (names in §5.2) expose all of this to a faction UI plugin.
 
+**§56 port notes (2026-09-27).** Rows `factions` + `faction_members` (one faction per character is the members'
+primary key); `ownerCharId` may be absent (owner character deleted → `SET NULL`). All factions and members are
+loaded once at start into memory (one query, retried with backoff; until then mutations answer `'unavailable'`,
+reads answer nothing, and a reconcile after the load fixes the state bags of sessions that loaded first) and every
+read is served from there. `create` is one awaited transaction (it charges first and refunds on failure; a 23505
+maps to `name_taken` / `tag_taken` / `already_in_faction`); `acceptInvite` / `kick` insert / delete the member row
+before they answer (a new `'save_failed'` on a database error); `deposit` / `withdraw` are ONE guarded
+`UPDATE factions SET bank = …` each, with Core.Money moved around the statement (a failed deposit refunds; a
+withdrawal pays out only after the bank moved and puts it back when the payout cannot land). `update` (name / tag /
+color) is an awaited `UPDATE` too: the unique indexes use Postgres `lower()` (Unicode), Lua's is ASCII only, so a 23505
+answers `name_taken` / `tag_taken` and memory changes only after success. Everything else is a queued patch/remove;
+`removeRank` writes absolute ranks per member row (idempotent, bulk-coalesced). These six calls now yield. Names, tags
+and rank names are valid UTF-8 and cut to their limits in CHARACTERS. After a timeout or a connection-class error an
+awaited write re-reads its row (member row, `factions.bank`, the new faction) before it rolls back or refunds; an
+outcome that stays unknown refunds nothing and is logged. A refund goes to the CHARACTER: online through Core.Money,
+offline as one queued atomic upsert of his `character_money` row. A queued write the database drops
+(`dbWriteFailed` on `factions` / `faction_members`) re-reads that faction and memory, GlobalState and the members'
+state follow the rows. `data.faction` is derived from `faction_members` at session load and never stored.
+
 ### 4.6 `Core.Vehicles` server (`server/vehicles.lua`)
 
 ```lua
@@ -723,6 +744,25 @@ MaxParked and the boot / stop reconciliation (§55.21.4 final notes).
   garaged (node removed, `stored = true`) and the hook `vehicleAutoStored (vehId, 'max_parked')` fires.
 - A read-back from a clone's owner changes only wear (`Core.Scene.mergeWear`); every props write re-imposes the
   record's plate; a live car parks through the promotion engine's hand-off (no blink for watchers).
+
+**§56 port notes (2026-09-27, run W2b).** Records are rows of `vehicles` (§56.6). The Lua record keeps its shape;
+`ownerCharId` / `parked` are `false` when NULL, `destroyed` is always a boolean, `lastUsedAt` is new, and zero-based
+props maps come back with string keys (`mods['0']` — §5 accepts both). Record reads AWAIT (a coroutine): `getRecord`,
+`getRecords` (the owner index, read-your-writes; `{}, err` when the read failed), `getInfoByRecord`, `spawnRecord` /
+`restoreRecord` (a failed read answers `'db'`, never `'no_record'`), and `park` / `store` / the vehId setters of a
+record not in the world. `persist` is an awaited insert: the owner must be an existing character (FK); a plate core
+chose that collides on the UNIQUE index is replaced and the insert retried, a plate the caller asked for fails it.
+Plate checks are indexed (one `plate = ANY($1)` query per batch of 16 random candidates, one lookup for an asked-for
+plate). Every other write is a QUEUED patch of only the changed columns — never `meta`, so `Vehicles.setData` keys
+survive; key / owner changes of a garaged record are single queued UPDATE statements. server/vehicles.lua mirrors the
+world records (parked, or the car live: owner, plate, model, parked, stored, destroyed, locked, keys, vehType /
+keyMode), so the scene hooks, the lock key, eviction, `delete` and the stop paths never await (a hook that misses the
+mirror before the boot check read it reads the record in a thread). `last_used_at` is stamped (queued) at every LRU
+use; the boot check reads the world records in ONE streamed query `ORDER BY last_used_at, id` (`vehicles_world_idx`),
+props only for the few re-parks, and after a failed read changes nothing and retries (10 s doubling to 5 min). A second
+`spawnRecord` while the record's car is being spawned answers `'already_spawned'`. For the files' size
+`getRecord` / `getRecords` / `deleteRecord` moved to server/vehicles_park.lua and the §5 net events +
+`core:vehicles:mine` to server/vehicles_fleet.lua.
 
 ### 4.7 `Core.Notify` server (`server/notify.lua`)
 
@@ -1657,6 +1697,12 @@ checks once per session (within 40 m, `GetClosestObjectOfType` 2 m) that an obje
 and heading of the object in front of the player (`Core.Raycast.getEntityInFront`, else the nearest object
 within 3 m via `GetGamePool('CObject')`), whether the door system knows it, and whether a registered core door
 at that spot expects a different model — with a ready `Core.Doors.register` line.
+**§56 port notes (2026-09-27).** Table `doors` (`auto_lock_ms`, `perms text[]`). Every row is loaded once at start
+by a file-scope thread (retried with backoff) and restored as a runtime door, as before. `register` reads the stored
+lock from memory (no per-call query) and queues a save only when the door differs from its row (an unchanged
+re-register writes nothing); `setLocked` queues a patch of `locked`. Nothing yields. A door registered before the
+load landed is merged then (the stored lock wins unless `setLocked` ran meanwhile) and saved. Forget a stored door
+with `Core.DB.remove('doors', id)` (effective from the next restart).
 
 ## 17. Environment (`Core.World`, `Core.Screen`, `Core.Cron`) — Rebar `useWorld`, `useCronJob`, time/weather services
 
@@ -1693,6 +1739,14 @@ visible?, health?, armour? })`. One thread (1000 ms) re-applies the clock while 
 
 **Note (2026-09-26, admin build, R2-9).** `Cron.remove(id)` is owner-checked like `Hooks.remove`: only the job's owner
 or core removes it (`false` otherwise); the owner-stop sweep still removes a stopped plugin's jobs.
+
+**§56 port notes (2026-09-27).** The world state is the row `world_state` id 1, read once in `onResourceStart`
+(`first`, awaited). Writes are queued saves: at once for `setTime` / `freezeTime` / `setWeather` and each weather-cycle
+step, at most once per real minute for the running clock (a crash loses ≤ 1 real minute of clock), and once more on
+core's stop. A field changed explicitly while the start read is out (time / freeze / weather) is re-applied over the
+adopted row; nothing is written during that read. A READ ERROR at start runs the config defaults and never writes the
+row; it is re-read every 15 s and adopted once readable — unless an explicit change was made meanwhile, which wins
+and is saved.
 
 ## 18. Stats (`Core.Stats`) — Rebar `useStatus` / needs
 
@@ -1876,6 +1930,15 @@ PlayerGrid.cellOf(src) -> key|nil                    -- tests and debug only
   slower. A loaded player whose ped does not exist yet (`GetPlayerPed == 0`) has no cell; it is kept in a
   pending set and added to every candidate list until its ped appears, which preserves
   `Player.getCoords`'s saved-position fallback for exactly those players.
+
+**§56 port notes (2026-09-27, run W1b) — Globals.** One `globals` row per key (`value` jsonb, `mirror` bool) replaces
+the `globals/server` document. All rows load once (ONE `select`, `sync`) behind the same barrier; `values`/`mirror` in
+memory are authoritative and every `set`/`increment`/`unset` is written behind with a queued `save`/`remove` (never
+yields; `increment` stays atomic in memory). A FAILED load is no longer read as an empty store: `get` answers its
+default, `set`/`increment`/`unset` refuse (false / nil), nothing is written, and the next access ≥ 10 s later retries.
+Mirrored keys are republished when the rows load. NaN / ±inf are refused (no JSON form: the row would be NULL and
+poison its flush), and a write the queue refuses is undone in memory and GlobalState. Tests: `tests/server/globals.lua`
+(86).
 
 ## 23. Chat (`Core.Chat`) — CEF messenger
 
@@ -2388,6 +2451,8 @@ README the config keys, and the checklist a step ("open /exmenu: the game behind
   `styles.css` header): "`backdrop-filter` is banned — put `data-core-blur` on the panel instead (§32)".
 
 ## 33. Postgres document store (`Config.DB.Adapter = 'postgres'`) — 2026-09-12, Liam's choice
+
+> **Superseded by §56 (2026-09-27):** `core_documents`, the adapters and the Node bridge in core are gone; old rows were imported and the table renamed `legacy_documents` (§56.7).
 
 `Core.DB` keeps its document model (§4.1, §22): collections of JSON documents, cached in memory, written
 through to an adapter `{ loadAll, put, remove, flush }` (§27, `DB.setAdapter`). This section adds a Postgres
@@ -4574,6 +4639,16 @@ Perms.grant(src, perm, scope?, { expiresAt? })                   -- temporary gr
   `tests/callback_tests.lua` (34, the refusal reasons). `server/perms.lua` is 891 lines: split the group management
   into its own file on the next addition.
 
+**§56 port notes (2026-09-27, run W1c).** Groups are rows of `perm_groups` (small: read whole with `{ sync = true }`),
+`removed` is a `text[]` column (a set in memory), no colour is NULL. The load always runs in a THREAD; only
+`groups`/`groupExists`/`effective`/`saveGroup`/`deleteGroup` wait for a running load (when they can yield) — the check
+path (`has`, `getGroup`, `getWeight`, `canTarget`, `explain`, `list`) never waits and never yields: account grants are
+read from the live session through the internal `Player.getAccountData` (§48 notes), character grants through
+`Player.getData`, groups from memory. `saveGroup`/`deleteGroup` await their upsert/delete (`save_failed` on an
+error, memory unchanged); the first-start seed and `define` defaults are queued saves (they run at start and at a
+plugin's file scope). A failed read keeps the config seed (`fallback`, retried after 30 s) and never seeds over the
+table. Tests: `tests/perms_tests.lua` 272 (new suite `no yield`: no core_db call from `has`, even inside a coroutine).
+
 ## 45. Settings (`Core.Settings`, server/settings.lua + client read side)
 
 Runtime-editable, schema-validated settings any plugin declares; a generic UI lists them (research §4).
@@ -4647,6 +4722,21 @@ Settings.get(key) -> value;  client hook 'settingChanged' (key, new, old)
   is defined by server/bans.lua at start (§47).
 - Tests: `tests/settings_tests.lua` (149).
 
+**§56 port notes (2026-09-27, run W1b).** Overrides are rows of the table `settings` (dotted `key` PK, `value` jsonb,
+`updated_by` jsonb = the `by` table, `updated_at`) instead of documents with `:` ids. Load = ONE `select` (`sync`)
+behind the same barrier; a failed load (`err`) leaves memory untouched, `get` on config/default and `set`/`reset` on
+`'unavailable'` until a retry ≥ 10 s later (a call outside a coroutine is not counted as a failure). `set` is an
+awaited `upsert`, `reset` an awaited `delete`: memory and watchers change only after the write committed (`'persist'`
+on failure, the old value stays), and writes of one key are serialised (a per-key slot) so two awaited writes never
+commit out of order. A value the field normalises to nil (an optional field set to nil) is a `reset`. Every JSON value
+round-trips (`false`, arrays, objects, the empty table). Review R2b: a load that lands after values were answered
+without the overrides (a late load after a failed one) queues every replicated key again and dispatches `onChange`
+for every key whose effective value differs from the config/default answered before (bans reads `tokenMatches` once);
+a failed load is retried by a thread every 10 s and at once on `Core.on('dbStatus', healthy)`. A write that times out
+on the Lua deadline (core_db may still commit it) re-writes what memory holds before the key's slot is freed.
+`Settings.isLoaded()` is internal (block-listed in server/api.lua): audit's prune guard. Tests:
+`tests/settings_tests.lua` (218).
+
 ## 46. Audit trail (`Core.Audit`, server/audit.lua)
 
 `Log.audit` only prints (§3.4). This is the persisted, queryable trail (research §1.5).
@@ -4715,6 +4805,24 @@ Audit.get(id) -> row|nil
 - **§17 — `Cron.remove` is owner-checked** (R2-9, like `Hooks.remove`): only the job's owner or core removes it; the
   owner-stop sweep uses an internal remover.
 - Tests: `tests/audit_tests.lua` (139, pools, rate cap and the Cron owner check included).
+
+**§56 port notes (2026-09-27, run W1b).** Storage is the table `audit_log` (§56.6); the lean index, the pending queue
+and the minted `'a<ms><seq>'` ids are gone. `record`/`recordLog` build the row exactly as before and hand it to
+`Core.DB.append` (queued, never yields; every column is given — NULL for absent ones — so a flush writes one bulk
+INSERT); the id is the identity assigned at commit, so **`record` answers `true`** (nil when refused: bad action, or
+the queue refused it — logged at most once per 10 s). Stored extras: `pool`, `actor_account_id`, `target_keys`
+(`type:id` + `account:<id>`, deduplicated, GIN) and `search` (the ≤ 640 haystack, cut on a UTF-8 boundary). `query` is
+ONE parameterised SELECT (`target_keys @> ARRAY[$n]`, `action LIKE $n || '%'` and `search ILIKE '%' || $n || '%'` with
+`\`/`%`/`_` escaped, `at` range, keyset `id < $n`, `ORDER BY id DESC LIMIT limit + 1`); rows keep the §46 shape with
+`id` as a decimal STRING and `ts` = `extract(epoch FROM at) * 1000`; `next` is the last row's id (an integer id works
+as `before` too; old `'<ts>/<id>'` cursors match nothing). `query`/`get` are awaited and answer `nil, err` when the
+database fails (never an empty page). Prune = age cut per pool, then per capped pool every row at or below the
+(cap+1)-th newest id, as `DELETE … WHERE id IN (SELECT … ORDER BY id LIMIT 5000)` batches (50 ms apart in a thread);
+triggers: start, `Cron.at(4, 30)`, `Settings.onChange('audit.')`, and max(500, cap/20) appends to a pool since the
+last prune (no row counting). Review R2b: a prune (age AND cap) is skipped — and retried 60 s later — while
+`Settings.isLoaded()` is false, because every limit read then is a default and would delete rows an admin keeps; the
+`target` filter normalises its id exactly like the write path (`12.0` → `player:12`, a fractional id matches nothing).
+Tests: `tests/audit_tests.lua` (198).
 
 ## 47. Bans on identifiers and tokens (`Core.Bans`, server/bans.lua; connect path in server/player.lua)
 
@@ -4794,6 +4902,31 @@ Bans.forAccount(accountId) -> array
 - Tests: `tests/bans_tests.lua` (193); the connect path, `Player.ban`, the index and the legacy commands in
   `tests/server_tests.lua` (suites `player admin`, `admin ranks`, `legacy commands`).
 
+**§56 port notes (2026-09-27, run W1c).** Rows `bans` + `ban_accounts` + `ban_identifiers` + `ban_tokens` (§56.6); the
+in-memory index, `ensureLoaded`, the Lua v1 migration and `newBanId` are gone (sql/0002 imports v1 and v2 documents;
+ids come from `ban_number_seq`, a clash with an imported `'B<n>'` retries). The returned shape is unchanged (+
+`updatedAt`); `identifiers`/`tokens` read back sorted. `check`/`checkConnecting` = ONE statement over the two link
+indexes (active only, identifier or ≥ `tokenMatches` distinct tokens per ban, best first; it also returns the account
+of the connecting license for account learning); a read error → `nil, 'unavailable'`, and the connect-time read
+gives up after 5 s so an outage reaches the fallback / `bans.failClosed` fast. Enrichment is QUEUED and never an
+unkeyed barrier (a player spamming reconnects must not fragment the flushes): hits as a `patch` with an absolute count
+(this core is the only writer; an in-memory count covers a patch still queued), new identifiers/tokens as PK-only
+`save`s, the account learning as ONE statement keyed per ban whose link row and flag come from the guard's RETURNING
+— the connect path never waits for a write. `add` and `remove` are one awaited transaction each (link rows
+included); an explicit `accountId` that does not exist is dropped when identifiers are given (FK). **`accounts.banned`
+= EXISTS (an active ban whose own `account_id` names the account)**, recomputed in ONE statement wherever it changes;
+READ COMMITTED lets a concurrent add/remove miss each other's row, so every account they touched is recomputed by the
+next sweep, and the first sweep after start recomputes every flagged account and every account an active ban names
+(imported / stale flags). `duration` is floored first and must then be 0 (permanent) or ≥ 1 (`(0, 1)` →
+`invalid_duration`). Identifiers and tokens are stored and matched LOWER-CASED (`BanIdentity.key`; the engine's are
+lower-case hex). `list`/`forAccount` page in SQL (`ILIKE` over id, name, reason, account and identifiers,
+`%`/`_`/`\` literal; cursor unchanged) and answer `nil, 'db'` on a read error. **Expiry changed:** no lazy retire on
+a hit — `sweep()` (one statement: bans ended since the last sweep, the flags of their accounts and of every touched
+account, live sessions through `Player.setAccountData`) runs at start and every 60 s (the 04:40 Cron job is gone).
+The R2-12 relink is one statement run by the sweeps until it succeeds once. Holders: `Player.findAccountsByIdentifier`
+per identifier + ONE query for their rows; a missing lookup counts as unreadable (the predicate scan is gone). Tests:
+`tests/bans_tests.lua` 286.
+
 ## 48. Sticky player states, teleport, account reader (server/player.lua, client/environment.lua, client/spawn.lua)
 
 - `Player.setFrozen/setInvincible/setVisible/setControls(src, on)` store the value in the session (`session.states`) and
@@ -4831,6 +4964,12 @@ Bans.forAccount(accountId) -> array
 - Size: `Player.getHealth/getArmour` and the `core:player:getInfo` callback moved from server/player.lua to
   server/getters.lua (no behaviour change) to keep player.lua under 900 lines.
 - Tests: `tests/server_tests.lua` suites `player admin`, `admin ranks`, `legacy commands` (1108 total).
+
+**§56 port notes (2026-09-27, run W1c).** Addition `Player.getAccountData(src, key)`: a deep copy of the LIVE
+account's raw key (`permissions`, `tempPermissions`, `banned`, a plugin key, …), nil without a session; never yields.
+It is Core.Perms' read path for account grants (§44 notes) and **internal**: block-listed in server/api.lua
+(`INTERNAL_FUNCTIONS`) — the raw account carries the license and every plugin's account keys, and `getAccount`/
+`getAccountById` stay the public view.
 
 ## 49. Target selectors (`Player.resolveTargets`, server/getters.lua; `lib/commands` param types)
 
@@ -5269,6 +5408,26 @@ verification. Every shown element — vehicles, peds and networked props include
 them (§55.15), and a move of a promoted node demotes it at the new pose. The stable paint survives: a map vehicle
 takes `Scene.PAINTS[joaat(uid) % 22 + 1]` (the same list as above). `Maps.respawn` puts nodes back to their authored
 state (§55.21.1 notes). The `networked` / `networkedTotal` limits still count vehicle, ped and networked-prop elements.
+
+**§56 port notes (2026-09-27, run W2c).** Tables `maps` / `map_elements` / `map_versions` / `map_journal` (§56.6); the
+Lua shapes are unchanged (element `by` / `updatedAt` = columns `author` / `rev`, versions `by` / `byName` / `from` =
+`author` / `author_name` / `from_version`, journal rows keep `id = '<mapId>:j<seq>'` and `by`). Start-up: `maps` with
+`sync`, elements streamed (`R.loadBatch` rows per tick), versions and journal as metadata only — the journal index keeps
+`(seq, w)` per row, nothing else — and one stream of the published snapshots of drafts. `Maps.rollback` reads its
+snapshot and `Maps.journal` its page with one awaited query each (`sync`); a failed read answers `'db'` (rollback) /
+`nil, err` (journal), never "missing" or an empty page. `Maps.create` awaits its insert (the id exists only once the row
+does). Every commit (apply / clear / publish / rollback / expiry) queues its rows in one execution slice = one
+transaction; the map row is written with `patch` (a map deleted meanwhile stays deleted), the journal prune is one
+queued `DELETE … seq <= cut` per map keyed `core:maps.prune:<id>` (the newer bound supersedes), `Maps.delete` one
+queued `DELETE FROM maps` (the foreign keys cascade), `Maps.clear` one queued `DELETE FROM map_elements WHERE map_id`
+(a raw statement is a coalescing barrier, §56.3.2: an undo's saves in the same flush land after it). The load starts only where the caller can yield; applies answer `'db'` while `Core.DB.isHealthy()` is
+false (was: a degraded `map_elements`). Review R3a: `R.readLimits` never calls Core.Settings (the maps.* settings as
+last read — at the load, by the 10 s expiry job, and through a `Settings.onChange('maps.')` watcher), so nothing
+yields between staging and the writes except plugin callables (model validator, `type.migrate` / `validate`, the
+hook); after each of them an apply re-checks its map object and generation (bumped by every persisted change) and
+re-stages on the new state (≤ 3 passes, then `'conflict'` `{ reason = 'concurrent' }`); `rollback` re-checks its map
+after the validator. Tests: maps 443, maps_store 267 (a database section: columns, metadata-only start-up, one
+transaction per commit, pruning by rows / weight, rollback's read, delete cascade, failed reads; an R3a section).
 
 ### 52.3 Server regions
 
@@ -6995,6 +7154,19 @@ second), loaded at start behind one barrier before `Core.onReady` listeners run;
   cannot wait (or a failed load) gets `'unavailable'`; a failed load is retried at most every 10 s and leaves no half
   state. A stored audience that cannot be restored loads as `{ editors = true }` (logged).
 
+**§56 port notes (2026-09-27, run W2d).** Nodes are rows of `scene_nodes` (§56.6): `id kind owner parent bucket` are
+columns (a root's `parent` is written as NULL, so a detach overwrites it; at load the columns win over anything in
+`doc`), `doc` jsonb holds the rest of the document above (`v = 1` kept, like the imported legacy rows). The counter is
+the row `core_counters('scene_nodes')` with the same meaning (the next id). The coalescing thread (≤ 1 write per node
+per second) now QUEUES: `Core.DB.save` / `Core.DB.remove` per dirty node and a `save` of the counter row — never a
+yield, so the stop writers (the store's, `R.promote`'s `followAll`, the fleet's `beforeStop`) stay synchronous and
+the `Core.DB.flush()` calls at core stop are gone (core_db commits the queue after core is gone, §56.1). While
+core_db is not started the rows stay dirty and are retried a second later. The load reads the counter with
+`sync = true` first (a `restart core` sees the previous VM's final writes), then streams the rows (`Core.DB.stream`,
+batches of 1000) and links nothing before both reads succeeded; a failed read fails the load (retry after 10 s),
+never an empty world. Only a caller that can yield starts the load: non-yieldable code (a plugin's export call before
+the start thread loaded) gets `'unavailable'` without failing it. `/dbexport` no longer exists (§56.5.6).
+
 ### 55.19 Security table (all through `Core.Net.on` / `Core.Callback.register`, AGENTS §3 order)
 
 | entry | schema | cooldown / rate | extra checks |
@@ -7347,6 +7519,12 @@ a parked copy and the compatibility list are in §4.6's addition; the security r
   `RemoveVehicleWindow`, `SetTyreHealth` (+ the corrected names). Tests: `tests/scene_parked_tests.lua` 583,
   `tests/server_tests.lua` 1166.
 
+**§56 port notes (2026-09-27, run W2b).** Parked cars stay persistent `scene_nodes` rows (§55.18 notes); the records
+are the `vehicles` table (§4.6 port notes). The MaxParked order is the `last_used_at` column, stamped at every use
+(park, promotion, demotion, lock key) — no longer implied by an update time. The boot check reads the world records in
+one streamed query in that order; a failed read changes nothing (no node removed, no mark dropped) and is retried.
+Tests: `tests/scene_parked_tests.lua` 604 (section 22: the boot read, a failed read, meta kept, hooks without reads).
+
 ### 55.22 Phase 0 — the §52 fade-band fix (amends §52.4)
 
 `client/maps_spawn.lua`: element radius `r = clamp(lod, 30, 400)` / despawn `r + 15` is replaced by the §55.11 prop
@@ -7446,3 +7624,677 @@ client for P3 / P10 where needed); the decisions landed in the sections named:
 | P11 collision | props 2 m up landed on collision at once near the player | the physics rule stands (§55.15 notes) |
 | P12 events | 9 / 9 arrived; a big reliable event delays its markers (head-of-line) | the byte budgets of §55.7 stand |
 
+
+---
+
+## 56. Relational database (`core_db` + `Core.DB`) — 2026-09-27, Liam: "one table is unperformant and bad practice"
+
+**§56 supersedes §4.1, the DB half of §22 (`nextId`/`migrate`/`export`/`import`), the MySQL adapter of §27,
+§29/§30's adapter notes and all of §33.** `Core.DB` is no longer a document store. There are no collections, no
+KVP adapter, no MySQL adapter, no whole-collection loads and no `core_documents` writes. Postgres is required.
+
+### 56.0 Why (the deep dive, 2026-09-27)
+
+- Every collection was read WHOLE into Lua on first access, and `find`/`findOne` were linear scans. `playerJoining`
+  scanned all accounts (`findOne{license}`) and all characters (`findOne{accountId}`) on every join. On a
+  1–2k-player server with tens of thousands of lifetime accounts, the first join after a restart decoded the
+  whole table on the main thread.
+- Every `update` re-encoded and upserted the WHOLE document (a 110 KB phone thread per SMS, a whole faction per
+  deposit). Writes were fire-and-forget over a 4-connection pool with **no per-row ordering**: two quick writes
+  of one document could commit in either order.
+- **Stop-time data loss.** FXServer frees a resource's Node environment in the same tick the resource stops
+  (`NodeScriptRuntime::Destroy`: one `uv_run(NOWAIT)`, then `node::FreeEnvironment`). The final
+  `Player.saveAll()` of `restart core` queued upserts that could never reach Postgres. Since money only lives in
+  the session between autosaves (5 min), every restart could roll balances back.
+- One table held every collection, so there were no types, constraints, foreign keys or per-table indexes, and
+  vacuum/bloat of the hot logs hit everything.
+
+### 56.1 Architecture
+
+```
+plugin VM ──┐   Core.DB (lib, lib/db/server.lua, compiled into every server VM by import.lua)
+core VM ────┤        │ one export hop (msgpack)
+            └──────▶ core_db (separate resource, JS/Node 22, bundled `pg`)
+                       ├─ pool (N connections, type parsers, health)
+                       ├─ migration runner (per-owner barrier, advisory lock, core_migrations)
+                       ├─ write-behind queue (coalescing, bulk statements, one transaction per flush)
+                       ├─ table helpers (catalog-validated identifiers, column-type-aware values)
+                       └─ interactive transactions + cursors
+```
+
+- **`core_db` is its own resource** (`resources/core_db`, own git repo). `core`'s manifest declares
+  `dependency 'core_db'`, so `ensure core` starts it first. It survives `restart core` and plugin restarts:
+  their final writes are handed to core_db synchronously (the export call returns once the entry is queued)
+  and core_db commits them after the caller is gone. The pool, catalog cache and queue outlive core.
+  **Never `restart core_db` on a live server** — that stops core and every plugin in the same tick and the
+  queue's last flush dies with core_db's Node environment (restart `core` instead). A server shutdown under
+  txAdmin flushes on `txAdmin:events:serverShuttingDown` (§56.3).
+- **`Core.DB` becomes a LIB namespace** (`LIB_MODULES.DB = 'db'`, file `lib/db/server.lua`, server only;
+  `lib/db/shared.lua` does not exist and the client never sees `Core.DB`). Each VM calls
+  `exports.core_db:<fn>(...)` directly: one hop for plugins (was two) and no load on core's VM for plugin
+  queries. The export proxy fallback of `import.lua` never forwards a `DB.*` call to core; unknown or removed
+  names error in the lib itself (§56.5.6).
+- **The owner of a call is the invoking resource** (`GetInvokingResource()` inside core_db). It keys migrations,
+  barriers, keyed-statement coalescing and logs. Nobody can act as another resource.
+- **Allowed invokers:** `core`, `core_db`, and any resource whose manifest declares `dependency 'core'` or
+  `dependency 'core_db'` (read with `GetNumResourceMetadata`/`GetResourceMetadata(res, 'dependency', i)`,
+  cached per resource, dropped on its `onResourceStart`). Anything else gets `'forbidden'`. Server resources are
+  trusted code; this guard only keeps random third-party resources off the pool.
+- **Durability model.** Awaited calls (`query`, `insert`, ...) commit before they return. Queued calls
+  (`save`, `patch`, `remove`, `append`, `enqueue`) return at once; the queue commits them within
+  `core_db_flush_ms` (default 250 ms) in ONE transaction per flush. Writes queued in one Lua execution slice
+  (no yield in between) always land in the same transaction (§56.3.4). A hard crash loses at most one flush
+  interval; `restart core` loses nothing.
+
+### 56.2 The `core_db` resource
+
+#### 56.2.1 Files
+
+| path | role |
+|---|---|
+| `fxmanifest.lua` | `fx_version 'cerulean'`, `game 'gta5'`, `node_version '22'`, `server_script 'dist/core_db.js'`, author, description. No client files. No `package.json` at the root (FXServer's yarn builder) and no `node_modules` (the Node sandbox cannot read it behind the symlink) — §33.1's reasons still hold. |
+| `src/core.js` | `createCoreDb(fivem, options) -> api`: builds pool, catalog, queue, migrator, tx manager and returns the API object whose keys are the export names of §56.2.3. **All FiveM globals are reached through the injected `fivem` adapter only**, so tests run the same code in plain Node. |
+| `src/fivem.js` | the real adapter over FiveM globals (§56.2.2). |
+| `src/index.js` | entry: `const api = createCoreDb(require('./fivem'), optionsFromConvars())`, registers every API function with `exports(name, fn)`, wires `onResourceStop`/`onResourceStart`/txAdmin events. |
+| `src/pool.js` | `pg.Pool`, type parsers (§56.2.4), health tracking, slow-query log, error formatting. |
+| `src/catalog.js` | table/column/primary-key introspection of the current schema (`pg_catalog`), cached; `invalidate()` after migrations. |
+| `src/sqlgen.js` | identifier validation + quoting, WHERE builder (§56.5.3), helper SQL (insert/select/update/delete/upsert/count), bulk statements for the queue (§56.3.3), value conversion by column type. |
+| `src/queue.js` | the write-behind queue (§56.3). |
+| `src/migrate.js` | the migration runner (§56.4). |
+| `src/tx.js` | interactive transactions and their deadlines (§56.2.3 `txBegin/txQuery/txEnd`). |
+| `build/package.json` | npm workspace member (`resources/package.json` `workspaces` gains `core_db/build`): script `build` = esbuild `../src/index.js --bundle --platform=node --target=node22 --format=cjs --external:pg-native --outfile=../dist/core_db.js` with the `// fxlint-disable-file` banner (§33.1). devDependencies `esbuild`, `pg`. |
+| `dist/core_db.js` | the committed bundle the manifest loads. Rebuild after every `src/` change. |
+| `tests/*.test.mjs` | `node --test` suites against `CORE_TEST_PG_URL` (§56.10); they `import` `src/core.js` with a fake adapter. |
+| `tests/bridge.mjs` | the Lua test bridge server (§56.10.2). |
+| `README.md` | ops notes: convars, `/dbstatus`, backups, never restart core_db live, dropping `legacy_documents`. |
+
+#### 56.2.2 The FiveM adapter (`src/fivem.js`)
+
+```js
+module.exports = {
+  resourceName(),                   // GetCurrentResourceName()
+  invoker(),                        // GetInvokingResource() — read SYNCHRONOUSLY at the top of every API call
+  registerExport(name, fn),         // exports(name, fn)  (CommonJS: take `global.exports` if `exports` is the module object, §33.1)
+  getConvar(name, fallback),        // GetConvar
+  loadResourceFile(res, path),      // LoadResourceFile -> string | null
+  resourceState(res),               // GetResourceState
+  dependsOnCore(res),               // manifest `dependency` entries include 'core' or 'core_db' (cached by core.js)
+  on(event, fn),                    // AddEventHandler / on(...)
+  emit(event, ...args),             // local server event (TriggerEvent / emit)
+  defer(fn),                        // setImmediate(fn): EVERY call into a Lua funcref goes through defer (§33 lesson)
+  log(level, message),              // console with a `[core_db]` prefix; never params, never the URL
+};
+```
+
+#### 56.2.3 Exports (the whole wire contract between the Lua lib and core_db)
+
+Callbacks are always the LAST argument, are called exactly once, through `fivem.defer`, inside `try/catch`
+(a callback into a stopped resource throws and is ignored). `err` is `null` or a string (§56.2.5). Values
+crossing the hop follow §56.2.4.
+
+| export | signature | answer |
+|---|---|---|
+| `query` | `(sql, params, opts, cb)` | `cb(err, rows, rowCount)`; `rows` = array of row objects (column name → value) |
+| `batch` | `(statements, opts, cb)` | `statements` = `[{ sql, params }]`, run in ONE transaction on one client; `cb(err, results)` with `results[i] = { rows, rowCount }` (rows omitted unless `opts.rows`) |
+| `crud` | `(op, table, args, txId, cb)` | table helpers (§56.5.3); `op` ∈ `insert insertMany select first count update delete upsert`; `txId` = `0`/`null` outside a transaction |
+| `nextId` | `(name, cb)` | `INSERT INTO core_counters (name, value) VALUES ($1, 1) ON CONFLICT (name) DO UPDATE SET value = core_counters.value + 1 RETURNING value` → `cb(err, value)` |
+| `txBegin` | `(opts, cb)` | `cb(err, txId)`; opts `{ timeoutMs }` (default 10000, max 60000). The tx belongs to the invoker; its deadline rolls it back and frees the client |
+| `txQuery` | `(txId, sql, params, cb)` | like `query`, on the tx's client; a statement error leaves the tx aborted (every later call answers `'tx_aborted'`) |
+| `txEnd` | `(txId, commit, cb)` | `COMMIT` (or `ROLLBACK` when `commit` is false or the tx is aborted) → `cb(err)`; an aborted tx committed answers `'tx_aborted'` after rolling back |
+| `enqueue` | `(entries)` | **synchronous, no callback**: validates and queues `entries` (§56.3.1), returns `{ seq }` or `{ error }` |
+| `sync` | `(seq, timeoutMs, cb)` | resolves once every entry with sequence ≤ `seq` (all entries when `seq` is null) was committed or dropped → `cb(err, { dropped })` |
+| `migrate` | `(list)` | **synchronous**: validates `list` (§56.4.1), installs the invoker's barrier, schedules the run, returns `{ ok = true }` or `{ error }` |
+| `awaitMigrations` | `(timeoutMs, cb)` | `cb(err)` once the invoker's barrier settles (`null` = applied); no barrier → `cb(null)` at once |
+| `status` | `(cb)` | `cb(null, { healthy, pool = { total, idle, waiting }, queue = { pending, inflight, dropped, flushes, lastFlushMs, lastError }, migrations = { [owner] = { version, state } } })` |
+| `isHealthy` | `()` | synchronous boolean |
+| `testReset` / `testFlush` | test mode only (§56.10) | absent unless `options.testMode` |
+
+`opts` for `query`/`crud` reads: `{ sync = bool, timeoutMs = n }`. `sync = true` first waits for every queued
+entry with a sequence ≤ the queue's current sequence (read-your-writes), then runs.
+
+**Barrier:** every export except `migrate`, `awaitMigrations`, `status`, `isHealthy` and `enqueue` first
+awaits the invoker's migration barrier when one is installed. A failed barrier answers
+`'migrations_failed: <reason>'` until that resource calls `migrate` again. `enqueue` never waits (it must stay
+synchronous); the QUEUE holds entries of an owner whose barrier is pending and flushes them after it settles
+(entries of an owner whose migrations FAILED are dropped with an error log).
+
+#### 56.2.4 Values across the hop
+
+- **Lua → JS.** The lib turns `Core.DB.NULL` into the marker object `{ __null: true }`, pads `nil` holes in
+  positional params with the same marker (`params.n` or the highest integer key), and never sends functions
+  or userdata. core_db maps the marker to SQL NULL. `Core.DB.op(name, value[, value2])` is
+  `{ __op: name, value, value2 }` (WHERE only).
+- **Params in raw SQL** go to `pg` as given, except: arrays → Postgres arrays (use `$1::text[]`, `= ANY($1)`),
+  plain objects → JSON text (pg's default). For a jsonb param in raw SQL pass `Core.DB.json(v)` (a JSON string)
+  and cast `$n::jsonb` — an empty Lua table cannot tell `[]` from `{}` across msgpack.
+- **Helpers, `save`, `patch`, `remove`, `append`** know each column's type from the catalog and convert:
+  `json`/`jsonb` ← any value (JSON-encoded by core_db); `timestamptz`/`timestamp` ← a number of **Unix seconds**
+  (ms precision kept when fractional) or an ISO string; `date` ← `'YYYY-MM-DD'`; arrays ← Lua sequences;
+  everything else as is. Unknown column or table → `'invalid: unknown column <t>.<c>'`.
+- **JS → Lua (type parsers, set once in `pool.js`):** `int8` → number when |v| ≤ 2^53 (else the string);
+  `numeric` → number; `timestamptz`/`timestamp` → **integer Unix seconds** (floor); `date` → `'YYYY-MM-DD'`
+  string; `json`/`jsonb` → parsed value; `bool` → boolean; SQL NULL → absent key in the row table. Need ms?
+  select `(extract(epoch from col) * 1000)::bigint AS col_ms`.
+
+#### 56.2.5 Errors, health, logging
+
+- `err` strings: `'<SQLSTATE> <message>'` for Postgres errors (e.g. `'23505 duplicate key value violates unique
+  constraint "vehicles_plate_key"'`), otherwise one of `timeout`, `unavailable` (no connection),
+  `forbidden`, `invalid: <what>`, `migrations_failed: <why>`, `tx_unknown`, `tx_aborted`, `tx_expired`.
+  `Core.DB.errorCode(err)` returns the SQLSTATE or the leading word.
+- **Health:** `healthy` flips to false on a connection-class failure (SQLSTATE class `08`, `57P01..03`, `53300`,
+  or a driver error without SQLSTATE such as ECONNREFUSED/timeout) and back to true on the next successful
+  statement. Every flip emits the local event `core:hook:dbStatus (healthy, reason)` — `Core.on('dbStatus',
+  fn)` in any VM — and logs once.
+- **Logging:** a statement slower than `core_db_slow_ms` logs `slow query <ms> ms (<owner>): <first 160
+  chars of SQL>`; never parameters (they carry identifiers, names, chat), never the URL. Dropped queue entries
+  log owner, kind, table and error (§56.3.5).
+
+#### 56.2.6 Convars (read once at start)
+
+| convar | default | meaning |
+|---|---|---|
+| `core_pg_url` | — (required) | the Postgres URL; kept from §33 so existing `core_pg.cfg` files work. A secret: never logged |
+| `core_db_pool_size` | `10` | max pool connections (the queue uses one of them per flush) |
+| `core_db_flush_ms` | `250` | queue flush interval |
+| `core_db_statement_timeout_ms` | `10000` | per-statement timeout (migrations run with `SET LOCAL statement_timeout = 0`) |
+| `core_db_slow_ms` | `250` | slow-query log threshold |
+
+### 56.3 The write-behind queue (`src/queue.js`)
+
+#### 56.3.1 Entries
+
+| kind | Lua call | entry | SQL it becomes |
+|---|---|---|---|
+| `sql` | `Core.DB.enqueue(sql, params?, key?)` | `{ t = 'sql', sql, params, key }` | the statement as given |
+| `save` | `Core.DB.save(table, row)` | `{ t = 'save', table, row }` | upsert by primary key; `row` must hold every PK column and every NOT NULL column without a default; `ON CONFLICT (pk) DO UPDATE SET` every non-PK column present in `row` |
+| `patch` | `Core.DB.patch(table, key, changes)` | `{ t = 'patch', table, key, changes }` | `UPDATE ... SET <changes> WHERE pk = key` (an absent row is a no-op, not an error) |
+| `remove` | `Core.DB.remove(table, key)` | `{ t = 'remove', table, key }` | `DELETE ... WHERE pk = key` |
+| `append` | `Core.DB.append(table, row)` | `{ t = 'append', table, row }` | plain `INSERT` (no conflict handling; identity/default columns fill themselves) |
+
+`key` is the PK value for a one-column primary key, or a table `{ col = value, ... }` holding every PK column.
+`enqueue` validates synchronously (table exists, columns exist, PK complete, sql is a non-empty string) and
+answers `{ error }` for a bad entry without queueing any part of the call. Every entry gets a global,
+increasing sequence number.
+
+#### 56.3.2 Coalescing (only against PENDING entries; an entry already in flight is never touched)
+
+- Row identity = `table` + PK values (not owner-scoped). A new `save`/`patch`/`remove` for a row that already has
+  a pending entry **replaces or merges into that entry in place** (it keeps the older position and takes the
+  newer sequence number):
+  - `save` after `save`, `save` after `patch`, `patch` after `save`, `patch` after `patch` → the column maps MERGE
+    (newer wins per column; a save that merges into a pending patch makes the entry a save).
+  - `remove` after `save`/`patch` → becomes the `remove`. `patch` after `remove` → dropped (the row is going away).
+  - `save` after `remove` → the remove STAYS and the save is queued as a NEW entry after it (a DELETE then an
+    INSERT: cascades run and omitted columns get their defaults, exactly as running both in order would).
+  - Entries of different owners never merge while either owner's migration barrier is pending (review R1 L14).
+- A raw `sql` entry is a **coalescing barrier**: it may touch any row, so a row entry queued after it never merges
+  into one queued before it (save → `DELETE` → save must end with the row present — found in review, 2026-09-27).
+- `sql` entries coalesce only when they carry a `key`: same owner + same key → the older statement is DROPPED and
+  the newer one runs at ITS position (never moved earlier past writes queued in between). Use a key only when the
+  newer statement fully supersedes the older one.
+- `append` never coalesces.
+
+#### 56.3.3 Flush
+
+- A timer runs every `core_db_flush_ms`; a flush also starts (on the next Node tick, never synchronously)
+  when more than 2000 entries are pending. At most ONE flush is in flight; entries queued meanwhile wait for
+  the next one.
+- A flush takes **all** pending entries and runs them in ONE transaction on one pooled client
+  (`BEGIN … COMMIT`). Statement building:
+  1. Raw `sql` entries are **barriers**: they split the list into segments and run in their exact position.
+  2. Inside a segment, entries are grouped per table (tables in order of first appearance); each table's
+     entries keep their relative order and are cut into **runs** of consecutive entries with the same kind and
+     the same column signature (sorted column names; `remove` has none).
+  3. A run becomes ONE bulk statement per ≤ 1000 rows, all through `jsonb_populate_recordset(NULL::<table>,
+     $1::jsonb)` so every column gets its real type:
+     - `save`: `INSERT INTO t (cols) SELECT cols FROM jsonb_populate_recordset(NULL::t, $1) ON CONFLICT (pk)
+       DO UPDATE SET c = EXCLUDED.c, …` (`DO NOTHING` when only PK columns were given)
+     - `patch`: `UPDATE t AS x SET c = v.c, … FROM jsonb_populate_recordset(NULL::t, $1) AS v WHERE x.pk = v.pk`
+     - `remove`: `DELETE FROM t AS x USING jsonb_populate_recordset(NULL::t, $1) AS v WHERE x.pk = v.pk`
+     - `append`: `INSERT INTO t (cols) SELECT cols FROM jsonb_populate_recordset(NULL::t, $1)`
+     The JSON payload is built by `sqlgen.js` with §56.2.4's conversion (timestamps as ISO strings, jsonb columns
+     as nested JSON, NULL markers as JSON null).
+- **Why cross-table reordering is safe:** every foreign key between tables that the queue writes is declared
+  `DEFERRABLE INITIALLY DEFERRED` (§56.6, and the plugin rule of §56.9), so FK checks run at COMMIT. Same-table
+  order is always kept (unique constraints stay immediate).
+- `sync(seq)` callers are resolved when the flush that contained their last entry finished.
+- **Atomicity guarantee (what it is and is not):** a flush never splits what one Lua execution slice queued —
+  core_db's timers and `setImmediate` callbacks cannot run while Lua is executing, so entries queued without a
+  yield in between are all pending together when the next flush starts, and a CONNECTION failure keeps or loses
+  them together (the batch is requeued whole). A STATEMENT error does not: safe mode (§56.3.5) drops only the
+  failing entries and commits the rest of the batch, so a poison entry can leave a group half-applied (logged and
+  reported through `dbWriteFailed`). Queue related writes in one slice for crash/connection atomicity; when a
+  group must be all-or-nothing even against bad data, write it with an awaited `transaction`.
+- **Duplicate risk:** a connection lost DURING `COMMIT` leaves the outcome unknown; the batch is requeued and may
+  apply twice — harmless for `save`/`patch`/`remove` (idempotent by key), a duplicate row for `append` and
+  whatever the statement does for raw `sql`. Keep raw queued statements idempotent where you can.
+
+#### 56.3.4 Owners and barriers
+
+Entries are stamped with their owner. While the owner's migration barrier is pending, its entries stay in the
+queue (other owners' entries flush around them; the positions of the held ones are kept). If the owner's
+migrations fail, its held and future entries are dropped with one error log per drop burst.
+
+#### 56.3.5 Failures
+
+1. **Connection-class error** (§56.2.5): ROLLBACK if possible; the whole batch goes back to the FRONT of the
+   pending list in its original order (coalescing into it is allowed again); retry with backoff 1 s, 2 s, 4 s …
+   capped at 30 s; `healthy = false`. Nothing is dropped. Pending > 50 000 logs a warning once per minute.
+2. **Statement error** (constraint, bad data, bug): ROLLBACK, then **safe mode** for that batch:
+   `BEGIN; SET CONSTRAINTS ALL IMMEDIATE;` then every entry **individually, in original order**, each inside
+   `SAVEPOINT e; …; RELEASE SAVEPOINT e` (on error `ROLLBACK TO SAVEPOINT e` and the entry is dropped);
+   `COMMIT`. A dropped entry logs `dropped queued <kind> on <table> by <owner>: <err>` and emits the local
+   event `core:hook:dbWriteFailed (owner, kind, table, err, key)` (`key` = the row's primary key value, or a map for a composite key; nil for `sql`/`append`). `sync` answers report the dropped count.
+3. Stop hooks: on `txAdmin:events:serverShuttingDown` and on `onResourceStop` of any OTHER resource, a flush
+   is started at once (not waited for). On core_db's own `onResourceStop` the pending count is logged as lost
+   when non-zero.
+
+### 56.4 Migrations (`src/migrate.js`)
+
+#### 56.4.1 Format
+
+```lua
+-- any server file of the resource, at FILE SCOPE (non-blocking, never yields):
+Core.DB.migrate({
+    'sql/0001_init.sql',                                         -- a file in the CALLING resource; version = its leading digits
+    { version = 2, name = 'thread_index', sql = 'CREATE INDEX ...' },   -- inline
+    { version = 3, file = 'sql/0003_backfill.sql' },
+})
+```
+
+- Versions are integers ≥ 1, strictly increasing in the list, unique. A file entry's version is the number
+  its basename starts with (`0001_init.sql` → 1) and its name the rest (`init`). Files are read with
+  `LoadResourceFile(owner, path)` (paths `^[%w_%-/%.]+%.sql$`, no `..`); a missing or empty file fails the
+  whole registration.
+- The table `core_migrations (owner text, version integer, name text NOT NULL, checksum text NOT NULL,
+  applied_at timestamptz NOT NULL DEFAULT now(), duration_ms integer NOT NULL, PRIMARY KEY (owner, version))`
+  is created by core_db itself (`CREATE TABLE IF NOT EXISTS`) before the first run.
+
+#### 56.4.2 Runner
+
+- Jobs run one at a time, FIFO in registration order (core registers first because plugins start after it).
+- Per job: read the applied versions of the owner; for each listed version not applied, in ascending order,
+  on one client: `BEGIN; SELECT pg_advisory_xact_lock(hashtext('core_db:migrate')); SET LOCAL
+  statement_timeout = 0;` re-check it is still unapplied, run the SQL text with the **simple query protocol**
+  (several statements and `DO $$ … $$` blocks allowed, no parameters), `INSERT INTO core_migrations …`
+  (checksum = md5 hex of the exact text), `COMMIT`. Any error → `ROLLBACK`, the job stops, the barrier fails
+  with `migrations_failed: <owner> v<n> <name>: <err>`, and core_db logs it as an error.
+- An applied version whose checksum differs logs a warning once (never re-run). A version applied in the
+  database but missing from the list logs a debug line. A missing version BELOW the highest applied one is
+  applied anyway with a warning (out-of-order).
+- After a job that applied anything: `catalog.invalidate()`.
+- `CREATE INDEX CONCURRENTLY` / `VACUUM` / anything that cannot run in a transaction is not supported in a
+  migration.
+
+#### 56.4.3 Rules for migration authors (core and plugins)
+
+- A migration is **immutable** once applied anywhere. Change the schema with a NEW version.
+- Tables are named `<resource>_<thing>` for plugins (`smartphone_threads`); core's tables are unprefixed.
+  core_db warns (does not refuse) when a plugin migration creates a table without its prefix.
+- `timestamptz` for times, `jsonb` for aggregates that are loaded and saved as a unit (appearance, props,
+  slots), real columns for anything filtered, joined, ordered, summed or constrained. `text` ids stay `text`.
+- Every FK to another table the queue may write is `DEFERRABLE INITIALLY DEFERRED`. References to characters
+  or accounts use `ON DELETE CASCADE` for owned data (inventories, phone data) and `ON DELETE SET NULL` for
+  shared data (a vehicle's owner, a faction's owner).
+- Tables with `updated_at` attach core's trigger: `CREATE TRIGGER <t>_touch BEFORE UPDATE ON <t> FOR EACH ROW
+  EXECUTE FUNCTION core_touch_updated_at();` (it sets `updated_at = now()` unless the statement set it).
+- Seeds are NOT migrations: default rows (perm groups, settings) are written by the module at runtime when
+  missing, so test resets (TRUNCATE) keep working.
+- Legacy data: a plugin's first migration may import its old documents from `legacy_documents` (§56.7), inside
+  `DO $$ BEGIN IF to_regclass('legacy_documents') IS NULL THEN IF to_regclass('core_documents') IS NOT NULL THEN
+  RAISE EXCEPTION '…core has not imported yet'; END IF; RETURN; END IF; … END $$;` — the RAISE matters: returning
+  quietly while core's import is still pending would record the plugin's import as applied with nothing copied.
+
+### 56.5 `Core.DB` — the Lua API (`lib/db/server.lua`)
+
+#### 56.5.1 Two classes of calls
+
+- **Awaited** calls yield until core_db answers (they call `Citizen.Await` on a promise the export callback
+  resolves; a Lua-side deadline of `opts.timeout` ms, default 30000, resolves `nil, 'timeout'`). They must run
+  in a coroutine (thread, event handler, command, callback, `Core.onReady` body). Outside one they return
+  `nil, 'not_in_coroutine'` and log once per call site — they never throw for that. They return
+  `result` or `nil, err` (§56.2.5): **a failed read is `nil, err`, never an empty result**.
+- **Queued** calls (`save`, `patch`, `remove`, `append`, `enqueue`) and `migrate` NEVER yield. They are safe in
+  `onResourceStop`, in non-yieldable code and at file scope. They return `true` or `false, err` (validation
+  only). Their write commits within one flush interval (§56.3).
+- When `core_db` is not started, awaited calls return `nil, 'unavailable'` and queued calls `false,
+  'unavailable'` (logged once per 10 s).
+
+#### 56.5.2 Raw SQL (awaited)
+
+```lua
+Core.DB.query(sql, params?, opts?)   -> rows | nil, err         -- rows = array of { column = value } (possibly empty)
+Core.DB.single(sql, params?, opts?)  -> row | nil, err          -- the first row; (nil, nil) when there is none
+Core.DB.scalar(sql, params?, opts?)  -> value | nil, err        -- the first column of the first row; (nil, nil) when none
+Core.DB.execute(sql, params?, opts?) -> rowCount | nil, err     -- INSERT/UPDATE/DELETE without RETURNING
+Core.DB.batch(statements, opts?)     -> results | nil, err      -- { { sql, params }, ... } one transaction, one hop; results[i] = { rowCount = n, rows = ... when opts.rows }
+Core.DB.transaction(fn, opts?)       -> true, fnResult | false, err
+Core.DB.stream(sql, params, fn, opts?) -> total | nil, err      -- server-side cursor; fn(rows) per batch of opts.batch (default 500); fn returning false stops; Wait(0) between batches
+Core.DB.nextId(name)                 -> integer | nil, err      -- core_counters, atomic
+Core.DB.flush(timeoutMs?)            -> true | false, err       -- waits until everything queued before the call committed; false, 'dropped:<n>' when entries were dropped
+```
+
+- Placeholders are Postgres `$1 … $n`. `opts`: `{ timeout = ms, sync = bool }` (`sync` = read-your-writes,
+  §56.2.3).
+- `transaction(fn)`: `fn(tx)` runs on one dedicated connection; `tx` has `query single scalar execute insert
+  select first update delete upsert count` with the same signatures. `fn` returning `false` (or throwing, or a
+  tx statement failing and `fn` returning normally) rolls back; the error is returned. `opts.timeout` = the tx
+  deadline (default 10000, max 60000). Keep transactions short and never `Wait` for gameplay inside one.
+- `stream` is `transaction` + `DECLARE c NO SCROLL CURSOR FOR <sql>` + `FETCH <batch> FROM c` in a loop
+  (`opts = { batch, timeout, sync }`; `sync = true` first waits for everything queued so far, like `flush`); use it
+  for start-up loads of big tables (scene nodes, inventory drops, map elements) so no single answer decodes
+  tens of MB on the main thread.
+
+#### 56.5.3 Table helpers (awaited, catalog-validated — no identifier ever reaches SQL unchecked)
+
+```lua
+Core.DB.insert(table, values, opts?)       -> row | nil, err       -- RETURNING * (opts.returning = { 'id' } or false → true)
+Core.DB.insertMany(table, rows, opts?)     -> count | nil, err     -- one statement
+Core.DB.select(table, where?, opts?)       -> rows | nil, err      -- opts: columns = { ... }, orderBy = 'col DESC, col2', limit, offset, sync, timeout
+Core.DB.first(table, where?, opts?)        -> row | nil, err       -- select with limit 1; (nil, nil) when none
+Core.DB.count(table, where?, opts?)        -> integer | nil, err
+Core.DB.update(table, set, where, opts?)   -> rowCount | nil, err  -- `where` must be non-empty (no accidental full-table update)
+Core.DB.delete(table, where, opts?)        -> rowCount | nil, err  -- `where` must be non-empty
+Core.DB.upsert(table, values, conflict, opts?) -> row | nil, err   -- conflict = 'col' or { 'a', 'b' }; opts.update = columns to overwrite (default: every non-conflict column in values); opts.returning as insert
+```
+
+- `values`/`set`/`row` maps: key = column; `nil` = not given (the column default applies on insert);
+  `Core.DB.NULL` = SQL NULL. Values convert by column type (§56.2.4).
+- `where`: a map of conditions joined with AND.
+  - `col = value` → `col = $n`
+  - `col = Core.DB.NULL` → `col IS NULL`
+  - `col = { a, b, c }` (a non-empty Lua sequence) → `col = ANY($n)`
+  - `col = Core.DB.op(op, value[, value2])` with `op` ∈ `= <> < <= > >= like ilike not_like in not_in between
+    is_null not_null contains overlaps` (`contains` = `@>`, `overlaps` = `&&` for arrays/jsonb)
+- `orderBy` is parsed strictly: `col [ASC|DESC] [NULLS FIRST|LAST]` separated by commas, columns checked.
+- Table names are `^[a-z_][a-z0-9_]*$` and must exist in the current schema; unknown → `invalid: unknown table`.
+
+#### 56.5.4 Queued writes (never yield)
+
+```lua
+Core.DB.save(table, row)              -> true | false, err
+Core.DB.patch(table, key, changes)    -> true | false, err
+Core.DB.remove(table, key)            -> true | false, err
+Core.DB.append(table, row)            -> true | false, err
+Core.DB.enqueue(sql, params?, key?)   -> true | false, err
+```
+
+Semantics, coalescing and atomicity: §56.3. Rules of thumb: hot per-player/per-entity state (session columns,
+money rows, containers, scene nodes, vehicle state, world state, lock states) → `save`/`patch`; logs and
+histories (audit, journals, messages) → `append`; rare user actions whose caller needs the id or must know it
+worked (create account, persist vehicle, add ban, create faction) → awaited `insert`/`transaction`.
+
+#### 56.5.5 Migrations, health, helpers
+
+```lua
+Core.DB.migrate(list)                 -> true | false, err   -- §56.4.1; non-blocking; call at file scope
+Core.DB.awaitMigrations(timeoutMs?)   -> true | false, err   -- awaited
+Core.DB.status()                      -> table | nil, err    -- awaited (§56.2.3)
+Core.DB.isHealthy()                   -> boolean             -- synchronous export call, no yield
+Core.DB.NULL                                                 -- SQL NULL sentinel (params, values, where)
+Core.DB.op(name, value, value2?)      -> condition           -- §56.5.3
+Core.DB.json(value)                   -> string              -- JSON text for a `$n::jsonb` raw param (json.encode)
+Core.DB.errorCode(err)                -> string | nil        -- '23505', 'timeout', 'unavailable', ...
+```
+
+`Core.on('dbStatus', function(healthy, reason) … end)` and `Core.on('dbWriteFailed', function(owner, kind,
+table, err, key) … end)` are local hooks emitted by core_db (§56.2.5, §56.3.5).
+
+#### 56.5.6 Removed names
+
+`get set find findOne all create export import setAdapter markDegraded isDegraded` (and the old `update`/
+`delete`/`count` signatures with a collection + id) are gone. The lib keeps `get set find findOne all create
+export import setAdapter markDegraded isDegraded` as functions that `error()` with
+`"Core.DB.<name> was removed (DESIGN §56): use Core.DB.<replacement>"` so a stale plugin fails loudly at the
+call site. `/dbexport` and `/dbimport` are removed — back up with `pg_dump` (§56.11). `Registry`'s blocked
+names `DB.setAdapter`/`DB.markDegraded` are removed from the export block list (core's `DB` no longer exists
+behind the export).
+
+### 56.6 Core's schema (`sql/0001_core_schema.sql` is the truth)
+
+core registers its migrations at file scope in `server/db.lua` (which now holds only that, `/dbstatus` and
+nothing else): `Core.DB.migrate({ 'sql/0001_core_schema.sql', 'sql/0002_core_legacy_import.sql' })`.
+
+| table | key | what lives there / replaces |
+|---|---|---|
+| `core_counters` | `name` | `Core.DB.nextId`, scene node ids (`'scene_nodes'`), map ids (`'maps'`) — was `counters` + `scene_meta` |
+| `accounts` | `id` (+ UNIQUE `license`) | the account document; `group` → `perm_group`; plugin keys (`adminPrefs`, …) → `data` jsonb |
+| `account_identifiers` | `(account_id, kind)` | `account.identifiers` map; indexed by `identifier` — replaces getters.lua's in-memory identifier index |
+| `characters` | `id` (index `account_id`) | the character document: columns `name model appearance position stats weapons attachments meta permissions temp_permissions`; any other top-level key a plugin sets (`Player.setData`) → `data` jsonb |
+| `character_money` | `(character_id, account)` | `data.money` (one row per `Config.Money.Accounts` key) |
+| `perm_groups` | `name` | `perm_groups`; `removed` map → `text[]` |
+| `bans` + `ban_accounts` + `ban_identifiers` + `ban_tokens` | `bans.id` = `'B' ‖ nextval(ban_number_seq)` | the ban document; `accountIds[]`, `identifiers[]`, `tokens[]` → link tables with indexes (the connect check is ONE indexed query, §56.8) |
+| `audit_log` | identity `id` | `audit`; `pool` stored (was derived); `target_keys text[]` (GIN) and `search` (trigram when `pg_trgm` exists) replace the in-memory index |
+| `settings` | `key` (dotted) | overrides only (§45) |
+| `globals` | `key` | one row per global (was one document with a `values` map) |
+| `world_state` | `id = 1` | the `world/state` document |
+| `doors` | `id` | persisted doors |
+| `factions` + `faction_members` | `factions.id`, members by `character_id` (one faction per character) | the faction document's `members` map → rows; UNIQUE `lower(name)`, `upper(tag)` |
+| `vehicles` | `id` (UNIQUE `plate`, index owner, partial index for the boot recovery) | vehicle records; `ownerCharId = false` → NULL; `parked = false` → NULL; LRU order → `last_used_at` (set explicitly by the park/fleet code, never implied by `updated_at`) |
+| `scene_nodes` | `id` integer | persistent nodes: `kind owner parent bucket` columns + `doc` jsonb (the rest of `docOf`) |
+| `maps` + `map_elements` + `map_versions` + `map_journal` | `maps.id`; the others `(map_id, element_id|version|seq)` | map documents; `by` → `author`; start-up reads metadata columns only |
+
+**Session ↔ rows (server/player.lua is the only writer of these tables while a session exists):**
+
+| session (`Player.getData` view, unchanged for callers) | stored as |
+|---|---|
+| `data.id`, `data.accountId`, `createdAt`, `updatedAt` | `characters.id`, `.account_id`, `.created_at`, `.updated_at` (read-only) |
+| `data.name model appearance position stats weapons attachments meta` | the column of the same name |
+| `data.permissions`, `data.tempPermissions` | `characters.permissions`, `.temp_permissions` |
+| `data.money = { cash, bank, … }` | `character_money` rows |
+| `data.faction = { id, rank } \| false` | NOT stored on the character: derived from `faction_members` at load (session-only, replicated) |
+| any other top-level key | `characters.data ->> key` |
+| `account.name group firstSeen lastSeen playtime banned permissions tempPermissions identifiers` | `accounts.name perm_group first_seen last_seen playtime banned permissions temp_permissions`, `account_identifiers` |
+| any other account key (`setAccountData`) | `accounts.data ->> key` |
+
+### 56.7 Legacy import (`sql/0002_core_legacy_import.sql`) and `legacy_documents`
+
+- One `DO $$ … $$` block that returns at once when `core_documents` does not exist in the search path (fresh install).
+  Otherwise it copies every core collection into the tables of §56.6 (`accounts`, identifiers, `characters`,
+  money rows, `perm_groups`, `bans` (v2 and v1 shapes) + link tables, `audit` → `audit_log` in `(ts, id)` order,
+  `settings`, `globals`, `world` → `world_state`, `doors`, `factions` + members, `vehicles`, `scene_nodes`,
+  `counters`/`scene_meta` → `core_counters` and `ban_number_seq`, the four map collections), skipping rows whose
+  parents are missing and counting what it skipped (`RAISE NOTICE`), then renames `core_documents` →
+  **`legacy_documents`**. Nothing ever writes `legacy_documents` again.
+- Plugin collections stay in `legacy_documents`; each plugin's first migration imports its own (§56.9).
+  Collections of removed resources (`trucking_*`) stay there untouched.
+- `legacy_documents` is never dropped automatically. Once every plugin has migrated and the data was checked
+  in game, drop it by hand (`DROP TABLE legacy_documents;`, README "Database").
+- `scripts/pg-import.js`, `server/db_pg.lua`, `server/db_pg.js`, `server/pg/`, `server/db_mysql.lua`,
+  `tests/pg_smoke.js` and `core/ui`'s `build:server` script (and its `pg` devDependency, which moves to
+  `core_db/build`) are deleted.
+
+### 56.8 Porting rules for core modules (binding for every module run)
+
+1. **No whole-table loads for unbounded tables** (`accounts`, `characters`, `vehicles`, `bans`, `audit_log`,
+   `map_journal`, `map_versions.elements`, plugin logs). Query by key or index. Whole loads are allowed for
+   small or world-state tables whose rows are needed in memory anyway: `perm_groups`, `settings`, `globals`,
+   `world_state`, `doors`, `factions` + `faction_members`, `maps` + `map_elements`, `scene_nodes` (use
+   `Core.DB.stream` for the last two).
+2. **Yields.** Every awaited call yields. Before converting a call site, check its context: a stop handler,
+   a `pcall`-less metamethod, a sort comparator, a scene hook that runs inside the flush, or any function
+   documented as "never yields" must not await — keep the needed data in memory, use a queued write, or
+   hand the work to `CreateThread`. A read-modify-write that used to be atomic (get → change → set with no
+   yield) must stay atomic: either do it in memory and queue the write, or do it in ONE SQL statement
+   (`UPDATE … SET bank = bank + $2 WHERE id = $1 AND bank + $2 >= 0 RETURNING bank`), or in a `transaction`.
+3. **Writes.** Hot state → `save`/`patch` (coalesced, bulk). Logs → `append`. A write whose caller must
+   know it happened or needs the generated id → awaited `insert`/`upsert`/`transaction`. Multi-row changes
+   that must commit together → queue them in one slice (§56.3.3) or use `transaction`.
+4. **Failure semantics.** A failed read is `nil, err` (never "empty"): keep the old "degraded" behaviour where
+   one exists (refuse writes, fail closed on bans per `bans.failClosed`, retry the load later) but drive it
+   from `err` and from `Core.on('dbStatus')` instead of `isDegraded`. Never create a row because a read
+   FAILED (the old `loadSession` could create a duplicate account on a degraded read).
+5. **Session loads** read with `{ sync = true }` (a player who drops and reconnects inside one flush interval
+   must see his own last save). The account row is fetched by `license` (`accounts_license_key`), the
+   character by `account_id`, money and faction in the same round trip (sub-selects), identifiers upserted
+   with `save`.
+6. **Autosave** builds, per chunk, ONE `patch` per dirty character (only the dirty columns; track dirty
+   top-level keys in the session), `save` per dirty money account, one `patch` per account (`last_seen`,
+   `playtime`, `name`), in that table order so the queue emits bulk statements. A save with nothing dirty
+   writes nothing. `Player.save` never yields (queued).
+7. **Times.** Lua keeps Unix seconds; columns are `timestamptz` and the queue/helpers convert. Where old code
+   needed milliseconds (`audit.ts`, map `rev`) keep an explicit bigint or select `extract(epoch …)*1000`.
+8. **Ids.** Existing text ids and their formats stay (32-hex uuids, `'B<n>'`, `'m<n>'`, `sms:<charId>:<n>`):
+   other data embeds them. New append-only tables use identity ids.
+9. **In-memory caches that stand in for queries** (getters' identifier index, bans' active index, audit's
+   entries index, maps' version/journal payload scans) are removed or reduced to what a tick needs; the
+   indexes of §56.6 answer those questions now. Caches of small hot tables (perm groups, settings, factions,
+   doors, globals, maps, scene nodes) stay and are written through with queued writes.
+10. **Tests** run against the real test database through the bridge (§56.10). Raw-KVP assertions
+    (`stubs.kvp['doc:…']`) become SQL assertions (`Core.DB.first('settings', { key = 'plug.maxWeight' })` or
+    the bridge's `sql` helper). A suite that simulated a "degraded collection" now simulates the failure at
+    the bridge (`bridge.fail(pattern)`, §56.10.2) or by stopping core_db (`GetResourceState`).
+
+### 56.9 Plugin guide (what a plugin does to persist data)
+
+```
+my_plugin/sql/0001_init.sql        -- CREATE TABLE my_plugin_things (...); indexes; FKs; triggers
+my_plugin/server/db.lua            -- first server file:
+                                   --   Core.DB.migrate({ 'sql/0001_init.sql' })
+my_plugin/server/main.lua          -- Core.onReady(function()
+                                   --     local rows = Core.DB.select('my_plugin_things', { character_id = charId })
+                                   --     Core.DB.save('my_plugin_things', { id = id, character_id = charId, data = t })
+                                   -- end)
+```
+
+- Nothing in the manifest: server files are read by path. Keep `sql/` out of `files {}` (clients never need it).
+- Hot state: keep it in memory, write it with `save`/`patch` (they coalesce); read with helpers or SQL.
+- Per-character data: `character_id text NOT NULL REFERENCES characters (id) ON DELETE CASCADE DEFERRABLE
+  INITIALLY DEFERRED` — deleting a character cleans the plugin's rows.
+- `templates/plugin` ships `sql/0001_init.sql` (an example table) and the `Core.DB.migrate` line; `core_example`
+  persists one small thing the same way.
+
+### 56.10 Tests
+
+#### 56.10.1 The test database
+
+`CORE_TEST_PG_URL` (default `postgres://core_test:core_test@127.0.0.1:5432/core_test`) names a THROWAWAY
+database. `scripts/test-db.sh up` creates the role and the database idempotently in the `core-postgres`
+container (`docker exec … psql -U core …`); CI runs a `postgres:16` service with those credentials. Test-only
+credentials, not secrets. Suites that need it fail with `the test database is unreachable — run
+scripts/test-db.sh up` (never skip silently).
+
+#### 56.10.2 The bridge (`core_db/tests/bridge.mjs` + `core/tests/pgbridge.lua`)
+
+- Node side: `createCoreDb(fakeFivem, { testMode: true, flushMs: 0 })` — the REAL core_db code with a fake adapter
+  (invoker = the request's invoker, `loadResourceFile(res, p)` reads `resources/<res>/<p>` from disk, `emit`
+  forwards events to Lua, `defer` = direct call). Line protocol over two FIFOs (Lua writes requests, Node writes
+  answers); one JSON object per line:
+  - Lua → Node `{ "id": n, "invoker": "core", "fn": "query", "args": [...] }` where a Lua function argument is
+    `{ "$cb": k }`.
+  - Node → Lua `{ "cb": k, "args": [...] }` for each callback as it fires, `{ "event": name, "args": [...] }`
+    for emitted events, then `{ "done": n, "ret": value }` once the call returned AND every callback it received
+    fired. Lua reads until `done`, so **every call is synchronous from Lua's point of view** and suites keep
+    calling DB-backed code from their main chunk.
+  - In test mode `enqueue` flushes before `done` (write-through), so a suite sees its queued writes at once;
+    queue timing is covered by `core_db/tests/queue.test.mjs` instead.
+- Lua side (`tests/pgbridge.lua`): `bridge.start()` (mkfifo in the scratch dir `tests/.bridge-<pid>/`, spawns
+  `node ../core_db/tests/bridge.mjs`, opens the FIFOs; Node exits on EOF when Lua exits), `bridge.install(env,
+  resourceName)` (puts `exports.core_db` into a VM's env and makes `GetResourceState('core_db')` answer
+  `'started'`), `bridge.reset()` (TRUNCATE every table except `core_migrations`, RESTART IDENTITY, reset the
+  queue, the catalog cache and every barrier — migrations stay applied), `bridge.recreate()` (DROP and
+  re-create the run's schema; for the legacy-import suite), `bridge.sql(sql, params)` (direct query as the
+  invoker `tests`), `bridge.fail(pattern, err)` / `bridge.unfail()` (the next statements matching a Lua pattern
+  answer `err` — simulates a broken database), `bridge.stop()`.
+- **Isolation:** every bridge process works in its own schema (`CORE_TEST_PG_SCHEMA`, default `t_<pid>`,
+  `search_path = <schema>, public` so extension objects in `public` resolve), created at start and dropped at
+  exit (stale `t_<pid>` schemas of dead processes are swept at start). Suites of different runs can therefore
+  use the one test database at the same time. Migration SQL must never qualify tables with `public.`.
+- `tests/stubs.lua` wires it: `stubs.newEnv` installs the bridge for server VMs; `stubs.resetServer()` calls
+  `bridge.reset()`. The KVP stubs stay (client KVP and `ped_behaviour` use them) but nothing in core's server
+  code reads server KVP any more.
+
+#### 56.10.3 Suites
+
+- `core_db/tests/*.test.mjs` (`node --test`): pool/type parsers, catalog, sqlgen (identifier refusal, WHERE ops,
+  conversions), helpers, tx (deadline, abort), migrations (order, checksum warning, barrier, failure, advisory
+  lock), queue (coalescing matrix of §56.3.2, run grouping, bulk ≤ 1000 chunking, deferred FKs across tables,
+  poison → safe mode drops exactly the bad entry, connection loss → requeue + backoff, sync/dropped counts,
+  owner barrier holding).
+- `core/tests/db_tests.lua` (new): the Lua lib over the bridge — marshalling (NULL, holes, ops), every awaited
+  call, queued calls, `transaction`/`stream`, `migrate` from a fixture resource, removed-name errors,
+  not-in-coroutine behaviour.
+- `core/tests/db_legacy_tests.lua` (new): `bridge.recreate()`, a `core_documents` table filled with one document
+  of every legacy shape (including v1 bans, identifiers as map and array, `removed` as `[]` and as a map,
+  `ownerCharId = false`, `parked = false`), run core's migrations, assert every row and the rename.
+- Every existing server suite is ported onto the bridge with the same coverage; counts are re-baselined in
+  AGENTS §5.
+
+### 56.11 Operations
+
+- `/dbstatus` (console, core): health, pool, queue counters, applied migrations per owner.
+- Backups: `pg_dump -Fc` of the database (the dev server: `docker exec core-postgres pg_dump -U core -Fc core
+  > backup.dump`). Restore with `pg_restore`. `/dbexport`/`/dbimport` are gone.
+- Deploy order: `core_db` next to `core` in `[local]` (symlink); `ensure core` starts it (dependency).
+  server.cfg keeps `exec core_pg.cfg` (the `core_pg_url` convar). Restart `core`, never `core_db`, on a live
+  server.
+- `Config.DB` is removed from core's config (the convars of §56.2.6 replace it).
+
+### 56.12 Implementation notes and review-driven changes (2026-09-27 — wins over §56.0–§56.11)
+
+Built by runs A1–A3, W1a–W3b (PLAN.md), reviewed by R1 (core_db + lib), R2a/R2b (sessions, perms, bans, audit,
+settings), R3a/R3b (factions, doors, world, maps, scene, vehicles), R4 (plugins); every confirmed finding was fixed
+with a regression test. Each module's own "§56 port notes" paragraph (end of §4.5, §4.6, §16, §17, §22, §44–§48,
+§52.2, §55.18, §55.21.4) describes its port. Contract-level changes:
+
+- **core_db exports:** `query`/`txQuery` accept `{ scalar = true }` → `cb(err, value, rowCount)` with the first column
+  BY FIELD ORDER (`Core.DB.scalar` uses it); `nextId(name, opts?, cb)`, `txQuery(txId, sql, params, opts?, cb)`;
+  `crud` args are named (`{ values|row, rows, where, set, conflict, opts }`) or positional. New error word `tx_limit`
+  (more than `core_db_tx_per_owner` open transactions/streams per resource). A statement timeout answers `57014 …`;
+  `timeout` is reserved for waits (pool, sync, barrier, deadline).
+- **Deadlines:** every awaited call sends `timeoutMs`; core_db treats it as an absolute deadline from receipt, never
+  STARTS work after it (checked after the barrier wait, the read-your-writes wait and connect) and runs each
+  statement with `statement_timeout = min(core_db_statement_timeout_ms, remaining − 250 ms)`. So a Lua `timeout`
+  means "not applied" except for a connection lost around COMMIT. `timeoutMs` cannot raise a statement above the
+  configured statement timeout.
+- **Read-your-writes is row-precise where it can be:** a `crud` select/first/count whose `where` pins EVERY
+  primary-key column with plain equality and `sync = true` waits only for that row's pending/in-flight
+  save/patch/remove entries (no flush when there are none). Every other sync read waits for everything queued
+  before it, except entries held behind ANOTHER owner's pending migration barrier. `stream` accepts `sync`.
+- **Error classes (§56.2.5, §56.3.5):** connection-class = driver/network signals (`Connection terminated`, `not
+  queryable`, query read timeouts, the flush watchdog) plus SQLSTATE 08000/08001/08003/08004/08006, 57P01–03, 53300
+  — NOT 08P01 (a bind/parameter-count error is a statement error). Retryable (requeued with backoff, health unchanged):
+  57014, 40P01, 40001, 55P03, 53100, 53200, 25006; an entry still failing alone with one of them on its 3rd
+  safe-mode attempt is dropped. An entry that was part of 5 consecutive failed batches goes straight to safe mode
+  (connect failures do not count). Pool saturation retries every 250 ms without doubling; a waiting `sync` cancels a
+  backoff once the database answers again.
+- **Queue internals:** a bulk statement never carries one row identity twice (a run ends where a key would repeat —
+  after a keyed-sql splice or a requeue two patches of one row could otherwise share one `UPDATE … FROM`, where
+  Postgres applies an arbitrary one). Safe mode runs the batch in ORIGINAL order in runs, each in its own savepoint,
+  and bisects a failing run (≈ log₂ n round trips). Every entry remembers the migration barrier current when it was
+  queued: it is held while THAT barrier is pending and dropped only if THAT barrier fails. Enqueue warns once when a
+  raw statement's highest `$n` differs from its parameter count. `core:hook:dbWriteFailed` carries a 5th argument
+  `key` (the row's primary key value, or a map for a composite key; nil for `sql`/`append`); drop accounting counts
+  every merged contribution per owner. Quoted values in Postgres messages are redacted in logs, events and status
+  (the caller's own answer keeps them).
+- **Resilience:** TCP keepalive; a client-side `query_timeout` of statement timeout + 5 s (hitting it = connection
+  loss, the client is destroyed); a flush watchdog requeues a stuck batch; the flush and migrations use a dedicated
+  2-connection system pool (`status.pool.system`); `RESET ALL` before a client is reused after a migration or a
+  session `SET`; checked-out clients carry an error listener; `onResourceStop` for a resource that is still
+  started/starting is ignored (a plugin cannot fake core_db's stop).
+- **Migrations:** the advisory lock is per schema (`hashtext('core_db:migrate:' || current_schema())`); migrations
+  run with `lock_timeout = core_db_migration_lock_timeout_ms`; a connection-class, pool-saturation or lock error keeps
+  the barrier PENDING and retries the job (1 s doubling to 30 s); only a statement error fails it. A plugin's
+  legacy import RAISEs while `core_documents` still exists (§56.4.3).
+- **New convars:** `core_db_lock_timeout_ms` (flush lock_timeout, default min(statement timeout / 2, 5000)),
+  `core_db_migration_lock_timeout_ms` (default 30000), `core_db_tx_per_owner` (default 4). `core_db_flush_ms` has a
+  50 ms minimum outside test mode.
+- **Lib:** `REMOVED_MODE = 'error'` since every module was ported (2026-09-27): a removed document-API name raises
+  the §56.5.6 message. Deadline timers are cleared when the answer arrives.
+- **Core sessions (§56.6 table, server/player_store.lua):** `server/player_store.lua` (row ↔ session mapping,
+  loads, creates, queued writes, the connect-time ban gate) hands over to `server/player.lua` through the one-shot
+  `CorePlayerStore`. Plugin keys go to `characters.data`/`accounts.data` as a `patch` of the whole map (an empty map
+  adds one keyed normalising statement). Every changed value is queued at once (money within one flush);
+  autosave writes only position/playtime/last_seen and what is still dirty. A reconnect re-reads when the old
+  session was released during its load; a takeover fires `playerDropped` for the ghost; `restart core` emits
+  `ready` first, flushes once, then restores sessions with non-sync reads on 12 worker threads; a txAdmin
+  shutdown runs `Player.saveAll()`. Export-blocked (internal): the whole `DB` namespace behind `exports.core:call`,
+  `Player.getAccountData`, `Player.saveAll`, `Settings.isLoaded`.
+- **Tests:** every server suite runs on the bridge in its own schema; `stubs.lua` makes an argument-less
+  `math.randomseed()` a no-op (all VMs of a suite share one Lua state, so reseeding repeated `Utils.uuid()`).
+- **Open (not blocking):** regression tests for four of R3b's vehicle items (the hook resync, the shared spawn
+  guard, the sync boot read, deleteRecord's live-car cleanup — the code is in, the suites are green);
+  `server/factions.lua` is 1259 lines (split the load/resync/lifecycle block into `factions_sync.lua`); the
+  client-authoritative vehicle cosmetics of `core:server:vehicleProps` (pre-existing §4.6 design, R3b #5) and the
+  door GlobalState fan-out (§16, R3a #9) are left for a later design decision.

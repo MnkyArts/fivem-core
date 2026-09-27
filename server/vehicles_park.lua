@@ -30,6 +30,14 @@
     Removed by anyone else → the record is out again. Every props write re-imposes props.plate = the record's plate.
     The lock key on a parked car's local copy: core:server:parkedLock(nodeId) (client/vehicles.lua) toggles the
     record's `locked` and the node field after the same checks as core:server:vehicleLock (keys, distance).
+    Since the §56 port this file also holds the record reads of server/vehicles.lua (getRecord / getRecords /
+    deleteRecord) and its spawnRecord / restoreRecord; the vehId setters (setLocked / giveKeys / removeKeys /
+    setOwner by vehId) and the §5 net events are server/vehicles_fleet.lua's (the files' size).
+    Database (§56): the hooks, the lock key, delete and the stop paths read only P.recs (the mirror of the world
+    records, server/vehicles.lua) and QUEUE their writes (P.write: only the changed columns, never `meta`); a
+    public call on a record the mirror lacks reads it (awaited). A hook that misses the mirror before the boot check
+    read the world records (P.recovered) reads the record in a thread and runs again. Every LRU touch (a park, a
+    promotion, a demotion, the lock key) stamps last_used_at (queued).
 
     Natives (fxref + natives_cfx.json 2026-09-27, server / CFX forms; BOOL answers read by truthiness):
       GetEntityCoords(entity), GetEntityRotation(entity), GetEntityRoutingBucket(entity),
@@ -44,13 +52,14 @@ local P = CoreVehiclesPark
 assert(type(P) == 'table' and P.spawned and P.track and P.writeState and P.cleanProps,
     'server/vehicles_park.lua loads right after server/vehicles.lua (CoreVehiclesPark)')
 
-local Vehicles, Validate, Utils, Log = Core.Vehicles, Core.Validate, Core.Utils, Core.Log
-local spawned, byVehId, clones = P.spawned, P.byVehId, P.clones
+local Vehicles, Validate, Utils, Log, DB = Core.Vehicles, Core.Validate, Core.Utils, Core.Log, Core.DB
+local spawned, byVehId, clones, recs, spawning = P.spawned, P.byVehId, P.clones, P.recs, P.spawning
 local entityOf, forget, track, writeState, publicInfo = P.entityOf, P.forget, P.track, P.writeState, P.publicInfo
 local validateProps, cleanProps, positionOf = P.validateProps, P.cleanProps, P.positionOf
+local write, readRecord, fromRead, mirrorOf, markWrite = P.write, P.readRecord, P.fromRead, P.mirrorOf, P.markWrite
 local toint, mtype = math.tointeger, math.type
 
-local COLLECTION <const> = 'vehicles'
+local TABLE <const> = 'vehicles'
 local SEAT_FIRST <const>, SEAT_LAST <const> = -1, 15
 local PROPS_TIMEOUT_MS <const> = 1000             -- the owner client's props before a car is parked (stop-gap path)
 local UNPARK_EXTRA_MS <const> = 6000              -- spawnRecord of a parked car: the promotion queue + its 5 s wait
@@ -78,12 +87,7 @@ local function same(a, b)
 end
 
 --- keys { [charId] = true } -> the record's sorted array; the record's array (+ the virtual owner key) -> the set.
-local function keyList(keys)
-    local out = {}
-    for charId in pairs(keys or EMPTY) do out[#out + 1] = charId end
-    table.sort(out)
-    return out
-end
+local keyList = P.keyList
 
 local function keySet(list, owner, keyMode)
     local keys = {}
@@ -184,8 +188,13 @@ local function spawnNode(fields, pos, rot, bucket)
         fields = fields, authority = PARKED_AUTHORITY })
 end
 
--- MaxParked bookkeeping (server/vehicles_fleet.lua fills P.touch / P.untouch / P.grew; looked up at call time)
-local function touch(vehId, nodeId) local f = P.touch if f then f(vehId, nodeId) end end
+-- MaxParked bookkeeping (server/vehicles_fleet.lua fills P.touch / P.untouch / P.grew; looked up at call time). A use
+-- (park, promotion, demotion, lock key) also stamps last_used_at, the order the boot check rebuilds (queued).
+local function touch(vehId, nodeId)
+    local f = P.touch
+    if f then f(vehId, nodeId) end
+    write(vehId, { lastUsedAt = os.time() })
+end
 local function untouch(vehId) local f = P.untouch if f then f(vehId) end end
 local function grew() local f = P.grew if f then f() end end
 
@@ -193,20 +202,37 @@ local function grew() local f = P.grew if f then f() end end
 -- The scene hooks: a parked car's clone is a core vehicle while it lives
 --------------------------------------------------------------------------------
 
---- The record a core-owned vehicle node parks -> record | nil, ours (false: a maps / plugin vehicle node).
+--- The mirrored record a core-owned vehicle node parks -> record | nil, ours (false: a maps / plugin vehicle node).
+--- Never awaits: the hooks run inside promotions, demotions, removals and core's stop.
 local function parkedRecordOf(node)
     local f = type(node) == 'table' and node.fields
     if type(f) ~= 'table' or type(f.vehId) ~= 'string' or node.owner ~= 'core' then return nil, false end
-    local record = Core.DB.get(COLLECTION, f.vehId)
+    local record = recs[f.vehId]
     if record and parkedOf(record) == node.id and record.stored == false then return record, true end
     return nil, true
 end
 
+--- A hook whose record the mirror lacks before the boot check read the world records (P.recovered): the record is
+--- read in a thread — never inside the hook — and the hook runs once more. -> true when deferred
+local function deferred(fn, node, arg, again)
+    if again or P.recovered or stopping() then return false end
+    local vehId = node.fields.vehId
+    CreateThread(function()
+        local _, err = readRecord(vehId)
+        if err ~= nil then
+            return Log.warn('vehicles: record %s of parked node %s could not be read (%s)', vehId, tostring(node.id),
+                tostring(err))
+        end
+        fn(node, arg, true)
+    end)
+    return true
+end
+
 --- promoted (node, netId): the clone of a parked car is adopted — the §8 bags, tracking, vehicleSpawned. A live
 --- car parkLive hands over (R.promote.adopt) keeps its tracking entry: it only becomes the node's clone.
-local function onPromoted(node, netId)
+local function onPromoted(node, netId, again)
     local record, ours = parkedRecordOf(node)
-    if not ours then return end
+    if not ours or (not record and deferred(onPromoted, node, netId, again)) then return end
     local h = handoff[node.id]
     if h and h.netId == netId and record and spawned[netId] == h.info then
         local info = h.info
@@ -235,7 +261,7 @@ local function onPromoted(node, netId)
         netId = netId, entity = entity, model = record.model, modelName = record.modelName, plate = record.plate,
         ownerCharId = owner, keys = keySet(record.keys, owner, keyMode), keyMode = keyMode, locked = f.locked == true,
         vehId = record.id, spawnedBy = 'core', createdAt = os.time(), vehType = meta.vehType,
-        props = type(f.props) == 'table' and f.props or record.props, parked = node.id, promoProps = f.props,
+        props = type(f.props) == 'table' and f.props or {}, parked = node.id, promoProps = f.props,
     }
     track(info)
     writeState(entity, info)
@@ -246,7 +272,7 @@ end
 --- A wrecked clone (D-C): the car never comes back intact at its spot — the record keeps its last saved state and
 --- is marked destroyed (not parked), the node goes. spawnRecord (a garage / an insurance plugin) brings it back.
 local function wrecked(node, record)
-    Core.DB.update(COLLECTION, record.id, { parked = false, destroyed = true })
+    write(record.id, { parked = false, destroyed = true })
     untouch(record.id)
     removeNode(node.id)
     Log.info('vehicles: %s was wrecked (node %s removed; the record is marked destroyed)', record.id,
@@ -255,25 +281,26 @@ end
 
 --- demoted (node, info): the car is a parked node again. The node's props carry the wear the engine merged from
 --- the owner's read-back (info.wear, FX1b); cosmetics a key holder saved while promoted (saveProps) win over the
---- node's. Props (plated), pose (+ bucket), lock and keys go into the record; the node's fields follow lock / props
---- (it is local now: Scene.set demotes nothing); the clone is untracked (vehicleDeleted). info.destroyed: wrecked().
-local function onDemoted(node, how)
+--- node's. Props (plated), pose (+ bucket), lock and keys go into the record (one queued patch — core's stop runs
+--- this too); the node's fields follow lock / props (it is local now: Scene.set demotes nothing); the clone is
+--- untracked (vehicleDeleted). info.destroyed: wrecked().
+local function onDemoted(node, how, again)
     local record, ours = parkedRecordOf(node)
-    if not ours then return end
+    if not ours or (not record and deferred(onDemoted, node, how, again)) then return end
     local netId = clones[node.id]
     local info = netId and spawned[netId]
     if record and type(how) == 'table' and how.destroyed == true then
         wrecked(node, record)
     elseif record then
         local f = node.fields
-        local props = type(f.props) == 'table' and f.props or record.props
+        local props = type(f.props) == 'table' and f.props or {}
         if info and info.propsSaved and type(info.props) == 'table' then
             props = mergeWear(info.props, f.props) or info.props       -- saved cosmetics + the demotion's wear
         end
         props = platedProps(props, record.plate)
         local patch = { stored = false, parked = node.id, position = nodePosition(node), props = props }
         if info then patch.locked, patch.keys = info.locked == true, keyList(info.keys) end
-        Core.DB.update(COLLECTION, record.id, patch)
+        write(record.id, patch)
         local fix
         if info and (f.locked == true) ~= (info.locked == true) then fix = { locked = info.locked == true } end
         if not same(props, f.props) then
@@ -291,16 +318,15 @@ end
 
 --- removed (node, reason) by anyone but this file: the record is out again (not parked) at the node's — or its
 --- clone's — last pose; an adopted clone is untracked.
-local function onRemoved(node, reason)
+local function onRemoved(node, reason, again)
     if removing[node.id] then return end
     local record, ours = parkedRecordOf(node)
-    if not ours then return end
+    if not ours or (not record and deferred(onRemoved, node, reason, again)) then return end
     local netId = clones[node.id]
     local info = netId and spawned[netId]
     if record then
         local e = info and entityOf(netId) or 0
-        Core.DB.update(COLLECTION, record.id, { parked = false,
-            position = e ~= 0 and positionOf(e) or nodePosition(node) })
+        write(record.id, { parked = false, position = e ~= 0 and positionOf(e) or nodePosition(node) })
         untouch(record.id)
         Log.warn('vehicles: the parked node %s of %s was removed (%s); the record is out, not parked',
             tostring(node.id), record.id, tostring(reason))
@@ -337,16 +363,19 @@ end
 -- Parking
 --------------------------------------------------------------------------------
 
---- Parks an out record that has no live vehicle, at its saved position (Vehicles.park(vehId), boot recovery).
+--- Parks an out record that has no live vehicle, at its saved position (Vehicles.park(vehId), boot recovery). The
+--- record carries props and position (a read); the mirror (its lock) wins where it has the record already.
 local function parkRecord(record)
+    if spawning[record.id] then return nil, 'busy' end          -- its car is being made (spawnRecord): never both
     local p = record.position
     if type(p) ~= 'table' or not (finite(p.x) and finite(p.y) and finite(p.z)) then return nil, 'bad_coords' end
-    local id, err = spawnNode(nodeFields(record, record.props, record.locked), { x = p.x, y = p.y, z = p.z },
+    local e = recs[record.id] or mirrorOf(record)
+    local id, err = spawnNode(nodeFields(record, record.props, e.locked), { x = p.x, y = p.y, z = p.z },
         { x = 0.0, y = 0.0, z = finite(p.heading) and p.heading or 0.0 }, toint(p.bucket) or 0)
-    if not id then return nil, err end
-    if not Core.DB.update(COLLECTION, record.id, { parked = id, stored = false }) then
-        removeNode(id)
-        return nil, 'db'
+    if not id or not write(record.id, { parked = id, stored = false }) then
+        if id then removeNode(id) end
+        P.settle(record.id)
+        return nil, id and 'db' or err
     end
     touch(record.id, id)
     return id
@@ -402,30 +431,43 @@ end
 --- damage), a node at the entity's pose (+ bucket), the record; then the live car becomes the node's clone and is
 --- demoted on the normal path (R.promote.adopt + Scene.demote) — or, without that engine path, it retires once the
 --- local copies exist. vehicleDeleted either way.
+--- The mirror entry of a live car's record (it is mirrored while the car lives; else read — AWAITED — and added).
+--- -> entry | nil (no record) | nil, err
+local function mirrored(vehId)
+    local e = recs[vehId]
+    if e then return e end
+    local rec, err = readRecord(vehId)
+    if not rec then return nil, err end
+    return recs[vehId] or mirrorOf(rec)
+end
+
 local function parkLive(info)
     local netId = info.netId
     local e = entityOf(netId)
     if e == 0 then return nil, 'no_entity' end
     if info.parking then return nil, 'busy' end
     if occupied(e) then return nil, 'occupied' end
-    local record = Core.DB.get(COLLECTION, info.vehId)
-    if not record then return nil, 'no_record' end
-    local props = info.props or record.props
     info.parking = true
-    local ok, got = pcall(ownerProps, e, netId, props)
+    local record, rerr = mirrored(info.vehId)
+    local props = info.props or {}                            -- a live car's props are its record's (saveProps)
+    local ok, got = true, nil
+    if record then ok, got = pcall(ownerProps, e, netId, props) end
     info.parking = nil
+    if rerr ~= nil then return nil, 'db' end
     if spawned[netId] ~= info or entityOf(netId) ~= e then return nil, 'gone' end
+    record = recs[info.vehId]
+    if not record then return nil, 'no_record' end
     if occupied(e) then return nil, 'occupied' end
     if ok and got then props = got end
     local adopt = adoptFn()
     local stale = parkedNode(record)                          -- a node of this record the live car outlived
-    record.plate, record.model, record.modelName = info.plate, info.model, info.modelName or record.modelName
-    local fields = nodeFields(record, props, info.locked)
+    local fields = nodeFields({ id = info.vehId, plate = info.plate, model = info.model,
+        modelName = info.modelName or record.modelName, meta = record.meta }, props, info.locked)
     local c, r, bucket = GetEntityCoords(e), GetEntityRotation(e), GetEntityRoutingBucket(e)
     local id, err, detail = spawnNode(fields, { x = c.x, y = c.y, z = c.z }, { x = r.x, y = r.y, z = r.z }, bucket)
     if not id then return nil, err, detail end
-    if not Core.DB.update(COLLECTION, info.vehId, { parked = id, stored = false, props = fields.props,
-        locked = info.locked == true, keys = keyList(info.keys), position = positionOf(e) }) then
+    if not write(info.vehId, { parked = id, stored = false, props = fields.props, locked = info.locked == true,
+        keys = keyList(info.keys), position = positionOf(e) }) then
         removeNode(id)
         return nil, 'db'
     end
@@ -464,16 +506,24 @@ function Vehicles.park(target)
     if type(target) == 'string' then
         if not Validate.value('id', target) then return nil, 'bad_target' end
         info = byVehId[target] and spawned[byVehId[target]]
+        local node = not info and recs[target] and parkedNode(recs[target])
+        if node then return node.id end
+        if not info and spawning[target] then return nil, 'busy' end
         if not info then
-            local record = Core.DB.get(COLLECTION, target)
+            local record, err = readRecord(target)            -- (awaited: position and props for parkRecord)
+            if err ~= nil then return nil, 'db' end
             if not record then return nil, 'no_record' end
-            local node = parkedNode(record)
-            if node then return node.id end
-            if record.stored ~= false then return nil, 'record_stored' end
-            if record.destroyed == true then return nil, 'destroyed' end
-            local id, err = parkRecord(record)
-            if id then grew() end
-            return id, err
+            info = byVehId[target] and spawned[byVehId[target]]   -- it went live during the read
+            if not info and spawning[target] then return nil, 'busy' end
+            if not info then
+                node = parkedNode(record)
+                if node then return node.id end
+                if record.stored ~= false then return nil, 'record_stored' end
+                if record.destroyed == true then return nil, 'destroyed' end
+                local id, perr = parkRecord(record)
+                if id then grew() end
+                return id, perr
+            end
         end
     elseif Validate.value('netId', target) then
         info = spawned[target]
@@ -515,49 +565,116 @@ local function unpark(record)
 end
 
 --------------------------------------------------------------------------------
--- The parked branches of the record API (wrapped: everything else is server/vehicles.lua's)
+-- The record reads (§56: moved here from server/vehicles.lua) and the parked branches of the record API
 --------------------------------------------------------------------------------
 
-local base = { spawnRecord = Vehicles.spawnRecord, restoreRecord = Vehicles.restoreRecord, store = Vehicles.store,
-    delete = Vehicles.delete, deleteRecord = Vehicles.deleteRecord, setLocked = Vehicles.setLocked,
-    giveKeys = Vehicles.giveKeys, removeKeys = Vehicles.removeKeys, setOwner = Vehicles.setOwner }
+--- The records of a character (one indexed read, read-your-writes; AWAITED) -> array ({} and err when the read
+--- failed — never mistake that for "no cars").
+function Vehicles.getRecords(charId)
+    if not Validate.value('id', charId) then return {} end
+    local start = P.writeSeq()
+    local rows, err = DB.select(TABLE, { owner_character_id = charId }, { orderBy = 'created_at, id', sync = true })
+    if not rows then
+        Log.error('vehicles: the records of %s could not be read (%s)', charId, tostring(err))
+        return {}, err
+    end
+    local out = {}
+    for i = 1, #rows do out[i] = fromRead(rows[i], start) end
+    return out
+end
+
+--- The record (AWAITED) -> record | nil | nil, err (the read failed).
+function Vehicles.getRecord(vehId)
+    if not Validate.value('id', vehId) then return nil end
+    local record, err = readRecord(vehId)
+    if err ~= nil then Log.error('vehicles: record %s could not be read (%s)', vehId, tostring(err)) end
+    return record, err
+end
+
+--- A record for spawnRecord / restoreRecord (AWAITED) -> record | nil, 'no_record' | nil, 'db' (the read failed).
+local function recordFor(vehId)
+    local record, err = Vehicles.getRecord(vehId)
+    if err ~= nil then return nil, 'db' end
+    if not record then return nil, 'no_record' end
+    return record
+end
+
+--- restoreRecord on a record in hand (the saved position and bucket unless coords are given).
+local function restoreFrom(record, coords, heading, ownerSrc)
+    if record.stored ~= false then return nil, 'record_stored' end
+    if record.destroyed == true then return nil, 'destroyed' end
+    local bucket
+    if coords == nil and type(record.position) == 'table' then
+        local p = record.position
+        if type(p.x) == 'number' and type(p.y) == 'number' and type(p.z) == 'number' then
+            coords = vector3(p.x, p.y, p.z)
+            heading = heading == nil and p.heading or heading
+            bucket = math.tointeger(p.bucket)
+            if bucket and (bucket < 1 or bucket > 65535) then bucket = nil end
+        end
+    end
+    if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
+    return P.spawnFromRecord(record, coords, heading, ownerSrc, bucket)
+end
+
+-- core_db dropped a queued write of a record (§56.3.5, `key` = the vehId): the row keeps what it had, so the mirror
+-- reads it again (the database wins) — in a thread after the current slice, never inside the hook.
+Core.on('dbWriteFailed', function(owner, _, tbl, _, key)
+    if owner ~= Core.name or tbl ~= TABLE or type(key) ~= 'string' then return end
+    Log.warn('vehicles: a queued write of record %s was dropped; the record is read again', key)
+    CreateThread(function()
+        Wait(0)
+        readRecord(key, true)
+    end)
+end)
+
+local base = { store = Vehicles.store, delete = Vehicles.delete }
 
 --- A parked record is promoted where it stands (coords / heading / ownerSrc unused): the clone's netId, valid
---- while it stays promoted (vehicleSpawned / vehicleDeleted tell).
+--- while it stays promoted (vehicleSpawned / vehicleDeleted tell). One read (AWAITED); 'db' when it failed.
 function Vehicles.spawnRecord(vehId, coords, heading, ownerSrc)
-    local record = Vehicles.getRecord(vehId)
-    if record and parkedOf(record) and record.stored == false and Validate.value('vector3', coords)
-        and hookScene() then
+    local record, err = recordFor(vehId)
+    if not record then return nil, err end
+    if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
+    if parkedOf(record) and record.stored == false and hookScene() then
         local live = byVehId[record.id]
         if live and spawned[live] and spawned[live].parked then return live end
         if live then return nil, 'already_spawned' end
         return unpark(record)
     end
-    return base.spawnRecord(vehId, coords, heading, ownerSrc)
+    return P.spawnFromRecord(record, coords, heading, ownerSrc)
 end
 
 --- A parked record is in the world already (a scene node): 'parked' — a boot restore must not duplicate it.
 function Vehicles.restoreRecord(vehId, coords, heading, ownerSrc)
-    local record = Vehicles.getRecord(vehId)
-    if record and record.stored == false and parkedOf(record) then return nil, 'parked' end
-    return base.restoreRecord(vehId, coords, heading, ownerSrc)
+    local record, err = recordFor(vehId)
+    if not record then return nil, err end
+    if record.stored == false and parkedOf(record) then return nil, 'parked' end
+    return restoreFrom(record, coords, heading, ownerSrc)
 end
 
---- store(netId | vehId): a vehId garages its live vehicle, its parked node, or a record with nothing in the world;
---- a parked car's clone takes its node along.
+--- store(netId | vehId): a vehId garages its live vehicle, its parked node, or a record with nothing in the world
+--- (a mirrored — parked — record without a yield: MaxParked's eviction uses it); a parked car's clone takes its node
+--- along.
 function Vehicles.store(target)
     if type(target) == 'string' then
         if not Validate.value('id', target) then return false end
         if byVehId[target] then return Vehicles.store(byVehId[target]) end
-        local record = Core.DB.get(COLLECTION, target)
-        if not record then return false end
+        local record = recs[target]
+        if not record then
+            local rec, err = readRecord(target)
+            if not rec or err ~= nil then return false end
+            if byVehId[target] then return Vehicles.store(byVehId[target]) end   -- it went live during the read
+            record = recs[target] or rec
+        end
         local node = parkedNode(record)
         local patch = { stored = true, parked = false }
         if node then
-            patch.position, patch.props = nodePosition(node), platedProps(node.fields.props or record.props,
-                record.plate)
+            patch.position = nodePosition(node)
+            local props = node.fields.props or record.props
+            if props then patch.props = platedProps(props, record.plate) end
         end
-        if not Core.DB.update(COLLECTION, target, patch) then return false end
+        if not write(target, patch) then return false end
         untouch(target)
         if node then removeNode(node.id) end
         return true
@@ -567,7 +684,7 @@ function Vehicles.store(target)
         local id = info.parked
         clones[id], info.parked = nil, nil
         removeNode(id)
-        Core.DB.update(COLLECTION, info.vehId, { parked = false })
+        write(info.vehId, { parked = false })
         untouch(info.vehId)
     end
     return base.store(target)
@@ -575,14 +692,14 @@ end
 
 --- A parked car's clone takes its node along (else the car would come back at its parking spot); the record is
 --- out again at the clone's pose (spawnRecord takes it back, the boot check re-parks it). Not while core stops
---- (the node keeps the car).
+--- (the node keeps the car). Never yields (server/main.lua's stop loop calls it).
 function Vehicles.delete(netId)
     local info = mtype(netId) == 'integer' and spawned[netId] or nil
     if info and info.parked and not stopping() then
         local id, e = info.parked, entityOf(netId)
-        local record = Core.DB.get(COLLECTION, info.vehId)
+        local record = recs[info.vehId]
         if record and parkedOf(record) == id then
-            Core.DB.update(COLLECTION, info.vehId, { parked = false, position = e ~= 0 and positionOf(e) or nil })
+            write(info.vehId, { parked = false, position = e ~= 0 and positionOf(e) or nil })
         end
         clones[id], info.parked = nil, nil
         removeNode(id)
@@ -591,21 +708,40 @@ function Vehicles.delete(netId)
     return base.delete(netId)
 end
 
+--- Deletes the record (one awaited DELETE — the caller learns whether it existed); its parked node goes, a promoted
+--- one's clone is untracked. -> bool
 function Vehicles.deleteRecord(vehId)
-    local record = Validate.value('id', vehId) and Core.DB.get(COLLECTION, vehId) or nil
+    if not Validate.value('id', vehId) then return false end
+    if not recs[vehId] then readRecord(vehId) end             -- a parked record joins the mirror (its node)
+    local count, err = DB.delete(TABLE, { id = vehId })
+    if not count then
+        Log.error('vehicles: record %s could not be deleted (%s)', vehId, tostring(err))
+        return false
+    end
+    markWrite(vehId)
+    local record = recs[vehId]                                -- (after the await: the node it parks now)
     local node = record and parkedNode(record)
-    local ok = base.deleteRecord(vehId)
-    if ok then untouch(vehId) end
-    if ok and node then
+    local liveNet = byVehId[vehId]
+    local live = liveNet and spawned[liveNet]
+    if live and not live.parked then                          -- its live car is a plain, unpersisted car now: no park
+        byVehId[vehId], live.vehId = nil, nil                 -- of a deleted record (AutoPark, core stop)
+        local e = entityOf(liveNet)
+        if e ~= 0 then Entity(e).state:set('vehId', nil, true) end
+    end
+    recs[vehId] = nil
+    if count < 1 then return false end
+    untouch(vehId)
+    if node then
         local netId = clones[node.id]
         removeNode(node.id)
         if netId and forget(netId) then Core.emitHook('vehicleDeleted', netId) end
     end
-    return ok
+    return true
 end
 
 --- Vehicles.getInfoByRecord(vehId) -> getInfo's fields (netId only while a vehicle is live — a promoted parked
 --- car's clone included) + parked (node id), stored, position { x, y, z, heading, bucket? }, destroyed | nil.
+--- A record without a live car is read (AWAITED); nil, err when that failed.
 function Vehicles.getInfoByRecord(vehId)
     if not Validate.value('id', vehId) then return nil end
     local netId = byVehId[vehId]
@@ -615,8 +751,8 @@ function Vehicles.getInfoByRecord(vehId)
         out.stored, out.position, out.destroyed = false, entity ~= 0 and positionOf(entity) or nil, false
         return out
     end
-    local record = Core.DB.get(COLLECTION, vehId)
-    if not record then return nil end
+    local record, err = readRecord(vehId)
+    if not record then return nil, err end
     local meta = type(record.meta) == 'table' and record.meta or EMPTY
     local owner, keyMode = record.ownerCharId or nil, meta.keyMode == 'item' and 'item' or 'virtual'
     local node = parkedNode(record)
@@ -627,72 +763,6 @@ function Vehicles.getInfoByRecord(vehId)
         keyMode = keyMode, locked = locked, vehId = vehId, createdAt = record.createdAt, parked = node and node.id,
         stored = record.stored == true, position = node and nodePosition(node) or record.position,
         destroyed = record.destroyed == true }
-end
-
---------------------------------------------------------------------------------
--- Lock and keys by vehId (review RV4 F13): the live car's netId path, else the record (+ a parked node's lock)
---------------------------------------------------------------------------------
-
---- target -> netId of its live car | nil, record (a vehId without a live car) | nil, nil (no such record).
-local function liveOrRecord(vehId)
-    if not Validate.value('id', vehId) then return nil, nil end
-    local netId = byVehId[vehId]
-    if netId and spawned[netId] then return netId end
-    return nil, Core.DB.get(COLLECTION, vehId)
-end
-
---- The record's explicit key set (without the owner's implicit virtual key) and the record's key mode.
-local function recordKeySet(record)
-    local meta = type(record.meta) == 'table' and record.meta or EMPTY
-    return keySet(record.keys, nil, nil), meta.keyMode == 'item' and 'item' or 'virtual'
-end
-
-function Vehicles.setLocked(target, locked)
-    if type(target) ~= 'string' then return base.setLocked(target, locked) end
-    if type(locked) ~= 'boolean' then return false end
-    local netId, record = liveOrRecord(target)
-    if netId then return base.setLocked(netId, locked) end
-    if not record or not Core.DB.update(COLLECTION, target, { locked = locked }) then return false end
-    local node = parkedNode(record)
-    if node and (node.fields.locked == true) ~= locked then sc('set', node.id, { locked = locked }) end
-    return true
-end
-
-function Vehicles.giveKeys(target, charId)
-    if type(target) ~= 'string' then return base.giveKeys(target, charId) end
-    if not Validate.value('id', charId) then return false end
-    local netId, record = liveOrRecord(target)
-    if netId then return base.giveKeys(netId, charId) end
-    if not record then return false end
-    local keys = recordKeySet(record)
-    keys[charId] = true
-    return Core.DB.update(COLLECTION, target, { keys = keyList(keys) }) == true
-end
-
-function Vehicles.removeKeys(target, charId)
-    if type(target) ~= 'string' then return base.removeKeys(target, charId) end
-    if not Validate.value('id', charId) then return false end
-    local netId, record = liveOrRecord(target)
-    if netId then return base.removeKeys(netId, charId) end
-    if not record then return false end
-    local keys = recordKeySet(record)
-    keys[charId] = nil
-    return Core.DB.update(COLLECTION, target, { keys = keyList(keys) }) == true
-end
-
---- The virtual keys follow ownership (as setOwner(netId) does): the previous owner's key goes, the new owner's
---- comes (a virtual-key car).
-function Vehicles.setOwner(target, charId)
-    if type(target) ~= 'string' then return base.setOwner(target, charId) end
-    if charId ~= nil and not Validate.value('id', charId) then return false end
-    local netId, record = liveOrRecord(target)
-    if netId then return base.setOwner(netId, charId) end
-    if not record then return false end
-    local keys, keyMode = recordKeySet(record)
-    local previous = record.ownerCharId
-    if previous and previous ~= charId then keys[previous] = nil end
-    if charId and keyMode == 'virtual' then keys[charId] = true end
-    return Core.DB.update(COLLECTION, target, { ownerCharId = charId or false, keys = keyList(keys) }) == true
 end
 
 --------------------------------------------------------------------------------
@@ -740,7 +810,7 @@ Core.Net.on('core:server:parkedLock', { { 'integer', min = 1, max = 0x7FFFFFFF }
         return Core.Notify.send(src, Config.Texts.no_keys, 'error')
     end
     local locked = n.fields.locked ~= true
-    if not Core.DB.update(COLLECTION, record.id, { locked = locked }) then return end
+    if not write(record.id, { locked = locked }) then return end
     sc('set', id, { locked = locked })
     touch(record.id, id)
     notifyLock(src, locked)
@@ -754,5 +824,6 @@ end, {
 P.sc, P.parkedOf, P.parkedNode, P.nodePosition, P.removeNode = sc, parkedOf, parkedNode, nodePosition, removeNode
 P.nodeFields, P.spawnNode, P.parkRecord, P.occupied, P.keyList = nodeFields, spawnNode, parkRecord, occupied, keyList
 P.platedProps, P.finite, P.stopping, P.hookScene, P.retireNow = platedProps, finite, stopping, hookScene, retireNow
+P.keySet = keySet
 P.isHooked = function() return hooked end
 P.parkedAuthority = PARKED_AUTHORITY

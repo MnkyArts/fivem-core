@@ -182,8 +182,6 @@ Config = {
         -- lifecycle lines, Inspector opens the panel /uiinspect toggles.
         Dev = { Enabled = false, Inspector = false, Log = false, Servers = {} },
     },
-    -- Adapter: 'kvp' (no setup) | 'mysql' (oxmysql, untested) | 'postgres' (needs the core_pg_url convar)
-    DB = { KeyPrefix = 'doc:', FlushIntervalMs = 5000, Adapter = 'postgres' },
     Admin = {
         CarDefaultModel = 'adder',
         -- Core.Admin dispatch (DESIGN §51)

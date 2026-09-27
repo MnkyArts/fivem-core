@@ -137,18 +137,20 @@ local function count(t)
 end
 
 --------------------------------------------------------------------------------
--- one core server VM: api, hooks, db (KVP), perms, the REAL player.lua, a fake scene, server/remote.lua
+-- one core server VM: api, hooks, db (the Postgres test bridge, DESIGN §56.10), perms, the REAL player_store.lua +
+-- player.lua, a fake scene, server/remote.lua, server/main.lua (after a restart it restores the sessions once the
+-- migrations applied, §56.1)
 --------------------------------------------------------------------------------
 
 local SERVER_FILES <const> = { 'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/perms.lua',
-    'server/player.lua' }
+    'server/player_store.lua', 'server/player.lua' }
 
---- opts = { keepKvp (a restart over the same KVP store and connected players), noScene, before = fn(env, F) }
+--- opts = { keepDb (a restart over the same database and connected players), noScene, before = fn(env, F) }
 local function newVM(opts)
     opts = opts or {}
     stubs.newWorld()
     stubs.clear()
-    if not opts.keepKvp then stubs.resetServer() end
+    if not opts.keepDb then stubs.resetServer() end
     stubs.tick(1000)
     local env = stubs.newEnv('server', 'core')
     stubs.loadImport(env)
@@ -157,7 +159,8 @@ local function newVM(opts)
     local F = not opts.noScene and fakeScene(env) or nil
     if opts.before then opts.before(env, F) end
     stubs.loadFile(env, 'server/remote.lua')
-    env.TriggerEvent('onResourceStart', 'core')      -- player.lua: sessions of the connected players (a restart)
+    stubs.loadFile(env, 'server/main.lua')
+    env.TriggerEvent('onResourceStart', 'core')      -- main.lua: sessions of the connected players (a restart)
     return env, env.Core, F
 end
 
@@ -503,10 +506,10 @@ do
     eq(callers(F, before), 'core', 'as core')
     eq(count(F.nodes), 0, 'no node left behind')
     local doc
-    for _, d in pairs(Core.DB.find('characters', function() return true end) or {}) do
-        if type(d) == 'table' and d.attachments then doc = d end
+    for _, d in ipairs(stubs.bridge.sql('SELECT attachments FROM characters') or {}) do
+        if type(d.attachments) == 'table' and #d.attachments > 0 then doc = d end
     end
-    check(doc ~= nil and #doc.attachments == 5, 'the character document kept the list (persisted by the drop save)')
+    check(doc ~= nil and #doc.attachments == 5, 'the character row kept the list (persisted by the drop save)')
 
     -- the same player comes back: the stored props come back
     before = #F.log
@@ -590,9 +593,9 @@ do
     Core.Attachments.add(2, def({ id = 'bag', model = 'prop_cs_heist_bag_02' }))
     Core.Player.saveAll()
 
-    -- core restarts: a fresh VM over the same KVP store, both players still connected, the scene store loading
+    -- core restarts: a fresh VM over the same database, both players still connected, the scene store loading
     local F2
-    env, Core, F2 = newVM({ keepKvp = true, before = function(_, F) F.ready = false end })
+    env, Core, F2 = newVM({ keepDb = true, before = function(_, F) F.ready = false end })
     eq(Core.Player.isLoaded(1) and Core.Player.isLoaded(2), true, 'player.lua rebuilt both sessions')
     stubs.tick(0)
     stubs.tick(3000)

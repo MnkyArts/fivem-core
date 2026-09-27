@@ -8,8 +8,9 @@
     radius policies and tiers, spawn validation order and refusals, set / move / motion / attach / detach /
     remove, parents and dependencies, owner stop, persistence round trips, the interaction path (every refusal),
     C2 driving, emit / query / list / batch / stats, hooks, the motion lifecycle (far-future plans, settle,
-    rebased persistence), a degraded database — and the exact R.index calls of each API call.
-    Harness: tests/scene_server_harness.lua (recording fakes of R.index / R.interest / R.flush). Exit 1 on failure.
+    rebased persistence), a failed database read, core_db not started — and the exact R.index calls of each API call.
+    Harness: tests/scene_server_harness.lua (recording fakes of R.index / R.interest / R.flush; the stored rows are
+    read through the Postgres test bridge, DESIGN §56.10). Exit 1 on failure.
 ]]
 
 local here = (arg and arg[0] or 'tests/scene_server_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
@@ -986,14 +987,14 @@ do
 end
 
 --------------------------------------------------------------------------------
--- persistence (§55.18): coalesced writes, restart round trip, ids, counter, motion re-anchor, placeholders
+-- persistence (§55.18, §56.6): coalesced queued writes, rows (columns + doc), restart round trip, ids, the counter
+-- row, motion re-anchor, placeholders
 --------------------------------------------------------------------------------
 do
     local env, Core, R = newServer()
     local Scene, store = Core.Scene, R.store
-    local writes = {}
-    local put = env.SetResourceKvpNoSync
-    env.SetResourceKvpNoSync = function(key, value) writes[key] = (writes[key] or 0) + 1 return put(key, value) end
+    local log = H.recordDb(env)
+    local function writes(id) return H.writeCount(log, id) end
     as('drops', 'defineKind', { id = 'drops:bag', class = 'custom', fields = { { name = 'items', type = 'integer',
         default = 1 } } })
     local spin = as('shop', 'spawn', { kind = 'prop', pos = P0, model = 'm', persist = true, fields = { tint = 2 },
@@ -1012,37 +1013,59 @@ do
     Scene.drive(car, at(45, 0, 0), { x = 2, y = 0, z = 0 }, 90)
     Scene.set(spin, { tint = 3 })
     Scene.set(spin, { tint = 4 })
-    eq(writes['doc:scene_nodes:n' .. spin], nil, 'nothing is written at once')
+    eq(writes(spin), 0, 'nothing is written at once')
+    eq(H.row(spin), nil, '... nothing is in the table either')
     stubs.tick(1000)
-    eq(writes['doc:scene_nodes:n' .. spin], 1, 'three changes inside a second → one write')
-    check(stubs.kvp['doc:scene_nodes:n' .. temp] == nil, 'non-persistent nodes are never written')
-    local meta = stubs.json.decode(stubs.kvp['doc:scene_meta:counter'])
-    eq(meta.value, car + 1, 'the id counter lives in scene_meta:counter')
-    local doc = stubs.json.decode(stubs.kvp['doc:scene_nodes:n' .. spin])
+    eq(writes(spin), 1, 'three changes inside a second → one write')
+    eq(H.doc(temp), nil, 'non-persistent nodes are never written')
+    eq(H.counter(), car + 1, "the id counter lives in core_counters('scene_nodes'): the next id")
+    local doc = H.doc(spin)
     check(doc.kind == 'prop' and doc.owner == 'shop' and doc.motion.t0 == nil and doc.mphase == 0
         and type(doc.motion.a0) == 'number', 'the document stores the motion rebased (spin angle in a0, mphase 0)')
+    local row = H.row(spin)
+    check(row.kind == 'prop' and row.owner == 'shop' and row.bucket == 0 and row.parent == nil,
+        'kind, owner, bucket are columns; a root has a NULL parent')
+    check(row.doc.kind == nil and row.doc.owner == nil and row.doc.bucket == nil and row.doc.parent == nil
+        and row.doc.id == nil, '... and are not repeated in doc')
+    eq(row.doc.v, 1, 'doc keeps its shape version (v = 1, like the imported legacy rows)')
+    local crow = H.row(child)
+    check(crow.parent == root and crow.doc.offset.x == 2 and crow.doc.bone == 'chassis',
+        'a child row: the parent column, offset and bone in doc')
+    eq(H.row(bag).doc.audience.faction, 'police', 'the audience (serialisable form) is in doc')
     local W = R.now()
     local _, _, _, _, _, rzBefore = store.pose(store.get(spin), W)
     local srcPhase = R.diff(W, Scene.get(src).fields.t0)
+    local x0 = H.xmin(spin)
     Scene.set(spin, { tint = 5 })
     stubs.tick(400)
-    eq(writes['doc:scene_nodes:n' .. spin], 1, '≤ one write per second')
+    eq(writes(spin), 1, '≤ one write per second')
+    eq(H.xmin(spin), x0, '... the row is untouched (its xmin did not move)')
     stubs.tick(600)
-    eq(writes['doc:scene_nodes:n' .. spin], 2, 'the next second writes the change')
+    eq(writes(spin), 2, 'the next second writes the change')
+    check(H.xmin(spin) ~= x0 and H.doc(spin).fields.tint == 5, '... one committed row version with tint 5')
     W = R.now()
     _, _, _, _, _, rzBefore = store.pose(store.get(spin), W)
     local gone = Scene.spawn({ kind = 'marker', pos = P0, persist = true })
     stubs.tick(1000)
-    check(stubs.kvp['doc:scene_nodes:n' .. gone] ~= nil, 'written')
+    check(H.row(gone) ~= nil, 'written')
     Scene.remove(gone)
     stubs.tick(1000)
-    eq(stubs.kvp['doc:scene_nodes:n' .. gone], nil, 'a removed persistent node loses its document')
+    eq(H.row(gone), nil, 'a removed persistent node loses its row (a queued remove)')
     local lastSpawn = Scene.spawn({ kind = 'marker', pos = P0, persist = true })
-    env.TriggerEvent('onResourceStop', 'core')
-    check(stubs.kvp['doc:scene_nodes:n' .. lastSpawn] ~= nil, 'core stop writes what is still dirty')
+    local stopLog = H.recordDb(env)
+    local co = coroutine.create(function() env.TriggerEvent('onResourceStop', 'core') end)
+    local resumed = coroutine.resume(co)
+    check(resumed and coroutine.status(co) == 'dead', 'the stop runs through without yielding')
+    local awaited = {}
+    for _, c in ipairs(stopLog) do if c.fn ~= 'enqueue' then awaited[#awaited + 1] = c.fn end end
+    check(#stopLog > 0 and #awaited == 0, 'core stop only QUEUES (enqueue; no flush / sync, no awaited call): '
+        .. table.concat(awaited, ','))
+    check(H.writeCount(stopLog, lastSpawn) == 1 and H.writeCount(stopLog, 'counter') == 1,
+        '... the dirty node and the counter (one slice: one transaction, §56.3.3)')
+    check(H.row(lastSpawn) ~= nil and H.counter() == lastSpawn + 1, 'core stop writes what is still dirty (it lands)')
 
-    -- restart over the same KVP store
-    local env2, Core2, R2 = newServer({ keepKvp = true })
+    -- restart over the same database
+    local env2, Core2, R2 = newServer({ keepDb = true })
     local S2, st2 = Core2.Scene, R2.store
     local L = R2.now()
     for _, id in ipairs({ spin, root, child, src, em, bag, car, lastSpawn }) do check(st2.get(id) ~= nil,
@@ -1078,7 +1101,126 @@ do
         'the plugin comes back')
     eq(S2.get(bag).placeholder, nil, 'its nodes are live again')
     eq(calls('put', bag)[1].kind, 'drops:bag', 're-put with the kind')
-    check(stubs.kvp['doc:scene_nodes:n' .. temp] == nil and env2 ~= env, 'a clean second VM')
+    check(H.row(temp) == nil and env2 ~= env, 'a clean second VM')
+end
+
+--------------------------------------------------------------------------------
+-- §56 port (run W2d): a detach writes a NULL parent, the columns win at load, the counter row behind / ahead, a
+-- streamed load over several batches, core_db not started, only a caller that can yield starts the load
+--------------------------------------------------------------------------------
+local function printedHas(needle)
+    for _, line in ipairs(stubs.printed) do if line:find(needle, 1, true) then return true end end
+    return false
+end
+do
+    local _, Core = newServer()
+    local Scene = Core.Scene
+    local root = Scene.spawn({ kind = 'group', pos = P0, persist = true })
+    local kid = Scene.spawn({ kind = 'light', parent = root, offset = { x = 1, y = 0, z = 0 }, persist = true })
+    stubs.tick(1000)
+    eq(H.row(kid).parent, root, 'the child row names its parent (column)')
+    eq(Scene.detach(kid), true, 'detach')
+    stubs.tick(1000)
+    eq(H.row(kid).parent, nil, 'a detach writes the parent column as NULL (the upsert overwrites it)')
+    H.putRow({ id = 900, kind = 'marker', owner = 'shop', bucket = 3, doc = { v = 1, kind = 'prop', owner = 'evil',
+        bucket = 9, parent = root, pos = P0, rot = ZERO, fields = { type = 1 } } })
+    H.setCounter(1)                                                 -- behind the rows (a lost counter write)
+    local _, Core2 = newServer({ keepDb = true })
+    local n = Core2.Scene.get(900)
+    check(n and n.kind == 'marker' and n.owner == 'shop' and n.bucket == 3 and n.parent == nil,
+        'the columns win over stale keys in doc (kind, owner, bucket, parent)')
+    eq(Core2.Scene.get(kid).parent, nil, 'the detached child reloads as a root')
+    eq(Core2.Scene.spawn({ kind = 'marker', pos = P0 }), 901,
+        'a counter behind the rows: ids go on after the highest row')
+    H.setCounter(5000)
+    local _, Core3 = newServer({ keepDb = true })
+    eq(Core3.Scene.spawn({ kind = 'marker', pos = P0 }), 5000, 'a counter ahead of the rows is kept (ids never reused)')
+end
+do  -- a streamed load: 2,500 rows in batches of 1000 (one FETCH per batch), a parent with a higher id than its child
+    newServer()
+    H.sql("INSERT INTO scene_nodes (id, kind, owner, bucket, doc) SELECT g, 'marker', 'core', 0, "
+        .. "jsonb_build_object('v', 1, 'pos', jsonb_build_object('x', 100 + g % 50, 'y', 200, 'z', 30), "
+        .. "'fields', jsonb_build_object('type', 1)) FROM generate_series(1, 2500) AS g")
+    H.sql('UPDATE scene_nodes SET parent = 2450 WHERE id = 7')
+    local log
+    local _, Core, R = newServer({ keepDb = true, beforeStore = function(e) log = H.recordDb(e) end })
+    local fetches = 0
+    for _, c in ipairs(log) do
+        if c.fn == 'txQuery' and tostring(c.args[2]):find('^FETCH 1000 FROM') then fetches = fetches + 1 end
+    end
+    eq(fetches, 3, 'Core.DB.stream in batches of 1000: three FETCHes for 2,500 rows')
+    eq(R.store.count(), 2500, 'every row is a node')
+    check(Core.Scene.get(7).parent == 2450 and Core.Scene.get(2450).children[1] == 7,
+        'a child whose parent has a higher id (a later batch) is linked: all rows are read before any is linked')
+    eq(Core.Scene.spawn({ kind = 'marker', pos = P0 }), 2501, 'no counter row: ids go on after the highest row')
+end
+do  -- review R3a #6: a row that cannot be built (rowOf throws) costs only that node — the others of the pass land,
+    -- it stays dirty (logged once) and is written once it can be built; at the stop the others' final rows land
+    local env, Core, R = newServer()
+    local Scene, store = Core.Scene, R.store
+    local a = Scene.spawn({ kind = 'marker', pos = P0, persist = true })
+    local b = Scene.spawn({ kind = 'marker', pos = at(1, 0, 0), persist = true })
+    local c = Scene.spawn({ kind = 'marker', pos = at(2, 0, 0), persist = true })
+    stubs.tick(1000)
+    local xa, xb, xc = H.xmin(a), H.xmin(b), H.xmin(c)
+    for _, id in ipairs({ a, b, c }) do Scene.set(id, { bob = true }) end
+    store.get(b).offset = 5                                         -- a corrupt record: v3(5) throws in rowOf
+    stubs.printed = {}
+    stubs.tick(1000)
+    check(H.xmin(a) ~= xa and H.xmin(c) ~= xc and H.doc(a).fields.bob == true and H.doc(c).fields.bob == true,
+        'the other dirty nodes of the pass are written')
+    eq(H.xmin(b), xb, 'the node whose row throws is not')
+    local function failures()
+        local n = 0
+        for _, line in ipairs(stubs.printed) do
+            if line:find(('node %d could not be persisted'):format(b), 1, true) then n = n + 1 end
+        end
+        return n
+    end
+    eq(failures(), 1, '... it is logged')
+    stubs.tick(3000)
+    eq(failures(), 1, '... once, while it stays dirty and is retried every second')
+    store.get(b).offset = nil
+    stubs.tick(1000)
+    check(H.xmin(b) ~= xb and H.doc(b).fields.bob == true, 'once its row can be built, it is written')
+    Scene.set(a, { bob = false })
+    Scene.set(b, { bob = false })
+    store.get(b).offset = 5
+    env.TriggerEvent('onResourceStop', 'core')
+    check(H.doc(a).fields.bob == false and H.doc(b).fields.bob == true,
+        'at the stop a throwing row loses only itself: the other final rows land')
+    check(printedHas('lost at the stop'), '... and the loss is logged')
+    store.get(b).offset = nil
+end
+do  -- core_db not started: rows stay dirty and are retried every second; a stop meanwhile logs what is lost
+    local env, Core = newServer()
+    local Scene = Core.Scene
+    stubs.resourceStates.core_db = 'stopped'
+    local id = Scene.spawn({ kind = 'marker', pos = P0, persist = true })
+    stubs.tick(3000)
+    eq(H.row(id), nil, 'core_db not started: nothing is written')
+    stubs.resourceStates.core_db = nil
+    stubs.tick(1000)
+    check(H.row(id) ~= nil and H.counter() == id + 1, '... it is back: the next second writes the node and the counter')
+    stubs.resourceStates.core_db = 'stopped'
+    Scene.set(id, { bob = true })
+    env.TriggerEvent('onResourceStop', 'core')
+    stubs.resourceStates.core_db = nil
+    check(printedHas('lost at the stop'), 'a stop while core_db is not started logs the lost writes')
+    eq(H.doc(id).fields.bob, false, '... the row keeps its last committed state')
+end
+do  -- the load needs a caller that can yield: a plugin's export call before the start thread ran neither loads nor
+    -- fails the load
+    local _, Core, R = newServer({ noStart = true })
+    local Scene = Core.Scene
+    local id, err = Scene.spawn({ kind = 'marker', pos = P0 })
+    check(id == nil and err == 'unavailable' and not R.store.loaded(),
+        'before the start thread ran, a non-yieldable caller gets unavailable')
+    check(not printedHas('could not be loaded') and not printedHas('outside a coroutine'),
+        '... without starting (or failing) a load')
+    stubs.tick(0)
+    check(R.store.loaded() and Scene.spawn({ kind = 'marker', pos = P0 }) ~= nil,
+        'the start thread loads at once (no 10 s retry wait)')
 end
 
 --------------------------------------------------------------------------------
@@ -1363,30 +1505,32 @@ do
     for _ = 1, 3 do Scene.spawn({ kind = 'marker', pos = P0 }) end
     eq(errOf(Scene.spawn({ kind = 'marker', pos = P0 })), 'limit', 'MaxNodes (server-wide)')
 end
-do
-    local down = true
-    local store = {}
-    local _, Core = newServer({ beforeStore = function(_, C)
-        C.DB.setAdapter({
-            loadAll = function(collection)
-                if down and collection == 'scene_nodes' then error('db offline') end
-                return store[collection] or {}
-            end,
-            put = function(collection, id, encoded)
-                store[collection] = store[collection] or {}
-                store[collection][id] = encoded
-            end,
-            remove = function(collection, id) if store[collection] then store[collection][id] = nil end end,
-            flush = function() end,
-        })
-    end })
+do  -- a failed read (§56.8 rule 4): the load fails — never an empty world — and is retried; no half state
+    local _, Core0 = newServer()
+    local kept = Core0.Scene.spawn({ kind = 'marker', pos = P0, persist = true })
+    local kid = Core0.Scene.spawn({ kind = 'light', parent = kept, persist = true })
+    stubs.tick(1000)
+    local bridge = H.bridge
+    bridge.fail('FROM scene_nodes ORDER BY id')                     -- the stream's cursor
+    local _, Core = newServer({ keepDb = true })
     local Scene = Core.Scene
     local id, err = Scene.spawn({ kind = 'marker', pos = P0 })
     check(id == nil and err == 'unavailable', 'while scene_nodes cannot be read, the API answers unavailable')
-    check(#Scene.list() == 0 and Scene.get(1) == nil and #Scene.query({ pos = P0, radius = 5 }) == 0, 'reads are empty')
-    down = false
+    check(#Scene.list() == 0 and Scene.get(kept) == nil and #Scene.query({ pos = P0, radius = 5 }) == 0,
+        'reads are empty')
+    local logged = false
+    for _, line in ipairs(stubs.printed) do logged = logged or line:find('could not be loaded', 1, true) ~= nil end
+    check(logged, 'the failed load is logged')
+    bridge.unfail()
+    bridge.fail('FROM core_counters WHERE name')                    -- the counter read fails the load as well
     stubs.tick(10000)
-    check(Scene.spawn({ kind = 'marker', pos = P0 }) ~= nil, 'the start thread retries (10 s) and the store opens')
+    eq(Scene.get(kept), nil, 'a failed counter read is a failed load too (ids could collide otherwise)')
+    bridge.unfail()
+    stubs.tick(10000)
+    check(Scene.get(kept) ~= nil and Scene.get(kid).parent == kept,
+        'the start thread retries (10 s): the rows are back')
+    local fresh = Scene.spawn({ kind = 'marker', pos = P0 })
+    check(fresh ~= nil and fresh > kid, '... and new ids never collide with them')
 end
 
 --------------------------------------------------------------------------------
@@ -1422,7 +1566,7 @@ do
     eq(store.settle({ id = 999, motion = {} }, 1, 2, 3), false, 'a node that is not in the store: no-op')
     eq(trace(), '', 'no index calls for no-ops')
     stubs.tick(1000)
-    local doc = stubs.json.decode(stubs.kvp['doc:scene_nodes:n' .. tw])
+    local doc = H.doc(tw)
     check(doc.motion == nil and doc.pos.x == P0.x + 10, 'a settled persistent node is persisted at its end pose')
     -- rebased persistence: osc keeps its own `phase`, a finished tween persists as an ended tween
     local osc = Scene.spawn({ kind = 'prop', pos = P0, model = 'm', persist = true,
@@ -1434,7 +1578,7 @@ do
     local _, _, oz = store.pose(store.get(osc), W)
     local _, dy = store.pose(store.get(done), W)
     env.TriggerEvent('onResourceStop', 'core')
-    local _, Core2, R2 = newServer({ keepKvp = true })
+    local _, Core2, R2 = newServer({ keepDb = true })
     local st2 = R2.store
     local L = R2.now()
     local _, _, oz2 = st2.pose(st2.get(osc), L)
@@ -1512,10 +1656,9 @@ do
 end
 do
     local big = function(C) C.Scene.MaxChildren = 10000 end
-    local _, Core0 = newServer({ config = big })
-    Core0.DB.set('scene_meta', 'counter', { value = 5000000 })   -- long-session ids: the Registry set is hashed
-    Core0.DB.flush()
-    local env, Core, R = newServer({ keepKvp = true, config = big })
+    newServer({ config = big })
+    H.setCounter(5000000)                                         -- long-session ids: the Registry set is hashed
+    local env, Core, R = newServer({ keepDb = true, config = big })
     local root = as('prefab', 'spawn', { kind = 'group', pos = P0 })
     for i = 1, 2000 do as('prefab', 'spawn', { kind = 'prop', parent = root, model = 'm', offset = { x = i % 40,
         y = 0, z = 0 } }) end
@@ -1564,10 +1707,9 @@ do
         'non-persistent nodes still may')
     local p = Scene.spawn({ kind = 'marker', pos = P0, persist = true, audience = { faction = 'x' } })
     eq(errOf(Scene.set(p, nil, { audience = { players = { 3 } } })), 'audience', 'nor through Scene.set')
-    Core.DB.set('scene_nodes', 'n777', { kind = 'marker', owner = 'core', bucket = 0, pos = P0, rot = ZERO,
-        fields = { type = 1 }, audience = { players = { 1 } } })             -- written before the fix
-    Core.DB.flush()
-    local _, Core2 = newServer({ keepKvp = true })
+    H.putRow({ id = 777, kind = 'marker', owner = 'core', bucket = 0, doc = { v = 1, pos = P0, rot = ZERO,
+        fields = { type = 1 }, audience = { players = { 1 } } } })          -- written before the fix
+    local _, Core2 = newServer({ keepDb = true })
     local old = Core2.Scene.get(777)
     check(old and old.audience and old.audience.editors == true and old.audience.players == nil,
         'an old players audience reloads fail-closed as editors-only')
@@ -1673,7 +1815,7 @@ do
     local _, Core = newServer()
     local root = Core.Scene.spawn({ kind = 'group', pos = P0, persist = true, allowChildren = { 'decor' } })
     stubs.tick(1000)
-    local _, Core2 = newServer({ keepKvp = true })
+    local _, Core2 = newServer({ keepDb = true })
     eq(Core2.Scene.get(root).allowChildren[1], 'decor', 'allowChildren survives a restart')
     check(as('decor', 'spawn', { kind = 'light', parent = root }) ~= nil, '… and still admits that resource')
 end
@@ -1879,7 +2021,7 @@ do
     local kept = Scene.spawn({ kind = 'prop', pos = P0, model = 'm', persist = true, fields = { snap = 'ground' },
         interact = { { action = 'use', prompt = { world = false, offsetZ = -1 } } } })
     stubs.tick(1000)
-    local _, Core2 = newServer({ keepKvp = true })
+    local _, Core2 = newServer({ keepDb = true })
     local k2 = Core2.Scene.get(kept)
     local kp = k2 and k2.interact[1].prompt
     check(k2 and k2.fields.snap == 'ground' and kp.world == false and kp.offsetZ == -1,
@@ -2022,10 +2164,10 @@ do  -- persistence: a persistent child keeps its rotOrder across a restart
     local kid = Scene.spawn({ kind = 'prop', parent = root, model = 'm', persist = true, rotOrder = 4, bone = 'b1' })
     local plain = Scene.spawn({ kind = 'prop', parent = root, model = 'm', persist = true })
     stubs.tick(1000)
-    local doc = stubs.json.decode(stubs.kvp['doc:scene_nodes:n' .. kid])
+    local doc = H.doc(kid)
     eq(doc.rotOrder, 4, 'the document stores rotOrder (like bone)')
-    eq(stubs.json.decode(stubs.kvp['doc:scene_nodes:n' .. plain]).rotOrder, nil, '... only when set')
-    local _, Core2, R2 = newServer({ keepKvp = true })
+    eq(H.doc(plain).rotOrder, nil, '... only when set')
+    local _, Core2, R2 = newServer({ keepDb = true })
     local n = R2.store.get(kid)
     check(n and n.rotOrder == 4 and n.bone == 'b1', 'the reloaded child has its rotOrder and bone')
     eq(R2.store.get(plain).rotOrder, nil, 'the other one none')
@@ -2209,7 +2351,7 @@ do
     eq(car.fields.vtype, 'bike', 'a vehicle kind without a vtype field: server-filled as before (input ignored)')
     local p = veh({ model = HASH, vtype = 'boat', vehId = 'v7' }, { persist = true })
     stubs.tick(1000)
-    local _, Core2 = newServer({ keepKvp = true })
+    local _, Core2 = newServer({ keepDb = true })
     local pv = Core2.Scene.get(p)
     check(pv and pv.fields.model == HASH and math.type(pv.fields.model) == 'integer' and pv.fields.vtype == 'boat'
         and pv.fields.vehId == 'v7', 'integer model, vtype and vehId survive a restart')
@@ -2297,17 +2439,16 @@ end
 do
     local env, Core, R = newServer()
     local Scene, store = Core.Scene, R.store
-    local writes = {}
-    local put = env.SetResourceKvpNoSync
-    env.SetResourceKvpNoSync = function(key, value) writes[key] = (writes[key] or 0) + 1 return put(key, value) end
+    local log = H.recordDb(env)
     local car = Scene.spawn({ kind = 'vehicle', pos = P0, model = 'adder', persist = true })
     local seat = Scene.spawn({ kind = 'prop', parent = car, model = 'm', persist = true })
     local other = Scene.spawn({ kind = 'vehicle', pos = at(0, 30, 0), model = 'adder', persist = true })
-    local key, kkey, okey = 'doc:scene_nodes:n' .. car, 'doc:scene_nodes:n' .. seat, 'doc:scene_nodes:n' .. other
+    local key, kkey = car, seat
+    local writes = setmetatable({}, { __index = function(_, id) return H.writeCount(log, id) end })
     stubs.tick(1000)
     local node = store.get(car)
     node.promoted = { netId = 21 }
-    local function doc(k) return stubs.json.decode(stubs.kvp[k]) end
+    local doc = H.doc
     local w0 = writes[key]
     store.follow(node, at(10, 0, 0))
     stubs.tick(1000)
@@ -2347,8 +2488,8 @@ do
     stubs.tick(1000)
     Scene.remove(other)
     stubs.tick(40000)
-    eq(stubs.kvp[okey], nil, 'a removed node keeps no document (its pending followed write is dropped)')
-    local _, Core2 = newServer({ keepKvp = true })
+    eq(H.row(other), nil, 'a removed node keeps no row (its pending followed write is dropped)')
+    local _, Core2 = newServer({ keepDb = true })
     local back, backSeat = Core2.Scene.get(car), Core2.Scene.get(seat)
     check(back and back.bucket == 4 and back.pos.x == P0.x + 80 and back.promoted == nil,
         'a restart finds the car where and in the bucket it was followed to (demoted)')

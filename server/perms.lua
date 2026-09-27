@@ -1,15 +1,17 @@
 -- core/server/perms.lua
 -- Core.Perms (DESIGN §4.4, §22, §44): console -> ACE -> account grants -> character grants -> group chain.
 --
--- Grants: the account's `permissions` (Player.setAccountData: the LIVE session document, a direct DB write
--- would be undone by the autosave) and the character's (Player.getData/setData), cached per src; the caches
--- drop on playerDataChanged, permsChanged 'grants'|'group' and playerDropped. Temporary grants live in a map
--- `tempPermissions = { [perm] = expiresAt }` (unix seconds) NEXT to the arrays, which stay plain strings;
--- expired entries are ignored at once, pruned on cache build and by one per-player timer (hook `expired`).
--- Groups: collection `perm_groups` (doc id = name), seeded once from Config.Perms, then the source of truth;
--- read only inside a coroutine (postgres yields) and served from the config seed until then. Resolved sets
--- (inherits, cycle-guarded, + "'core.admin' implies the admin chain") are cached, dropped on any change.
--- `removed` remembers what an owner took out of a group, so `define`'s default is added once, ever.
+-- Grants: the account's `permissions`/`tempPermissions` (the LIVE session: Player.getAccountData/setAccountData) and
+-- the character's (Player.getData/setData), cached per src; the caches drop on playerDataChanged, permsChanged
+-- 'grants'|'group' and playerDropped. Temporary grants: `tempPermissions = { [perm] = expiresAt }` (unix seconds) NEXT
+-- to the plain-string arrays; expired entries are ignored at once, pruned on cache build and by one per-player timer
+-- (hook `expired`). Perms.has and its whole path never yield: no DB read (§56.8 rule 2).
+-- Groups: table `perm_groups` (small: loaded whole), seeded once from Config.Perms, then the truth; loaded in a
+-- thread, the config seed answers until then (groups/groupExists/effective/saveGroup/deleteGroup wait for a running
+-- load when they can yield). saveGroup/deleteGroup AWAIT their upsert/delete; the seed and define defaults are QUEUED
+-- saves (start, a plugin's file scope). Resolved sets (inherits, cycle-guarded, + "'core.admin' implies the admin
+-- chain") are cached, dropped on any change. `removed` (a text[] row column, a set in memory) remembers what an
+-- owner took out of a group, so `define`'s default is added once, ever.
 --
 -- Natives: IsPlayerAceAllowed(playerSrc, object) (server, BOOL: read by truthiness), GetGameTimer() (server).
 -- GetPlayers, CreateThread, SetTimeout and Citizen.Await are runtime helpers, not natives.
@@ -18,7 +20,7 @@ local Perms = {}
 Core.Perms = Perms
 
 local DEFAULT_GROUP <const>, ADMIN_GROUP <const>, ADMIN_PERM <const> = 'user', 'admin', 'core.admin'
-local MANAGE_PERM <const>, COLLECTION <const>, TEMP_KEY <const> = 'core.perms.manage', 'perm_groups', 'tempPermissions'
+local MANAGE_PERM <const>, TABLE <const>, TEMP_KEY <const> = 'core.perms.manage', 'perm_groups', 'tempPermissions'
 local DEF_KIND <const>, MAX_SRC <const>, MAX_PERM <const>, MAX_GROUP_NAME <const> = 'permDef', 4096, 64, 32
 local MAX_LABEL <const>, MAX_TEXT <const>, MAX_CATEGORY <const> = 64, 256, 32
 local MAX_GROUP_PERMS <const>, MAX_INHERITS <const>, MAX_WEIGHT <const> = 512, 16, 1000000
@@ -144,12 +146,13 @@ end
 
 -- == Groups: normalisation, the config seed, loading and resolution =========================================
 
---- `removed` as a { [perm] = true } map.
+--- `removed` as a { [perm] = true } set — from the row's text[] (or an in-memory set).
 local function cleanRemoved(value)
     local out = {}
     if type(value) ~= 'table' then return out end
-    for perm, flag in pairs(value) do
-        if flag == true and isPerm(perm) then out[perm] = true end
+    for key, flag in pairs(value) do
+        local perm = math.type(key) == 'integer' and flag or (flag == true and key or nil)
+        if isPerm(perm) then out[perm] = true end
     end
     return out
 end
@@ -197,9 +200,20 @@ end
 
 for name, doc in pairs(seedGroups()) do groupDocs[name] = doc end
 
---- Persist one group document (the stored shape is the normalized one).
-local function writeGroup(doc)
-    return Core.DB.set(COLLECTION, doc.name, copyGroup(doc)) == true
+--- The perm_groups row of a normalized group (`removed` as a sorted text[], no colour = NULL).
+local function groupRow(doc)
+    local removed = {}
+    for perm in pairs(doc.removed) do removed[#removed + 1] = perm end
+    table.sort(removed)
+    return { name = doc.name, label = doc.label, weight = doc.weight, inherits = cleanList(doc.inherits),
+        perms = cleanList(doc.perms), removed = removed, color = doc.color or Core.DB.NULL }
+end
+
+--- A queued save of one group (never yields: the seed and define defaults run at start / a plugin's file scope).
+local function queueGroup(doc)
+    local ok, err = Core.DB.save(TABLE, groupRow(doc))
+    if not ok then Core.Log.error('perms: group %s was not queued (%s)', doc.name, tostring(err)) end
+    return ok == true
 end
 
 --- Add a define's default perm to its group once: never when the group lists it or an owner removed it.
@@ -208,32 +222,31 @@ local function applyDefault(def)
     if not doc or doc.removed[def.perm] or listHas(doc.perms, def.perm) then return false end
     local updated = copyGroup(doc)
     updated.perms[#updated.perms + 1] = def.perm
-    if not writeGroup(updated) then return false end
+    if not queueGroup(updated) then return false end
     groupDocs[doc.name] = updated
     resolved = {}
     return true
 end
 
---- Read `perm_groups` (seeding it on the very first start). Runs inside a coroutine only.
+local GROUPS_SQL <const> = 'SELECT name, label, weight, inherits, perms, removed, color FROM perm_groups'
+
+--- Read `perm_groups` whole (seeding it on the very first start). Runs in a thread (ensureGroups).
 local function loadGroups()
     local ok, err = pcall(function()
-        local docs = Core.DB.all(COLLECTION)
-        if Core.DB.isDegraded(COLLECTION) then error('the collection could not be read', 0) end
+        local rows, readErr = Core.DB.query(GROUPS_SQL, nil, { sync = true })
+        if not rows then error(readErr or 'the table could not be read', 0) end   -- never seed over a failed read
         local loaded, seeded = {}, 0
-        if #docs == 0 then
+        if #rows == 0 then
             loaded = seedGroups()
-            for _, doc in pairs(loaded) do
-                if writeGroup(doc) then seeded = seeded + 1 end
-            end
-            Core.Log.info('perms: seeded %d group(s) into %s from Config.Perms', seeded, COLLECTION)
+            for _, doc in pairs(loaded) do seeded = seeded + (queueGroup(doc) and 1 or 0) end
+            Core.Log.info('perms: seeded %d group(s) into %s from Config.Perms', seeded, TABLE)
         else
-            for i = 1, #docs do
-                local name = docs[i].id
-                if isGroupName(name) then loaded[name] = normalizeGroup(name, docs[i]) end
+            for _, row in ipairs(rows) do
+                if isGroupName(row.name) then loaded[row.name] = normalizeGroup(row.name, row) end
             end
             if not loaded[DEFAULT_GROUP] then
                 loaded[DEFAULT_GROUP] = normalizeGroup(DEFAULT_GROUP, { label = 'User' })
-                writeGroup(loaded[DEFAULT_GROUP])
+                queueGroup(loaded[DEFAULT_GROUP])
             end
         end
         groupDocs = loaded
@@ -244,30 +257,25 @@ local function loadGroups()
     if not ok then
         groupState = 'fallback'
         retryAt = GetGameTimer() + LOAD_RETRY_MS
-        Core.Log.error('perms: %s could not be loaded (%s); using Config.Perms until it can', COLLECTION, tostring(err))
+        Core.Log.error('perms: %s could not be loaded (%s); using Config.Perms until it can', TABLE, tostring(err))
     end
     local barrier = loadBarrier
-    loadBarrier = nil
+    loadBarrier = nil   -- before resolving: a waiter that resumes sees the finished state
     if barrier then barrier:resolve(true) end
     if ok then changed(nil, 'load') end
 end
 
---- The group documents. The first call starts the load: directly when the caller may yield, in a thread
---- otherwise; callers arriving during a load wait on its barrier when they can, or read the seed.
-local function ensureGroups()
+--- The group documents (the config seed until perm_groups was read). The first call starts the load in a thread;
+--- `wait` = a caller that can yield waits for a running load (the check path never does: Perms.has never yields).
+local function ensureGroups(wait)
     if groupState == 'ready' then return groupDocs end
     if groupState == 'fallback' and GetGameTimer() < retryAt then return groupDocs end
-    if groupState == 'loading' then
-        if loadBarrier and coroutine.isyieldable() then pcall(Citizen.Await, loadBarrier) end
-        return groupDocs
-    end
-    groupState = 'loading'
-    loadBarrier = promise.new()
-    if coroutine.isyieldable() then
-        loadGroups()
-    else
+    if groupState ~= 'loading' then
+        groupState = 'loading'
+        loadBarrier = promise.new()
         CreateThread(loadGroups)
     end
+    if wait and loadBarrier and coroutine.isyieldable() then pcall(Citizen.Await, loadBarrier) end
     return groupDocs
 end
 
@@ -321,14 +329,10 @@ local function setState(src, scope, state)
     if scope == 'account' then accountPerms[src] = state else charPerms[src] = state end
 end
 
-local function writeList(src, scope, list)
-    if scope == 'account' then return Core.Player.setAccountData(src, 'permissions', list) == true end
-    return Core.Player.setData(src, 'permissions', list) == true
-end
-
-local function writeTemp(src, scope, temp)
-    if scope == 'account' then return Core.Player.setAccountData(src, TEMP_KEY, temp) == true end
-    return Core.Player.setData(src, TEMP_KEY, temp) == true
+--- One grant key of the account (Player.setAccountData) or the character (Player.setData): both queue, never yield.
+local function write(src, scope, key, value)
+    if scope == 'account' then return Core.Player.setAccountData(src, key, value) == true end
+    return Core.Player.setData(src, key, value) == true
 end
 
 --- Permanent or a temporary grant that is still running.
@@ -344,7 +348,7 @@ local function pruneScope(src, scope, now)
     if not state then return false end
     local temp, pruned = cleanTemp(state.temp, now)
     if not pruned then return false end
-    if not writeTemp(src, scope, temp) then return false end
+    if not write(src, scope, TEMP_KEY, temp) then return false end
     setState(src, scope, newState(state.list, temp))
     return true
 end
@@ -391,17 +395,16 @@ local function armExpiry(src)
     end)
 end
 
---- The account grants (cached per session), or nil when the player has no session.
+--- The account grants (cached per session), or nil when the player has no session. Read from the LIVE session
+--- (Player.getAccountData: synchronous copies, never the DB), so a permission check never yields.
 local function accountState(src)
     local cached = accountPerms[src]
     if cached then return cached end
-    local info = Core.Player.getInfo(src)
-    if not info or type(info.accountId) ~= 'string' then return nil end
-    local account = Core.DB.get('accounts', info.accountId)   -- kept in sync by Player.setAccountData
-    local stored, storedTemp = account and account.permissions, account and account[TEMP_KEY]
-    local temp, pruned = cleanTemp(storedTemp, os.time())
-    if pruned then Core.Player.setAccountData(src, TEMP_KEY, temp) end
-    local state = newState(cleanList(stored), temp)
+    local player = Core.Player
+    if not player.isLoaded(src) then return nil end
+    local temp, pruned = cleanTemp(player.getAccountData(src, TEMP_KEY), os.time())
+    if pruned then player.setAccountData(src, TEMP_KEY, temp) end   -- write first: the hook drops accountPerms[src]
+    local state = newState(cleanList(player.getAccountData(src, 'permissions')), temp)
     accountPerms[src] = state
     if next(temp) then armExpiry(src) end
     return state
@@ -442,7 +445,7 @@ end
 
 --- True when a group of that name exists (Player.setGroup asks this, §44).
 function Perms.groupExists(name)
-    return isGroupName(name) and ensureGroups()[name] ~= nil
+    return isGroupName(name) and ensureGroups(true)[name] ~= nil
 end
 
 --- console -> ACE -> account grants -> character grants -> the group chain (inherits + the legacy
@@ -502,15 +505,15 @@ function Perms.grant(src, perm, scope, opts)
         if temp[perm] == expiresAt then return true end
         temp = copyMap(temp)
         temp[perm] = expiresAt
-        if not writeTemp(target, scope, temp) then return false end
+        if not write(target, scope, TEMP_KEY, temp) then return false end
     else
         list = cleanList(list)
         list[#list + 1] = perm
-        if not writeList(target, scope, list) then return false end
+        if not write(target, scope, 'permissions', list) then return false end
         if temp[perm] then   -- a permanent grant replaces a temporary one
             temp = copyMap(temp)
             temp[perm] = nil
-            writeTemp(target, scope, temp)
+            write(target, scope, TEMP_KEY, temp)
         end
     end
     setState(target, scope, newState(list, temp))
@@ -542,12 +545,12 @@ function Perms.revoke(src, perm, scope)
         for i = 1, #state.list do
             if state.list[i] ~= perm then list[#list + 1] = state.list[i] end
         end
-        if not writeList(target, scope, list) then return false end
+        if not write(target, scope, 'permissions', list) then return false end
     end
     if inTemp then
         temp = copyMap(temp)
         temp[perm] = nil
-        if not writeTemp(target, scope, temp) then return false end
+        if not write(target, scope, TEMP_KEY, temp) then return false end
     end
     setState(target, scope, newState(list, temp))
     Core.Log.audit('perms', target, 'revoked %s (%s)', perm, scope)
@@ -583,7 +586,7 @@ function Perms.effective(src)
     local out = {}
     if src == 0 then
         for perm in pairs(defs) do out[perm] = true end
-        for _, doc in pairs(ensureGroups()) do
+        for _, doc in pairs(ensureGroups(true)) do
             for i = 1, #doc.perms do out[doc.perms[i]] = true end
         end
         return out
@@ -688,7 +691,7 @@ end
 --- Every group, sorted by weight then name (copies; `removed` is internal bookkeeping and not included).
 function Perms.groups()
     local out = {}
-    for _, doc in pairs(ensureGroups()) do
+    for _, doc in pairs(ensureGroups(true)) do
         out[#out + 1] = { name = doc.name, label = doc.label, weight = doc.weight, color = doc.color,
             inherits = cleanList(doc.inherits), perms = cleanList(doc.perms) }
     end
@@ -799,7 +802,7 @@ function Perms.saveGroup(name, patch, actorSrc)
     if not isGroupName(name) then return false, 'invalid_name' end
     if type(patch) ~= 'table' then return false, 'invalid_patch' end
     if actorSrc ~= nil and actorSrc ~= 0 and not toSrc(actorSrc) then return false, 'invalid_actor' end
-    local docs = ensureGroups()
+    local docs = ensureGroups(true)
     if groupState ~= 'ready' then return false, 'not_ready' end
     if not allowedActor(actorSrc, 'perms.saveGroup', name) then return false, 'no_permission' end
     local existing = docs[name]
@@ -810,7 +813,11 @@ function Perms.saveGroup(name, patch, actorSrc)
         groupAudit(actorSrc, 'perms.saveGroup', name, 'denied', refused)
         return false, refused
     end
-    if not writeGroup(doc) then return false, 'save_failed' end
+    local stored, storeErr = Core.DB.upsert(TABLE, groupRow(doc), 'name', { returning = false })   -- awaited
+    if not stored then
+        Core.Log.error('perms: group %s could not be saved (%s)', name, tostring(storeErr))
+        return false, 'save_failed'
+    end
     groupDocs[name] = doc
     resolved = {}
     groupAudit(actorSrc, 'perms.saveGroup', name, 'ok', nil, groupChanges(existing, doc))
@@ -825,7 +832,7 @@ function Perms.deleteGroup(name, actorSrc)
     if not isGroupName(name) then return false, 'invalid_name' end
     if name == DEFAULT_GROUP then return false, 'protected' end
     if actorSrc ~= nil and actorSrc ~= 0 and not toSrc(actorSrc) then return false, 'invalid_actor' end
-    local docs = ensureGroups()
+    local docs = ensureGroups(true)
     if groupState ~= 'ready' then return false, 'not_ready' end
     local doc = docs[name]
     if not doc then return false, 'unknown_group' end
@@ -842,7 +849,11 @@ function Perms.deleteGroup(name, actorSrc)
         local info = Core.Player.getInfo(tonumber(players[i]))
         if info and info.group == name then return false, 'in_use' end
     end
-    if not Core.DB.delete(COLLECTION, name) then return false, 'save_failed' end
+    local deleted, deleteErr = Core.DB.delete(TABLE, { name = name })   -- awaited
+    if not deleted then
+        Core.Log.error('perms: group %s could not be deleted (%s)', name, tostring(deleteErr))
+        return false, 'save_failed'
+    end
     groupDocs[name] = nil
     resolved = {}
     groupAudit(actorSrc, 'perms.deleteGroup', name, 'ok', nil, groupChanges(doc, { inherits = {}, perms = {} }))

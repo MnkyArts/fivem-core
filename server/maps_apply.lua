@@ -19,12 +19,17 @@
     refs ('ref'), parents ('parents'), per-map / per-type / server-wide limits ('limit'), type.validate
     ('validate', one pcall'ed hop per created or updated element), then the hook `maps:beforeApply` ('hook').
     A limit refuses only an apply that raises a count above it, so lowering a limit never blocks deletes.
-    Then memory changes, only the touched element documents are written, one journal row is appended
-    and the active contexts re-render the touched ids (maps_runtime.lua).
+    Then memory changes and, in ONE execution slice (so core_db commits them in one transaction, DESIGN §56.3.3),
+    the touched element rows are queued (save / remove), one journal row, the journal prune and the map row;
+    then the active contexts re-render the touched ids (maps_runtime.lua). While core_db reports the database
+    unhealthy, applies and clears answer 'db' (nothing changes).
 
     `fields` of an update merge into the current fields (`replace = true` replaces them, which invert
     uses); a create may carry the `id` of an element that no longer exists (undo of a delete keeps ids).
     An element whose type version is older than its type's is migrated (type.migrate) when its fields change.
+
+    The journal (table map_journal): R.loadJournal reads (map_id, seq, w) at start-up (never `ops` / `ids`) into
+    R.state.journalIdx; Maps.journal reads a page of full rows with one awaited query.
 
     Natives: none (CreateThread, AddEventHandler are runtime helpers).
 ]]
@@ -36,6 +41,7 @@ local Maps = Core.Maps
 local Log = Core.Log
 local Utils = Core.Utils
 local Schema = Core.Schema
+local DB = Core.DB
 
 local types = R.types
 local maps, sets = R.state.maps, R.state.sets
@@ -52,6 +58,7 @@ local EXPIRY_CHECK_MS <const> = 10000
 local JOURNAL_PAGE <const>, JOURNAL_PAGE_MAX <const> = 50, 200
 local ID_MAX <const> = 999999999          -- R.normId's limit: nextElementId never passes it
 local CLEAR_IDS_PER_OP <const> = 100      -- a clear row's journal weight: 1 per this many deleted ids
+local JOURNAL_LOAD_BATCH <const> = 5000   -- (map_id, seq, w) rows per stream batch at start-up
 R.journalOpsTotal = 200000                -- stored journal ops across every map (the oldest rows of the fullest map go)
 
 local function round(v, mult)
@@ -496,47 +503,98 @@ local function journalOp(r)
     return { op = 'update', id = r.id, before = db, after = da }
 end
 
-local function dropOldest(S, mapId)
-    local old = table.remove(S.journalIdx[mapId], 1)
-    Core.DB.delete('map_journal', mapId .. ':j' .. old.seq)
-    local w = old.w or 1
-    S.journalOps[mapId] = (S.journalOps[mapId] or w) - w
-    S.journalTotal = S.journalTotal - w
+--- A map's journal index: the rows' seq and weight, oldest first, as a window [first, last] of two arrays.
+local function newIndex()
+    return { first = 1, last = 0, seq = {}, w = {} }
 end
 
---- Appends one row (the caller persists the map) and prunes: per map to journalMax rows and journalMaxOps
---- weight (the newest row always stays), then server-wide to R.journalOpsTotal, the fullest map first.
+--- Start-up (called by maps.lua's loader, awaited): the index of every map from (map_id, seq, w) — never `ops` /
+--- `ids`, which only Maps.journal reads. A journal row newer than its map row moves the map's journalSeq on.
+function R.loadJournal()
+    local S = R.state
+    local maps, idxOf, opsOf = S.maps, S.journalIdx, S.journalOps
+    local total, err = DB.stream('SELECT map_id, seq, w FROM map_journal ORDER BY map_id, seq', {}, function(rows)
+        for i = 1, #rows do
+            local row = rows[i]
+            local seq = math.tointeger(row.seq)
+            if maps[row.map_id] and seq then
+                local idx = idxOf[row.map_id] or newIndex()
+                idxOf[row.map_id] = idx
+                local w = math.tointeger(row.w) or 1
+                idx.last = idx.last + 1
+                idx.seq[idx.last], idx.w[idx.last] = seq, w
+                opsOf[row.map_id] = (opsOf[row.map_id] or 0) + w
+                S.journalTotal = S.journalTotal + w
+            end
+        end
+    end, { batch = JOURNAL_LOAD_BATCH })
+    if not total then return false, 'map_journal: ' .. tostring(err) end
+    for id, idx in pairs(idxOf) do
+        local map = maps[id]
+        if idx.last >= idx.first and idx.seq[idx.last] > map.journalSeq then map.journalSeq = idx.seq[idx.last] end
+    end
+    return true
+end
+
+--- Drops the oldest row of a map's index -> its seq (the caller deletes every row up to the highest one dropped).
+local function dropOldest(S, mapId)
+    local idx = S.journalIdx[mapId]
+    local i = idx.first
+    local seq, w = idx.seq[i], idx.w[i] or 1
+    idx.seq[i], idx.w[i], idx.first = nil, nil, i + 1
+    S.journalOps[mapId] = (S.journalOps[mapId] or w) - w
+    S.journalTotal = S.journalTotal - w
+    return seq
+end
+
+local function rowsOf(idx)
+    return idx and idx.last - idx.first + 1 or 0
+end
+
+--- Queues one row (the caller persists the map in the same slice) and prunes: per map to journalMax rows and
+--- journalMaxOps weight (the newest row always stays), then server-wide to R.journalOpsTotal, the fullest map
+--- first. A pruned map gets ONE queued, keyed `DELETE … seq <= cut` behind the rows it covers; no later write
+--- ever targets a pruned seq (seqs only grow).
 local function journalAppend(map, info, source, row, lim)
     local S = R.state
     map.journalSeq = map.journalSeq + 1
     local seq, at = map.journalSeq, os.time()
-    row.mapId, row.seq, row.at, row.by, row.source = map.id, seq, at, info.by, source
-    row.actor = { kind = info.kind, src = info.src, name = info.name }
-    if not Core.DB.set('map_journal', map.id .. ':j' .. seq, row) then
-        Log.warn('maps: could not write journal row %s:%d', map.id, seq)
+    local ok, err = DB.save('map_journal', { map_id = map.id, seq = seq, at = at, author = info.by,
+        source = source, actor = { kind = info.kind, src = info.src, name = info.name }, count = row.count,
+        w = row.w, clear = row.clear == true, ops = row.ops or DB.NULL, ids = row.ids or DB.NULL })
+    if not ok then
+        Log.warn('maps: could not queue journal row %s:%d: %s', map.id, seq, tostring(err))
         return seq
     end
-    local idx = S.journalIdx[map.id] or {}
+    local idx = S.journalIdx[map.id] or newIndex()
     S.journalIdx[map.id] = idx
-    idx[#idx + 1] = { seq = seq, at = at, by = info.by, w = row.w }
+    idx.last = idx.last + 1
+    idx.seq[idx.last], idx.w[idx.last] = seq, row.w
     S.journalOps[map.id] = (S.journalOps[map.id] or 0) + row.w
     S.journalTotal = S.journalTotal + row.w
-    while #idx > 1 and (#idx > lim.journalMax or S.journalOps[map.id] > lim.journalMaxOps) do
-        dropOldest(S, map.id)
+    local cut = {}                              -- [mapId] = highest pruned seq
+    while rowsOf(idx) > 1 and (rowsOf(idx) > lim.journalMax or S.journalOps[map.id] > lim.journalMaxOps) do
+        cut[map.id] = dropOldest(S, map.id)
     end
     while S.journalTotal > R.journalOpsTotal do
         local worst, most = nil, 0
         for id, n in pairs(S.journalOps) do
-            local list = S.journalIdx[id]
-            if n > most and list and #list > 1 then worst, most = id, n end
+            if n > most and rowsOf(S.journalIdx[id]) > 1 then worst, most = id, n end
         end
         if not worst then break end
-        dropOldest(S, worst)
+        cut[worst] = dropOldest(S, worst)
+    end
+    for id, upTo in pairs(cut) do
+        -- keyed: a newer bound supersedes a pending older one and runs at its own (later) position (§56.3.2),
+        -- so a burst of applies on a full journal leaves ONE barrier per map in a flush, not one per apply
+        local queued, perr = DB.enqueue('DELETE FROM map_journal WHERE map_id = $1 AND seq <= $2', { id, upTo },
+            'core:maps.prune:' .. id)
+        if not queued then Log.warn('maps: could not queue the journal prune of %s: %s', id, tostring(perr)) end
     end
     return seq
 end
 
---- Memory, then the touched documents, then one journal row, then the world.
+--- Memory, then (one slice, one transaction) the touched rows, one journal row and the map row, then the world.
 local function commit(map, stage, cx, lim, source)
     local set, order = stage.set, stage.order
     for i = 1, #order do
@@ -549,10 +607,11 @@ local function commit(map, stage, cx, lim, source)
         set.els[id] = el or nil
         if el then
             R.writeElement(map.id, el)
-        elseif stage.before[id] then
+        elseif stage.before[id] and not cx.clearing then
             R.removeElement(map.id, id)
         end
     end
+    if cx.clearing then R.clearElements(map.id) end      -- every element: one statement, not one entry per row
     map.nextElementId = cx.nextId
     map.updatedAt = os.time()
     local results = {}
@@ -583,15 +642,24 @@ end
 
 local OP_HANDLERS <const> = { create = opCreate, update = opUpdate, delete = opDelete }
 
---- The pipeline behind apply and clear. `clearing` skips opsPerApply and journals a summary.
-local function run(id, ops, actor, opts, clearing)
-    if not R.ensureLoaded() then return nil, 'unavailable' end
-    if type(id) ~= 'string' or not maps[id] then return nil, 'not_found' end
-    if opts ~= nil and type(opts) ~= 'table' then return nil, 'opts' end
-    opts = opts or {}
-    local lim = R.readLimits(maps[id])          -- may yield once (settings load): nothing is staged yet
+local RESTAGE <const> = {}                 -- attempt(): the map moved while a validator / hook yielded
+local ATTEMPTS <const> = 3
+
+--- One pass of the pipeline behind apply and clear (`clearing` skips opsPerApply and journals a summary;
+--- `ops` may be a function(id) -> ops, re-read per pass). Model validators, type.migrate / validate and the hook
+--- may cross the export hop and YIELD; after each of them the map must still be the same object at the same
+--- generation (R.persistMap bumps it), else RESTAGE — nothing is written from a stale staging (a second apply
+--- would reuse this one's new ids, a delete meanwhile would get its map row back).
+local function attempt(id, ops, actor, opts, clearing)
     local map, set = maps[id], sets[id]
     if not map then return nil, 'not_found' end
+    local gen = R.genOf(id)
+    local function moved() return maps[id] ~= map or R.genOf(id) ~= gen end
+    local lim = R.readLimits(map)               -- never yields (the settings as last read)
+    if type(ops) == 'function' then
+        ops = ops(id)
+        if clearing and #ops == 0 then return true, { seq = map.journalSeq, ops = {} } end
+    end
     if type(ops) ~= 'table' or #ops == 0 then return nil, 'ops' end
     local count = #ops
     if not clearing and count > lim.opsPerApply then return nil, 'too_many_ops', { max = lim.opsPerApply } end
@@ -607,7 +675,7 @@ local function run(id, ops, actor, opts, clearing)
             end
         end
     end
-    if Core.DB.isDegraded('map_elements') then return nil, 'db' end
+    if not DB.isHealthy() then return nil, 'db' end     -- the old 'degraded' refusal, from core_db's health
     local base = R.countSet(set.els)
     local cx = { mapId = id, info = R.actorInfo(actor), actor = actor, nextId = map.nextElementId, models = {},
         base = base, counts = copyCounts(base), source = map.mode == 'live' and 'live' or 'draft', clearing = clearing }
@@ -616,17 +684,34 @@ local function run(id, ops, actor, opts, clearing)
         local op = ops[i]
         local handler = type(op) == 'table' and OP_HANDLERS[op.op]
         if not handler then return nil, 'op', { index = i } end
-        local err, detail = handler(stage, i, op, cx)
+        local err, detail = handler(stage, i, op, cx)          -- model validator / type.migrate: may yield
         if err then return nil, err, detail end
     end
+    if moved() then return RESTAGE end
     local err, detail = checkRefs(stage)
     if not err then err, detail = checkReferenced(stage, cx) end
     if not err then err, detail = checkParents(cx) end
     if not err then err, detail = checkLimits(cx, lim) end
-    if not err then err, detail = runValidators(stage, cx) end
+    if not err then err, detail = runValidators(stage, cx) end  -- type.validate: may yield
+    if not err and moved() then return RESTAGE end
     if not err then err, detail = runHook(stage, cx, map, source, count) end
     if err then return nil, err, detail end
-    return commit(map, stage, cx, lim, source)
+    if moved() then return RESTAGE end
+    return commit(map, stage, cx, lim, source)                  -- never yields: one slice, one transaction
+end
+
+--- apply / clear: a pass that found its map moved runs again on the new state (its `expect` is re-checked
+--- there); after ATTEMPTS moved passes -> 'conflict' { reason = 'concurrent' }.
+local function run(id, ops, actor, opts, clearing)
+    if not R.ensureLoaded() then return nil, 'unavailable' end
+    if type(id) ~= 'string' or not maps[id] then return nil, 'not_found' end
+    if opts ~= nil and type(opts) ~= 'table' then return nil, 'opts' end
+    opts = opts or {}
+    for _ = 1, ATTEMPTS do
+        local res = table.pack(attempt(id, ops, actor, opts, clearing))
+        if res[1] ~= RESTAGE then return table.unpack(res, 1, res.n) end
+    end
+    return nil, 'conflict', { reason = 'concurrent' }
 end
 
 --- Maps.apply(id, ops, actor, opts) -> true, applied | nil, err, detail (see the header).
@@ -656,17 +741,24 @@ function Maps.invert(applied)
     return Utils.deepCopy(ops), expect
 end
 
+--- The delete ops of every element a map has now (re-read by every pass of run).
+local function clearOps(id)
+    local ids = R.sortedIds(sets[id].els)
+    local ops = {}
+    for i = 1, #ids do ops[i] = { op = 'delete', id = ids[i] } end
+    return ops
+end
+
 --- Maps.clear(id, actor, opts?) -> true, applied | nil, err. One journaled apply of every delete.
 function Maps.clear(id, actor, opts)
     if not R.ensureLoaded() then return nil, 'unavailable' end
     local set = type(id) == 'string' and sets[id]
     if not set then return nil, 'not_found' end
-    local ids = R.sortedIds(set.els)
-    if #ids == 0 then return true, { seq = maps[id].journalSeq, ops = {} } end
-    local ops = {}
-    for i = 1, #ids do ops[i] = { op = 'delete', id = ids[i] } end
-    local ok, applied, detail = run(id, ops, actor, opts, true)
-    if ok and maps[id] then R.audit('clear', maps[id], actor, nil, { elements = #ids, seq = applied.seq }) end
+    if next(set.els) == nil then return true, { seq = maps[id].journalSeq, ops = {} } end
+    local ok, applied, detail = run(id, clearOps, actor, opts, true)
+    if ok and maps[id] and #applied.ops > 0 then
+        R.audit('clear', maps[id], actor, nil, { elements = #applied.ops, seq = applied.seq })
+    end
     return ok, applied, detail
 end
 
@@ -674,7 +766,15 @@ end
 -- Journal, respawn, the type / event delegates
 --------------------------------------------------------------------------------
 
---- Maps.journal(id, { limit? = 50 (<= 200), before? = seq, author? = by }) -> rows, newest first
+--- A `map_journal` row -> the journal row shape (by = author; clear / ops / ids only where set).
+local function journalRow(mapId, r)
+    return { id = mapId .. ':j' .. tostring(r.seq), mapId = mapId, seq = r.seq, at = r.at, by = r.author,
+        source = r.source, actor = r.actor, count = r.count, w = r.w, clear = r.clear == true or nil, ops = r.ops,
+        ids = r.ids }
+end
+
+--- Maps.journal(id, { limit? = 50 (<= 200), before? = seq, author? = by }) -> rows, newest first | nil, err.
+--- One awaited query (index map_journal_author_idx for author pages); `sync` sees rows still in the queue.
 function Maps.journal(id, filter)
     if not R.ensureLoaded() then return nil end
     if type(id) ~= 'string' or not maps[id] then return nil end
@@ -683,16 +783,26 @@ function Maps.journal(id, filter)
     limit = math.max(1, math.min(limit, JOURNAL_PAGE_MAX))
     local before = math.tointeger(filter.before)
     local author = type(filter.author) == 'string' and filter.author or nil
-    local rows, idx = {}, R.state.journalIdx[id] or {}
-    for i = #idx, 1, -1 do
-        local e = idx[i]
-        if (not before or e.seq < before) and (not author or e.by == author) then
-            local row = Core.DB.get('map_journal', id .. ':j' .. e.seq)
-            if row then rows[#rows + 1] = row end
-            if #rows >= limit then break end
-        end
+    local sql, params = { 'SELECT seq, at, author, source, actor, count, w, clear, ops, ids FROM map_journal '
+        .. 'WHERE map_id = $1' }, { id }
+    if before then
+        params[#params + 1] = before
+        sql[#sql + 1] = ' AND seq < $' .. #params
     end
-    return rows
+    if author then
+        params[#params + 1] = author
+        sql[#sql + 1] = ' AND author = $' .. #params
+    end
+    params[#params + 1] = limit
+    sql[#sql + 1] = ' ORDER BY seq DESC LIMIT $' .. #params
+    local rows, err = DB.query(table.concat(sql), params, { sync = true })
+    if not rows then
+        Log.warn('maps: could not read the journal of %s: %s', id, tostring(err))
+        return nil, err
+    end
+    local out = {}
+    for i = 1, #rows do out[i] = journalRow(id, rows[i]) end
+    return out
 end
 
 --- Maps.respawn(id, elementId?) -> how many element nodes were put back to their authored state (spawned again,
@@ -753,7 +863,10 @@ AddEventHandler('onResourceStart', function(resource)
     if resource ~= Core.name then return end
     local Cron = rawget(Core, 'Cron')
     if Cron and Cron.every then
-        Cron.every(EXPIRY_CHECK_MS, checkExpiry)
+        Cron.every(EXPIRY_CHECK_MS, function()
+            R.refreshLimits()                  -- a job thread: may wait for Settings; picks up a late settings load
+            checkExpiry()
+        end)
     else
         Log.warn('maps: Core.Cron is missing; live-map expiry is not enforced')
     end
@@ -764,3 +877,11 @@ AddEventHandler('onResourceStart', function(resource)
         checkExpiry()
     end)
 end)
+
+-- maps.* settings changed: R.readLimits sees the new value (it never reads Core.Settings itself)
+local Settings = rawget(Core, 'Settings')
+if Settings and Settings.onChange then
+    Settings.onChange('maps.', function(key, value) R.limitChanged(key, value) end)
+else
+    Log.warn('maps: Core.Settings is missing; the maps.* limits stay at their defaults')
+end

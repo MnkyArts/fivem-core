@@ -11,13 +11,15 @@
       Maps.openDraft(id, actor) -> bucket / Maps.closeDraft(id) -> bool
       Maps.apply / invert / clear / journal / respawn and the type / event delegates: maps_apply.lua
 
-    Collections: `maps` (one document per map), `map_elements` (one per element, id '<mapId>:<elementId>',
-    so an apply writes only what changed), `map_versions` (id '<mapId>:v<n>', published snapshots, the
-    newest VERSIONS_KEEP kept), `map_journal` (id '<mapId>:j<seq>', pruned per map to `maps.journalMax` rows and
-    `maps.journalMaxOps` stored ops, and server-wide to R.journalOpsTotal — maps_apply.lua).
-    Everything is read once behind the async barrier of server/globals.lua (§22): the first caller parks a
-    promise while Core.DB loads (it yields on postgres/mysql) and every caller arriving meanwhile waits.
-    The journal and version indexes are built through a DB.find predicate that copies nothing.
+    Tables (DESIGN §56.6): `maps`, `map_elements` (key (map_id, element_id): an apply writes only what changed),
+    `map_versions` (published snapshots, the newest VERSIONS_KEEP kept), `map_journal` (pruned per map and
+    server-wide — maps_apply.lua). Columns map to the Lua shapes in one place each (mapRow / mapFromRow,
+    R.writeElement / elementDoc: `by` = author, `updatedAt` = rev; the version index: author, author_name,
+    from_version = by, byName, from). Start-up behind one barrier (callers park on its promise): maps (sync), the
+    elements streamed, versions and journal as METADATA only (never `elements` / `ops` / `ids`), the published
+    snapshots of drafts streamed. Then memory answers, except Maps.rollback / Maps.journal (awaited queries).
+    Writes are queued: everything one change writes goes out in one execution slice = one transaction
+    (§56.3.3). Maps.create awaits its insert; Maps.delete is one queued DELETE (the foreign keys cascade).
 
     Activation (which content is in which bucket) is recomputed per map by R.syncMap: a live map's elements
     in targetBucket while active, a draft's published snapshot in targetBucket while active, a draft's
@@ -40,18 +42,20 @@ Core.Maps = Maps
 local Log = Core.Log
 local Utils = Core.Utils
 local Registry = Core.Registry
+local DB = Core.DB
 
 local S = R.state
 local maps, sets, snaps, editorBuckets = S.maps, S.sets, S.snaps, S.editorBuckets
--- [mapId] = ascending { seq, at, by } / { version, by, byName, note, at, count, from }
+-- [mapId] = the journal rows' seq and prune weight, oldest first (maps_apply.lua: R.loadJournal, appends,
+-- prunes) / ascending { version, by, byName, note, at, count, from }
 local journalIdx, versionIdx = {}, {}
 local journalOps = {}                   -- [mapId] = stored journal weight (ops) of that map; S.journalTotal = sum
 S.journalIdx, S.versionIdx, S.journalOps, S.journalTotal = journalIdx, versionIdx, journalOps, 0
+S.gen = {}                              -- [mapId] = generation, see R.persistMap
 
-local C_MAPS <const> = 'maps'
-local C_ELEMENTS <const> = 'map_elements'
-local C_VERSIONS <const> = 'map_versions'
-local C_JOURNAL <const> = 'map_journal'
+local T_MAPS <const> = 'maps'
+local T_ELEMENTS <const> = 'map_elements'
+local T_VERSIONS <const> = 'map_versions'
 local DRAFT_KIND <const> = 'mapsDraft'
 local MAP_ID_PATTERN <const> = '^[%w_%-]+$'
 local MAP_ID_MAX <const> = 24
@@ -59,7 +63,6 @@ local NAME_MAX <const> = 64
 local DESCRIPTION_MAX <const> = 1024
 local NOTE_MAX <const> = 256
 local VERSIONS_KEEP <const> = 20
-local EXPIRY_CHECK_MS <const> = 10000
 local LOAD_RETRY_S <const> = 10
 local BUCKET_MAX <const> = 0x7FFFFFFF
 local LIMIT_RANGE <const> = {             -- per-map overrides of the maps.limits.* settings (same bounds)
@@ -68,6 +71,9 @@ local LIMIT_RANGE <const> = {             -- per-map overrides of the maps.limit
 local SETTING_DEFAULTS <const> = {
     elements = 3000, perModel = 300, uniqueModels = 200, networked = 20, networkedTotal = 200, opsPerApply = 200,
 }
+
+local SNAPSHOT_LOAD_BATCH <const> = 4     -- published snapshots (up to ~1 MB each) per stream batch
+R.loadBatch = 1000                        -- element rows per stream batch at start-up (one server tick each)
 
 local loaded, loading, failedAt = false, nil, nil
 local lastStamp, stampBase, timerBase = 0, nil, nil
@@ -116,17 +122,39 @@ function R.audit(action, map, actor, changes, ctx)
     if not ok then Log.warn('maps: audit record %s failed: %s', action, tostring(err)) end
 end
 
---- Effective limits of a map: its own overrides, else the maps.limits.* settings (may yield once while
---- the settings load — call it before staging anything).
-function R.readLimits(map)
+-- The maps.* settings as last read. R.readLimits never calls Core.Settings (whose first read may wait for its
+-- load): nothing between staging and the writes of an apply / publish / setActive may yield. Filled by
+-- R.refreshLimits (the start-up load, the 10 s expiry job) and kept current by a Settings.onChange watcher.
+local LIMIT_KEYS <const> = {
+    elements = 'maps.limits.elements', perModel = 'maps.limits.perModel', uniqueModels = 'maps.limits.uniqueModels',
+    networked = 'maps.limits.networked', networkedTotal = 'maps.limits.networkedTotal',
+    opsPerApply = 'maps.limits.opsPerApply', journalMax = 'maps.journalMax', journalMaxOps = 'maps.journalMaxOps',
+}
+local limitValues = {}                    -- [name] = integer as last read (absent: the default)
+
+--- Re-reads every maps.* setting. MAY YIELD (Settings loads on first use): only from a coroutine that holds no
+--- staged change (the loader, the expiry job).
+function R.refreshLimits()
     local Settings = rawget(Core, 'Settings')
-    local out = {}
-    for key, fallback in pairs(SETTING_DEFAULTS) do
-        local v = Settings and Settings.get('maps.limits.' .. key)
-        out[key] = math.tointeger(v) or fallback
+    if not (Settings and Settings.get) then return end
+    local fresh = {}
+    for name, key in pairs(LIMIT_KEYS) do fresh[name] = math.tointeger(Settings.get(key)) end
+    limitValues = fresh
+end
+
+--- A changed maps.* setting (the Settings.onChange watcher of maps_apply.lua): its new effective value.
+function R.limitChanged(key, value)
+    for name, k in pairs(LIMIT_KEYS) do
+        if k == key then limitValues[name] = math.tointeger(value) end
     end
-    out.journalMax = math.tointeger(Settings and Settings.get('maps.journalMax')) or 5000
-    out.journalMaxOps = math.tointeger(Settings and Settings.get('maps.journalMaxOps')) or 20000
+end
+
+--- Effective limits of a map: its own overrides, else the maps.* settings as last read. Never yields.
+function R.readLimits(map)
+    local out = {}
+    for key, fallback in pairs(SETTING_DEFAULTS) do out[key] = limitValues[key] or fallback end
+    out.journalMax = limitValues.journalMax or 5000
+    out.journalMaxOps = limitValues.journalMaxOps or 20000
     if map and type(map.limits) == 'table' then
         for key in pairs(LIMIT_RANGE) do
             if math.tointeger(map.limits[key]) then out[key] = map.limits[key] end
@@ -161,28 +189,67 @@ function R.countSet(els)
     return c
 end
 
+--------------------------------------------------------------------------------
+-- Rows (DESIGN §56.6): the ONE place where columns map to the Lua shapes. Writes are queued and never yield.
+--------------------------------------------------------------------------------
+
+local NULL = DB.NULL
+
+--- The `maps` row of an in-memory map (every column: a `save` overwrites what it names, NULL clears).
+local function mapRow(map)
+    return {
+        id = map.id, name = map.name, mode = map.mode, active = map.active == true, target_bucket = map.targetBucket,
+        published_version = map.publishedVersion, published_seq = map.publishedSeq,
+        next_element_id = map.nextElementId, journal_seq = map.journalSeq, meta = map.meta or {},
+        limits = map.limits or NULL, expires_at = map.expiresAt or NULL, created_by = map.createdBy or NULL,
+        created_at = map.createdAt, updated_at = map.updatedAt,
+    }
+end
+
+--- Queues the map row as a PATCH (an absent row — the map was deleted meanwhile — stays absent; a save would
+--- re-insert it) and bumps the map's generation: a staged apply that yielded re-stages when it moved (maps_apply).
+--- true, or false when core_db refused the entry (logged).
 function R.persistMap(map)
-    if Core.DB.set(C_MAPS, map.id, map) then return true end
-    Log.error('maps: could not persist map %s', map.id)
+    S.gen[map.id] = (S.gen[map.id] or 0) + 1
+    local row = mapRow(map)
+    row.id, row.created_at, row.created_by = nil, nil, nil        -- the key and what never changes
+    local ok, err = DB.patch(T_MAPS, map.id, row)
+    if ok then return true end
+    Log.error('maps: could not persist map %s: %s', map.id, tostring(err))
     return false
 end
 
---- The stored form of an element: its fields plus mapId. Core.DB forces `id` to the document id and
---- `updatedAt` to the write time in seconds, so the element's own stamp is stored as `rev`.
-local function elementDocId(mapId, elementId)
-    return mapId .. ':' .. elementId
+--- The generation of a map (bumped by every persisted change of it).
+function R.genOf(id)
+    return S.gen[id] or 0
 end
 
+--- Queues an element row (the whole row: cleared keys become NULL). `by` is stored as author, the element's
+--- millisecond stamp `updatedAt` as rev (updated_at is the row's own write time).
 function R.writeElement(mapId, el)
-    local doc = { mapId = mapId, type = el.type, typeVersion = el.typeVersion, pos = el.pos, rot = el.rot,
-        fields = el.fields, layer = el.layer, cam = el.cam, by = el.by, rev = el.updatedAt, info = el.info }
-    if Core.DB.set(C_ELEMENTS, elementDocId(mapId, el.id), doc) then return true end
-    Log.error('maps: could not write element %s:%s', mapId, el.id)
+    local ok, err = DB.save(T_ELEMENTS, {
+        map_id = mapId, element_id = math.tointeger(tonumber(el.id)), type = el.type, type_version = el.typeVersion,
+        pos = el.pos, rot = el.rot, fields = el.fields or {}, layer = el.layer, cam = el.cam or NULL,
+        author = el.by or NULL, rev = el.updatedAt, info = el.info or NULL,
+    })
+    if ok then return true end
+    Log.error('maps: could not write element %s:%s: %s', mapId, el.id, tostring(err))
     return false
 end
 
+--- Queues the removal of an element row.
 function R.removeElement(mapId, elementId)
-    Core.DB.delete(C_ELEMENTS, elementDocId(mapId, elementId))
+    local ok, err = DB.remove(T_ELEMENTS, { map_id = mapId, element_id = math.tointeger(tonumber(elementId)) })
+    if not ok then Log.error('maps: could not remove element %s:%s: %s', mapId, elementId, tostring(err)) end
+    return ok
+end
+
+--- Queues the removal of every element row of a map (Maps.clear): one statement. A raw statement is a coalescing
+--- barrier (§56.3.2), so an element written after it in the same flush (the clear's undo) is written after it.
+function R.clearElements(mapId)
+    local ok, err = DB.enqueue('DELETE FROM map_elements WHERE map_id = $1', { mapId })
+    if not ok then Log.error('maps: could not queue the clear of %s: %s', mapId, tostring(err)) end
+    return ok
 end
 
 local function vec(v, fallback)
@@ -191,23 +258,29 @@ local function vec(v, fallback)
     return { x = x, y = y, z = z }
 end
 
---- A stored element document (or a snapshot entry) -> the in-memory element, or nil when unusable.
+--- An element document (the shape of a snapshot entry: by, updatedAt | rev) -> the in-memory element, or nil
+--- when unusable. Documents come freshly decoded from core_db, so their tables are taken over, not copied.
 local function toElement(doc, elementId)
     if type(doc) ~= 'table' or type(doc.type) ~= 'string' then return nil end
     local pos = vec(doc.pos)
     if not pos or not elementId then return nil end
-    local info = type(doc.info) == 'table' and Utils.deepCopy(doc.info) or nil
     return {
         id = elementId, type = doc.type, typeVersion = math.tointeger(doc.typeVersion) or 1, pos = pos,
         rot = vec(doc.rot, { x = 0, y = 0, z = 0 }),
-        fields = type(doc.fields) == 'table' and Utils.deepCopy(doc.fields) or {},
+        fields = type(doc.fields) == 'table' and doc.fields or {},
         layer = type(doc.layer) == 'string' and doc.layer or 'default', cam = vec(doc.cam),
-        by = type(doc.by) == 'string' and doc.by or 'system', info = info,
+        by = type(doc.by) == 'string' and doc.by or 'system', info = type(doc.info) == 'table' and doc.info or nil,
         updatedAt = math.tointeger(doc.rev) or math.tointeger(doc.updatedAt) or 0,
     }
 end
 
---- Snapshot array (map_versions) -> { [id] = element }.
+--- A `map_elements` row -> the document shape toElement reads.
+local function elementDoc(row)
+    return { type = row.type, typeVersion = row.type_version, pos = row.pos, rot = row.rot, fields = row.fields,
+        layer = row.layer, cam = row.cam, by = row.author, rev = row.rev, info = row.info }
+end
+
+--- Snapshot array (map_versions.elements) -> { [id] = element }.
 local function fromArray(list)
     local els = {}
     if type(list) ~= 'table' then return els end
@@ -294,94 +367,114 @@ local function int(v, lo, fallback)
     return fallback
 end
 
---- A stored map document -> the in-memory map (normalised), or nil.
-local function normalizeMap(doc)
-    local id = doc.id
+--- A `maps` row -> the in-memory map (normalised), or nil.
+local function mapFromRow(row)
+    local id = row.id
     if type(id) ~= 'string' or #id > MAP_ID_MAX or not id:find(MAP_ID_PATTERN) then return nil end
-    if doc.mode ~= 'draft' and doc.mode ~= 'live' then return nil end
-    local meta = type(doc.meta) == 'table' and doc.meta or {}
+    if row.mode ~= 'draft' and row.mode ~= 'live' then return nil end
+    local meta = type(row.meta) == 'table' and row.meta or {}
     return {
-        id = id, name = type(doc.name) == 'string' and doc.name or id, mode = doc.mode, active = doc.active == true,
-        targetBucket = int(doc.targetBucket, 0, 0), publishedVersion = int(doc.publishedVersion, 0, 0),
-        publishedSeq = int(doc.publishedSeq, -1, 0), nextElementId = int(doc.nextElementId, 1, 1),
-        journalSeq = int(doc.journalSeq, 0, 0),
+        id = id, name = type(row.name) == 'string' and row.name or id, mode = row.mode, active = row.active == true,
+        targetBucket = int(row.target_bucket, 0, 0), publishedVersion = int(row.published_version, 0, 0),
+        publishedSeq = int(row.published_seq, -1, 0), nextElementId = int(row.next_element_id, 1, 1),
+        journalSeq = int(row.journal_seq, 0, 0),
         meta = { description = type(meta.description) == 'string' and meta.description or nil },
-        limits = type(doc.limits) == 'table' and doc.limits or nil, expiresAt = int(doc.expiresAt, 1, nil),
-        createdAt = doc.createdAt, createdBy = doc.createdBy, updatedAt = doc.updatedAt,
+        limits = type(row.limits) == 'table' and next(row.limits) ~= nil and row.limits or nil,
+        expiresAt = int(row.expires_at, 1, nil), createdAt = row.created_at,
+        createdBy = type(row.created_by) == 'table' and row.created_by or nil, updatedAt = row.updated_at,
     }
 end
 
-local function loadAll()
-    local DB = Core.DB
-    local docs = DB.all(C_MAPS)
-    if DB.isDegraded(C_MAPS) then return false, C_MAPS end
-    for i = 1, #docs do
-        local map = normalizeMap(docs[i])
+local function loadMaps()
+    -- sync: the previous core's final queued writes (a `restart core` inside one flush interval) land first
+    local rows, err = DB.select(T_MAPS, nil, { sync = true })
+    if not rows then return false, 'maps: ' .. tostring(err) end
+    for i = 1, #rows do
+        local map = mapFromRow(rows[i])
         if map then
             maps[map.id], sets[map.id] = map, { els = {} }
         else
-            Log.warn('maps: skipping unreadable map document %s', tostring(docs[i].id))
-        end
-    end
-    local orphans = 0
-    -- predicates read the stored documents and copy only what is kept (returning false: DB copies nothing)
-    DB.find(C_ELEMENTS, function(doc)
-        local mapId, elementId = tostring(doc.id):match('^([%w_%-]+):(%d+)$')
-        local set = mapId and sets[mapId]
-        local el = set and toElement(doc, elementId)
-        if el then
-            set.els[elementId] = el
-            if el.updatedAt > lastStamp then lastStamp = el.updatedAt end
-            local map = maps[mapId]
-            local n = tonumber(elementId)
-            if n >= map.nextElementId then map.nextElementId = n + 1 end
-        else
-            orphans = orphans + 1
-        end
-        return false
-    end)
-    if DB.isDegraded(C_ELEMENTS) then return false, C_ELEMENTS end
-    if orphans > 0 then Log.warn('maps: ignored %d element document(s) without a readable map', orphans) end
-    DB.find(C_VERSIONS, function(doc)
-        local list = maps[doc.mapId] and (versionIdx[doc.mapId] or {})
-        local version = math.tointeger(doc.version)
-        if list and version then
-            versionIdx[doc.mapId] = list
-            list[#list + 1] = { version = version, by = doc.by, byName = doc.byName, note = doc.note, at = doc.at,
-                count = doc.count, from = doc.from }
-        end
-        return false
-    end)
-    DB.find(C_JOURNAL, function(doc)
-        local list = maps[doc.mapId] and (journalIdx[doc.mapId] or {})
-        local seq = math.tointeger(doc.seq)
-        if list and seq then
-            journalIdx[doc.mapId] = list
-            local w = math.tointeger(doc.w) or (type(doc.ops) == 'table' and #doc.ops) or 1
-            list[#list + 1] = { seq = seq, at = doc.at, by = doc.by, w = w }
-            journalOps[doc.mapId] = (journalOps[doc.mapId] or 0) + w
-            S.journalTotal = S.journalTotal + w
-        end
-        return false
-    end)
-    for _, list in pairs(versionIdx) do table.sort(list, function(a, b) return a.version < b.version end) end
-    for _, list in pairs(journalIdx) do table.sort(list, function(a, b) return a.seq < b.seq end) end
-    for id, map in pairs(maps) do
-        if map.mode == 'draft' and map.publishedVersion > 0 then
-            local doc = DB.get(C_VERSIONS, id .. ':v' .. map.publishedVersion)
-            if doc then
-                snaps[id] = { version = map.publishedVersion, els = fromArray(doc.elements) }
-            else
-                Log.warn('maps: published version %d of %s is missing; nothing is shown for it',
-                    map.publishedVersion, id)
-            end
+            Log.warn('maps: skipping unreadable map row %s', tostring(rows[i].id))
         end
     end
     return true
 end
 
---- Loads every map once; true when the documents are in memory. A failed load (degraded collection) is
---- retried at most every LOAD_RETRY_S seconds. The first successful load activates every map.
+--- Every element (world content, all of it is needed in memory), streamed in batches of R.loadBatch rows.
+local function loadElements()
+    local orphans = 0
+    local total, err = DB.stream('SELECT map_id, element_id, type, type_version, pos, rot, fields, layer, cam, '
+        .. 'author, rev, info FROM map_elements', {}, function(rows)
+        for i = 1, #rows do
+            local row = rows[i]
+            local set = sets[row.map_id]
+            local n = math.tointeger(row.element_id)
+            local elementId = n and n > 0 and tostring(n) or nil
+            local el = set and elementId and toElement(elementDoc(row), elementId)
+            if el then
+                set.els[elementId] = el
+                if el.updatedAt > lastStamp then lastStamp = el.updatedAt end
+                local map = maps[row.map_id]
+                if n >= map.nextElementId then map.nextElementId = n + 1 end
+            else
+                orphans = orphans + 1
+            end
+        end
+    end, { batch = R.loadBatch })
+    if not total then return false, 'map_elements: ' .. tostring(err) end
+    if orphans > 0 then Log.warn('maps: ignored %d unreadable element row(s)', orphans) end
+    return true
+end
+
+--- The version index: metadata columns only (the snapshots stay in the database).
+local function loadVersions()
+    local rows, err = DB.query('SELECT map_id, version, author, author_name, note, at, count, from_version '
+        .. 'FROM map_versions ORDER BY map_id, version')
+    if not rows then return false, 'map_versions: ' .. tostring(err) end
+    for i = 1, #rows do
+        local row = rows[i]
+        local version = math.tointeger(row.version)
+        if maps[row.map_id] and version then
+            local list = versionIdx[row.map_id] or {}
+            versionIdx[row.map_id] = list
+            list[#list + 1] = { version = version, by = row.author, byName = row.author_name, note = row.note,
+                at = row.at, count = row.count, from = row.from_version }
+        end
+    end
+    return true
+end
+
+--- The snapshot every published draft shows: only those rows' `elements`, a few per batch.
+local function loadSnapshots()
+    local total, err = DB.stream('SELECT v.map_id, v.elements FROM map_versions v JOIN maps m ON m.id = v.map_id '
+        .. "WHERE m.mode = 'draft' AND m.published_version > 0 AND v.version = m.published_version", {}, function(rows)
+        for i = 1, #rows do
+            local map = maps[rows[i].map_id]
+            if map then snaps[map.id] = { version = map.publishedVersion, els = fromArray(rows[i].elements) } end
+        end
+    end, { batch = SNAPSHOT_LOAD_BATCH })
+    if not total then return false, 'map_versions (snapshots): ' .. tostring(err) end
+    for id, map in pairs(maps) do
+        if map.mode == 'draft' and map.publishedVersion > 0 and not snaps[id] then
+            Log.warn('maps: published version %d of %s is missing; nothing is shown for it', map.publishedVersion, id)
+        end
+    end
+    return true
+end
+
+--- Reads everything the map system keeps in memory -> true | false, reason. Awaited: runs in a coroutine.
+local function loadAll()
+    R.refreshLimits()                          -- may wait for the settings load: nothing is staged here
+    for _, step in ipairs({ loadMaps, loadElements, loadVersions, R.loadJournal, loadSnapshots }) do
+        local ok, err = step()
+        if not ok then return false, err end
+    end
+    return true
+end
+
+--- Loads every map once; true when the documents are in memory. A failed load (a failed read: never treated as
+--- "no maps") is retried at most every LOAD_RETRY_S seconds. The first successful load activates every map.
+--- The load awaits core_db, so it only starts where the caller may yield (a thread, handler, export call).
 local function ensureLoaded()
     if loaded then return true end
     if loading then
@@ -389,15 +482,15 @@ local function ensureLoaded()
         if not ok then Log.error('maps: waiting for the load failed: %s', tostring(err)) end
         return loaded
     end
+    if not coroutine.isyieldable() then return false end   -- a stop handler, a comparator: never a failed load
     if failedAt and os.time() - failedAt < LOAD_RETRY_S then return false end
     local barrier = promise.new()
     loading = barrier
-    local ok, done, which = pcall(loadAll)
+    local ok, done, why = pcall(loadAll)
     if ok and done then
         loaded, failedAt = true, nil
     else
-        Log.error('maps: could not load (%s); maps are unavailable until it loads',
-            ok and ('collection ' .. tostring(which) .. ' is degraded') or tostring(done))
+        Log.error('maps: could not load (%s); maps are unavailable until it loads', ok and tostring(why) or tostring(done))
         for id in pairs(maps) do
             maps[id], sets[id], snaps[id], journalIdx[id], versionIdx[id], journalOps[id] = nil, nil, nil, nil, nil, nil
         end
@@ -491,15 +584,18 @@ local function summary(map, withModels)
     return out
 end
 
+--- A new map id 'm<n>' from the `maps` counter (core_counters, awaited) -> id | nil, err. A counter behind the
+--- ids in memory (a restored backup) falls back to random 'm' ids, as before; a failed read never does.
 local function newMapId()
-    local n = Core.DB.nextId('maps')
-    local id = n and ('m' .. n)
-    if id and not maps[id] then return id end
+    local n, err = DB.nextId('maps')
+    if not n then return nil, err end
+    local id = 'm' .. n
+    if not maps[id] then return id end
     for _ = 1, 8 do
         id = 'm' .. Utils.randomString(10, 'abcdefghijklmnopqrstuvwxyz0123456789')
         if not maps[id] then return id end
     end
-    return nil
+    return nil, 'id'
 end
 
 --------------------------------------------------------------------------------
@@ -530,9 +626,12 @@ function Maps.create(input, actor)
     local active = input.active
     if active == nil then active = mode == 'live' end
     if type(active) ~= 'boolean' then return nil, 'active' end
-    if Core.DB.isDegraded(C_MAPS) or Core.DB.isDegraded(C_ELEMENTS) then return nil, 'db' end
-    local id = newMapId()
-    if not id then return nil, 'db' end
+    local id, idErr = newMapId()                 -- yields (awaited): nothing is staged yet
+    if not id then
+        Log.error('maps: no id for a new map: %s', tostring(idErr))
+        return nil, 'db'
+    end
+    if isEditorBucket(bucket) then return nil, 'targetBucket' end   -- a draft opened it meanwhile
     local info, t = R.actorInfo(actor), os.time()
     local map = {
         id = id, name = name, mode = mode, active = active, targetBucket = bucket, publishedVersion = 0,
@@ -540,11 +639,14 @@ function Maps.create(input, actor)
         expiresAt = expiresAt or nil, createdAt = t, updatedAt = t,
         createdBy = { kind = info.kind, accountId = info.accountId, name = info.name },
     }
-    maps[id], sets[id] = map, { els = {} }
-    if not R.persistMap(map) then
-        maps[id], sets[id] = nil, nil
+    -- awaited: the caller gets the id only once the row exists (element rows reference it)
+    local okInsert, insertErr = DB.insert(T_MAPS, mapRow(map), { returning = false })
+    if not okInsert then
+        Log.error('maps: could not create map %s: %s', id, tostring(insertErr))
         return nil, 'db'
     end
+    if maps[id] then return nil, 'db' end        -- defensive: the insert would have refused a taken id
+    maps[id], sets[id] = map, { els = {} }
     R.syncMap(id)
     R.audit('create', map, actor, nil, { mode = mode, targetBucket = bucket, active = active })
     return summary(map)
@@ -726,7 +828,10 @@ end
 -- The resource that opened a draft stopped: the draft closes with it.
 Registry.onOwnerStop(DRAFT_KIND, closeDraft)
 
---- Maps.delete(id, actor) -> true | false, err. Elements, versions and journal go with the map.
+--- Maps.delete(id, actor) -> true | false, err. Elements, versions and journal go with the map: ONE queued
+--- `DELETE FROM maps` whose foreign keys cascade. A raw statement on purpose: it is a barrier in the queue
+--- (§56.3.3), so writes of this map still pending (an apply a moment ago) commit before it and are deleted with it;
+--- a row-keyed remove would be grouped with other `maps` entries and could run before them.
 function Maps.delete(id, actor)
     if not ensureLoaded() then return false, 'unavailable' end
     local map = type(id) == 'string' and maps[id]
@@ -735,15 +840,12 @@ function Maps.delete(id, actor)
     map.active = false
     R.syncMap(id)
     local count = 0
-    for elementId in pairs(sets[id].els) do
-        R.removeElement(id, elementId)
-        count = count + 1
-    end
-    for _, v in ipairs(versionIdx[id] or {}) do Core.DB.delete(C_VERSIONS, id .. ':v' .. v.version) end
-    for _, j in ipairs(journalIdx[id] or {}) do Core.DB.delete(C_JOURNAL, id .. ':j' .. j.seq) end
-    Core.DB.delete(C_MAPS, id)
+    for _ in pairs(sets[id].els) do count = count + 1 end
+    local ok, err = DB.enqueue('DELETE FROM maps WHERE id = $1', { id })
+    if not ok then Log.error('maps: could not queue the delete of map %s: %s', id, tostring(err)) end
     S.journalTotal = S.journalTotal - (journalOps[id] or 0)
     maps[id], sets[id], snaps[id], versionIdx[id], journalIdx[id], journalOps[id] = nil, nil, nil, nil, nil, nil
+    S.gen[id] = nil
     R.audit('delete', map, actor, nil, { mode = map.mode, elements = count })
     return true
 end
@@ -766,8 +868,12 @@ local function publishSet(map, els, actor, note, action, from)
     if over then return nil, 'limit', { limit = 'networkedTotal', max = limits.networkedTotal } end
     local info, at = R.actorInfo(actor), os.time()
     local list = toArray(copy)
-    if not Core.DB.set(C_VERSIONS, map.id .. ':v' .. version, { mapId = map.id, version = version,
-        elements = list, by = info.by, byName = info.name, note = note, at = at, count = #list, from = from }) then
+    -- one slice from here on: the snapshot row, the map row and the pruned versions commit together
+    local saved, err = DB.save(T_VERSIONS, { map_id = map.id, version = version, elements = list, count = #list,
+        author = info.by or NULL, author_name = info.name or NULL, note = note or NULL, from_version = from or NULL,
+        at = at })
+    if not saved then
+        Log.error('maps: could not queue version %d of %s: %s', version, map.id, tostring(err))
         return nil, 'db'
     end
     snaps[map.id] = { version = version, els = copy }
@@ -782,7 +888,7 @@ local function publishSet(map, els, actor, note, action, from)
     local excess = #idx - VERSIONS_KEEP
     for i = excess, 1, -1 do
         if idx[i].version ~= version then
-            Core.DB.delete(C_VERSIONS, map.id .. ':v' .. idx[i].version)
+            DB.remove(T_VERSIONS, { map_id = map.id, version = idx[i].version })
             table.remove(idx, i)
         end
     end
@@ -809,19 +915,38 @@ function Maps.publish(id, actor, note)
     return publishSet(map, sets[id].els, actor, text, 'publish', nil)
 end
 
+local function hasVersion(id, version)
+    local idx = versionIdx[id]
+    for i = 1, idx and #idx or 0 do
+        if idx[i].version == version then return true end
+    end
+    return false
+end
+
 --- Maps.rollback(id, version, actor) -> new version | nil, err, detail. Publishes a copy of an older
---- snapshot after re-checking it (model validator, limits); the draft itself is left as it is.
+--- snapshot after re-checking it (model validator, limits); the draft itself is left as it is. The snapshot is
+--- read from the database (awaited: the caller runs in a coroutine, as every Core.Maps caller does); a failed
+--- read answers 'db', never 'version'.
 function Maps.rollback(id, version, actor)
     if not ensureLoaded() then return nil, 'unavailable' end
     local map = type(id) == 'string' and maps[id]
     if not map then return nil, 'not_found' end
     if map.mode ~= 'draft' then return nil, 'mode' end
     local v = math.tointeger(version)
-    local doc = v and Core.DB.get(C_VERSIONS, id .. ':v' .. v)
-    if not doc then return nil, 'version' end
-    local els = fromArray(doc.elements)
-    local err, detail = R.checkSnapshot(map, els)     -- today's model validator and limits (maps_apply.lua)
-    if err then return nil, err, detail end
+    if not v or not hasVersion(id, v) then return nil, 'version' end
+    -- sync: a version published within the last flush interval is still in the queue
+    local row, err = DB.single('SELECT elements FROM map_versions WHERE map_id = $1 AND version = $2', { id, v },
+        { sync = true })
+    if err then
+        Log.error('maps: could not read version %d of %s: %s', v, id, tostring(err))
+        return nil, 'db'
+    end
+    if not row then return nil, 'version' end
+    if maps[id] ~= map or map.mode ~= 'draft' then return nil, 'not_found' end   -- deleted while it was read
+    local els = fromArray(row.elements)
+    local cerr, detail = R.checkSnapshot(map, els)     -- today's model validator (may yield) and limits
+    if cerr then return nil, cerr, detail end
+    if maps[id] ~= map or map.mode ~= 'draft' then return nil, 'not_found' end   -- deleted during the validator
     return publishSet(map, els, actor, ('rollback to v%d'):format(v), 'rollback', v)
 end
 
