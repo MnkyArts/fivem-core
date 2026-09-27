@@ -1163,6 +1163,128 @@ local function suiteReady()
 end
 
 --------------------------------------------------------------------------------
+-- suite: Core.Clock (DESIGN §55.2)
+--------------------------------------------------------------------------------
+
+local function suiteClock()
+    suite('clock')
+    stubs.newWorld()
+    stubs.clear()
+    local MASK, TWO31 = 0xFFFFFFFF, 0x80000000
+
+    -- pure maths (server VM of core)
+    local _, S = newVM('server', 'core')
+    local Clock = S.Clock
+    check(type(rawget(Clock, 'now')) == 'function', 'Core.Clock loads from lib/clock/shared.lua')
+    local diff, add = Clock.diff, Clock.add
+    eq(diff(5, 3), 2, 'diff: plain positive')
+    eq(diff(3, 5), -2, 'diff: plain negative')
+    eq(diff(0, MASK), 1, 'diff across the 2^32 wrap: 0 is 1 ms after 0xFFFFFFFF')
+    eq(diff(MASK, 0), -1, 'diff across the 2^32 wrap, backwards')
+    eq(diff(10, 0xFFFFFFF0), 26, 'diff: a stamp just after the wrap')
+    eq(diff(0xFFFFFFF0, 10), -26, 'diff: a stamp just before the wrap')
+    eq(diff(TWO31, TWO31 - 1), 1, 'diff across 2^31 (where Lua int32 values turn negative)')
+    eq(diff(TWO31 - 1, TWO31), -1, 'diff across 2^31, backwards')
+    eq(diff(TWO31 - 1, 0), TWO31 - 1, 'diff: the largest positive difference')
+    eq(diff(TWO31, 0), -TWO31, 'diff: 2^31 apart is the most negative difference')
+    eq(diff(-5, 0xFFFFFFF0), 11, 'diff takes an unmasked int32 (negative) stamp too')
+    eq(math.type(diff(1, 2)), 'integer', 'diff answers an integer')
+    eq(diff(10.7, 0), 10, 'diff floors a fractional stamp')
+    eq(add(MASK, 1), 0, 'add wraps at 2^32')
+    eq(add(0, -1), MASK, 'add wraps below 0')
+    eq(add(5, 0x100000000), 5, 'add of a whole wrap is the identity')
+    eq(add(TWO31 - 1, 1), TWO31, 'add crosses 2^31 as an unsigned value')
+    eq(add(100, 1.5), 101, 'add floors a fractional ms')
+    eq(math.type(add(100, 1.0)), 'integer', 'add answers an integer')
+
+    -- server clock: GetGameTimer() & 0xFFFFFFFF
+    stubs.tick(1234)
+    local now = Clock.now()
+    eq(now, math.floor(stubs.now()) & MASK, 'server now() is GetGameTimer() & 0xFFFFFFFF')
+    eq(Clock.at(200), add(now, 200), 'at(ms) = add(now(), ms)')
+    stubs.tick(50)
+    eq(diff(Clock.now(), now), 50, 'server now() follows the game timer')
+    eq(Clock.ready(), true, 'the server clock is always ready')
+    eq(Clock.local2net(1234), 1234, 'server local2net is the identity')
+    eq(Clock.net2local(0x100000005), 5, 'server net2local masks to u32')
+
+    -- client (a plugin VM: the lib runs in the caller's own VM)
+    local client = stubs.newEnv('client', 'core_example')
+    local frame, net, netReads = 1, 0, 0
+    client.GetFrameCount = function() return frame end
+    client.GetNetworkTimeAccurate = function() netReads = netReads + 1; return net end
+    local C = stubs.loadImport(client).Clock
+    check(type(rawget(C, 'now')) == 'function', 'a plugin VM compiles Core.Clock locally (no proxy hop)')
+    local game = math.floor(stubs.now()) & MASK
+    eq(C.now(), game, 'network time 0 → the game timer')
+    eq(C.ready(), false, 'not ready while the network time reads 0')
+    eq(C.local2net(4321), 4321, 'no network sample yet: local2net is the identity')
+
+    frame, net = 2, 50000
+    local reads, timerReads = netReads, stubs.gameTimerReads
+    local a, b, c = C.now(), C.now(), C.now()
+    eq(netReads - reads, 1, 'three now() calls in one frame read the network time once')
+    eq(stubs.gameTimerReads - timerReads, 1, 'and the game timer once')
+    check(a == 50000 and b == a and c == a, 'every call of the frame sees the same value')
+    net = 50009
+    eq(C.now(), 50000, 'the value is latched for the whole frame')
+    eq(C.ready(), false, 'one non-zero sample is not ready yet')
+    frame, net = 3, 50016
+    eq(C.now(), 50016, 'the next frame samples again')
+    eq(C.ready(), true, 'a second, advancing non-zero sample → ready')
+    eq(C.local2net(game), game + 50016 - game, 'local2net adds the measured offset')
+    eq(C.net2local(50016), game, 'net2local subtracts it')
+
+    -- max filter over 10 s: a lower offset waits, a higher one wins at once
+    local offset = 50016 - game
+    stubs.tick(100)
+    frame = 4
+    net = (math.floor(stubs.now()) & MASK) + offset - 10
+    C.now()
+    eq(C.local2net(1000), 1000 + offset, 'a lower offset within 10 s does not replace the max')
+    for i = 1, 11 do
+        stubs.tick(1000)
+        frame = 4 + i
+        net = (math.floor(stubs.now()) & MASK) + offset - 10
+        C.now()
+    end
+    eq(C.local2net(1000), 1000 + offset - 10, 'after 10 s the old maximum ages out')
+    frame = 100
+    net = (math.floor(stubs.now()) & MASK) + offset + 25
+    C.now()
+    eq(C.local2net(1000), 1000 + offset + 25, 'a higher offset counts at once')
+    eq(C.local2net(MASK), offset + 24, 'local2net wraps at 2^32')
+    eq(C.net2local(offset + 24), MASK, 'net2local wraps below 0')
+
+    -- the network time drops to 0 after it was seen: continuous (game timer + offset)
+    frame, net = 101, 0
+    eq(C.now(), (math.floor(stubs.now()) & MASK) + offset + 25, 'a lost network time continues on the offset')
+    eq(C.ready(), true, 'ready stays true')
+
+    -- an int32 network time past 2^31 (negative in Lua) is masked
+    frame, net = 102, -5
+    eq(C.now(), 0xFFFFFFFB, 'a negative int32 network time becomes its u32 value')
+    eq(C.diff(C.now(), 0xFFFFFFF0), 11, 'and compares across the wrap')
+
+    -- a network time that does not advance never becomes ready
+    local stuck = stubs.newEnv('client', 'core')
+    local sf = 1
+    stuck.GetFrameCount = function() return sf end
+    stuck.GetNetworkTimeAccurate = function() return 7000 end
+    local SC = stubs.loadImport(stuck).Clock
+    SC.now()
+    sf = 2
+    SC.now()
+    eq(SC.ready(), false, 'two equal samples are not "advancing"')
+
+    -- no network-time native at all (and no frame counter): the game timer, never ready
+    local bare = stubs.newEnv('client', 'core')
+    local BC = stubs.loadImport(bare).Clock
+    eq(BC.now(), math.floor(stubs.now()) & MASK, 'without the native now() is the game timer')
+    eq(BC.ready(), false, 'and never ready')
+end
+
+--------------------------------------------------------------------------------
 -- runner
 --------------------------------------------------------------------------------
 
@@ -1177,6 +1299,7 @@ local suites = {
     { 'commands', suiteCommands },
     { 'keys', suiteKeys },
     { 'log', suiteLog },
+    { 'clock', suiteClock },
 }
 
 for i = 1, #suites do

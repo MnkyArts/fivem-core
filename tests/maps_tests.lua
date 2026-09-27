@@ -1,19 +1,33 @@
 --[[
-    core/tests/maps_tests.lua — offline suite for Core.Maps (DESIGN §52.1, §52.2, §52.4a), part 1.
+    core/tests/maps_tests.lua — offline suite for Core.Maps (DESIGN §52.1, §52.2, §55.21.1), part 1.
 
         lua5.4 tests/maps_tests.lua    (from the resource directory, or from tests/)
 
-    Types, documents, tuples per kind, apply validation/atomicity, limits, the validator and networked
-    elements (native stubs), expect/conflict/invert/restore, drafts (editor bucket, publish, rollback),
-    events, hooks, validate, parents, refs, migrate, id caps. Harness: tests/maps_harness.lua. Journal,
-    clear, expiry, persistence: tests/maps_store_tests.lua. Exit 1 on failure.
+    Types, documents, the projection onto Core.Scene (the map:data kind, the exact node def of every element
+    kind, contexts opening, closing and swapping by diff, changes keeping their node, kind changes, placeholders,
+    respawn — promoted, displaced, changed, missing nodes —, the Scene store barrier and its waiter, calls as
+    core, refusals, re-entrancy, the per-uid vehicle paint), the networked limits, the validator, drafts (editor
+    bucket, publish, rollback), the final-review fixes (RV4 F2 / RV6 F6 slicing: <= SLICE Scene calls per worker
+    slice, an honest API mid-projection, adoption of a closing context, the pending boxes in GlobalState; RV4 F3
+    'limit' retries with backoff; RV5 F3 faded editor removals; RV6 F8 promotion policies) and passes against the
+    REAL scene server files. Harness: tests/maps_harness.lua (a recording fake of Core.Scene). Journal, clear, expiry, persistence, expect / conflict / invert, events,
+    hooks, validate, parents, refs, migrate, restores, id caps, apply validation and limits:
+    tests/maps_store_tests.lua. Exit 1 on failure.
 ]]
 
 local here = (arg and arg[0] or 'tests/maps_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
 -- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test files
 local H = dofile(here .. '/maps_harness.lua')
-local stubs, check, eq, callable, calls, reset = H.stubs, H.check, H.eq, H.callable, H.calls, H.reset
-local newServer, as, stop, lastAudit, byUid = H.newServer, H.as, H.stop, H.lastAudit, H.byUid
+local stubs, check, eq, callable, calls, reset, same = H.stubs, H.check, H.eq, H.callable, H.calls, H.reset, H.same
+local newServer, as, stop, lastAudit, node = H.newServer, H.as, H.stop, H.lastAudit, H.node
+
+local function printed(needle)
+    local n = 0
+    for i = 1, #stubs.printed do
+        if stubs.printed[i]:find(needle, 1, true) then n = n + 1 end
+    end
+    return n
+end
 
 --------------------------------------------------------------------------------
 -- element types: built-ins, define, ownership, public list, callback
@@ -67,7 +81,48 @@ do
 end
 
 --------------------------------------------------------------------------------
--- documents, a live map, tuples per kind (§52.4a)
+-- the map:data kind: defined once, as core, when core starts (before any plugin could take the id)
+--------------------------------------------------------------------------------
+do
+    local env, Core = newServer()
+    local defs = calls('defineKind')
+    eq(#defs, 1, 'core start defines one scene kind')
+    local def = defs[1] and defs[1].def or {}
+    check(def.id == 'map:data' and def.class == 'data' and def.radius == 150 and defs[1].caller == 'core',
+        'map:data: class data, radius 150 (the editor view), defined as core')
+    local names = {}
+    for i, f in ipairs(def.fields or {}) do names[f.name] = f end
+    check(names.t and names.t.required and names.k and names.k.required and names.size and names.size.type == 'vector3'
+        and names.f and names.f.type == 'table' and names.mapEl and names.mapType, 'fields t, k, size, f, mapEl, mapType')
+    local validate = names.f and names.f.validate
+    check(validate({ label = 'x', slot = '3' }) == true, 'f: label values pass')
+    check(validate({ label = 5 }) == false and validate({ ['bad name'] = 'x' }) == false
+        and validate({ x = ('y'):rep(65) }) == false, 'f: only field-named strings <= 64')
+    local many = {}
+    for i = 1, 17 do many['f' .. i] = 'x' end
+    eq(validate(many), false, 'f: at most 16 labels')
+    local map = Core.Maps.create({ name = 'K', mode = 'live' }, 1)
+    Core.Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
+    eq(#calls('defineKind'), 1, 'a map:data spawn does not define it again')
+    env.TriggerEvent('onResourceStart', 'other')
+    eq(#calls('defineKind'), 1, "another resource's start defines nothing")
+
+    local _, Core2 = newServer({ refuse = { defineKind = 'owner' } })
+    eq(printed('map:data was refused: owner'), 1, 'a refusal at start is logged')
+    reset()
+    local m2 = Core2.Maps.create({ name = 'K2', mode = 'live' }, 1)
+    Core2.Maps.apply(m2.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
+    eq(#calls('defineKind'), 1, 'a map:data spawn asks again')
+    eq(printed('map:data was refused'), 1, 'a second refusal within a minute is not logged')
+    H.refuse.defineKind = nil
+    Core2.Maps.apply(m2.id, { { op = 'create', type = 'core:zone', pos = { x = 1, y = 0, z = 0 } } }, 1)
+    Core2.Maps.apply(m2.id, { { op = 'create', type = 'core:zone', pos = { x = 2, y = 0, z = 0 } } }, 1)
+    eq(#calls('defineKind'), 2, 'the next one defines it, and nothing asks after that')
+    eq(#calls('spawn'), 3, 'the nodes were spawned all along')
+end
+
+--------------------------------------------------------------------------------
+-- documents, a live map, the node def of every kind (§55.21.1)
 --------------------------------------------------------------------------------
 do
     local env, Core = newServer()
@@ -112,58 +167,65 @@ do
     eq(applied.ops[1].after.by, 'acc1', 'by = the actor account')
     check(applied.ops[1].after.updatedAt > 0, 'updatedAt is stamped')
     check(applied.ops[2].after.updatedAt > applied.ops[1].after.updatedAt, 'stamps are strictly increasing')
-    eq(#calls('put', 0), 5, 'five tuples are put in bucket 0')
-    local prop = byUid(calls('put'), map.id .. ':1').tuple
-    eq(prop[1], map.id .. ':1', 'tuple uid = <mapId>:<elementId>')
-    eq(prop[2], 1, 'kind code 1 = prop')
-    eq(prop[3], R.joaat('prop_barrier'), 'signed joaat model hash')
-    eq(prop[4], 1.235, 'coordinates rounded to 3 decimals')
-    eq(prop[9], 12.35, 'rotations rounded to 2 decimals')
-    eq(prop[10], 7, 'flags: collision | frozen | unbreakable')
-    eq(prop[11], 150, 'lod 150 without validator info')
-    eq(prop[12], nil, 'props carry no extra')
-    local marker = byUid(calls('put'), map.id .. ':2').tuple
-    eq(marker[2], 2, 'kind code 2 = marker')
-    eq(marker[3], 0, 'non-model kinds hash 0')
-    local ex = marker[12]
-    check(ex.type == 2 and ex.r == 255 and ex.g == 0 and ex.b == 0 and ex.a == 128, 'marker extra: type and rgba')
-    check(ex.sx == 2 and ex.sz == 1 and ex.dd == 50 and ex.bob == true and ex.face == false, 'marker extra: scale, dd, bob, face')
-    local hide = byUid(calls('put'), map.id .. ':3').tuple
-    check(hide[2] == 3 and hide[3] == R.joaat('prop_bin_01a') and hide[12].radius == 3, 'hide: kind 3, model hash, radius')
-    local point = byUid(calls('put'), map.id .. ':4').tuple
-    check(point[2] == 4 and point[10] == 16 and point[9] == 90 and point[12].t == 'core:point'
-        and point[12].f.label == 'start', 'point: kind 4, data flag, yaw, extra t + the $label field')
-    local zone = byUid(calls('put'), map.id .. ':5').tuple
-    check(zone[2] == 5 and zone[10] == 16 and zone[12].sx == 5 and zone[12].sz == 7 and zone[12].t == 'core:zone'
-        and zone[12].f == nil, 'zone: kind 5, data flag, size, extra t (no label preview: no f)')
+    local spawns = calls('spawn', 0)
+    eq(#spawns, 5, 'five nodes are spawned in bucket 0')
+    local function uid(id) return map.id .. ':' .. id end
+    local function defOf(id) local c = H.byUid(spawns, uid(id)) return c and c.def end
+    check(same(defOf(1), { kind = 'prop', bucket = 0, persist = false, pos = { x = 1.235, y = 2, z = 3 },
+        rot = { x = 0, y = 0, z = 12.35 }, fields = { model = 'prop_barrier', frozen = true, collision = true,
+        invincible = true, mapEl = uid(1), mapType = 'core:prop' } }),
+        'prop: model, frozen, collision, invincible = unbreakable (lod is Scene-filled), mapEl, mapType')
+    check(same(defOf(2), { kind = 'marker', bucket = 0, persist = false, pos = { x = 10, y = 0, z = 0 },
+        rot = { x = 0, y = 0, z = 0 }, fields = { type = 2, color = '#FF000080', scale = { x = 2, y = 2, z = 1 },
+        drawDistance = 50, bob = true, face = false, mapEl = uid(2), mapType = 'core:marker' } }),
+        'marker: type, colour, scale, drawDistance, bob, face')
+    check(same(defOf(3), { kind = 'hide', bucket = 0, persist = false, pos = { x = 20, y = 0, z = 0 },
+        rot = { x = 0, y = 0, z = 0 }, fields = { model = 'prop_bin_01a', radius = 3, mapEl = uid(3),
+        mapType = 'core:hide' } }), 'hide: model name and radius')
+    check(same(defOf(4), { kind = 'map:data', bucket = 0, persist = false, pos = { x = 30, y = 0, z = 0 },
+        rot = { x = 0, y = 0, z = 90 }, audience = { editors = true }, fields = { t = 'core:point', k = 'point',
+        f = { label = 'start' }, mapEl = uid(4), mapType = 'core:point' } }),
+        'point: map:data for editors, t, k, the $label value in f')
+    check(same(defOf(5), { kind = 'map:data', bucket = 0, persist = false, pos = { x = 40, y = 0, z = 0 },
+        rot = { x = 0, y = 0, z = 0 }, audience = { editors = true }, fields = { t = 'core:zone', k = 'zone',
+        size = { x = 5, y = 6, z = 7 }, mapEl = uid(5), mapType = 'core:zone' } }),
+        'zone: map:data with its size (no label preview: no f)')
+    for _, c in ipairs(spawns) do check(c.caller == 'core', 'spawned as core: ' .. tostring(c.uid)) end
+    check(same(R.nodeDef({ mapId = 'm9', bucket = 4 }, { id = '7', type = 'core:marker', pos = { x = 0, y = 0, z = 0 },
+        rot = { x = 0, y = 0, z = 0 }, fields = {} }).fields, { type = 1, color = '#E0A33AB4',
+        scale = { x = 1, y = 1, z = 1 }, drawDistance = 50, bob = false, face = false, mapEl = 'm9:7',
+        mapType = 'core:marker' }), 'a marker without fields gets the defaults')
     Maps.apply(map.id, { { op = 'create', type = 'garage:spot', pos = { x = 0, y = 0, z = 0 }, fields = { note = ('n'):rep(70) } } }, 1)
-    local spotX = byUid(calls('put'), map.id .. ':6').tuple[12]
-    check(spotX.t == 'garage:spot' and spotX.f.slot == '3' and #spotX.f.note == 64, 'extra.f: $field labels as strings <= 64')
+    local spot = H.byUid(calls('spawn', 0), uid(6)).def.fields
+    check(spot.t == 'garage:spot' and spot.k == 'point' and spot.f.slot == '3' and #spot.f.note == 64,
+        'f: $field labels as strings <= 64')
     check(stubs.kvp['doc:map_elements:' .. map.id .. ':1'] ~= nil, 'each element is its own document')
     eq(#Maps.elements(map.id), 6, 'elements() lists the working set')
     eq(Maps.elements(map.id)[1].id, '1', 'ascending ids')
     eq(Maps.get(map.id).counts.elements, 6, 'get() counts elements')
     eq(Maps.get(map.id).counts.uniqueModels, 1, 'hides do not count as streamed models')
+    eq(Core.MapsRuntime.stats().nodes, 6, 'stats: six nodes')
 
     reset()
+    local before = node(uid(1))
     local kvpBefore = stubs.kvp['doc:map_elements:' .. map.id .. ':2']
     ok = Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 5, y = 5, z = 5 } } } }, 1)
     check(ok, 'an update by numeric id')
-    eq(#calls('put', 0), 1, 'one put moves the element')
-    eq(calls('put', 0)[1].tuple[4], 5.0, 'at its new position')
+    eq(H.trace(), 'move:' .. uid(1), 'one move, nothing else')
+    check(node(uid(1)) == before and node(uid(1)).pos.x == 5.0, 'the same node, at its new position')
     eq(stubs.kvp['doc:map_elements:' .. map.id .. ':2'], kvpBefore, 'untouched elements are not rewritten')
     reset()
     ok = Maps.apply(map.id, { { op = 'delete', id = '1' } }, 1)
     check(ok, 'a delete')
-    eq(#calls('remove', 0), 1, 'one remove')
-    eq(calls('remove', 0)[1].uid, map.id .. ':1', 'of that uid')
+    eq(H.trace(), 'remove:' .. uid(1), 'one remove of that uid')
+    eq(node(uid(1)), nil, 'its node is gone')
     eq(stubs.kvp['doc:map_elements:' .. map.id .. ':1'], nil, 'its document is gone')
 
     reset()
     local updated = Maps.update(map.id, { targetBucket = 5, name = 'Arena' }, 1)
     eq(updated.targetBucket, 5, 'update moves the target bucket')
     eq(#calls('remove', 0), 5, 'content leaves bucket 0')
-    eq(#calls('put', 5), 5, 'and appears in bucket 5')
+    eq(#calls('spawn', 5), 5, 'and appears in bucket 5')
     local u = lastAudit('maps.update')
     check(u and #u.changes == 2, 'update is audited with its changes')
     eq(select(2, Maps.update(map.id, { name = 5 })), 'name', 'update refuses a bad name')
@@ -171,113 +233,11 @@ do
 end
 
 --------------------------------------------------------------------------------
--- apply validation and atomicity
---------------------------------------------------------------------------------
-do
-    local _, Core = newServer()
-    local Maps = Core.Maps
-    local map = Maps.create({ name = 'V', mode = 'live' }, 1)
-    local prop = { op = 'create', type = 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'prop_a' } }
-    local function refused(ops, want, label, opts)
-        reset()
-        local before = Maps.get(map.id)
-        local ok, err, detail = Maps.apply(map.id, ops, 1, opts)
-        check(ok == nil and err == want, ('%s -> %s (got %s)'):format(label, want, tostring(err)))
-        local after = Maps.get(map.id)
-        check(after.counts.elements == before.counts.elements and after.nextElementId == before.nextElementId
-            and after.journalSeq == before.journalSeq and #H.regionLog == 0, label .. ': nothing changed')
-        return detail
-    end
-    local detail = refused({ prop, { op = 'create', type = 'nope:x', pos = { x = 0, y = 0, z = 0 } } }, 'type',
-        'an unknown type after a valid create')
-    eq(detail.index, 2, 'the detail names the failing op')
-    refused({ { op = 'create', type = 'core:prop', pos = { x = 20000, y = 0, z = 0 }, fields = { model = 'p' } } },
-        'bounds', 'outside the world')
-    refused({ { op = 'create', type = 'core:prop', pos = { x = 0 / 0, y = 0, z = 0 }, fields = { model = 'p' } } },
-        'position', 'a NaN position')
-    refused({ { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 }, rot = { x = 10, y = 0, z = 0 } } },
-        'rotation', 'pitch on a yaw-only type')
-    refused({ { op = 'create', type = 'core:hide', pos = { x = 0, y = 0, z = 0 }, rot = { x = 0, y = 0, z = 5 },
-        fields = { model = 'x' } } }, 'rotation', 'any rotation on a fixed type')
-    detail = refused({ { op = 'create', type = 'core:marker', pos = { x = 0, y = 0, z = 0 }, fields = { markerType = 99 } } },
-        'fields', 'a field out of range')
-    eq(detail.fields.markerType, 'max', 'the field error is reported')
-    detail = refused({ { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 }, fields = { color = 1 } } },
-        'fields', 'an unknown field')
-    eq(detail.fields.color, 'unknown', 'as unknown')
-    refused({ { op = 'create', type = 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'bad model' } } },
-        'fields', 'a model name that is not a name')
-    refused({ { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } } },
-        'no_validator', 'a vehicle without a model validator')
-    refused({ { op = 'create', type = 'core:physprop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'p' } } },
-        'no_validator', 'a networked prop without a model validator')
-    refused({ { op = 'create', type = 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'p' }, layer = 'a b' } },
-        'layer', 'a bad layer name')
-    refused({ { op = 'spin', id = 1 } }, 'op', 'an unknown op')
-    refused({ { op = 'update', id = 99, set = {} } }, 'not_found', 'updating a missing element')
-    refused({ { op = 'delete', id = 'x' } }, 'not_found', 'deleting a bad id')
-    refused({}, 'ops', 'an empty op list')
-    refused({ prop }, 'source', 'an unknown source', { source = 'hack' })
-    check(Maps.apply('nope', { prop }, 1) == nil, 'an unknown map is refused')
-
-    reset()
-    local ok, applied = Maps.apply(map.id, { prop, { op = 'update', id = 1, set = { pos = { x = 1, y = 1, z = 1 } } },
-        { op = 'create', type = 'core:point', pos = { x = 2, y = 2, z = 2 } }, { op = 'delete', id = 2 } }, 1)
-    check(ok, 'later ops see earlier ones (create, update it, create, delete it)')
-    eq(#Maps.elements(map.id), 1, 'one element remains')
-    eq(Maps.elements(map.id)[1].pos.x, 1.0, 'with the update applied')
-    eq(#calls('put', 0), 1, 'the world got the final state once')
-    eq(#calls('remove', 0), 0, 'and nothing was removed (element 2 never existed outside the apply)')
-    eq(applied.seq, 1, 'the journal sequence')
-    eq(Maps.get(map.id).nextElementId, 3, 'both ids are used up')
-
-    Core.Settings.set('maps.limits.opsPerApply', 2)
-    refused({ prop, prop, prop }, 'too_many_ops', 'more ops than maps.limits.opsPerApply')
-end
-
---------------------------------------------------------------------------------
--- limits (settings and per map), increase-only refusal
---------------------------------------------------------------------------------
-do
-    local _, Core = newServer()
-    local Maps = Core.Maps
-    local map = Maps.create({ name = 'L', mode = 'live' }, 1)
-    local function create(model, typeId)
-        return { op = 'create', type = typeId or 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = model } }
-    end
-    Core.Settings.set('maps.limits.elements', 3)
-    check(Maps.apply(map.id, { create('a'), create('b'), create('c') }, 1), 'up to the element limit')
-    local ok, err, detail = Maps.apply(map.id, { create('d') }, 1)
-    check(ok == nil and err == 'limit' and detail.limit == 'elements' and detail.max == 3, 'the element limit')
-    Core.Settings.set('maps.limits.elements', 2)
-    check(Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 1, y = 1, z = 1 } } } }, 1),
-        'a lowered limit does not block an update')
-    check(Maps.apply(map.id, { { op = 'delete', id = 3 } }, 1), 'nor a delete')
-    Core.Settings.reset('maps.limits.elements')
-
-    Maps.update(map.id, { limits = { perModel = 2 } }, 1)
-    check(Maps.apply(map.id, { create('a') }, 1), 'a second of one model')
-    ok, err, detail = Maps.apply(map.id, { create('a') }, 1)
-    check(err == 'limit' and detail.limit == 'perModel' and detail.model == 'a', 'the per-model limit (per-map override)')
-    Maps.update(map.id, { limits = { uniqueModels = 2 } }, 1)
-    ok, err, detail = Maps.apply(map.id, { create('z') }, 1)
-    check(err == 'limit' and detail.limit == 'uniqueModels', 'the unique-model limit')
-    eq(Maps.get(map.id).limits.perModel, nil, 'update replaces the per-map limits')
-    Maps.update(map.id, { limits = false }, 1)
-    eq(Maps.get(map.id).limits, nil, 'limits = false clears them')
-
-    eq(as('race', 'defineType', { id = 'race:start', kind = 'point', limits = { perMap = 1 } }), true, 'a type with perMap')
-    check(Maps.apply(map.id, { { op = 'create', type = 'race:start', pos = { x = 0, y = 0, z = 0 } } }, 1), 'one start')
-    ok, err, detail = Maps.apply(map.id, { { op = 'create', type = 'race:start', pos = { x = 1, y = 0, z = 0 } } }, 1)
-    check(err == 'limit' and detail.limit == 'perMap' and detail.type == 'race:start', 'the per-type limit')
-end
-
---------------------------------------------------------------------------------
--- the model validator and networked elements (server entities)
+-- the model validator; vehicles, peds and physics props are nodes too (local copies Scene may promote)
 --------------------------------------------------------------------------------
 do
     local env, Core = newServer()
-    local Maps, R = Core.Maps, Core.MapsRuntime
+    local Maps, paintOf = Core.Maps, Core.MapsRuntime.paintOf
     local seen = {}
     local validator = callable(function(kind, model)
         seen[#seen + 1] = kind .. ':' .. model
@@ -289,6 +249,7 @@ do
     eq(as('catalogue', 'setModelValidator', validator), true, 'a plugin registers the model validator')
     eq(Core.Registry.getOwned('catalogue').mapsModelValidator.validator, true, "tracked as 'mapsModelValidator'")
     local map = Maps.create({ name = 'N', mode = 'live', targetBucket = 7 }, 1)
+    local function uid(id) return map.id .. ':' .. id end
     reset()
     local ok, applied = Maps.apply(map.id, {
         { op = 'create', type = 'core:vehicle', pos = { x = 1, y = 2, z = 3 }, rot = { x = 0, y = 0, z = 90 },
@@ -298,468 +259,367 @@ do
         { op = 'create', type = 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'prop_tall' } },
         { op = 'create', type = 'core:prop', pos = { x = 1, y = 0, z = 0 }, fields = { model = 'prop_tall' } },
     }, 1)
-    check(ok, 'networked elements pass with a validator')
+    check(ok, 'vehicle, ped and physics prop pass with a validator')
     eq(#seen, 4, 'the validator is asked once per distinct model')
     eq(applied.ops[1].after.info.vehicleType, 'bike', 'the vehicle type is kept on the element')
     eq(applied.ops[4].after.info.lod, 300, 'the lod is kept on the element')
     eq(applied.ops[4].after.info.junk, nil, 'nothing else from the validator is kept')
-    eq(byUid(calls('put', 7), map.id .. ':4').tuple[11], 300, 'the prop tuple uses the validator lod')
-    eq(#calls('put'), 2, 'networked elements are never packed')
-    eq(#H.natives, 3, 'three entities are created')
-    local veh = H.natives[1]
-    check(veh.name == 'CreateVehicleServerSetter' and veh.args[1] == R.joaat('bati') and veh.args[2] == 'bike'
-        and veh.args[6] == 90.0, 'CreateVehicleServerSetter(hash, vehicleType, x, y, z, heading)')
-    local ped = H.natives[2]
-    check(ped.name == 'CreatePed' and ped.args[1] == 4 and ped.args[7] == true and ped.args[8] == true, 'CreatePed(4, …, true, true)')
-    local obj = H.natives[3]
-    check(obj.name == 'CreateObjectNoOffset' and obj.args[5] == true and obj.args[6] == true and obj.args[7] == true,
-        'CreateObjectNoOffset(…, true, true, true)')
-    local function entityOf(elementId)
-        for handle, rec in pairs(stubs.entities) do
-            local state = stubs.entityState(env, handle)
-            if rec.exists and state.mapEl == map.id .. ':' .. elementId then return handle, rec, state end
-        end
-    end
-    local vh, vrec, vstate = entityOf('1')
-    check(vh ~= nil, 'the vehicle carries the mapEl state bag')
-    eq(vrec.bucket, 7, 'entities are moved into the target bucket')
-    eq(vrec.orphanMode, 2, 'orphan mode 2 (keep)')
-    eq(vrec.plate, 'EVENT 1', 'the plate is set')
-    eq(vrec.lockState, 2, 'locked')
-    check(vrec.primary[1] == 16 and vrec.secondary[3] == 48, 'the colour is set')
-    eq(vstate.mapCfg.locked, true, 'mapCfg carries the lock for the client')
-    local _, prec, pstate = entityOf('2')
-    eq(prec.frozen, true, 'a frozen ped is frozen')
-    check(pstate.mapCfg.invincible == true and pstate.mapCfg.scenario == 'WORLD_HUMAN_SMOKING', 'mapCfg: invincible, scenario')
-    local _, orec, ostate = entityOf('3')
-    check(orec.rot and orec.rot.x == 10.0 and orec.rot.order == 2, 'a rotated physics prop gets SetEntityRotation(…, 2)')
-    check(ostate.mapCfg.rot.x == 10 and ostate.mapCfg.rot.z == 0, 'mapCfg.rot for the owning client')
+    eq(#calls('spawn', 7), 5, 'every element is a node in the target bucket')
+    local function defOf(id) return H.byUid(calls('spawn', 7), uid(id)).def end
+    local p1, s1 = paintOf(uid(1))
+    check(same(defOf(1), { kind = 'vehicle', bucket = 7, persist = false, pos = { x = 1, y = 2, z = 3 },
+        rot = { x = 0, y = 0, z = 90 }, fields = { model = 'bati', plate = 'EVENT 1', locked = true, frozen = true,
+        props = { colorPrimary = p1, colorSecondary = s1, customPrimary = { 16, 32, 48 },
+        customSecondary = { 16, 32, 48 } }, mapEl = uid(1), mapType = 'core:vehicle' },
+        authority = { mode = 'local' } }),
+        "vehicle: model, plate, locked, frozen, the uid's paint and the colour as both custom colours on top")
+    check(same(defOf(1).authority, { mode = 'local' }),
+        "vehicle in its target bucket: authority local (enter / damage promote it, a passer-by does not; RV6 F8)")
+    check(same(defOf(2), { kind = 'ped', bucket = 7, persist = false, pos = { x = 4, y = 5, z = 6 },
+        rot = { x = 0, y = 0, z = 0 }, fields = { model = 'a_m_y_x', scenario = 'WORLD_HUMAN_SMOKING', invincible = true,
+        frozen = true, blockEvents = true, mapEl = uid(2), mapType = 'core:ped' } }),
+        'ped: model, scenario, invincible, frozen, blockEvents (authority: the class default, local)')
+    check(same(defOf(3), { kind = 'prop', bucket = 7, persist = false, pos = { x = 7, y = 8, z = 9 },
+        rot = { x = 10, y = 0, z = 0 }, fields = { model = 'prop_crate', frozen = true, collision = true,
+        invincible = false, physics = 'promote', mapEl = uid(3), mapType = 'core:physprop' } }),
+        "physics prop: a prop with physics = 'promote'")
+    check(defOf(4).fields.lod == nil and defOf(4).fields.physics == nil, "a plain prop: no physics, lod is Scene's (chain)")
+    eq(Core.MapsRuntime.netTotal(), 3, 'three networked elements are counted')
+    eq(Maps.get(map.id).counts.networked, 3, 'and reported per map')
 
     reset()
-    local sentBefore = #stubs.sent
+    local vehicle = node(uid(1))
     check(Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 50, y = 50, z = 50 } } } }, 1), 'move the vehicle')
-    eq(vrec.exists, true, 'moved in place: the entity stays')
-    eq(#H.natives, 0, 'nothing is created')
-    local pose = H.poses(sentBefore + 1)
-    check(#pose == 1 and pose[1].target == 1 and pose[1].args[1] == vrec.netId and pose[1].args[2] == map.id .. ':1'
-        and pose[1].args[3] == 50.0 and pose[1].args[8] == 90.0, 'core:maps:pose (netId, uid, x, y, z, rx, ry, rz) to the owner')
-    stubs.coords[vh], stubs.headings[vh] = stubs.vector3(50.0, 50.0, 50.4), 90.0   -- the owning client applied it
-    stubs.tick(2100)
-    eq(entityOf('1'), vh, 'the synced pose matches: still the same entity')
-    local nh = vh
-    eq(Maps.respawn(map.id), 0, 'respawn has nothing to do while every entity exists')
-    stubs.entities[nh].exists = false
-    eq(Maps.respawn(map.id, 1), 1, 'respawn re-creates a destroyed element')
-    check(entityOf('1') ~= nil, 'the vehicle is back')
+    eq(H.trace(), 'move:' .. uid(1), 'a move of its node')
+    check(node(uid(1)) == vehicle and vehicle.pos.x == 50.0 and vehicle.rot.z == 90, 'the same node, moved')
     check(Maps.apply(map.id, { { op = 'delete', id = 2 } }, 1), 'delete the ped')
-    eq(prec.exists, false, 'its entity is deleted')
-
-    stubs.spawnDelayMs = 200
-    reset()
-    check(Maps.apply(map.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } } }, 1),
-        'a slow vehicle')
-    local slow = nil
-    for handle, rec in pairs(stubs.entities) do if rec.model == R.joaat('adder') then slow = handle end end
-    eq(stubs.entities[slow].exists, false, 'not there yet')
-    check(Maps.apply(map.id, { { op = 'delete', id = 6 } }, 1), 'deleted while it is still being created')
-    stubs.tick(300)
-    eq(stubs.entities[slow].exists, false, 'the worker deletes it once it appears')
-    stubs.spawnDelayMs = 0
+    eq(node(uid(2)), nil, 'its node is removed')
+    eq(Core.MapsRuntime.netTotal(), 2, 'and it no longer counts')
 
     reset()
     local ok2, err = Maps.apply(map.id, { { op = 'create', type = 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'nope' } } }, 1)
     check(ok2 == nil and err == 'model', 'the validator refuses a model')
+    eq(#H.log, 0, 'and nothing reaches the scene')
     check(Maps.setActive(map.id, false, 1), 'deactivate the live map')
-    local alive = 0
-    for _, rec in pairs(stubs.entities) do if rec.exists then alive = alive + 1 end end
-    eq(alive, 0, 'deactivation deletes every map entity')
-    eq(#calls('remove', 7), 2, 'and removes both props from the regions')
+    eq(next(H.nodes), nil, 'deactivation removes every node')
+    eq(#calls('remove', 7), 4, 'four removes in the target bucket')
+    eq(Core.MapsRuntime.netTotal(), 0, 'nothing networked is shown')
     check(Maps.setActive(map.id, true, 1), 'activate again')
-    check(entityOf('1') ~= nil, 'entities come back with the content')
+    eq(#calls('spawn', 7), 4, 'the nodes come back with the content')
+    check(node(uid(1)) ~= nil and node(uid(1)) ~= vehicle, 'as new nodes')
     stop(env, 'catalogue')
     local ok3, err3 = Maps.apply(map.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } } }, 1)
     check(ok3 == nil and err3 == 'no_validator', 'the validator goes with its resource')
-    stop(env, 'core')
-    eq(entityOf('1'), nil, 'core stopping deletes its map entities')
+    eq(node(uid(1)).fields.model, 'bati', 'active vehicles stay (their models were checked when placed)')
 end
 
 --------------------------------------------------------------------------------
--- networked elements updated in place, stable vehicle paint (§52.2 notes, run UX C2)
+-- a map vehicle's paint: per element UID, exactly the pre-migration rule (§52 notes, run UX C2)
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer()
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    -- pinned with the pre-migration code: HEAD:server/maps_runtime.lua PAINTS[R.joaat(uid) % #PAINTS + 1]
+    local pinned = { ['m1:1'] = 50, ['m1:2'] = 3, ['m7:42'] = 89, ['m12:3'] = 70, ['event_arena:999'] = 4 }
+    for uid, index in pairs(pinned) do
+        local p, s = R.paintOf(uid)
+        check(p == index and s == index, ('paint of %s = { %d, %d }, as before the migration'):format(uid, index, index))
+    end
+    local list = Core.Scene.PAINTS
+    check(#list == 22 and same(list[1], { 0, 0 }) and same(list[7], { 111, 111 }) and same(list[22], { 145, 145 }),
+        'Scene.PAINTS is the 22-paint §52 list, in its order')
+    local stable, distinct, seen = true, 0, {}
+    for i = 1, 60 do
+        local uid = 'm' .. i .. ':' .. i
+        local p = R.paintOf(uid)
+        stable = stable and R.paintOf(uid) == p and p == list[R.joaat(uid) % 22 + 1][1]
+        if not seen[p] then seen[p], distinct = true, distinct + 1 end
+    end
+    check(stable and distinct >= 10, 'a uid always gets the same paint, and uids spread over the list')
+
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local map = Maps.create({ name = 'Paint', mode = 'draft', targetBucket = 4, active = true }, 1)
+    local uid = map.id .. ':1'
+    Maps.apply(map.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } } }, 1)
+    Maps.publish(map.id, 1)
+    local bucket = Maps.openDraft(map.id, 1)
+    local p, s = R.paintOf(uid)
+    local target, editor = node(uid, 4), node(uid, bucket)
+    check(target.id ~= editor.id and same(target.fields.props, { colorPrimary = p, colorSecondary = s,
+        customPrimary = false, customSecondary = false }) and same(editor.fields.props, target.fields.props),
+        'the editor bucket and the target bucket show the same paint (two nodes, one uid)')
+    Maps.setActive(map.id, false, 1)
+    Maps.setActive(map.id, true, 1)
+    local again = node(uid, 4)
+    check(again.id ~= target.id and again.fields.props.colorPrimary == p, 'a new node after a setActive toggle: the same paint')
+    Maps.apply(map.id, { { op = 'update', id = 1, set = { fields = { color = '#00FF00' } } } }, 1)
+    local ep = node(uid, bucket).fields.props
+    check(ep.colorPrimary == p and ep.colorSecondary == s and same(ep.customPrimary, { 0, 255, 0 }),
+        'a set colour goes on top of the paint')
+    Maps.closeDraft(map.id)
+    newServer({ keepKvp = true })
+    local restarted = node(uid, 4)
+    check(restarted and restarted.fields.props.colorPrimary == p, 'after a restart: the same paint')
+end
+
+--------------------------------------------------------------------------------
+-- the networked limits still bound vehicles, peds and physics props (per map and server-wide)
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer()
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local map = Maps.create({ name = 'Net', mode = 'live', limits = { networked = 2 } }, 1)
+    local function op(typeId, model)
+        return { op = 'create', type = typeId, pos = { x = 0, y = 0, z = 0 }, fields = model and { model = model } or nil }
+    end
+    check(Maps.apply(map.id, { op('core:vehicle', 'adder'), op('core:ped', 'a_m_y_x'), op('core:prop', 'prop_a'),
+        op('core:point') }, 1), 'two networked elements (and two that are not)')
+    local ok, err, detail = Maps.apply(map.id, { op('core:physprop', 'prop_crate') }, 1)
+    check(ok == nil and err == 'limit' and detail.limit == 'networked' and detail.max == 2,
+        'a physics prop is the third networked element: refused')
+    check(Maps.apply(map.id, { op('core:prop', 'prop_b'), op('core:marker') }, 1), 'plain props and markers are not')
+    Core.Settings.set('maps.limits.networkedTotal', 3)
+    local other = Maps.create({ name = 'Net2', mode = 'live' }, 1)
+    check(Maps.apply(other.id, { op('core:vehicle', 'adder') }, 1), 'three server-wide')
+    ok, err, detail = Maps.apply(other.id, { op('core:ped', 'a_m_y_x') }, 1)
+    check(ok == nil and err == 'limit' and detail.limit == 'networkedTotal', 'the fourth exceeds networkedTotal')
+    eq(R.netTotal(), 3, 'R.netTotal counts what is shown')
+    eq(R.stats().networked, 3, 'stats too')
+end
+
+--------------------------------------------------------------------------------
+-- a change keeps its node: moves, field diffs (set + remove), kind changes, placeholders, refusals, lost nodes
 --------------------------------------------------------------------------------
 do
     local env, Core = newServer()
     local Maps, R = Core.Maps, Core.MapsRuntime
-    as('catalogue', 'setModelValidator', callable(function(kind)
-        return true, kind == 'vehicle' and { vehicleType = 'automobile' } or nil
-    end))
-    local map = Maps.create({ name = 'Place', mode = 'live', targetBucket = 5 }, 1)
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    eq(as('deco', 'defineType', { id = 'deco:thing', kind = 'point' }), true, 'a plugin point type')
+    eq(as('garage', 'defineType', { id = 'garage:car', kind = 'vehicle', model = 'adder' }), true, 'a plugin vehicle type')
+    local map = Maps.create({ name = 'C', mode = 'live' }, 1)
     local function uid(id) return map.id .. ':' .. id end
-    local function entityOf(id, bucket)
-        for handle, rec in pairs(stubs.entities) do
-            if rec.exists and stubs.entityState(env, handle).mapEl == uid(id)
-                and (bucket == nil or rec.bucket == bucket) then return handle, rec end
-        end
+    local function update(id, set, replace)
+        return Maps.apply(map.id, { { op = 'update', id = id, set = set, replace = replace } }, 1)
     end
-    local function alive(id)
-        local n = 0
-        for handle, rec in pairs(stubs.entities) do
-            if rec.exists and stubs.entityState(env, handle).mapEl == uid(id) then n = n + 1 end
-        end
-        return n
-    end
-    local function update(id, set) return Maps.apply(map.id, { { op = 'update', id = id, set = set } }, 1) end
-    local function replace(id, fields)
-        return Maps.apply(map.id, { { op = 'update', id = id, replace = true, set = { fields = fields } } }, 1)
-    end
-    --- the owning client applied the pose event: the synced position/heading the server reads
-    local function landed(h, x, y, z, heading) stubs.coords[h], stubs.headings[h] = stubs.vector3(x, y, z), heading end
-    reset()
     check(Maps.apply(map.id, {
-        { op = 'create', type = 'core:vehicle', pos = { x = 10, y = 10, z = 30 }, fields = { model = 'sultan' } },
-        { op = 'create', type = 'core:ped', pos = { x = 20, y = 10, z = 30 }, rot = { x = 0, y = 0, z = 45 },
-            fields = { model = 'a_m_y_x', frozen = true, invincible = true, scenario = 'WORLD_HUMAN_SMOKING' } },
-        { op = 'create', type = 'core:physprop', pos = { x = 30, y = 10, z = 30 }, fields = { model = 'prop_crate' } },
-        { op = 'create', type = 'core:vehicle', pos = { x = 40, y = 10, z = 30 },
-            fields = { model = 'sultan', color = '#FF0000', plate = 'EVT' } },
-    }, 1), 'a vehicle, a ped, a physics prop and a painted vehicle')
+        { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 },
+            fields = { model = 'adder', plate = 'EVENT', color = '#102030' } },
+        { op = 'create', type = 'core:ped', pos = { x = 5, y = 0, z = 0 }, fields = { model = 'a_m_y_x', scenario = 'X' } },
+        { op = 'create', type = 'deco:thing', pos = { x = 10, y = 0, z = 0 } },
+        { op = 'create', type = 'garage:car', pos = { x = 15, y = 0, z = 0 } },
+    }, 1), 'four elements')
+    eq(R.netTotal(), 3, 'vehicle, ped and the plugin vehicle count as networked')
+    local veh = node(uid(1))
 
-    -- paint: picked from the uid when `color` is unset; a set colour paints over it
-    local vh, vrec = entityOf(1)
+    reset()
+    check(update(1, { fields = { plate = 'NEW' } }), 'change the plate')
+    local c = calls('set')[1]
+    check(#H.log == 1 and c.id == veh.id and same(c.patch, { plate = 'NEW' }) and c.remove == nil,
+        'one set of the changed field on the same node')
+    reset()
+    check(update(1, { fields = { model = 'adder' } }, true), 'replace the fields: plate and colour gone')
+    c = calls('set')[1]
     local p1, s1 = R.paintOf(uid(1))
-    check(math.type(p1) == 'integer' and p1 >= 0 and p1 <= 160 and math.type(s1) == 'integer', 'a paint index pair')
-    check(vrec.colours and vrec.colours[1] == p1 and vrec.colours[2] == s1, 'a vehicle without colour gets its uid paint')
-    eq(vrec.primary, nil, 'and no custom colour')
-    local _, crec = entityOf(4)
-    check(crec.primary and crec.primary[1] == 255 and crec.primary[2] == 0 and crec.secondary[1] == 255,
-        'a set colour paints over it (custom primary + secondary)')
-    local distinct, n = {}, 0
-    for i = 1, 8 do
-        local p = R.paintOf('m' .. i .. ':' .. i)
-        if not distinct[p] then distinct[p], n = true, n + 1 end
-        eq((R.paintOf('m' .. i .. ':' .. i)), p, 'the same uid always gets the same paint (' .. i .. ')')
-    end
-    check(n >= 2, 'different uids get different paints (' .. n .. ' of 8 distinct)')
+    check(#H.log == 1 and same(c.patch, { props = { colorPrimary = p1, colorSecondary = s1, customPrimary = false,
+        customSecondary = false } }) and same(c.remove, { 'plate' }),
+        'the custom colours are cleared explicitly (the paint stays), the plate removed')
+    eq(veh.fields.plate, nil, 'the node has no plate')
+    reset()
+    check(update(1, { pos = { x = 1, y = 1, z = 0 }, rot = { x = 0, y = 0, z = 45 }, fields = { locked = true } }),
+        'move, turn and lock it in one update')
+    eq(H.trace(), 'move:' .. uid(1) .. ' set:' .. uid(1), 'the move first, then the set')
+    check(same(calls('move')[1].rot, { x = 0, y = 0, z = 45 }) and same(calls('set')[1].patch, { locked = true }),
+        'with the new rotation and only the changed field')
+    reset()
+    check(update(1, { layer = 'deco' }), 'a change the node does not show (layer)')
+    eq(#H.log, 0, 'no scene call')
+    check(node(uid(1)) == veh, 'still the first node')
+    reset()
+    check(update(2, { fields = { model = 'a_m_y_x' } }, true), 'the ped loses its scenario')
+    c = calls('set')[1]
+    check(c and c.patch and next(c.patch) == nil and same(c.remove, { 'scenario' }), 'set with remove = { scenario }')
 
-    -- rotate: in place, the heading goes to the owning client, the paint is not touched
+    local got = {}
+    as('events', 'on', '*', callable(function(event, record) got[#got + 1] = event .. ':' .. record.uid end))
     reset()
-    local from = #stubs.sent
-    check(update(1, { rot = { x = 0, y = 0, z = 45 } }), 'rotate the vehicle')
-    eq(entityOf(1), vh, 'rotated in place: the same entity (and net id)')
-    check(#H.natives == 0 and vrec.exists, 'nothing is created or deleted')
-    local ev = H.poses(from + 1)
-    check(#ev == 1 and ev[1].target == 1 and ev[1].args[1] == vrec.netId and ev[1].args[2] == uid(1)
-        and ev[1].args[3] == 10.0 and ev[1].args[8] == 45.0, 'core:maps:pose with the new heading to the owner')
-    eq(#H.rpcCalls('SetVehicleColours'), 0, 'the paint is not set again')
-    landed(vh, 10, 10, 30.2, 45.0)
-    stubs.tick(2100)
-    eq(entityOf(1), vh, 'the synced heading matches after 2 s: kept')
+    local first = node(uid(3))
+    eq(first.kind, 'map:data', 'the point type is map:data')
+    eq(as('deco', 'defineType', { id = 'deco:thing', kind = 'marker' }), true, 'the owner redefines it as a marker')
+    eq(H.trace(), 'remove:' .. uid(3) .. ' spawn:' .. uid(3), 'another scene kind: remove + spawn')
+    check(node(uid(3)).kind == 'marker' and node(uid(3)).audience == nil, 'a public marker node now')
+    stop(env, 'deco')
+    local ph = node(uid(3))
+    check(ph.kind == 'map:data' and same(ph.fields, { t = 'deco:thing', k = 'placeholder', mapEl = uid(3),
+        mapType = 'deco:thing' }) and same(ph.audience, { editors = true }),
+        'its resource stopped: an editor-only placeholder (k = placeholder, t = the type id)')
+    eq(#Maps.elements(map.id), 4, 'the record is kept')
+    reset()
+    eq(as('deco', 'defineType', { id = 'deco:thing', kind = 'marker' }), true, 'the type returns')
+    eq(H.trace(), 'remove:' .. uid(3) .. ' spawn:' .. uid(3), 'the placeholder becomes a marker again')
+    stop(env, 'garage')
+    eq(node(uid(4)).fields.k, 'placeholder', 'a vehicle of a stopped type is a placeholder too')
+    eq(R.netTotal(), 2, 'and no longer counts as networked (the core vehicle and the ped do)')
+    as('garage', 'defineType', { id = 'garage:car', kind = 'vehicle', model = 'adder' })
+    check(node(uid(4)).kind == 'vehicle' and R.netTotal() == 3, 'back: a vehicle node, counted again')
+    stubs.tick(10)
+    eq(#got, 0, 'type changes emit no events (the content did not change)')
 
-    -- a move the owning client never applied (it lost control meanwhile) is re-created there
     reset()
-    check(update(1, { pos = { x = 15, y = 12, z = 30 } }), 'move the vehicle')
-    eq(entityOf(1), vh, 'moved in place first')
-    stubs.tick(2100)
-    local vh2, vrec2 = entityOf(1)
-    check(vh2 ~= nil and vh2 ~= vh and vrec.exists == false, 'still at the old place after 2 s: re-created')
-    local c = H.natives[1]
-    check(c and c.args[3] == 15.0 and c.args[4] == 12.0 and c.args[6] == 45.0, 'at the new pose')
-    check(vrec2.colours[1] == p1 and vrec2.colours[2] == s1, 'with the same paint as the first spawn')
+    H.refuse.set = 'fields'
+    local before = printed('failed: fields')
+    check(update(1, { fields = { plate = 'A1' } }), 'the apply itself succeeds')
+    eq(printed('failed: fields'), before + 1, 'a refused set is logged')
+    check(update(1, { fields = { plate = 'A2' } }), 'another change')
+    eq(printed('failed: fields'), before + 1, 'the next refusal within a minute is not')
+    H.refuse.set = nil
+    reset()
+    check(update(1, { fields = { plate = 'A3' } }), 'once Scene accepts again')
+    check(same(calls('set')[1].patch, { plate = 'A3' }) and node(uid(1)).fields.plate == 'A3',
+        'the next change brings the node up to date')
 
-    -- what keeps the respawn path: another model, the server owning it, a wreck, another bucket
-    reset()
-    check(update(1, { fields = { model = 'adder' } }), 'another model')
-    local vh3 = entityOf(1)
-    check(vh3 ~= vh2 and stubs.entities[vh2].exists == false and #H.natives == 1, 'a model change re-creates')
-    reset()
-    H.owners[vh3] = -1
-    check(update(1, { pos = { x = 16, y = 12, z = 30 } }), 'move while the server owns it')
-    local vh4 = entityOf(1)
-    check(vh4 ~= vh3 and #H.natives == 1, 'nobody near: re-created at once (exact and unseen)')
-    reset()
-    stubs.health[vh4] = 0
-    check(update(1, { rot = { x = 0, y = 0, z = 90 } }), 'rotate a wreck')
-    local vh5 = entityOf(1)
-    check(vh5 ~= vh4 and #H.natives == 1, 'a dead entity is re-created')
-    reset()
-    stubs.entities[vh5].bucket = 99
-    check(update(1, { pos = { x = 17, y = 12, z = 30 } }), 'move an entity someone put in another bucket')
-    local vh6, r6 = entityOf(1)
-    check(vh6 ~= vh5 and r6.bucket == 5, 'another bucket: re-created in the map bucket')
+    H.refuse.spawn = 'hook'                                  -- a veto (not 'limit': that one is retried, below)
+    check(Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 30, y = 0, z = 0 } } }, 1),
+        'an element Scene refuses to spawn')
+    eq(node(uid(5)), nil, 'has no node')
+    check(#Maps.records('core:point') == 1, 'but it is active content (records, events)')
+    eq(R.stats().retrying, 0, 'a veto is not retried')
+    H.refuse.spawn = nil
+    check(update(5, { pos = { x = 31, y = 0, z = 0 } }), 'its next change')
+    eq(node(uid(5)).pos.x, 31.0, 'spawns it')
 
-    -- field-only changes: RPCs + mapCfg, no pose event, no new entity
+    local lost = node(uid(2))
+    H.nodes[lost.id] = nil
     reset()
-    from = #stubs.sent
-    check(update(1, { fields = { plate = 'NEW 1', locked = true } }), 'plate and lock')
-    eq(entityOf(1), vh6, 'a field change keeps the entity')
-    check(r6.plate == 'NEW 1' and r6.lockState == 2, 'plate and lock set by RPC')
-    eq(stubs.entityState(env, vh6).mapCfg.locked, true, 'mapCfg carries the lock')
-    eq(#H.poses(from + 1), 0, 'no pose event without a move')
-    eq(#H.rpcCalls('SetVehicleNumberPlateText'), 1, 'one plate RPC')
-    reset()
-    check(update(1, { fields = { locked = false, color = '#00FF00' } }), 'unlock and paint')
-    check(r6.lockState == 1 and r6.primary[2] == 255 and r6.secondary[2] == 255, 'unlocked (1) and painted in place')
-    eq(stubs.entityState(env, vh6).mapCfg.locked, false, 'mapCfg: unlocked')
-    check(entityOf(1) == vh6 and #H.rpcCalls('SetVehicleNumberPlateText') == 0, 'same entity, the plate untouched')
-    reset()
-    check(replace(1, { model = 'adder', plate = 'NEW 1' }), 'the colour cleared')
-    local vh7, r7 = entityOf(1)
-    check(vh7 ~= vh6 and r7.primary == nil and r7.colours[1] == p1, 'a cleared colour re-creates, back to the uid paint')
-    reset()
-    check(replace(1, { model = 'adder' }), 'the plate cleared')
-    check(entityOf(1) ~= vh7, 'a cleared plate re-creates')
-
-    -- a ped: frozen and scenario in place, invincible on -> off re-creates
-    local ph, prec = entityOf(2)
-    eq(prec.frozen, true, 'the ped was frozen on creation')
-    reset()
-    check(update(2, { fields = { frozen = false, scenario = 'WORLD_HUMAN_AA_COFFEE' } }), 'unfreeze, another scenario')
-    eq(entityOf(2), ph, 'the ped stays')
-    eq(prec.frozen, false, 'unfrozen by RPC')
-    local pcfg = stubs.entityState(env, ph).mapCfg
-    check(pcfg.frozen == false and pcfg.scenario == 'WORLD_HUMAN_AA_COFFEE' and pcfg.invincible == true,
-        'mapCfg updated for the owning client')
-    reset()
-    check(replace(2, { model = 'a_m_y_x', invincible = true, frozen = false }), 'the scenario cleared')
-    check(entityOf(2) == ph and prec.tasksCleared == true, 'ClearPedTasks ends it, same ped')
-    reset()
-    from = #stubs.sent
-    check(update(2, { pos = { x = 21, y = 11, z = 30 }, rot = { x = 0, y = 0, z = 90 } }), 'move the ped')
-    ev = H.poses(from + 1)
-    check(entityOf(2) == ph and #ev == 1 and ev[1].args[3] == 21.0 and ev[1].args[8] == 90.0, 'a ped moves in place')
-    landed(ph, 21, 11, 30, 90.0)
-    reset()
-    check(update(2, { fields = { invincible = false } }), 'no longer invincible')
-    check(entityOf(2) ~= ph and prec.exists == false, 'invincible on -> off re-creates (the native is client-only)')
-
-    -- a physics prop: full rotation in the pose event and mapCfg.rot, checked by position only
-    local oh = entityOf(3)
-    reset()
-    from = #stubs.sent
-    check(update(3, { rot = { x = 15, y = 0, z = 30 } }), 'tilt the physics prop')
-    ev = H.poses(from + 1)
-    check(entityOf(3) == oh and #ev == 1 and ev[1].args[6] == 15.0 and ev[1].args[8] == 30.0,
-        'the prop stays, its full rotation goes to the owner')
-    eq(stubs.entityState(env, oh).mapCfg.rot.x, 15, 'mapCfg.rot follows')
-    stubs.tick(2100)
-    eq(entityOf(3), oh, 'kept: a prop is checked by position (its rotation rides mapCfg.rot)')
-
-    -- an unchanged element shown again (its type redefined by its owner) keeps its entity
-    eq(as('garage', 'defineType', { id = 'garage:car', kind = 'vehicle', fields = {
-        { name = 'model', type = 'model', kinds = { 'vehicle' }, required = true } } }), true, 'a plugin vehicle type')
-    local ok5, ap5 = Maps.apply(map.id, { { op = 'create', type = 'garage:car', pos = { x = 50, y = 10, z = 30 },
-        fields = { model = 'sultan' } } }, 1)
-    check(ok5, 'a plugin vehicle')
-    local gid = ap5.ops[1].id
-    local gh = entityOf(gid)
-    reset()
-    from = #stubs.sent
-    eq(as('garage', 'defineType', { id = 'garage:car', label = 'Car', kind = 'vehicle', fields = {
-        { name = 'model', type = 'model', kinds = { 'vehicle' }, required = true } } }), true, 'redefined')
-    check(entityOf(gid) == gh and #H.natives == 0 and #H.poses(from + 1) == 0, 'a redefinition re-renders in place')
-
-    -- still being created when it moves: the old entity goes once it appears, the element ends at the latest pose
-    reset()
-    stubs.spawnDelayMs = 200
-    local ok6, ap6 = Maps.apply(map.id, { { op = 'create', type = 'core:vehicle', pos = { x = 60, y = 10, z = 30 },
-        fields = { model = 'sultan' } } }, 1)
-    check(ok6, 'a slow vehicle')
-    local sid = ap6.ops[1].id
-    check(update(sid, { pos = { x = 65, y = 11, z = 30 }, rot = { x = 0, y = 0, z = 180 } }), 'moved while being created')
-    stubs.tick(1000)
-    local sh = entityOf(sid)
-    eq(alive(sid), 1, 'one entity for the element')
-    check(sh and stubs.coords[sh].x == 65.0 and stubs.headings[sh] == 180.0, 'at the latest pose')
-    -- queued behind another creation: nothing extra, it reads the latest element when its turn comes
-    reset()
-    local ok7, ap7 = Maps.apply(map.id, {
-        { op = 'create', type = 'core:vehicle', pos = { x = 70, y = 10, z = 30 }, fields = { model = 'sultan' } },
-        { op = 'create', type = 'core:vehicle', pos = { x = 80, y = 10, z = 30 }, fields = { model = 'sultan' } } }, 1)
-    check(ok7, 'two slow vehicles')
-    local qid = ap7.ops[2].id
-    check(update(qid, { pos = { x = 85, y = 12, z = 30 } }), 'the queued one moves')
-    stubs.tick(1000)
-    local qh = entityOf(qid)
-    check(#H.natives == 2 and qh and stubs.coords[qh].x == 85.0, 'created once, at the latest position')
-    stubs.spawnDelayMs = 0
-
-    -- a draft: the editor bucket and the published copy share the uid paint; publish moves in place
-    local draft = Maps.create({ name = 'D', mode = 'draft', targetBucket = 6 }, 1)
-    local eb = as('admin', 'openDraft', draft.id, 1)
-    check(Maps.apply(draft.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 30 },
-        fields = { model = 'sultan' } } }, 1), 'a vehicle in the draft')
-    check(Maps.setActive(draft.id, true, 1) and Maps.publish(draft.id, 1) == 1, 'published')
-    local function draftEntity(bucket)
-        for handle, rec in pairs(stubs.entities) do
-            if rec.exists and rec.bucket == bucket and stubs.entityState(env, handle).mapEl == draft.id .. ':1' then
-                return handle, rec
-            end
-        end
-    end
-    local eh, erec = draftEntity(eb)
-    local th, trec = draftEntity(6)
-    check(eh and th and eh ~= th, 'one entity in the editor bucket, one in the target bucket')
-    check(erec.colours[1] == trec.colours[1] and erec.colours[2] == trec.colours[2], 'the same paint in both')
-    reset()
-    from = #stubs.sent
-    check(Maps.apply(draft.id, { { op = 'update', id = 1, set = { pos = { x = 3, y = 0, z = 30 } } } }, 1), 'edit the draft')
-    eq(draftEntity(eb), eh, 'the editor copy moves in place')
-    eq(draftEntity(6), th, 'the world copy is untouched')
-    eq(Maps.publish(draft.id, 1), 2, 'publish the move')
-    check(draftEntity(6) == th and #H.natives == 0 and #H.poses(from + 1) == 2, 'publishing moves the world copy in place')
+    check(update(2, { pos = { x = 6, y = 0, z = 0 } }), 'a node that went missing behind our back')
+    eq(H.trace(), 'move:nil spawn:' .. uid(2), 'the move answers missing: spawned again')
+    check(node(uid(2)) ~= nil and node(uid(2)).id ~= lost.id, 'a new node')
+    eq(R.stats().nodes, 5, 'five nodes')
 end
 
 --------------------------------------------------------------------------------
--- review fixes: reused server handles are never deleted (F1); the pose check re-creates only a move that did not
--- land (F2)
---------------------------------------------------------------------------------
-do
-    local env, Core = newServer()
-    local Maps = Core.Maps
-    as('catalogue', 'setModelValidator', callable(function() return true end))
-    local map = Maps.create({ name = 'Reuse', mode = 'live', targetBucket = 5 }, 1)
-    local function uid(id) return map.id .. ':' .. id end
-    local function entityOf(id)
-        for handle, rec in pairs(stubs.entities) do
-            if rec.exists and stubs.entityState(env, handle).mapEl == uid(id) then return handle, rec end
-        end
-    end
-    local function update(id, set) return Maps.apply(map.id, { { op = 'update', id = id, set = set } }, 1) end
-    --- a client deleted the map entity and the server gave its handle to someone else's entity (fresh bag)
-    local function reuse(h) stubs.entityState(env, h).mapEl, stubs.entityState(env, h).mapCfg = nil, nil end
-    check(Maps.apply(map.id, {
-        { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 30 }, fields = { model = 'sultan' } },
-        { op = 'create', type = 'core:vehicle', pos = { x = 20, y = 0, z = 30 }, fields = { model = 'sultan' } },
-        { op = 'create', type = 'core:physprop', pos = { x = 40, y = 0, z = 30 }, fields = { model = 'prop_ball' } },
-        { op = 'create', type = 'core:ped', pos = { x = 60, y = 0, z = 30 }, fields = { model = 'a_m_y_x' } },
-    }, 1), 'two vehicles, a ball and a ped')
-
-    -- F1: a reused handle
-    local h1, r1 = entityOf(1)
-    reuse(h1)
-    eq(Maps.respawn(map.id), 1, "respawn sees the element's entity as gone (the handle is someone else's)")
-    eq(r1.exists, true, 'and leaves the foreign entity alone')
-    local n1 = entityOf(1)
-    check(n1 and n1 ~= h1, 'the element has a new entity')
-    reuse(n1)
-    check(update(1, { pos = { x = 2, y = 0, z = 30 } }), 'move an element whose handle was reused')
-    check(stubs.entities[n1].exists and entityOf(1) ~= nil and entityOf(1) ~= n1,
-        'not moved in place, not deleted: the element is re-created')
-    local h2, r2 = entityOf(2)
-    reuse(h2)
-    local lastOf1 = entityOf(1)
-    check(Maps.setActive(map.id, false, 1), 'deactivate')
-    check(r2.exists and not stubs.entities[lastOf1].exists, 'deactivation deletes its own entities only')
-    check(Maps.setActive(map.id, true, 1), 'activate again')
-    local h3 = entityOf(1)
-    reuse(h3)
-    stop(env, 'core')
-    eq(stubs.entities[h3].exists, true, 'core stop never deletes a foreign entity either')
-end
-
-do
-    local env, Core = newServer()
-    local Maps = Core.Maps
-    as('catalogue', 'setModelValidator', callable(function() return true end))
-    local map = Maps.create({ name = 'Verify', mode = 'live', targetBucket = 5 }, 1)
-    local function entityOf(id)
-        for handle, rec in pairs(stubs.entities) do
-            if rec.exists and stubs.entityState(env, handle).mapEl == map.id .. ':' .. id then return handle, rec end
-        end
-    end
-    local function update(id, set) return Maps.apply(map.id, { { op = 'update', id = id, set = set } }, 1) end
-    local function at(h, x, y, z, heading) stubs.coords[h], stubs.headings[h] = stubs.vector3(x, y, z), heading end
-    check(Maps.apply(map.id, {
-        { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 30 }, fields = { model = 'sultan' } },
-        { op = 'create', type = 'core:physprop', pos = { x = 40, y = 0, z = 30 }, fields = { model = 'prop_ball' } },
-        { op = 'create', type = 'core:ped', pos = { x = 60, y = 0, z = 30 }, fields = { model = 'a_m_y_x', frozen = false } },
-    }, 1), 'a vehicle, a ball and a ped')
-    local vh = entityOf(1)
-    check(update(1, { pos = { x = 5, y = 0, z = 30 } }), 'move the vehicle')
-    at(vh, 5, 0, 30, 0.0)               -- landed …
-    at(vh, 40, 30, 30, 120.0)           -- … and was driven away within the 2 s
-    stubs.tick(2100)
-    eq(entityOf(1), vh, 'landed, then driven away: kept (far from the target AND from where it was)')
-    check(update(1, { pos = { x = 45, y = 30, z = 30 } }), 'move it again')
-    stubs.vehicleSeats[vh] = { [-1] = 101 }   -- a player sits in it; the move never landed
-    stubs.tick(2100)
-    eq(entityOf(1), vh, 'a vehicle with an occupant is never re-created under them')
-    stubs.vehicleSeats[vh] = nil
-    at(vh, 45, 30, 30, 0.0)             -- the player got out; the owner applied the move after all
-    check(update(1, { rot = { x = 0, y = 0, z = 90 } }), 'rotate it')
-    stubs.tick(2100)
-    local v2 = entityOf(1)
-    check(v2 ~= vh, 'the heading still the old one at the target position: re-created')
-    check(update(1, { pos = { x = 50, y = 30, z = 30 } }), 'a burst: move once')
-    check(update(1, { pos = { x = 55, y = 30, z = 30 } }), 'and again before the check')
-    stubs.tick(2100)
-    check(entityOf(1) ~= v2, 'neither landed (still at the pose before the burst): re-created')
-
-    local bh = entityOf(2)
-    check(update(2, { pos = { x = 42, y = 0, z = 30 } }), 'move the ball')
-    at(bh, 48, 6, 29, 0.0)              -- landed and rolled away
-    stubs.tick(2100)
-    eq(entityOf(2), bh, 'a prop that landed and rolled away is kept')
-    local ph = entityOf(3)
-    check(update(3, { rot = { x = 0, y = 0, z = 90 } }), 'turn the ped')
-    at(ph, 60, 0, 30, 200.0)            -- turned, then bumped round by a car
-    stubs.tick(2100)
-    eq(entityOf(3), ph, 'a ped that turned and was bumped round is kept (neither heading)')
-end
-
---------------------------------------------------------------------------------
--- expect / conflict and invert (undo, redo)
+-- respawn: promoted, displaced, changed and missing nodes go back to their authored state
 --------------------------------------------------------------------------------
 do
     local _, Core = newServer()
-    local Maps = Core.Maps
-    eq(as('catalogue', 'setModelValidator', callable(function() return true end)), true, 'a permissive validator')
-    local map = Maps.create({ name = 'U', mode = 'live' }, 1)
-    local ok, created = Maps.apply(map.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 },
-        fields = { model = 'adder' } } }, 1)
-    check(ok, 'a vehicle without a plate')
-    local at = created.ops[1].after.updatedAt
-    local err, detail
-    ok, err, detail = Maps.apply(map.id, { { op = 'update', id = 1, set = { fields = { plate = 'X' } } } }, 2,
-        { expect = { ['1'] = at - 1 } })
-    check(ok == nil and err == 'conflict' and detail.id == '1' and detail.current == at, 'a stale expect is a conflict')
-    ok, err = Maps.apply(map.id, { { op = 'update', id = 1, set = {} } }, 2, { expect = { [9] = 1 } })
-    check(ok == nil and err == 'conflict', 'expecting a missing element is a conflict')
-    local changed
-    ok, changed = Maps.apply(map.id, { { op = 'update', id = 1, set = { fields = { plate = 'EVENT', locked = true },
-        pos = { x = 3, y = 3, z = 3 } } } }, 2, { expect = { [1] = at } })
-    check(ok, 'the right expect passes (integer keys too)')
-    eq(changed.ops[1].before.fields.plate, nil, 'before has no plate')
-    eq(changed.ops[1].after.fields.plate, 'EVENT', 'after has the plate (partial fields merge)')
-    eq(changed.ops[1].after.fields.model, 'adder', 'the merge kept the model')
-    eq(changed.ops[1].after.by, 'acc1', 'by stays the creator')
+    local Maps, paintOf = Core.Maps, Core.MapsRuntime.paintOf
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local map = Maps.create({ name = 'Respawn', mode = 'live', targetBucket = 3 }, 1)
+    local function uid(id) return map.id .. ':' .. id end
+    check(Maps.apply(map.id, {
+        { op = 'create', type = 'core:vehicle', pos = { x = 1, y = 2, z = 3 }, rot = { x = 0, y = 0, z = 90 },
+            fields = { model = 'adder', color = '#FF0000' } },
+        { op = 'create', type = 'core:ped', pos = { x = 4, y = 0, z = 0 }, fields = { model = 'a_m_y_x' } },
+        { op = 'create', type = 'core:physprop', pos = { x = 8, y = 0, z = 0 }, fields = { model = 'prop_crate' } },
+        { op = 'create', type = 'core:point', pos = { x = 9, y = 0, z = 0 } },
+    }, 1), 'vehicle, ped, physics prop, point')
+    reset()
+    eq(Maps.respawn(map.id), 0, 'nothing to do while every node is as placed')
+    eq(#calls('move') + #calls('set') + #calls('spawn'), 0, 'and no scene call')
 
-    local undo, expect = Maps.invert(changed)
-    eq(#undo, 1, 'invert of one update is one update')
-    check(undo[1].restore ~= nil and undo[1].restore.fields.plate == nil, 'which restores the earlier record')
-    eq(expect['1'], changed.ops[1].after.updatedAt, 'expect = the after stamp')
-    local undone
-    ok, undone = Maps.apply(map.id, undo, 2, { expect = expect })
-    check(ok, 'undo applies')
-    local el = Maps.elements(map.id)[1]
-    check(el.fields.plate == nil and el.fields.locked == false and el.pos.x == 0, 'undo restored fields and position')
-    ok, err = Maps.apply(map.id, undo, 2, { expect = expect })
-    check(ok == nil and err == 'conflict', 'undoing twice is a conflict')
-    local redo, redoExpect = Maps.invert(undone)
-    check(Maps.apply(map.id, redo, 2, { expect = redoExpect }), 'redo = invert of the undo')
-    eq(Maps.elements(map.id)[1].fields.plate, 'EVENT', 'redo is back')
+    local veh = node(uid(1))
+    veh.promoted = { netId = 55 }
+    veh.pos = { x = 40, y = 40, z = 3 }                     -- somebody drove it away
+    veh.fields.props = { colorPrimary = 12, customPrimary = false }   -- props read back on a demote
+    reset()
+    eq(Maps.respawn(map.id, 1), 1, 'respawn of the promoted, driven vehicle')
+    local mv, st = calls('move')[1], calls('set')[1]
+    check(mv and mv.id == veh.id and mv.promoted == true and same(mv.pos, { x = 1, y = 2, z = 3 })
+        and same(mv.rot, { x = 0, y = 0, z = 90 }), 'Scene.move of the promoted node to the authored pose (Scene demotes it)')
+    local p1, s1 = paintOf(uid(1))
+    check(st and st.id == veh.id and same(st.patch, { props = { colorPrimary = p1, colorSecondary = s1,
+        customPrimary = { 255, 0, 0 }, customSecondary = { 255, 0, 0 } } }), 'Scene.set puts the authored props back')
+    check(node(uid(1)) == veh and veh.promoted == nil and #calls('spawn') == 0, 'the same node, no new one')
 
-    local _, deleted = Maps.apply(map.id, { { op = 'delete', id = 1 } }, 1)
-    local restore = Maps.invert(deleted)
-    eq(restore[1].op, 'create', 'invert of a delete is a create')
-    local _, restored = Maps.apply(map.id, restore, 1)
-    eq(restored.ops[1].id, '1', 'with the same id')
-    eq(Maps.elements(map.id)[1].fields.plate, 'EVENT', 'and the same fields')
-    ok, err = Maps.apply(map.id, restore, 1)
-    check(ok == nil and err == 'exists', 'restoring over a live id is refused')
-    local _, created2 = Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
-    eq(created2.ops[1].id, '2', 'new ids continue after a restored one')
-    local removeIt, e2 = Maps.invert(created2)
-    check(removeIt[1].op == 'delete' and Maps.apply(map.id, removeIt, 1, { expect = e2 }), 'invert of a create deletes it')
+    local ped = node(uid(2))
+    ped.pos = { x = 4.5, y = 0, z = 0 }
+    local prop = node(uid(3))
+    prop.rot = { x = 0, y = 0, z = 0.005 }                  -- within 0.01°: not displaced
+    reset()
+    eq(Maps.respawn(map.id), 1, 'respawn all: only the displaced ped')
+    check(#calls('move') == 1 and calls('move')[1].id == ped.id and ped.pos.x == 4, 'the ped is moved back')
+
+    H.nodes[prop.id] = nil                                   -- the node is gone (e.g. removed with its clone)
+    reset()
+    eq(Maps.respawn(map.id, '3'), 1, 'respawn of an element whose node is missing (string id)')
+    check(node(uid(3)) ~= nil and node(uid(3)).id ~= prop.id and calls('spawn')[1].uid == uid(3), 'spawned again')
+    eq(Maps.respawn(map.id, 99), 0, 'an unknown element')
+    eq(Maps.respawn('nope'), 0, 'an unknown map')
+    eq(Maps.respawn(map.id, 'x'), 0, 'a bad id')
+
+    local draft = Maps.create({ name = 'RD', mode = 'draft', targetBucket = 3 }, 1)
+    Maps.apply(draft.id, { { op = 'create', type = 'core:ped', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'a_m_y_x' } } }, 1)
+    Maps.setActive(draft.id, true, 1)
+    Maps.publish(draft.id, 1)
+    local bucket = Maps.openDraft(draft.id, 1)
+    local a, na = node(draft.id .. ':1', bucket)
+    local b = node(draft.id .. ':1', 3)
+    check(na == 1 and a and b and a ~= b, 'a draft element has a node in its editor bucket and one in the target')
+    a.pos, b.pos = { x = 1, y = 0, z = 0 }, { x = 2, y = 0, z = 0 }
+    eq(Maps.respawn(draft.id), 2, 'respawn covers every active context of the map')
+    check(a.pos.x == 0 and b.pos.x == 0, 'both are back')
+end
+
+--------------------------------------------------------------------------------
+-- the Scene store barrier, the waiter, calls as core
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer({ sceneLoaded = false })
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    eq(#calls('defineKind'), 1, 'map:data is defined at start even before the store loaded')
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local got = {}
+    as('events', 'on', '*', callable(function(event, record) got[#got + 1] = event .. ':' .. record.uid end))
+    local map = Maps.create({ name = 'Early', mode = 'live' }, 1)
+    reset()
+    check(Maps.apply(map.id, {
+        { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } },
+        { op = 'create', type = 'core:prop', pos = { x = 1, y = 0, z = 0 }, fields = { model = 'prop_a' } },
+        { op = 'create', type = 'core:point', pos = { x = 2, y = 0, z = 0 } } }, 1), 'apply before the store loaded')
+    check(Maps.apply(map.id, { { op = 'update', id = 2, set = { pos = { x = 3, y = 0, z = 0 } } } }, 1), 'and change it')
+    eq(#H.log, 0, 'nothing reaches the scene')
+    stubs.tick(10)
+    eq(#got, 4, 'the events go on (three added, one changed)')
+    eq(R.netTotal(), 1, 'the counts go on')
+    eq(Maps.respawn(map.id), 0, 'respawn has nothing to do yet')
+    check(R.stats().waiting == true and R.stats().nodes == 0, 'stats: waiting, no nodes')
+    local draft = Maps.create({ name = 'Gone', mode = 'draft' }, 1)
+    Maps.apply(draft.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
+    Maps.openDraft(draft.id, 1)
+    Maps.closeDraft(draft.id)
+    stubs.tick(2000)
+    eq(#H.log, 0, 'still nothing while the store loads')
+    H.sceneLoaded = true
+    stubs.tick(1000)
+    eq(#calls('spawn', 0), 3, 'the waiter projects every context once the store is there')
+    eq(node(map.id .. ':2').pos.x, 3.0, 'with the current content')
+    eq(#calls('remove'), 0, 'a context closed meanwhile costs nothing')
+    check(R.stats().waiting == false and R.stats().nodes == 3, 'stats: done, three nodes')
+    stubs.tick(5000)
+    eq(#calls('spawn'), 3, 'the waiter is gone')
+
+    local _, Core2 = newServer({ sceneLoaded = false })
+    local m2 = Core2.Maps.create({ name = 'Slow', mode = 'live' }, 1)
+    Core2.Maps.apply(m2.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
+    stubs.tick(29000)
+    eq(printed('has not loaded'), 0, 'no warning before 30 s')
+    stubs.tick(2000)
+    eq(printed('has not loaded after 30 s'), 1, 'one warning after 30 s')
+    stubs.tick(60000)
+    eq(printed('has not loaded'), 1, 'and only one')
+    H.sceneLoaded = true
+    stubs.tick(1000)
+    eq(#calls('spawn'), 1, 'projected once it loads')
+
+    local _, Core3 = newServer()
+    local m3 = Core3.Maps.create({ name = 'Plugin', mode = 'live' }, 1)
+    reset()
+    local ok = as('admin', 'apply', m3.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
+    check(ok == true, 'a plugin applies through the export')
+    check(calls('spawn')[1].caller == 'core' and node(m3.id .. ':1').owner == 'core', 'the node is spawned AS core')
+    as('admin', 'apply', m3.id, { { op = 'update', id = 1, set = { pos = { x = 1, y = 0, z = 0 } } } }, 1)
+    as('admin', 'setActive', m3.id, false, 1)
+    check(calls('move')[1].caller == 'core' and calls('remove')[1].caller == 'core', 'moved and removed as core too')
 end
 
 --------------------------------------------------------------------------------
@@ -772,36 +632,37 @@ do
     reset()
     check(Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 1, y = 1, z = 1 } },
         { op = 'create', type = 'core:point', pos = { x = 2, y = 2, z = 2 } } }, 1), 'edit a closed draft')
-    eq(#H.regionLog, 0, 'a closed, unpublished draft shows nothing')
+    eq(#H.log, 0, 'a closed, unpublished draft shows nothing')
     local bucket = as('admin', 'openDraft', map.id, 1)
     local lo = Core.Config.Buckets.Range[1]
     check(type(bucket) == 'number' and bucket >= lo, 'openDraft allocates a bucket from the range')
     eq(Core.Buckets.info(bucket).owner, 'core', 'owned by core even when a plugin opens it')
     check(H.population[bucket] == false and H.lockdown[bucket] == 'strict', 'population off, lockdown strict')
     eq(as('admin', 'openDraft', map.id, 2), bucket, 'a second editor gets the same bucket')
-    eq(#calls('put', bucket), 2, 'the draft is live in its editor bucket')
+    eq(#calls('spawn', bucket), 2, 'the draft is live in its editor bucket')
     eq(Maps.get(map.id).editorBucket, bucket, 'get() reports the editor bucket')
     eq(select(2, Maps.update(map.id, { targetBucket = bucket })), 'targetBucket', 'an editor bucket cannot be a target')
     reset()
     check(Maps.setActive(map.id, true, 1), 'activate the unpublished draft')
-    eq(#calls('put', 3), 0, 'nothing published, nothing shown')
+    eq(#calls('spawn', 3), 0, 'nothing published, nothing shown')
     eq(Maps.publish(map.id, 1, 'first'), 1, 'publish -> version 1')
-    eq(#calls('put', 3), 2, 'the snapshot is shown in the target bucket')
+    eq(#calls('spawn', 3), 2, 'the snapshot is shown in the target bucket')
+    local target = node(map.id .. ':1', 3)
     eq(lastAudit('maps.publish').changes[1].new, 1, 'publish is audited')
     eq(Maps.get(map.id).dirty, false, 'not dirty after publishing')
     reset()
     check(Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 9, y = 9, z = 9 } } } }, 1), 'edit the draft')
-    eq(#calls('put', bucket), 1, 'the editor bucket sees the edit')
-    eq(#calls('put', 3), 0, 'the world does not')
+    eq(#calls('move', bucket), 1, 'the editor bucket sees the edit')
+    eq(#calls('move', 3), 0, 'the world does not')
     eq(Maps.get(map.id).dirty, true, 'dirty after an edit')
     reset()
     eq(Maps.publish(map.id, 1), 2, 'publish -> version 2')
-    eq(#calls('put', 3), 1, 'only the changed element is re-put')
-    eq(calls('put', 3)[1].tuple[4], 9.0, 'at its new position')
+    eq(H.trace(), 'move:' .. map.id .. ':1', 'only the changed element is moved (a diff by updatedAt)')
+    check(node(map.id .. ':1', 3) == target and target.pos.x == 9.0, 'the same node, at its new position')
     reset()
     eq(Maps.rollback(map.id, 1, 1), 3, 'rollback publishes a copy as version 3')
-    eq(#calls('put', 3), 1, 'the element goes back')
-    eq(calls('put', 3)[1].tuple[4], 1.0, 'to its version-1 position')
+    eq(H.trace(), 'move:' .. map.id .. ':1', 'the element goes back')
+    eq(target.pos.x, 1.0, 'to its version-1 position')
     eq(Maps.elements(map.id)[1].pos.x, 9.0, 'the draft is untouched')
     eq(Maps.get(map.id).dirty, true, 'and differs from what is published')
     local versions = Maps.versions(map.id)
@@ -814,8 +675,8 @@ do
     eq(select(2, Maps.openDraft(live.id, 1)), 'mode', 'nor opened as drafts')
     reset()
     eq(Maps.closeDraft(map.id), true, 'closeDraft')
-    eq(#calls('clear', bucket), 1, 'the editor bucket is cleared in one call')
-    eq(#calls('remove', bucket), 0, 'without per-element removes')
+    eq(#calls('remove', bucket), 2, 'the editor bucket loses its nodes')
+    eq(node(map.id .. ':1', bucket), nil, 'none is left there')
     eq(Core.Buckets.info(bucket), nil, 'the bucket is released')
     check(Maps.closeDraft(map.id) == false and #calls('remove', 3) == 0, 'closing twice is false; the published content stays')
     local b2 = as('admin', 'openDraft', map.id, 1)
@@ -823,166 +684,510 @@ do
     reset()
     stop(env, 'admin')
     eq(Maps.get(map.id).editorBucket, nil, 'the opener stopping closes the draft')
-    eq(#calls('clear', b2), 1, 'and clears its bucket')
+    eq(#calls('remove', b2), 2, 'and empties its bucket')
     for i = 1, 22 do Maps.publish(map.id, 1, 'v' .. i) end
     eq(#Maps.versions(map.id), 20, 'the newest 20 versions are kept')
     eq(stubs.kvp['doc:map_versions:' .. map.id .. ':v1'], nil, 'older snapshots are deleted')
 end
 
 --------------------------------------------------------------------------------
--- events (Maps.on / records), hooks, type.validate, parents, refs, migrate
+-- publish / rollback swap the target context by diff: removed, changed, added, untouched
 --------------------------------------------------------------------------------
 do
-    local env, Core = newServer()
+    local _, Core = newServer()
     local Maps = Core.Maps
+    local map = Maps.create({ name = 'Swap', mode = 'draft', targetBucket = 9, active = true }, 1)
+    local function uid(id) return map.id .. ':' .. id end
+    Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 1, y = 0, z = 0 }, fields = { label = 'a' } },
+        { op = 'create', type = 'core:point', pos = { x = 2, y = 0, z = 0 } },
+        { op = 'create', type = 'core:marker', pos = { x = 3, y = 0, z = 0 } } }, 1)
+    eq(Maps.publish(map.id, 1), 1, 'v1')
+    local one, three = node(uid(1), 9), node(uid(3), 9)
     local got = {}
-    local handle = as('garage', 'on', 'core:point', callable(function(event, record, mapId)
-        got[#got + 1] = { event = event, record = record, mapId = mapId }
-    end))
-    check(type(handle) == 'string', 'Maps.on returns a handle')
-    eq(as('garage', 'on', 'bad', callable(function() end)), nil, 'a bad type id is refused')
-    local map = Maps.create({ name = 'E', mode = 'live' }, 1)
-    Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 1, y = 2, z = 3 }, fields = { label = 'a' } },
-        { op = 'create', type = 'core:zone', pos = { x = 0, y = 0, z = 0 } } }, 1)
-    eq(#got, 1, 'only the listened type is delivered')
-    local r = got[1].record
-    check(got[1].event == 'added' and got[1].mapId == map.id and r.uid == map.id .. ':1' and r.bucket == 0
-        and r.editor == false and r.key == '0|' .. map.id .. ':1' and r.fields.label == 'a', 'added: the record')
-    Maps.apply(map.id, { { op = 'update', id = 1, set = { fields = { label = 'b' } } } }, 1)
-    check(got[2].event == 'changed' and got[2].record.fields.label == 'b', 'changed')
-    local records = Maps.records('core:point')
-    check(#records == 1 and records[1].fields.label == 'b', 'records() lists active content of a type')
-    eq(#Maps.records('*'), 2, "records('*') lists everything active")
-    Maps.apply(map.id, { { op = 'delete', id = 1 } }, 1)
-    check(got[3].event == 'removed' and got[3].record.fields.label == 'b', 'removed carries the last record')
-    local draft = Maps.create({ name = 'D', mode = 'draft' }, 1)
-    Maps.apply(draft.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
-    eq(#got, 3, 'a closed draft emits nothing')
-    local bucket = Maps.openDraft(draft.id, 1)
-    check(got[4].event == 'added' and got[4].record.editor == true and got[4].record.bucket == bucket,
-        'an open draft emits for its editor bucket (editor = true)')
-    Maps.closeDraft(draft.id)
-    eq(got[5].event, 'removed', 'closing it removes')
-    stop(env, 'garage')
-    Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } } }, 1)
-    eq(#got, 5, 'listeners go with their resource')
-
-    local payload
-    local hook = Core.Hooks.register('maps:beforeApply', function(p)
-        payload = p
-        if p.ops[1].model == 'prop_forbidden' then return false, 'blacklisted' end
-    end)
-    local ok, err, detail = Maps.apply(map.id, { { op = 'create', type = 'core:prop', pos = { x = 1, y = 1, z = 1 },
-        fields = { model = 'prop_forbidden' } } }, 1, { source = 'editor' })
-    check(ok == nil and err == 'hook' and detail.reason == 'blacklisted', 'maps:beforeApply vetoes')
-    check(payload.mapId == map.id and payload.source == 'editor' and payload.actor == 'acc1' and payload.count == 1
-        and payload.ops[1].pos.x == 1, 'the hook payload')
-    check(Maps.apply(map.id, { { op = 'create', type = 'core:prop', pos = { x = 1, y = 1, z = 1 }, fields = { model = 'prop_ok' } } }, 1),
-        'the hook lets others pass')
-    Core.Hooks.remove(hook)
-
-    local ctxSeen
-    eq(as('race', 'defineType', { id = 'race:start', kind = 'point' }), true, 'race:start')
-    eq(as('race', 'defineType', { id = 'race:cp', kind = 'point', parents = { 'race:start' },
-        fields = { { name = 'next', type = 'ref', refType = 'race:cp' }, { name = 'n', type = 'integer', default = 0 } },
-        validate = callable(function(record, ctx)
-            ctxSeen = ctx
-            if record.fields.n > 9 then return false, 'too many laps' end
-            return true
-        end) }), true, 'race:cp with parents, a ref field and validate')
-    local race = Maps.create({ name = 'Race', mode = 'live' }, 1)
-    local function cp(extra)
-        local op = { op = 'create', type = 'race:cp', pos = { x = 0, y = 0, z = 0 }, fields = {} }
-        for k, v in pairs(extra or {}) do op.fields[k] = v end
-        return op
-    end
-    ok, err = Maps.apply(race.id, { cp() }, 1)
-    check(ok == nil and err == 'parents', 'a checkpoint needs a start')
-    ok = Maps.apply(race.id, { { op = 'create', type = 'race:start', pos = { x = 0, y = 0, z = 0 } }, cp() }, 1)
-    check(ok, 'start and checkpoint in one apply')
-    check(ctxSeen and ctxSeen.mapId == race.id and ctxSeen.op == 'create' and ctxSeen.actor == 1, 'validate gets { mapId, actor, op }')
-    ok, err, detail = Maps.apply(race.id, { cp({ n = 10 }) }, 1)
-    check(ok == nil and err == 'validate' and detail.reason == 'too many laps', 'type.validate refuses')
-    ok, err = Maps.apply(race.id, { { op = 'delete', id = 1 } }, 1)
-    check(ok == nil and err == 'parents', 'the last start cannot go while checkpoints need it')
-    ok, err = Maps.apply(race.id, { cp({ next = '99' }) }, 1)
-    check(ok == nil and err == 'ref', 'a ref to a missing element')
-    ok, err = Maps.apply(race.id, { cp({ next = '1' }) }, 1)
-    check(ok == nil and err == 'ref', 'a ref to the wrong type')
-    check(Maps.apply(race.id, { cp({ next = '2' }) }, 1), 'a ref to a checkpoint')
-
-    eq(as('race', 'defineType', { id = 'race:cp', kind = 'point', parents = { 'race:start' }, version = 2,
-        fields = { { name = 'next', type = 'ref', refType = 'race:cp' }, { name = 'laps', type = 'integer', default = 0 } },
-        migrate = callable(function(fields, from)
-            fields.laps = (fields.n or 0) + from
-            fields.n = nil
-            return fields
-        end) }), true, 'race:cp version 2 renames a field')
-    local _, migratedApply = Maps.apply(race.id, { { op = 'update', id = 2, set = { fields = { next = '3' } } } }, 1)
-    local after = migratedApply and migratedApply.ops[1].after
-    check(after and after.typeVersion == 2 and after.fields.laps == 1 and after.fields.n == nil and after.fields.next == '3',
-        'migrate runs when an old element changes')
+    as('events', 'on', '*', callable(function(event, record) got[#got + 1] = event .. ':' .. record.id end))
+    Maps.apply(map.id, { { op = 'delete', id = 2 }, { op = 'update', id = 3, set = { fields = { bob = true } } },
+        { op = 'create', type = 'core:hide', pos = { x = 4, y = 0, z = 0 }, fields = { model = 'prop_bench' } } }, 1)
+    reset()
+    eq(Maps.publish(map.id, 1), 2, 'v2')
+    eq(H.trace(), 'remove:' .. uid(2) .. ' set:' .. uid(3) .. ' spawn:' .. uid(4),
+        'the target bucket: element 2 removed, 3 set (same node), 4 spawned; 1 untouched')
+    check(node(uid(1), 9) == one and node(uid(3), 9) == three and three.fields.bob == true, 'the kept nodes are the same')
+    stubs.tick(10)
+    eq(table.concat(got, ' '), 'removed:2 changed:3 added:4', 'and the events of the swap')
+    reset()
+    eq(Maps.rollback(map.id, 1, 1), 3, 'rollback to v1')
+    eq(H.trace(), 'remove:' .. uid(4) .. ' spawn:' .. uid(2) .. ' set:' .. uid(3),
+        'the same diff backwards (gone first, then ascending ids)')
+    eq(three.fields.bob, false, 'the marker is as it was')
 end
 
 --------------------------------------------------------------------------------
--- restores (placeholders, cams, old type versions), id caps, 'referenced', target buckets
+-- re-entrancy: a synchronous Scene listener that calls back into Core.Maps mid-pass counts nothing twice
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer()
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local map = Maps.create({ name = 'Re', mode = 'live', active = false }, 1)
+    Maps.apply(map.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } },
+        { op = 'create', type = 'core:vehicle', pos = { x = 5, y = 0, z = 0 }, fields = { model = 'adder' } } }, 1)
+    H.onSpawn = function()
+        Maps.apply(map.id, { { op = 'update', id = 2, set = { pos = { x = 6, y = 0, z = 0 } } } }, 1)
+    end
+    check(Maps.setActive(map.id, true, 1), 'activate: the first spawn re-enters Core.Maps and shows element 2')
+    local _, n2 = node(map.id .. ':2')
+    check(R.netTotal() == 2 and n2 == 1 and node(map.id .. ':2').pos.x == 6.0, 'two counted, one node each, the latest pose')
+    check(Maps.setActive(map.id, false, 1) and R.netTotal() == 0 and next(H.nodes) == nil, 'and all of it goes again')
+end
+
+--------------------------------------------------------------------------------
+-- a Scene that throws: logged once a minute, the element stays active without a node
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer()
+    local Maps = Core.Maps
+    local spawn = Core.Scene.spawn
+    Core.Scene.spawn = function() error('boom') end
+    local map = Maps.create({ name = 'Err', mode = 'live' }, 1)
+    check(Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 } },
+        { op = 'create', type = 'core:point', pos = { x = 1, y = 0, z = 0 } } }, 1), 'the apply succeeds')
+    eq(printed('Scene.spawn failed'), 1, 'one error line for two throws')
+    eq(#Maps.records('core:point'), 2, 'the content is active')
+    eq(Core.MapsRuntime.stats().nodes, 0, 'without nodes')
+    Core.Scene.spawn = spawn
+    eq(Maps.respawn(map.id), 2, 'respawn spawns them once Scene works again')
+    eq(Core.MapsRuntime.stats().nodes, 2, 'two nodes')
+end
+
+--------------------------------------------------------------------------------
+-- slicing (reviews RV4 F2, RV6 F6): a big activation makes <= SLICE Scene calls per server tick (one worker slice
+-- per Wait(0)); the API stays honest mid-projection: stats, a second apply, a deactivation, a re-activation (the
+-- standing nodes are adopted), core stopping; the pending boxes in GlobalState; openDraft, a first publish, the
+-- boot projection and a type refresh go through the same worker
 --------------------------------------------------------------------------------
 do
     local env, Core = newServer()
-    local Maps = Core.Maps
-    local sign = { id = 'deco:sign', kind = 'point', fields = { { name = 'text', type = 'string' } } }
-    eq(as('deco', 'defineType', sign), true, 'a plugin type')
-    local map = Maps.create({ name = 'R', mode = 'live' }, 1)
-    Maps.apply(map.id, { { op = 'create', type = 'deco:sign', pos = { x = 1, y = 1, z = 1 }, fields = { text = 'hi' } } }, 1)
-    local _, moved = Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 2, y = 2, z = 2 },
-        cam = { x = 9, y = 9, z = 9 } } } }, 1)
-    sign.version = 2
-    as('deco', 'defineType', sign)
-    local _, retext = Maps.apply(map.id, { { op = 'update', id = 1, set = { fields = { text = 'yo' } } } }, 1)
-    eq(retext.ops[1].after.typeVersion, 2, 'a field change moves the element to the current type version')
-    local undo, expect = Maps.invert(retext)
-    check(Maps.apply(map.id, undo, 1, { expect = expect }), 'undo the field change')
-    local el = Maps.elements(map.id)[1]
-    check(el.typeVersion == 1 and el.fields.text == 'hi', 'the restore keeps the old type version')
-    undo = Maps.invert(moved)                  -- its expect is stale now (the undo above re-stamped it)
-    check(Maps.apply(map.id, undo, 1), 'undo the move')
-    el = Maps.elements(map.id)[1]
-    check(el.cam == nil and el.pos.x == 1, 'undo removes the cam the update added')
-    stop(env, 'deco')
-    local _, moved2 = Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 5, y = 5, z = 5 } } } }, 1)
-    local u2, e2 = Maps.invert(moved2)
-    check(Maps.apply(map.id, u2, 1, { expect = e2 }), 'undo of an update on a placeholder')
-    local _, gone = Maps.apply(map.id, { { op = 'delete', id = 1 } }, 2)
-    check(Maps.apply(map.id, (Maps.invert(gone)), 2), 'undo of a placeholder delete')
-    el = Maps.elements(map.id)[1]
-    check(el and el.type == 'deco:sign' and el.fields.text == 'hi' and el.by == 'acc1' and el.pos.x == 1,
-        'the raw record is back, creator kept')
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    local SLICE, N = R.SLICE or 200, 1000
+    eq(SLICE, 200, 'SLICE: 200 Scene calls per worker slice')
+    H.countYields(env)
+    local writes = H.recordGlobal(env, 'core:mapsPending')
+    local map = H.bigMap(Maps, 'Big', N)
+    local function uid(id) return map.id .. ':' .. id end
+    eq(#calls('spawn'), 0, 'an inactive map projects nothing')
+    reset()
+    check(Maps.setActive(map.id, true, 1), 'activate a map of 1,000 props')
+    local s = R.stats()
+    eq(s.nodes, SLICE, 'right after the call ONE slice is projected (not 1,000 spawns in the caller\'s tick)')
+    eq(s.pending, N - SLICE, 'stats: the rest is pending')
+    eq(s.projecting, true, 'stats: the worker runs')
+    eq(#Maps.records('core:prop'), N, 'the content itself is active at once (records, events)')
+    eq(#writes, 0, 'no pending box for a run that may end within PUBLISH_AFTER slices')
+    stubs.tick(0)
+    local sl = H.slices()
+    eq(sl[1].spawn, nil, 'nothing inline: the activation went through the worker')
+    eq(#sl - 1, N // SLICE, 'five worker slices')
+    local most = 0
+    for i = 2, #sl do most = math.max(most, H.sliceCalls(sl[i])) end
+    eq(most, SLICE, 'no slice made more than SLICE Scene calls')
+    eq(#H.yields, #sl - 2, 'a Wait(0) (the next server tick) after every slice but the last')
+    s = R.stats()
+    check(s.nodes == N and s.pending == 0 and s.projecting == false, 'drained: 1,000 nodes, nothing pending, no worker')
+    eq(#calls('spawn'), N, 'one spawn per element')
+    eq(#writes, 2, 'a long run publishes its box once and clears it at the end')
+    check(type(writes[1]) == 'table' and same(writes[1], { { 0, 1, 0, N, 0 } }),
+        'GlobalState core:mapsPending = { { bucket 0, x1 1, y1 0, x2 1000, y2 0 } } while it ran')
+    eq(writes[2], 'nil', 'and nil once the queue drained')
 
-    local ids = Maps.create({ name = 'Ids', mode = 'live' }, 1)
-    local function pt(id) return { op = 'create', type = 'core:point', pos = { x = 0, y = 0, z = 0 }, id = id } end
-    eq(select(2, Maps.apply(ids.id, { pt(999999999) }, 1)), 'id', 'an id that would exhaust the id space is refused')
-    check(Maps.apply(ids.id, { pt(999999998) }, 1), 'the id below it is fine')
-    local _, last = Maps.apply(ids.id, { pt() }, 1)
-    eq(last and last.ops[1].id, '999999999', 'the last automatic id')
-    eq(select(2, Maps.apply(ids.id, { pt() }, 1)), 'id', 'then automatic ids are exhausted')
-    check(Maps.apply(ids.id, { { op = 'delete', id = '999999999' } }, 1) and Maps.clear(ids.id, 1),
-        'every element stays manageable')
+    -- a small change is reconciled inline: no worker, no pending box
+    reset()
+    check(Maps.apply(map.id, { { op = 'update', id = 3, set = { pos = { x = 3, y = 9, z = 0 } } } }, 1), 'a small apply')
+    eq(H.trace(), 'move:' .. uid(3), 'moved inline')
+    eq(#H.slices(), 1, 'no worker slice')
+    eq(#writes, 2, 'no GlobalState write')
 
-    eq(as('race', 'defineType', { id = 'race:cp', kind = 'point',
-        fields = { { name = 'next', type = 'ref', refType = 'race:cp' } } }), true, 'a type with a ref field')
-    local race = Maps.create({ name = 'Race', mode = 'live' }, 1)
-    Maps.apply(race.id, { { op = 'create', type = 'race:cp', pos = { x = 0, y = 0, z = 0 } },
-        { op = 'create', type = 'race:cp', pos = { x = 1, y = 0, z = 0 }, fields = { next = '1' } } }, 1)
-    local okR, errR, detR = Maps.apply(race.id, { { op = 'delete', id = 1 } }, 1)
-    check(okR == nil and errR == 'referenced' and detR.id == '1' and detR.by == '2', 'deleting a referenced element')
-    check(Maps.apply(race.id, { { op = 'update', id = 2, replace = true, set = { fields = {} } }, { op = 'delete', id = 1 } }, 1),
-        'unless the same apply drops the reference')
+    -- a second apply mid-projection: a queued element changes (projected at once, its queue entry goes stale), a
+    -- queued one is deleted (never spawned), a projected one moves
+    check(Maps.setActive(map.id, false, 1), 'deactivate')
+    stubs.tick(0)
+    eq(R.stats().nodes, 0, 'every node removed (sliced)')
+    reset()
+    Maps.setActive(map.id, true, 1)
+    eq(node(uid(900)), nil, 'element 900 is still queued')
+    check(Maps.apply(map.id, { { op = 'update', id = 900, set = { pos = { x = 900, y = 5, z = 0 } } },
+        { op = 'delete', id = 950 }, { op = 'update', id = 10, set = { pos = { x = 10, y = 5, z = 0 } } } }, 1),
+        'an apply while the projection runs')
+    check(node(uid(900)) ~= nil and node(uid(900)).pos.y == 5.0, 'the queued element is projected at once, changed')
+    eq(node(uid(10)).pos.y, 5.0, 'the projected one moved')
+    eq(R.stats().pending, N - SLICE - 2, 'stats: 900 left the queue, 950 is gone from it')
+    stubs.tick(0)
+    local _, n900 = node(uid(900))
+    eq(n900, 1, 'one node for 900: its stale queue entry did nothing')
+    eq(node(uid(950)), nil, 'the deleted element never spawned')
+    eq(#calls('spawn'), N - 1, 'every other element spawned exactly once')
+    eq(R.stats().nodes, N - 1, 'stats: 999 nodes')
 
-    eq(select(2, Maps.create({ name = 'x', mode = 'live', targetBucket = 10000 })), 'targetBucket',
-        'a target inside Config.Buckets.Range is refused')
-    eq(select(2, Maps.update(race.id, { targetBucket = 60000 })), 'targetBucket', 'on update too')
-    check(Maps.update(race.id, { targetBucket = 60001 }), 'above the range is fine')
+    -- a deactivation mid-projection: what stands goes, what was queued never comes
+    local m2 = H.bigMap(Maps, 'Big2', N, { y = 100 })
+    reset()
+    Maps.setActive(m2.id, true, 1)
+    check(Maps.setActive(m2.id, false, 1), 'deactivated while its projection runs')
+    s = R.stats()
+    eq(s.pending, N - SLICE, 'stats: the queued entries are still due (they reconcile to nothing)')
+    stubs.tick(0)
+    eq(#calls('spawn'), SLICE, 'no spawn after the deactivation')
+    eq(#calls('remove'), SLICE, 'the 200 that stood were removed')
+    check(R.stats().pending == 0 and R.stats().closing == 0, 'stats: nothing pending, no closing context')
+
+    -- a re-activation while the removal of the same context runs: the standing nodes are adopted, not re-made
+    Maps.setActive(m2.id, true, 1)
+    stubs.tick(0)
+    reset()
+    check(Maps.setActive(m2.id, false, 1), 'deactivate 1,000 standing nodes')
+    eq(#calls('remove'), SLICE, 'the first removal slice ran at once')
+    eq(R.stats().closing, 1, 'stats: the closed context keeps its other 800 nodes for the worker')
+    eq(R.stats().nodes, (N - 1) + (N - SLICE), 'stats: nodes counts what still stands (the first map + 800)')
+    check(Maps.setActive(m2.id, true, 1), 're-activated before the removal finished')
+    stubs.tick(0)
+    eq(#calls('remove'), SLICE, 'no further removal: the new context adopted the 800 standing nodes')
+    eq(#calls('spawn'), SLICE, 'only the 200 removed ones were made again')
+    check(R.stats().nodes == 2 * N - 1 and R.stats().closing == 0, 'stats: both maps fully projected again')
+    local writesBefore = #writes
+
+    -- core stops mid-projection: the worker ends without another Scene call
+    local m3 = H.bigMap(Maps, 'Big3', N, { y = 200 })
+    reset()
+    Maps.setActive(m3.id, true, 1)
+    stubs.tick(0)
+    eq(#writes, writesBefore + 2, 'the long run published its box and cleared it')
+    reset()
+    Maps.setActive(m3.id, false, 1)
+    Maps.setActive(m3.id, true, 1)                  -- adopted: 200 to make again, the worker holds them
+    stubs.tick(0)
+    reset()
+    Maps.setActive(m3.id, false, 1)                 -- 1,000 to remove, one slice ran
+    local after = #H.log
+    H.shutdown(env)
+    stubs.tick(1000)
+    eq(#H.log, after, 'core stopped mid-slice: no Scene call after the stop')
+    eq(#stubs.failures, 0, 'nothing threw')
 end
 
+do  -- openDraft, a first publish, the boot projection and a type refresh are sliced too
+    local env, Core = newServer()
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    local SLICE, N = R.SLICE or 200, 600
+    local draft = H.bigMap(Maps, 'Draft', N, { mode = 'draft', bucket = 4 })
+    reset()
+    local bucket = Maps.openDraft(draft.id, 1)
+    eq(#calls('spawn', bucket), SLICE, 'openDraft: one slice in the caller\'s tick')
+    stubs.tick(0)
+    eq(#calls('spawn', bucket), N, 'the editor bucket fills over the next ticks')
+    reset()
+    Maps.setActive(draft.id, true, 1)
+    eq(Maps.publish(draft.id, 1), 1, 'the first publish')
+    eq(#calls('spawn', 4), SLICE, 'the first publish: one slice in the caller\'s tick')
+    stubs.tick(0)
+    eq(#calls('spawn', 4), N, 'then the rest')
+    local most = 0
+    for _, s in ipairs(H.slices()) do most = math.max(most, H.sliceCalls(s)) end
+    check(most <= SLICE, 'no slice above SLICE')
+    -- a plugin type with N elements: its resource stops (placeholders) and comes back — both sliced
+    eq(as('deco', 'defineType', { id = 'deco:lamp', kind = 'prop', model = 'prop_lamp' }), true, 'a plugin prop type')
+    local live = H.bigMap(Maps, 'Deco', N, { type = 'deco:lamp' })
+    Maps.setActive(live.id, true, 1)
+    stubs.tick(0)
+    reset()
+    stop(env, 'deco')
+    eq(#calls('remove'), SLICE // 2, 'a type refresh of 600 elements: a kind change is remove + spawn, sliced')
+    stubs.tick(0)
+    check(#calls('remove') == N and #calls('spawn') == N, 'every element became a placeholder')
+    most = 0
+    for _, s in ipairs(H.slices()) do most = math.max(most, H.sliceCalls(s)) end
+    check(most <= SLICE, 'no slice above SLICE')
+    H.shutdown(env)
+
+    -- the boot projection after a restart: every active context, through the worker
+    local _, Core2 = newServer({ keepKvp = true, sceneLoaded = false })
+    local R2 = Core2.MapsRuntime
+    eq(#calls('spawn'), 0, 'nothing before the scene store loaded')
+    eq(R2.stats().pending, 2 * N, 'stats: the whole boot projection is pending (the published draft + the live map)')
+    H.sceneLoaded = true
+    stubs.tick(100)
+    local sl = H.slices()
+    eq(#sl - 1, 2 * N // SLICE, 'the boot projection ran in slices')
+    most = 0
+    for i = 1, #sl do most = math.max(most, H.sliceCalls(sl[i])) end
+    eq(most, SLICE, 'none above SLICE')
+    eq(R2.stats().nodes, 2 * N, 'every active context projected')
+    H.shutdown(_)
+end
+
+--------------------------------------------------------------------------------
+-- capacity (review RV4 F3): a spawn refused 'limit' is retried with backoff (5 s, doubling to 60 s while nothing gets
+-- placed); after one 'limit' answer the rest of a pass is not tried; a freed slot of ours lets spawns through again
+--------------------------------------------------------------------------------
+do
+    local env, Core = newServer()
+    local Maps, R = Core.Maps, Core.MapsRuntime
+    H.cap = 3                                          -- the fake answers 'limit' while 3 nodes exist
+    local map = Maps.create({ name = 'Cap', mode = 'live' }, 1)
+    local function uid(id) return map.id .. ':' .. id end
+    local ops = {}
+    for i = 1, 6 do ops[i] = { op = 'create', type = 'core:point', pos = { x = i, y = 0, z = 0 } } end
+    check(Maps.apply(map.id, ops, 1), 'six elements, room for three')
+    eq(R.stats().nodes, 3, 'three nodes')
+    eq(#calls('spawn'), 4, 'the fourth spawn was refused; the fifth and sixth were not even tried')
+    eq(R.stats().retrying, 3, 'stats: three elements wait for capacity')
+    check(printed('failed: limit') >= 1, 'the refusal is logged')
+    stubs.tick(4900)
+    eq(#calls('spawn'), 4, 'nothing before the first retry (5 s)')
+    stubs.tick(200)
+    eq(#calls('spawn'), 5, 'a retry round at 5 s: one refused attempt, the rest held back')
+    stubs.tick(9700)
+    eq(#calls('spawn'), 5, 'the next round waits 10 s (nothing was placed)')
+    stubs.tick(200)
+    eq(#calls('spawn'), 6, 'round 2 at 15 s')
+    stubs.tick(20000)
+    eq(#calls('spawn'), 7, 'round 3 at 35 s (20 s later)')
+    stubs.tick(40000)
+    eq(#calls('spawn'), 8, 'round 4 at 75 s (40 s later)')
+    stubs.tick(60000)
+    eq(#calls('spawn'), 9, 'round 5 at 135 s (60 s: the cap of the backoff)')
+    H.cap = 10                                         -- the cap frees
+    stubs.tick(60000)
+    eq(R.stats().nodes, 6, 'the next round places every waiting element')
+    eq(R.stats().retrying, 0, 'nobody waits any more')
+    local spawns = #calls('spawn')
+    stubs.tick(300000)
+    eq(#calls('spawn'), spawns, 'and the retry thread is gone')
+
+    -- a removal of ours frees a slot: the held spawns pass at once (no waiting for the backoff)
+    H.cap = 6
+    check(Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 7, y = 0, z = 0 } } }, 1), 'a 7th')
+    eq(node(uid(7)), nil, 'refused: the cap is full')
+    check(Maps.apply(map.id, { { op = 'delete', id = 1 }, { op = 'update', id = 7, set = { pos = { x = 8, y = 0, z = 0 } } } }, 1),
+        'delete one and change the waiting one in one apply')
+    check(node(uid(7)) ~= nil and node(uid(7)).pos.x == 8.0, 'the freed slot takes it at once')
+    eq(R.stats().retrying, 0, 'it no longer waits')
+    -- respawn tries a held-back spawn again
+    check(Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 9, y = 0, z = 0 } } }, 1), 'an 8th')
+    eq(node(uid(8)), nil, 'refused')
+    H.cap = 10
+    eq(Maps.respawn(map.id, 8), 1, 'Maps.respawn of the waiting element')
+    check(node(uid(8)) ~= nil and R.stats().retrying == 0, 'placed at once')
+    -- a deactivated context forgets its waiting elements
+    H.cap = 7
+    check(Maps.apply(map.id, { { op = 'create', type = 'core:point', pos = { x = 10, y = 0, z = 0 } } }, 1), 'a 9th')
+    eq(R.stats().retrying, 1, 'waits')
+    Maps.setActive(map.id, false, 1)
+    eq(R.stats().retrying, 0, 'deactivated: nothing waits')
+    H.shutdown(env)
+end
+
+--------------------------------------------------------------------------------
+-- removals the editor watches fade (review RV5 F3); a live map switched off or swapped leaves visibility-safely
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer()
+    local Maps = Core.Maps
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    eq(as('deco', 'defineType', { id = 'deco:thing', kind = 'point' }), true, 'a plugin point type')
+    local live = Maps.create({ name = 'Fade', mode = 'live' }, 1)
+    Maps.apply(live.id, { { op = 'create', type = 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'p' } },
+        { op = 'create', type = 'deco:thing', pos = { x = 1, y = 0, z = 0 } },
+        { op = 'create', type = 'core:prop', pos = { x = 2, y = 0, z = 0 }, fields = { model = 'p' } } }, 1)
+    reset()
+    Maps.apply(live.id, { { op = 'delete', id = 1 } }, 1, { source = 'editor' })
+    eq(calls('remove')[1].fade, true, 'an element an apply deleted fades (it no longer lingers ≤ 10 s in view)')
+    reset()
+    eq(as('deco', 'defineType', { id = 'deco:thing', kind = 'marker' }), true, 'another scene kind for element 2')
+    eq(H.trace(), 'remove:' .. live.id .. ':2 spawn:' .. live.id .. ':2', 'remove + spawn')
+    eq(calls('remove')[1].fade, true, 'the old copy fades while the new one comes (no overlap of two copies)')
+    reset()
+    Maps.setActive(live.id, false, 1)
+    local r = calls('remove')
+    check(#r == 2 and not r[1].fade and not r[2].fade, 'a live map switched off: visibility-safe removal (no fade)')
+
+    local draft = Maps.create({ name = 'FadeD', mode = 'draft', targetBucket = 6, active = true }, 1)
+    Maps.apply(draft.id, { { op = 'create', type = 'core:prop', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'p' } },
+        { op = 'create', type = 'core:prop', pos = { x = 1, y = 0, z = 0 }, fields = { model = 'p' } } }, 1)
+    Maps.publish(draft.id, 1)
+    local bucket = Maps.openDraft(draft.id, 1)
+    Maps.apply(draft.id, { { op = 'delete', id = 2 } }, 1)
+    reset()
+    Maps.publish(draft.id, 1)
+    local pr = calls('remove', 6)
+    check(#pr == 1 and not pr[1].fade, 'a publish swap removes the published copy visibility-safely (players)')
+    reset()
+    Maps.closeDraft(draft.id)
+    local er = calls('remove', bucket)
+    check(#er == 1 and er[1].fade == true, 'closeDraft: the editor bucket\'s nodes fade')
+end
+
+--------------------------------------------------------------------------------
+-- promotion policy (review RV6 F8): nothing in an editor bucket is ever promoted; a map vehicle in its target bucket
+-- is promoted by enter / damage only (no proximity), props and peds there keep the class default
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer()
+    local Maps = Core.Maps
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local draft = Maps.create({ name = 'Auth', mode = 'draft', targetBucket = 8, active = true }, 1)
+    Maps.apply(draft.id, {
+        { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } },
+        { op = 'create', type = 'core:ped', pos = { x = 1, y = 0, z = 0 }, fields = { model = 'a_m_y_x' } },
+        { op = 'create', type = 'core:physprop', pos = { x = 2, y = 0, z = 0 }, fields = { model = 'prop_crate' } },
+        { op = 'create', type = 'core:prop', pos = { x = 3, y = 0, z = 0 }, fields = { model = 'prop_a' } },
+        { op = 'create', type = 'core:marker', pos = { x = 4, y = 0, z = 0 } },
+        { op = 'create', type = 'core:point', pos = { x = 5, y = 0, z = 0 } } }, 1)
+    Maps.publish(draft.id, 1)
+    local bucket = Maps.openDraft(draft.id, 1)
+    local function auth(id, b) local n = node(draft.id .. ':' .. id, b) return n and n.authority end
+    local EDITOR = { mode = 'local', enter = false, damage = false }
+    for id = 1, 4 do
+        check(same(auth(id, bucket), EDITOR), 'editor bucket: element ' .. id .. ' is never promoted (local, no enter, no damage)')
+    end
+    check(auth(5, bucket) == nil and auth(6, bucket) == nil, 'markers and data nodes carry no policy')
+    check(same(auth(1, 8), { mode = 'local' }), 'target bucket: the vehicle promotes on enter / damage only')
+    check(auth(2, 8) == nil and auth(3, 8) == nil and auth(4, 8) == nil,
+        'target bucket: ped, physics prop and prop keep their class default')
+    local live = Maps.create({ name = 'AuthL', mode = 'live' }, 1)
+    Maps.apply(live.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } } }, 1)
+    check(same(node(live.id .. ':1', 0).authority, { mode = 'local' }), 'a live map vehicle: local too')
+end
+
+--------------------------------------------------------------------------------
+-- against the REAL scene server (scene_kinds → scene_store → scene): every def validates, the model-info chain
+-- fills lod / vtype from the §52 validator, moves keep the node, respawn demotes a promoted node (R.promote)
+--------------------------------------------------------------------------------
+do
+    local _, Core = newServer({ scene = 'real' })
+    local Maps, Scene, SR, paintOf = Core.Maps, Core.Scene, Core.SceneRuntime, Core.MapsRuntime.paintOf
+    local kind = SR.kinds.get('map:data')
+    check(kind and kind.owner == 'core' and kind.class == 'data' and kind.handler == 'core' and kind.radius == 150,
+        'map:data is a core kind: class data, handler core, radius 150')
+    eq(SR.kinds.tier(SR.kinds.radius(kind, { fields = {} }), false), 'S', 'its nodes are near-grid (tier S)')
+    as('catalogue', 'setModelValidator', callable(function(k, model)
+        if k == 'vehicle' then return true, { vehicleType = 'bike' } end
+        if model == 'prop_tall' then return true, { lod = 300 } end
+        return true
+    end))
+    eq(as('deco', 'defineType', { id = 'deco:sign', kind = 'point', preview = { { kind = 'label', text = '$text' } },
+        fields = { { name = 'text', type = 'string', maxLength = 32 } } }), true, 'a plugin point type')
+    local map = Maps.create({ name = 'Real', mode = 'live', targetBucket = 7 }, 1)
+    local function uid(id) return map.id .. ':' .. id end
+    check(Maps.apply(map.id, {
+        { op = 'create', type = 'core:prop', pos = { x = 1, y = 2, z = 3 }, rot = { x = 10, y = 0, z = 45 },
+            fields = { model = 'prop_tall', collision = false } },
+        { op = 'create', type = 'core:physprop', pos = { x = 2, y = 2, z = 3 }, fields = { model = 'prop_crate' } },
+        { op = 'create', type = 'core:vehicle', pos = { x = 3, y = 2, z = 3 }, rot = { x = 0, y = 0, z = 90 },
+            fields = { model = 'bati', plate = 'AB 12', color = '#102030', locked = true } },
+        { op = 'create', type = 'core:ped', pos = { x = 4, y = 2, z = 3 }, fields = { model = 'a_m_y_x', scenario = 'WORLD_HUMAN_SMOKING' } },
+        { op = 'create', type = 'core:marker', pos = { x = 5, y = 2, z = 3 }, fields = { color = '#FF000080', bob = true } },
+        { op = 'create', type = 'core:hide', pos = { x = 6, y = 2, z = 3 }, fields = { model = 'prop_bin_01a', radius = 3 } },
+        { op = 'create', type = 'core:point', pos = { x = 7, y = 2, z = 3 }, fields = { label = 'start' } },
+        { op = 'create', type = 'core:zone', pos = { x = 8, y = 2, z = 3 }, fields = { size = { x = 5, y = 6, z = 7 } } },
+        { op = 'create', type = 'deco:sign', pos = { x = 9, y = 2, z = 3 }, fields = { text = 'hello' } },
+    }, 1), 'one element of every kind')
+    stop(_, 'deco')
+    local ids = Scene.list({ owner = 'core' })
+    eq(#ids, 9, 'the real Scene took a node for every element (the plugin type now a placeholder)')
+    local byUid = {}
+    for _, id in ipairs(ids) do
+        local n = Scene.get(id)
+        byUid[n.fields.mapEl] = n
+    end
+    local function n(id) return byUid[uid(id)] or {} end
+    for i = 1, 9 do
+        local x = n(i)
+        check(x.bucket == 7 and x.persist == false and x.owner == 'core' and x.fields and x.fields.mapType ~= nil,
+            'node ' .. i .. ': bucket 7, not persistent, owned by core, carries mapEl + mapType')
+    end
+    local p = n(1).fields or {}
+    check(n(1).kind == 'prop' and p.lod == 300 and p.r == 2 and p.collision == false and p.frozen == true
+        and p.invincible == true and p.physics == 'static', "prop: lod 300 through Scene's model-info chain")
+    check(n(1).rot and n(1).rot.x == 10 and n(1).rot.z == 45, 'with its full rotation')
+    eq((n(2).fields or {}).physics, 'promote', "physics prop: physics = 'promote'")
+    local v = n(3).fields or {}
+    check(n(3).kind == 'vehicle' and v.vtype == 'bike' and v.plate == 'AB 12' and v.locked == true and v.frozen == true
+        and v.props and v.props.customPrimary[1] == 16 and v.props.customSecondary[3] == 48,
+        'vehicle: vtype from the chain, plate, locked, frozen, custom colours')
+    local pp, ps = paintOf(uid(3))
+    check(v.props and v.props.colorPrimary == pp and v.props.colorSecondary == ps, "vehicle: the uid's paint passes the props rules")
+    local pd = n(4).fields or {}
+    check(n(4).kind == 'ped' and pd.scenario == 'WORLD_HUMAN_SMOKING' and pd.invincible and pd.frozen and pd.blockEvents,
+        'ped: scenario, invincible, frozen, blockEvents')
+    local mk = n(5).fields or {}
+    check(n(5).kind == 'marker' and mk.color == '#FF000080' and mk.bob == true and mk.type == 1, 'marker')
+    check(n(6).kind == 'hide' and (n(6).fields or {}).radius == 3, 'hide')
+    for _, i in ipairs({ 7, 8, 9 }) do
+        check(n(i).kind == 'map:data' and same(n(i).audience, { editors = true }), 'data node ' .. i .. ': editors only')
+    end
+    check((n(7).fields or {}).f and n(7).fields.f.label == 'start', 'point: f')
+    check((n(8).fields or {}).size and n(8).fields.size.y == 6, 'zone: size')
+    check((n(9).fields or {}).k == 'placeholder' and n(9).fields.t == 'deco:sign', 'placeholder: k, t')
+
+    local propId = n(1).id
+    check(Maps.apply(map.id, { { op = 'update', id = 1, set = { pos = { x = 11, y = 2, z = 3 } } } }, 1), 'move the prop')
+    local moved = Scene.get(propId)
+    check(moved and moved.pos.x == 11 and moved.fields.mapEl == uid(1), 'the same node moved')
+    check(Maps.apply(map.id, { { op = 'update', id = 4, replace = true, set = { fields = { model = 'a_m_y_x' } } } }, 1),
+        'clear the ped scenario')
+    eq(Scene.get(n(4).id).fields.scenario, nil, 'Scene.set removed it')
+
+    local vehId = n(3).id
+    SR.store.get(vehId).promoted = { netId = 9 }            -- promoted by proximity meanwhile
+    H.promoteLog = {}
+    eq(Maps.respawn(map.id), 1, 'respawn: only the promoted vehicle')
+    local pl = H.promoteLog[1]
+    check(pl and pl.what == 'move' and pl.id == vehId and pl.promoted == true,
+        'Scene.move ran R.promote.beforeChange(node, move) on the promoted node')
+    eq(Scene.get(vehId).promoted, nil, 'demoted')
+    check(Maps.apply(map.id, { { op = 'update', id = 3, set = { fields = { plate = 'ZZ 99' } } } }, 1), 'a new plate')
+    check(H.promoteLog[#H.promoteLog].what == 'set' and Scene.get(vehId).fields.plate == 'ZZ 99',
+        'Scene.set (beforeChange set) on the same node')
+
+    check(same(Scene.get(vehId).authority, { mode = 'local' }),
+        'the real Scene took the map vehicle\'s policy (local: no proximity promotion, RV6 F8)')
+
+    check(Maps.setActive(map.id, false, 1), 'deactivate')
+    eq(#Scene.list({ owner = 'core' }), 0, 'every node is removed')
+    H.shutdown(_)
+end
+
+do  -- review RV4 F3 on the REAL scene store: the global node cap is full (a plugin's nodes), a map element is refused
+    -- 'limit'; once the plugin frees its nodes the retry gives the element its node — no Maps.respawn needed. And the
+    -- editor bucket's policy passes the real Scene's authority check.
+    local env, Core = newServer({ scene = 'real' })
+    local Maps, Scene, R = Core.Maps, Core.Scene, Core.MapsRuntime
+    env.Config.Scene.MaxNodes = 5
+    env.Config.Scene.CoreReserve = { nodes = 0, persistent = 0 }
+    local plugin = {}
+    for i = 1, 5 do
+        local _, id = Core.Registry.withCaller('someplugin', Scene.spawn, { kind = 'prop', pos = { x = i, y = 0, z = 0 },
+            fields = { model = 'prop_a' } })
+        plugin[i] = id
+    end
+    eq(#Scene.list({ owner = 'someplugin' }), 5, 'a plugin holds the whole (lowered) global budget')
+    local map = Maps.create({ name = 'Cap', mode = 'live' }, 1)
+    check(Maps.apply(map.id, { { op = 'create', type = 'core:prop', pos = { x = 50, y = 50, z = 10 },
+        fields = { model = 'prop_a' } } }, 1), 'an element is created')
+    check(R.stats().nodes == 0 and R.stats().retrying == 1, 'refused (limit): no node, it waits for capacity')
+    for i = 1, 5 do Core.Registry.withCaller('someplugin', Scene.remove, plugin[i]) end
+    stubs.tick(6000)
+    eq(R.stats().nodes, 1, 'the plugin freed its nodes: the retry placed the element')
+    eq(#Scene.list({ owner = 'core' }), 1, 'the real Scene holds it, owned by core')
+    env.Config.Scene.MaxNodes = 100000
+    as('catalogue', 'setModelValidator', callable(function() return true end))
+    local draft = Maps.create({ name = 'Ed', mode = 'draft' }, 1)
+    Maps.apply(draft.id, { { op = 'create', type = 'core:vehicle', pos = { x = 0, y = 0, z = 0 }, fields = { model = 'adder' } } }, 1)
+    local bucket = Maps.openDraft(draft.id, 1)
+    local ids = Scene.list({ owner = 'core', kind = 'vehicle' })
+    local veh = ids[1] and Scene.get(ids[1])
+    check(veh and veh.bucket == bucket and same(veh.authority, { mode = 'local', enter = false, damage = false }),
+        'the editor bucket\'s vehicle: the real Scene keeps "never promote" (RV6 F8)')
+    H.shutdown(env)
+end
 
 H.finish()

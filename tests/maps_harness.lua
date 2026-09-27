@@ -1,20 +1,30 @@
 --[[
     core/tests/maps_harness.lua — the shared harness of tests/maps_tests.lua and tests/maps_store_tests.lua
-    (Core.Maps, DESIGN §52). Not a suite: `local H = dofile(here .. '/maps_harness.lua')`.
+    (Core.Maps, DESIGN §52.1, §52.2, §55.21.1). Not a suite: `local H = dofile(here .. '/maps_harness.lua')`.
 
-    A core server VM with the real api, hooks, db (KVP or a given adapter), settings, buckets and the four
-    map files; Audit, Cron and Player are recording stand-ins, Core.MapRegions a fake that records every
-    put/remove/clearBucket (§52.4a). The recorded state lives on H and is replaced by every newServer():
-    H.audits, H.cronJobs, H.regionLog, H.population, H.lockdown, H.natives (entity creations), H.rpcs
-    (plate / paint / lock RPCs), H.owners / H.owner (the network owner NetworkGetEntityOwner answers).
+    A core server VM with the real api, hooks, db (KVP or a given adapter), settings, buckets and the four map
+    files; Audit, Cron and Player are recording stand-ins. Core.Scene is a RECORDING FAKE by default (the real lib
+    part, lib/scene/shared.lua — PAINTS, paintOf, tierOf — behind it): spawn / set / move / remove (with its
+    `fade` flag) / get / defineKind / batch, every call in H.log in order with the Registry caller it ran as (a
+    batch is logged as op 'batch' before its calls: H.slices() splits the log per worker slice), the live nodes in
+    H.nodes (their `authority` kept), Core.SceneRuntime.store.loaded() answering H.sceneLoaded, H.refuse[op] = err
+    making an op fail, H.refuseIf(op, fn(def|id) -> err|nil) refusing selectively, H.onSpawn = fn(def) running once
+    inside the next spawn (Scene fires its hooks synchronously), H.cap = n refusing spawns with 'limit' while n
+    fake nodes exist. `scene = 'real'` loads the real scene server files instead (codec, motion, scene_kinds →
+    scene_store → scene; no-op R.index / R.interest / R.flush, a recording R.promote: H.promoteLog). The recorded
+    state lives on H and is replaced by every newServer(): H.audits, H.cronJobs, H.log, H.nodes, H.kinds,
+    H.population, H.lockdown, H.cap, H.refuseIf.
 ]]
 
 local here = (arg and arg[0] or 'tests/maps_tests.lua'):match('^(.*)[/\\][^/\\]*$') or '.'
 -- fxlint-disable-next-line S006 -- offline harness loads only the checked-in test stubs
 local stubs = dofile(here .. '/stubs.lua')
 
-local H = { stubs = stubs, name = 'maps', passed = 0, failed = 0, audits = {}, cronJobs = {}, regionLog = {},
-    population = {}, lockdown = {}, natives = {}, rpcs = {}, owners = {}, owner = 1 }
+local H = { stubs = stubs, name = 'maps', passed = 0, failed = 0, audits = {}, cronJobs = {}, log = {}, nodes = {},
+    kinds = {}, refuse = {}, promoteLog = {}, population = {}, lockdown = {}, sceneLoaded = true, filters = {} }
+
+--- H.refuseIf(op, fn(def | id) -> err | nil): the fake refuses `op` whenever fn answers an error code.
+function H.refuseIf(op, fn) H.filters[op] = fn end
 
 function H.check(cond, label)
     if cond then H.passed = H.passed + 1 else H.failed = H.failed + 1; print(('FAIL  [%s] %s'):format(H.name, label)) end
@@ -27,116 +37,221 @@ end
 
 function H.callable(fn) return setmetatable({}, { __call = function(_, ...) return fn(...) end }) end
 
---- The internal region interface of §52.4a, recording every call in order.
-local function fakeRegions()
-    local function log(entry) H.regionLog[#H.regionLog + 1] = entry end
-    return { stats = function() return {} end,
-        put = function(bucket, uid, tuple) log({ op = 'put', bucket = bucket, uid = uid, tuple = tuple }) end,
-        remove = function(bucket, uid) log({ op = 'remove', bucket = bucket, uid = uid }) end,
-        clearBucket = function(bucket) log({ op = 'clear', bucket = bucket }) end }
+local function deepCopy(v)
+    if type(v) ~= 'table' then return v end
+    local out = {}
+    for k, x in pairs(v) do out[k] = deepCopy(x) end
+    return out
+end
+H.deepCopy = deepCopy
+
+--- Deep equality of plain data (exact node defs).
+function H.same(a, b)
+    if a == b then return true end
+    if type(a) ~= 'table' or type(b) ~= 'table' then return false end
+    for k, v in pairs(a) do if not H.same(v, b[k]) then return false end end
+    for k in pairs(b) do if a[k] == nil then return false end end
+    return true
 end
 
---- The region calls recorded since the last reset(), optionally filtered by op and bucket.
+--- Core.Scene as a recording fake (§55.4 shapes). A move or a fields set clears `promoted` (the real Scene demotes
+--- a promoted node first); a node's `owner` is the Registry caller its spawn ran as.
+local function fakeScene(env)
+    local nextId = 0
+    local Scene = {}
+    local function log(entry)
+        entry.caller = env.Core.Registry.getCaller()
+        H.log[#H.log + 1] = entry
+        return entry
+    end
+    local function about(op, id, extra)
+        local n = H.nodes[id]
+        local entry = extra or {}
+        entry.op, entry.id = op, id
+        entry.bucket, entry.uid = n and n.bucket, n and n.fields.mapEl
+        entry.promoted = n ~= nil and n.promoted ~= nil
+        return log(entry)
+    end
+    function Scene.defineKind(def)
+        log({ op = 'defineKind', def = def })
+        if H.refuse.defineKind then return false, H.refuse.defineKind end
+        H.kinds[def.id] = def
+        return true
+    end
+    local function live()
+        local n = 0
+        for _ in pairs(H.nodes) do n = n + 1 end
+        return n
+    end
+    function Scene.spawn(def)
+        local entry = log({ op = 'spawn', def = deepCopy(def), bucket = def.bucket, kind = def.kind,
+            uid = def.fields and def.fields.mapEl })
+        if H.refuse.spawn then return nil, H.refuse.spawn end
+        local veto = H.filters.spawn and H.filters.spawn(def)
+        if veto then return nil, veto end
+        if H.cap and live() >= H.cap then
+            entry.refused = 'limit'
+            return nil, 'limit'
+        end
+        nextId = nextId + 1
+        local id = nextId
+        entry.id = id
+        H.nodes[id] = { id = id, kind = def.kind, bucket = def.bucket or 0, pos = deepCopy(def.pos),
+            rot = deepCopy(def.rot), fields = deepCopy(def.fields or {}), audience = deepCopy(def.audience),
+            authority = deepCopy(def.authority), persist = def.persist, owner = entry.caller }
+        local hook = H.onSpawn                    -- a one-shot synchronous 'spawned' listener (Scene fires them inline)
+        if hook then
+            H.onSpawn = nil
+            hook(def)
+        end
+        return id
+    end
+    function Scene.move(id, pos, rot)
+        about('move', id, { pos = deepCopy(pos), rot = deepCopy(rot) })
+        if H.refuse.move then return false, H.refuse.move end
+        local n = H.nodes[id]
+        if not n then return false, 'missing' end
+        n.pos, n.rot, n.promoted = deepCopy(pos), rot and deepCopy(rot) or n.rot, nil
+        return true
+    end
+    function Scene.set(id, patch, opts)
+        about('set', id, { patch = deepCopy(patch), remove = opts and deepCopy(opts.remove) })
+        if H.refuse.set then return false, H.refuse.set end
+        local n = H.nodes[id]
+        if not n then return false, 'missing' end
+        for k, v in pairs(patch or {}) do n.fields[k] = deepCopy(v) end
+        for _, k in ipairs(opts and opts.remove or {}) do n.fields[k] = nil end
+        n.promoted = nil
+        return true
+    end
+    function Scene.remove(id, opts)
+        about('remove', id, { fade = type(opts) == 'table' and opts.fade == true or nil })
+        local n = H.nodes[id]
+        if not n then return false, 'missing' end
+        H.nodes[id] = nil
+        return true
+    end
+    function Scene.get(id)
+        local n = H.nodes[id]
+        return n and deepCopy(n) or nil
+    end
+    --- Scene.batch: the calls of fn in one slice (logged as op 'batch' first), errors caught like the real one.
+    function Scene.batch(fn, ...)
+        H.log[#H.log + 1] = { op = 'batch' }
+        local res = table.pack(pcall(fn, ...))
+        if not res[1] then
+            H.batchErrors = (H.batchErrors or 0) + 1
+            return nil, 'error'
+        end
+        return table.unpack(res, 2, res.n)
+    end
+    return Scene
+end
+
+--- The recorded Scene calls since the last reset(), optionally filtered by op and bucket.
 function H.calls(op, bucket)
     local out = {}
-    for _, c in ipairs(H.regionLog) do
+    for _, c in ipairs(H.log) do
         if (op == nil or c.op == op) and (bucket == nil or c.bucket == bucket) then out[#out + 1] = c end
     end
     return out
 end
 
-function H.reset() H.regionLog, H.natives, H.rpcs = {}, {}, {} end
+--- 'spawn:m1:1 move:m1:1 remove:m1:2' — the call sequence since the last reset(), compact.
+function H.trace()
+    local parts = {}
+    for _, c in ipairs(H.log) do
+        if c.op ~= 'defineKind' and c.op ~= 'batch' then parts[#parts + 1] = c.op .. ':' .. tostring(c.uid) end
+    end
+    return table.concat(parts, ' ')
+end
 
---- Natives stubs.lua does not have (all fxref-verified server / server-RPC forms).
+function H.reset() H.log = {} end
+
+--- The recorded calls split at every 'batch' entry: { { spawn = n, remove = n, move = n, set = n, get = n }, … } —
+--- slices[1] holds what ran before the first batch (inline work), then one entry per worker slice.
+function H.slices()
+    local out, cur = {}, {}
+    for _, c in ipairs(H.log) do
+        if c.op == 'batch' then
+            out[#out + 1] = cur
+            cur = {}
+        elseif c.op ~= 'defineKind' then
+            cur[c.op] = (cur[c.op] or 0) + 1
+        end
+    end
+    out[#out + 1] = cur
+    return out
+end
+
+--- The live fake node of a uid (in `bucket` when given), or nil — and how many there are.
+function H.node(uid, bucket)
+    local found, n = nil, 0
+    for _, node in pairs(H.nodes) do
+        if node.fields.mapEl == uid and (bucket == nil or node.bucket == bucket) then found, n = node, n + 1 end
+    end
+    return found, n
+end
+
+--- The first entry of a list of recorded calls (H.calls(...)) about `uid`.
+function H.byUid(list, uid)
+    for i = 1, #list do if list[i].uid == uid then return list[i] end end
+end
+
+--- Natives stubs.lua does not have (fxref-verified server forms, used by server/buckets.lua).
 local function installNatives(env)
     env.SetRoutingBucketPopulationEnabled = function(bucket, mode) H.population[bucket] = mode end
     env.SetRoutingBucketEntityLockdownMode = function(bucket, mode) H.lockdown[bucket] = mode end
-    local function create(name, kind, hash, x, y, z, args)
-        H.natives[#H.natives + 1] = { name = name, args = args }
-        local e = stubs.newEntity(kind, { model = hash })
-        stubs.coords[e] = stubs.vector3(x, y, z)
-        return e
-    end
-    env.CreatePed = function(...) local a = { ... } return create('CreatePed', 1, a[2], a[3], a[4], a[5], a) end
-    env.CreateObjectNoOffset = function(...)
-        local a = { ... }
-        return create('CreateObjectNoOffset', 3, a[1], a[2], a[3], a[4], a)
-    end
-    local createVehicle = env.CreateVehicleServerSetter
-    env.CreateVehicleServerSetter = function(...)
-        H.natives[#H.natives + 1] = { name = 'CreateVehicleServerSetter', args = { ... } }
-        return createVehicle(...)
-    end
-    local function setter(key, pack)
-        return function(e, ...)
-            local rec = stubs.entities[e]
-            if rec then rec[key] = pack(...) end
-        end
-    end
-    env.SetEntityRotation = setter('rot', function(x, y, z, order) return { x = x, y = y, z = z, order = order } end)
-    env.FreezeEntityPosition = setter('frozen', function(on) return on end)
-    env.SetVehicleCustomPrimaryColour = setter('primary', function(r, g, b) return { r, g, b } end)
-    env.SetVehicleCustomSecondaryColour = setter('secondary', function(r, g, b) return { r, g, b } end)
-    -- in-place updates (§52.2 notes): paint, cleared scenario, bucket / owner reads. H.owners[e] = a
-    -- player's net id or -1 (server-owned); unset = H.owner (1: a client near every entity)
-    env.SetVehicleColours = function(e, p, s)
-        H.rpcs[#H.rpcs + 1] = { name = 'SetVehicleColours', args = { e, p, s } }
-        local rec = stubs.entities[e]
-        if rec then rec.colours = { p, s } end
-    end
-    env.ClearPedTasks = setter('tasksCleared', function() return true end)
-    env.GetEntityRoutingBucket = function(e)
-        local rec = stubs.entities[e]
-        return rec and rec.exists and rec.bucket or 0
-    end
-    env.NetworkGetEntityOwner = function(e)
-        local rec = stubs.entities[e]
-        if not (rec and rec.exists) then return -1 end
-        return H.owners[e] or H.owner
-    end
-    local setPlate = env.SetVehicleNumberPlateText
-    env.SetVehicleNumberPlateText = function(e, plate)
-        H.rpcs[#H.rpcs + 1] = { name = 'SetVehicleNumberPlateText', args = { e, plate } }
-        return setPlate(e, plate)
-    end
-    local setLocked = env.SetVehicleDoorsLocked
-    env.SetVehicleDoorsLocked = function(e, status)
-        H.rpcs[#H.rpcs + 1] = { name = 'SetVehicleDoorsLocked', args = { e, status } }
-        return setLocked(e, status)
-    end
 end
 
---- The cosmetic RPC natives recorded since the last reset() with that name (H.natives holds creations).
-function H.rpcCalls(name)
-    local out = {}
-    for _, c in ipairs(H.rpcs) do if c.name == name then out[#out + 1] = c end end
-    return out
-end
-
---- The `core:maps:pose` events the server sent since `from` (index into stubs.sent, default 1).
-function H.poses(from)
-    local out = {}
-    for i = from or 1, #stubs.sent do
-        local s = stubs.sent[i]
-        if s.name == 'core:maps:pose' then out[#out + 1] = s end
-    end
-    return out
+--- The real scene server files (manifest order: after the map files) with no-op R.index / R.interest / R.flush
+--- and a recording R.promote whose beforeChange demotes (H.promoteLog { what, id, promoted }).
+local function loadRealScene(env)
+    local Core = env.Core
+    stubs.loadFile(env, 'server/scene_kinds.lua')
+    local R = Core.SceneRuntime
+    local none = function() end
+    local empty = function() return {} end
+    R.index = { put = none, changed = none, remove = none, event = none, dr = none, cellsNear = empty,
+        nodesIn = empty, gatedIn = empty, stats = empty }
+    R.interest = { allows = function() return true end, pin = none, prefetch = none, drop = none, stats = empty }
+    R.flush = { queue = none, queueLatent = none, wake = none, stats = empty }
+    stubs.loadFile(env, 'server/scene_store.lua')
+    stubs.loadFile(env, 'server/scene.lua')
+    R.promote = {
+        beforeChange = function(node, what)
+            H.promoteLog[#H.promoteLog + 1] = { what = what, id = node.id, promoted = node.promoted ~= nil }
+            local was = node.promoted ~= nil
+            node.promoted = nil
+            return was
+        end,
+        refuses = function() return false end,
+        stats = empty,
+    }
 end
 
 --- A core server VM with the map system started. opts = { keepKvp (a restart over the same KVP store),
---- adapter = fn(env) -> DB adapter, noRegions }.
+--- adapter = fn(env) -> DB adapter, sceneLoaded = false (the fake Scene store has not loaded), refuse = the fake's
+--- H.refuse from the start, scene = 'real' }.
 function H.newServer(opts)
     opts = opts or {}
     stubs.newWorld()
     stubs.clear()
     if not opts.keepKvp then stubs.resetServer() end
     stubs.tick(1000)
-    H.audits, H.cronJobs, H.population, H.lockdown, H.owners, H.owner = {}, {}, {}, {}, {}, 1
-    H.reset()
+    H.audits, H.cronJobs, H.population, H.lockdown = {}, {}, {}, {}
+    H.log, H.nodes, H.kinds, H.refuse, H.promoteLog, H.onSpawn = {}, {}, {}, opts.refuse or {}, {}, nil
+    H.filters, H.cap, H.batchErrors = {}, nil, nil
+    H.sceneLoaded = opts.sceneLoaded ~= false
+    local real = opts.scene == 'real'
     local env = stubs.newEnv('server', 'core')
     installNatives(env)
     stubs.loadImport(env)
     stubs.loadFile(env, 'shared/config.lua')
+    if real then
+        stubs.loadFile(env, 'shared/scene_codec.lua')
+        stubs.loadFile(env, 'shared/scene_motion.lua')
+    end
     stubs.loadFile(env, 'server/api.lua')
     stubs.loadFile(env, 'shared/hooks.lua')
     stubs.loadFile(env, 'server/db.lua')
@@ -147,15 +262,22 @@ function H.newServer(opts)
         H.cronJobs[#H.cronJobs + 1] = { ms = ms, fn = fn }
         return 'cron:' .. #H.cronJobs
     end }
-    Core.Player = { getInfo = function(src) return { accountId = 'acc' .. src, name = 'Player' .. src } end }
+    Core.Player = { getInfo = function(src) return { accountId = 'acc' .. src, name = 'Player' .. src } end,
+        isLoaded = function() return true end }
     stubs.loadFile(env, 'server/settings.lua')
     stubs.loadFile(env, 'server/buckets.lua')
-    if not opts.noRegions then Core.MapRegions = fakeRegions() end
+    if not real then
+        local lib = Core.Scene                    -- lib/scene/shared.lua (PAINTS, paintOf, tierOf) behind the fake
+        Core.Scene = setmetatable(fakeScene(env), { __index = lib })
+        Core.SceneRuntime = { store = { loaded = function() return H.sceneLoaded end } }
+    end
     stubs.loadFile(env, 'server/maps_types.lua')
     stubs.loadFile(env, 'server/maps_runtime.lua')
     stubs.loadFile(env, 'server/maps.lua')
     stubs.loadFile(env, 'server/maps_apply.lua')
+    if real then loadRealScene(env) end
     env.TriggerEvent('onResourceStart', 'core')
+    if real then stubs.tick(500) end              -- the scene store loads, the maps waiter projects
     return env, Core
 end
 
@@ -166,12 +288,59 @@ end
 
 function H.stop(env, resource) env.TriggerEvent('onResourceStop', resource) end
 
-function H.lastAudit(action)
-    for i = #H.audits, 1, -1 do if H.audits[i].action == action then return H.audits[i] end end
+--- core stops in `env`: its projector's threads (worker, waiter, retry) end at their next wake without a Scene call,
+--- so a later server's ticks never run an old VM's work.
+function H.shutdown(env) env.TriggerEvent('onResourceStop', 'core') end
+
+--- A map of `n` props at x = 1..n (y = opts.y or 0; rows of 5,000) created inactive, filled by applies of 200 ops.
+--- opts = { mode = 'live' | 'draft', bucket = targetBucket, type = 'core:prop', y }
+function H.bigMap(Maps, name, n, opts)
+    opts = opts or {}
+    local map = assert(Maps.create({ name = name, mode = opts.mode or 'live', active = false,
+        targetBucket = opts.bucket, limits = { elements = math.max(n, 1), perModel = math.min(math.max(n, 1), 10000) } },
+        1))
+    local made = 0
+    while made < n do
+        local ops = {}
+        for i = 1, math.min(200, n - made) do
+            made = made + 1
+            ops[i] = { op = 'create', type = opts.type or 'core:prop',
+                pos = { x = (made - 1) % 5000 + 1, y = (opts.y or 0) + (made - 1) // 5000, z = 0 },
+                fields = (opts.type or 'core:prop') == 'core:prop' and { model = 'prop_' .. made % 8 } or nil }
+        end
+        assert(Maps.apply(map.id, ops, 1))
+    end
+    return map
 end
 
-function H.byUid(list, uid)
-    for i = 1, #list do if list[i].uid == uid then return list[i] end end
+--- Every Wait(0) of the VM (the worker's yields between slices) records the log length: H.yields.
+function H.countYields(env)
+    H.yields = {}
+    local wait = env.Wait
+    env.Wait = function(ms)
+        if ms == 0 then H.yields[#H.yields + 1] = #H.log end
+        return wait(ms)
+    end
+end
+
+--- The Scene calls (spawn / remove / move / set) of one H.slices() entry.
+function H.sliceCalls(s) return (s.spawn or 0) + (s.remove or 0) + (s.move or 0) + (s.set or 0) end
+
+--- GlobalState writes of `key` in `env`: a proxy that records every write (nil as the string 'nil') -> the list.
+function H.recordGlobal(env, key)
+    local store, writes = {}, {}
+    env.GlobalState = setmetatable({}, {
+        __index = store,
+        __newindex = function(_, k, v)
+            if k == key then writes[#writes + 1] = v == nil and 'nil' or v end
+            store[k] = v
+        end,
+    })
+    return writes
+end
+
+function H.lastAudit(action)
+    for i = #H.audits, 1, -1 do if H.audits[i].action == action then return H.audits[i] end end
 end
 
 --- Prints the summary line and exits 1 on any failure or uncaught thread/handler error.

@@ -24,6 +24,7 @@ import { isDev, post, setTransport, resetTransport } from './runtime/transport.t
 import type { TransportImpl } from './runtime/transport.ts'
 import { createHost } from './runtime/host.ts'
 import { installGlobalHandlers, report, setOriginMap } from './runtime/errors.ts'
+import { installAudio } from './runtime/audio/index.ts'
 import App_ from './App.vue'
 
 /**
@@ -106,6 +107,8 @@ export function createShell(target: string | Element, opts?: ShellOptions): Shel
   if (options.gameBlur !== false) CoreUI.gameBlur = installGameBlur(el)
   const removeGlobalHandlers = installGlobalHandlers(window)
   installDevSeams()
+  // §55.16 scene audio: subscribes the `audio:*` actions only — no AudioContext before a message.
+  const removeAudio = installAudio()
 
   // 6 — Lua replays dev:set, every plugin:register, every page:register and the state snapshot.
   if (options.ready !== false) post('ui_ready', {})
@@ -115,6 +118,7 @@ export function createShell(target: string | Element, opts?: ShellOptions): Shel
     host,
     coreui: CoreUI,
     unmount() {
+      removeAudio()
       removeGlobalHandlers()
       app.unmount()
       if (options.transport) resetTransport()

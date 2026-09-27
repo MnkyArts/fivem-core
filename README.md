@@ -67,6 +67,8 @@ The wave-2 keys in `shared/config.lua` worth a look before you go live (§28):
 | `Config.World.TimeScale` | `30` | game seconds per real second — `30` is a 48-minute day, `1` is real time, `0` freezes the clock |
 | `Config.Locale` | `'en'` | `'de'` ships too; adds `<resource>/locales/<lang>.json` lookups for `Core.Locale.t` (§26) |
 | `Config.DB.Adapter` | `'kvp'` | `'postgres'` is the production backend (setup under "Where data lives"); `'mysql'` switches to the oxmysql adapter — **untested**, see "DB tools" below |
+| `Config.Vehicles.AutoPark` · `.AutoParkIdleMs` · `.AutoParkRadius` · `.AutoParkSweepMs` | `true` · `30000` · `50` · `10000` | a persisted car that stands still with nobody inside and nobody of its bucket within the radius for the idle time is **parked**: it becomes a `Core.Scene` node (no networked entity) until someone gets in or damages it (DESIGN §4.6 notes). `false` parks nothing on its own — only an explicit `Core.Vehicles.park` does |
+| `Config.Vehicles.MaxParked` | `20000` | the most parked cars at once; past it the longest-unused one that is not promoted is garaged (its node removed, `stored = true`) and the hook `vehicleAutoStored (vehId, 'max_parked')` fires |
 | `Config.Interiors.Enabled` | `true` | master switch for the §36 IPL loader (`false` loads nothing — only for debugging map issues) |
 | `Config.Interiors.<group>` | per-group | `base heists bikers casino tuner …` default on; `north_yankton ufo red_carpet` default off; newer DLC groups self-gate on the game build / DLC (`/interiors` prints the effective state) |
 | `Config.Hud.Anchor` | `'bottom-left'` | where the §39 vitals strip sits: 24 px from both screen edges, never reading the map rect (the streamed `sf_minimap` cluster draws the map in a top corner, so the vanilla bottom-left maths would only offset the strip), or `'minimap'` — right of the live minimap rect, its glyphs flush with the map's bottom edge. No centre or right anchor on purpose: those corners belong to the progress bar / text UI and to the key hints |
@@ -86,8 +88,7 @@ The admin-platform keys (§41–§53, 2026-09-26):
 | `Config.Admin.LegacyCommands` | `true` | core's own staff commands (`/tp /bring /kick /ban /setcash …`, see "Commands"); `false` registers none of them — for servers running the admin plugin |
 | `Config.Chat.JoinLeave` | `'staff'` | join/leave chat lines: `'staff'` (on the staff set only), `'all'` (one broadcast per connect/drop — small servers), `'off'` |
 | `Config.Buckets.Range` | `{ 10000, 60000 }` | the routing buckets `Core.Buckets.allocate` hands out (editor drafts, events); keep it clear of buckets other resources pick by hand |
-| `Config.Maps.RegionSize` … `MaxMarkers` | `512` m regions, `LatentBps 250000`, `MaxLocalObjects 1500`, … (DESIGN §52.5) | the map runtime's streaming budget; the per-map element limits are **settings** (`maps.limits.*`), not config |
-| `Config.Maps.PackBudgetBytes` · `.PackBudgetWindowMs` | `2000000` · `10000` | per-player region-pack byte budget (2 MB burst, 200 kB/s sustained) — raise only for very dense maps |
+| `Config.Maps.MaxMarkers` | `64` | the admin editor view's preview budget (map points, zones, helpers drawn at once). Map content itself streams as `Core.Scene` nodes since 2026-09-27 (see "Scene streaming"), so its budgets are `Config.Scene`'s; the per-map element limits are **settings** (`maps.limits.*`), not config |
 
 Discord logging is a convar, never a config value, so the URL never lands in git:
 
@@ -354,6 +355,18 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 | `Schema.check(field, value)` `checkAll(fields, values, { partial? })` | `ok, value\|err` / `ok, out\|errs`; never coerces; errors are machine strings (`'required'`, `'min'`, `'custom:<text>'`, nested `'<name>.<err>'`) |
 | `Schema.default(field)` `public(fields)` | deep-copied default · JSON-safe copies for the UI (`<CoreSchemaForm>`), no functions, no secret defaults |
 
+**`Core.Clock`** (§55.2) — one millisecond timeline for every VM: the server's `GetGameTimer()` = the clients' OneSync
+network time (±5–20 ms)
+
+| function | purpose |
+|---|---|
+| `Clock.now()` `at(ms)` `add(t, ms)` | u32 ms now · a future stamp (motion / audio t0) · stamp arithmetic |
+| `Clock.diff(a, b)` | signed 32-bit difference — the ONLY way to compare stamps (they wrap) |
+| `Clock.ready()` `local2net(ms)` `net2local(ms)` | the client clock has synced · map `GetGameTimer()` stamps ↔ network time |
+
+**`Core.Scene` helpers** (§55.3) — `Scene.tierOf(radius, global?)` `validKindId(id)` `isPluginKind(id)`
+`paintOf(id)` `PAINTS` in every VM; `Scene.handle` / `on` / `off` run in your client VM (see "Scene streaming").
+
 **Client-only libs** (§3.8–§3.12)
 
 | function | purpose |
@@ -381,8 +394,9 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 | | `invite` `acceptInvite` `declineInvite` `leave` `kick(src, charId)` `setRank` `setRankDef` `addRank` `removeRank` `setOwner` `update` |
 | | `deposit(src, amount)` `withdraw` `getBank(id)` `setMeta(id, k, v)` `getMeta(id, k)` |
 | `Core.Vehicles` §4.6 | `spawn(opts)` `delete(netId)` `exists` `getEntity` `getInfo` `setLocked` `isLocked` `list()` |
-| | `giveKeys(netId, charId)` `removeKeys` `hasKeys(src, netId)` `setOwner` `getOwner` `getPlayerVehicles(src)` — `keyMode = 'virtual'` is default; `'item'` leaves virtual keys empty for a domain plugin's physical-key check |
-| | `persist(netId)` `getRecords(charId)` `getRecord(vehId)` `spawnRecord` `restoreRecord` `adopt(netId, opts)` `store(netId)` `saveProps` `deleteRecord` |
+| | `giveKeys(netId, charId)` `removeKeys` `hasKeys(src, netId)` `setOwner` `getOwner` `getPlayerVehicles(src)` — `keyMode = 'virtual'` is default; `'item'` leaves virtual keys empty for a domain plugin's physical-key check. `setLocked` / `giveKeys` / `removeKeys` / `setOwner` also take a `vehId` (a parked or garaged car: the record, no promotion) |
+| | `persist(netId)` `getRecords(charId)` `getRecord(vehId)` `spawnRecord` `restoreRecord` `adopt(netId, opts)` `store(netId \| vehId)` `saveProps` `deleteRecord` |
+| | `park(netId \| vehId) -> nodeId` (a persisted car becomes a `Core.Scene` node; `'destroyed'` for a wreck) · `getInfoByRecord(vehId)` (live, parked or garaged; `parked` = the node id, `destroyed` = a wreck) — parked cars: see "Vehicle records and key modes". `adopt` refuses a scene clone (`'scene_clone'`); `restoreRecord` answers `'parked'` / `'destroyed'` |
 | `Core.Notify` §4.7 | `send(src, message, type?, duration?)` `broadcast(message, type?)` — types `info` `success` `error` `warning` |
 | `Core.Settings` §45 | `define(section)` `get(key)` `set(key, value, actorSrc?, reason?)` `reset` `inspect(key)` `list(viewerSrc?)` `onChange(prefix, fn)` `offChange(handle)` |
 | `Core.Audit` §46 | `record(row) -> id` `query(filter) -> { rows, next }` `get(id)` `prune()` |
@@ -390,6 +404,7 @@ Specs: `'integer' 'number' 'string' 'boolean' 'table' 'function' 'any' 'vector3'
 | `Core.Buckets` §50 | `allocate({ label?, population?, lockdown? })` `release(b)` `info(b)` `list()` |
 | `Core.Admin` §51 | `category/action/page/playerTab(def)` `run(actor, id, opts)` `snapshot(src)` `setDuty/isOnDuty` `setMode/getModes` `staff(onDutyOnly?)` `echo(text, opts?)` — hook `staffModeChanged (src, modes)` |
 | `Core.Maps` §52 | `defineType` `types` `setModelValidator` · `create` `get` `list` `update` `delete` `setActive` `elements` · `apply` `invert` `clear` `journal` · `openDraft` `closeDraft` `publish` `versions` `rollback` · `respawn` `on` `off` `records` |
+| `Core.Scene` §55 | `spawn` `set` `move` `motion` `attach` `detach` `drive` `emit` `remove` · `get` `query` `list` `batch` · `on` `onInteract` `off` · `defineKind` `kinds` `setModelInfo` `stats` `setFocus` · `promote` `demote` `lease` · `audio.play` `audio.kill` `audio.stats` · `voice.start` `voice.stop` `voice.list` — see "Scene streaming (Core.Scene)" |
 
 Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `Core.Player(src).money:add('cash', 10)`.
 
@@ -397,7 +412,7 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 
 | namespace | functions |
 |---|---|
-| `Core.Spawn` §6.1 | `spawnPlayer(opts)` `applyAppearance(ped, appearance)` `teleport(coords, heading?, { withVehicle?, fade? }?)` `setModel(model, appearance?)` — teleports wait for map content (`Core.Maps.waitAreaReady`, ≤ 3 s) and keep a sticky freeze (§48) |
+| `Core.Spawn` §6.1 | `spawnPlayer(opts)` `applyAppearance(ped, appearance)` `teleport(coords, heading?, { withVehicle?, fade? }?)` `setModel(model, appearance?)` — teleports wait for the scene content at the destination (`Core.Scene.waitAreaReady`, ≤ 3 s; map content included) and keep a sticky freeze (§48) |
 | | `appearance` (§34, every group optional, applied in this order): `headBlend` `components` `props` `faceFeatures` `headOverlays` `hairColor` `eyeColor` |
 | `Core.Player` §6.2 | `getData(key)` `refresh()` (on top of the lib reads above) · `getStates()` `reapplyStates(ped?)` — the §48 sticky states |
 | `Core.Markers` §6.4 | `add(opts)` `update(id, partial)` `remove(id)` `removeAll()` |
@@ -407,6 +422,7 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 | | `worldPrompt = true \| { range, offsetZ, icon, description }` — opt-in 3D dot; per-entry default is `Config.Interactions.WorldPrompt.Enabled` |
 | `Core.Vehicles` §6.8 | `getClosest(coords?, radius?)` `getCurrent()` `isDriver()` `getSeat()` `getNetId(veh)` `fromNetId(netId, timeout?)` |
 | | `getProps(veh)` `setProps` `getPlate` `getDisplayName` `hasKeys(veh)` `isLocked` `toggleLock(veh?)` `setEngine` `repair` `saveProps` |
+| | `setPropsLocal(veh, props)` — `setProps` for a LOCAL vehicle this client created (a Core.Scene copy): no network-control wait, never yields |
 | `Core.Raycast` §6.9 | `fromCamera(distance?, flags?, ignoreEntity?)` `between(from, to, …)` `getEntityInFront(distance?)` |
 | | §42, the RENDERED camera (scripted cameras too): `screenToWorld(fx, fy) -> origin, direction` `worldToScreen(coords) -> onScreen, fx, fy` `fromScreen(fx, fy, distance?, flags?, ignore?)` `fromRenderedCamera(distance?, flags?, ignore?)` → `hit, coords, normal, entity`; fx/fy in 0..1, distance ≤ 5000 |
 | `Core.Interiors` §36 | `request(ipl)` `remove(ipl)` `isActive(ipl)` — owner-tracked IPLs; `activateSet(coords, set)` `deactivateSet` `isSetActive` `refreshAt(coords)` — interior entity sets; `listGroups()` |
@@ -420,7 +436,8 @@ Sugar: `Core.Player(src)` gives a handle — `Core.Player(src):getInfo()` and `C
 | | §54 `hideHud(reason?)` `showHud(reason?)` `isHudHidden()` — hide the HUD LAYER only (vitals, stat bars, world prompts, other resources' overlays / text UI / key hints, GTA radar + HUD); your own page, overlays and toasts stay; owner-tracked; hook `hudHiddenChanged (hidden)` |
 | `Core.Settings` §45 | `get(key)` — `replicate = true` keys only; hook `settingChanged (key, new, old)` |
 | `Core.Admin` §51 | `getSelf()` → `{ duty, modes }` · `getStaffStates()` → `{ [src] = state }` (empty unless on duty) — display only; hooks `staffSelfChanged (state)` / `staffStateChanged (src, state\|nil)` |
-| `Core.Maps` §52.4 | `isAreaReady(coords, radius?)` `waitAreaReady(coords, timeoutMs?)` `handleOf(uid)` `uidOf(entity)` `hold(uid)` `release(uid)` — owner-tracked holds (the runtime leaves a dragged element alone); `setEditorView(on)` (owner-tracked previews of data kinds within 150 m) `stats()` |
+| `Core.Maps` §52.4 | `isAreaReady(coords, radius?)` `waitAreaReady(coords, timeoutMs?)` (not ready while the server still projects a large map change around the point: `GlobalState['core:mapsPending']`) `handleOf(uid)` `uidOf(entity)` `hold(uid)` `release(uid)` — owner-tracked holds (the runtime leaves a dragged element alone); `setEditorView(on)` (owner-tracked previews of data kinds within 150 m) `stats()` |
+| `Core.Scene` §55.10 | `get(id)` `handleOf(id)` `idOf(entity)` `isAreaReady(pos, radius?)` `waitAreaReady(pos, radius?, timeoutMs?)` `hold(id)` `release(id)` `stats()` · in your VM: `handle(kind, handlers)` `on(event, kindOrId, fn)` `off(handle)` — see "Scene streaming (Core.Scene)" |
 
 Also on `Core` itself: `Core.name` `isServer` `isClient` `isCore` `version` `Config` (core's config, read-only),
 `Core.on(hook, fn)` `Core.emitHook(hook, …)` `Core.isReady()` `Core.onReady(fn)` `Core.onPlayerLoaded(fn)` (§2.4).
@@ -1059,7 +1076,8 @@ Hooks are local events on the same side: `Core.on('playerLoaded', fn)` / `Core.e
 | server | `playerDropped` | `src, charId` (before the session is removed) |
 | server | `moneyChanged` | `src, account, amount, delta, reason` |
 | server | `factionChanged` / `factionUpdated` | `src, summary\|nil` / `factionId` |
-| server | `vehicleSpawned` / `vehicleDeleted` | `netId, info` / `netId` |
+| server | `vehicleSpawned` / `vehicleDeleted` | `netId, info` / `netId` — also at every promotion / park (demotion) of a parked car: a persisted car's netId is not stable, key by `info.vehId` |
+| server | `vehicleAutoStored` | `vehId, reason` — core garaged a parked car on its own (`'max_parked'`: over `Config.Vehicles.MaxParked`) |
 | server | `audit` | `category, src, message` |
 | server | `permsChanged` | `src\|nil, what, detail` — §44: `grant` `revoke` `group` `grants` `saveGroup` `deleteGroup` `define` `expired` `load` (src nil = a whole group changed; `group`/`grants` also from `Player.setGroup`/`setAccountData`) |
 | server | `adminAction` | `{ id, actor, targets, args, reason, source, result, message }` — §51, after every executed admin action (never for refusals) |
@@ -1081,7 +1099,7 @@ State bags are server-written, client-read. Read them with `Core.Player.get(key)
 |---|---|
 | `player:<src>` | `loaded` `name` `charId` `group` `cash` `bank` `faction` (summary or `false`) `dead` — `duty` / `staffModes` are reserved names but never written: staff state goes by event (§51, `Core.Admin.getSelf()`) |
 | `entity:<netId>` (core vehicles) | `coreVeh` `locked` `owner` `keys` `keyMode` `plate` `vehId` `coreProps` (optional persisted props) |
-| `entity:<netId>` (map entities, §52) | `mapEl` = `'<mapId>:<elementId>'` · `mapCfg` = peds `{ invincible, frozen, scenario? }`, vehicles `{ locked }`, physics props `{ rot }` |
+| `entity:<netId>` (promoted `Core.Scene` clones, §55.15) | `sn` = the node id · `snv` = the node version it was promoted at · `snCfg` = what the owning client applies (a vehicle's props / lock / dirt / paint once, then only `{ plate, invincible, frozen, applied }`) — core-internal. Map entities no longer carry `mapEl` / `mapCfg` (maps are scene nodes since 2026-09-27; a node's `fields.mapEl` names its element) |
 | `GlobalState` | `core:ready`, `faction:<id>` = `{ name, tag, color, memberCount }` or `false` · `cs:<key>` + `cs:keys` — replicated settings (§45) |
 
 ## Commands
@@ -1096,6 +1114,8 @@ State bags are server-written, client-read. Read them with `Core.Player.get(key)
 | `/kick <player> [reason…]` · `/ban <player> <hours> [reason…]` | `core.mod` / `core.admin` | `0` hours = permanent |
 | `/announce <message…>` · `/revive [player]` · `/heal [player]` | `core.mod` | broadcast · respawn where they stand · health + armour |
 | `/faction <action> …` | — | chat front-end over `Core.Factions` |
+| `/scene` · `/scene debug` *(client)* | `Config.Scene.Debug`, ACE `core.admin` or staff on duty | Core.Scene counters in F8 · the overlay (cell / node / byte counters, the nearest 32 nodes and their state) |
+| `/audio [volume\|hrtf\|streams\|offset\|voices\|debug\|stats] …` · `/audiodebug` *(client)* | — | your own world-audio preferences (client KVP) · the audio engine's voices, decoders, drift |
 
 The staff commands above (and `/weapon`, `/weapons`, the `/tpm` handler) follow the admin platform's rules since
 2026-09-26: under `Config.Admin.RequireDuty` a player must be on duty (`Core.Admin.setDuty`), every executed command
@@ -1211,7 +1231,7 @@ it, so increases always come from `addAmmo`. Hook `weaponsChanged (src)`.
 | `Core.Native.invoke(src, name, …)` · `invokeWithResult(src, name, …)` | allowlisted by `Config.Native.Allow` (`nil` = any global matching `^%u[%w_]+$`) |
 | `Core.Anim.play(src, dict, clip, opts?)` · `Core.Anim.stop(src)` | drives the client `Core.Anim` lib (§3.10) |
 | `Core.Audio.playFrontend(src, name, set)` · `playAt(coords, name, set, range?)` | `playAt` reaches everyone in range (≤ 20 targets); the same without `src`, plus `stop(id)`, is the `lib/audio` namespace *(client)* |
-| `Core.Attachments.add(src, { id?, model, bone, offset, rotation })` `remove(src, id)` `clear(src)` `list(src)` | persisted in `data.attachments`, replicated so **every** client sees the prop |
+| `Core.Attachments.add(src, { id?, model, bone, offset, rotation })` `remove(src, id)` `clear(src)` `list(src)` | persisted in `data.attachments`; each entry is a `Core.Scene` prop node attached to the player (DESIGN §55.21.3), so every client near him sees it and it follows respawns and model swaps. `model` = a name or a hash, `bone` = a tag 0..65535 or a bone name (else the right hand), offsets ≤ 1000 m, ≤ 12 per player; `add` answers `nil, 'scene refused the prop (<code>)'` when the scene refuses it — except when the scene is FULL (`'limit'`): then the entry is stored, `add` returns its id and the prop appears once there is room (retried). No state bag any more |
 | `Core.Waypoint.set(src, coords)` `clear(src)` `get(src)` · `Core.Raycast.fromPlayer(src, distance = 10.0) -> hit, coords, netId` | `get` and the raycast await the client |
 | `Core.Screenshot.take(src, opts?) -> url\|nil` | needs `screenshot-basic` started, otherwise `nil, 'unavailable'` |
 | `Core.Player.setReplicated(src, key, value)` | your own `Player(src).state` keys; core's §8 keys are refused |
@@ -1269,6 +1289,9 @@ getters. A player who teleports further than 64 m can be missed by a query for a
 ### Vehicle records and key modes
 
 `Core.Vehicles` owns the live entity and its generic record, including the complete property payload (custom colors, extras, liveries, wheel/mod/toggle maps, dirt, tyre health/bursts, doors, window intactness and lights). `stored = true` means deliberately garaged; `stored = false` means the vehicle belongs in the world. A clean core stop preserves that world state and captures the final server position before deleting only the obsolete runtime entity. A domain plugin restores out records with `restoreRecord`, which refuses stored records and duplicate vehIds. `adopt` promotes an existing network vehicle (for example, a server-validated hotwired ambient car) into the same server-owned persistent contract. Restored props are projected through `coreProps` and refreshed only when a validated saved-property payload changes, so any client that streams the vehicle can apply them even if its owner is offline. Property maps use GTA's zero-based native ids and safely survive JSON round trips. Plates are trimmed/uppercased and unique across both stored records and live entities; the default `LS-` prefix produces values such as `LS-48291`. GTA cannot distinguish a lowered window from a broken one through `IsVehicleWindowIntact`, so both persist as non-intact. `spawn` defaults to `keyMode = 'virtual'`, which inserts the owner into the replicated `keys` map and keeps existing `U` lock behaviour. A domain plugin that issues a physical inventory key must spawn with `keyMode = 'item'`: core still records the owner, but grants no virtual key. Core's `U` route then no-ops without a misleading error, allowing that plugin to bind `U` and validate the actual item before calling `Core.Vehicles.setLocked`.
+
+**Parked cars (2026-09-27, DESIGN §4.6 notes, §55.21.4).** A persisted car that nobody uses is *parked*: `Core.Vehicles.park(netId | vehId)`, or AutoPark on its own (`Config.Vehicles.AutoPark`), turns it into a persistent `Core.Scene` vehicle node — every client nearby shows a local copy with the same props, plate, lock state and paint, and no networked entity exists. It becomes networked again (a promoted clone, adopted as a normal core vehicle: state bags, keys, `vehicleSpawned`) the moment a player tries to get in or damages it — walking past does not promote it — and parks again when it is left alone (`vehicleDeleted`); a car driven into another bucket (an instance) takes its node along. A WRECKED car does not come back: its record keeps its last saved state marked `destroyed` (`restoreRecord` / `park` refuse it, `spawnRecord` brings it back). Core's stop parks every live persisted car, so a boot spawns nothing, and past `Config.Vehicles.MaxParked` the longest-unused parked car is garaged (`vehicleAutoStored`). A parked copy streams in with its damage applied silently (flat tyres, missing windows). `U` on a parked copy works (the server checks the record's keys and the distance). Parked cars survive restarts as nodes, so a boot spawns nothing; `restoreRecord` answers `nil, 'parked'` for them, `spawnRecord` promotes the node in place instead of making a second car, and `store(netId | vehId)` garages a parked car too. `getInfoByRecord(vehId)` answers for live, parked and garaged records alike. **For plugins**: key persisted cars by `vehId`, never by netId (it changes at every promotion); never `DeleteEntity` a clone (the car comes back at its spot — use `delete` / `store`); entity state bags you set on a clone are gone after it parks.
+
 `Core.Api` hands a live table across resources, so **every call costs two msgpack hops**: fine for wiring,
 never for per-frame work. A table leaves `Api.get` the moment its owning resource stops.
 
@@ -1385,7 +1408,9 @@ npm run check:ui                          # at the resources folder: validate ev
 rewrites every placeholder and prints the next steps. `check.sh` stops at the first failure, in nine steps:
 `luac5.4 -p` over every `.lua`; `fxlint` on core and `core_example` (skipped with a notice when it is not on
 `PATH`); the Lua suites (`run_tests`, the §40 service suites, `client_chat_tests`, `client_interiors_tests`,
-`client_ui_tests`, the eighteen §41–§53 suites from `raycast` to `chat_hook`, `server_tests`); `node --test` over the chat model, `ui/tests/unit` and `ui/sdk/tests`;
+`client_ui_tests`, the eighteen §41–§53 suites from `raycast` to `chat_hook`, the eleven §55 scene suites from
+`scene_codec` to `scene_promote`, `server_tests`); `node --test` over the chat model, `ui/tests/unit` and
+`ui/sdk/tests`;
 `vue-tsc --noEmit -p ui/tsconfig.json`; `gen-kit-types --check` and `check-plugins.mjs`; the shell build; and
 with `--full` the three browser suites (`ui/tests/run-browser-suites.mjs`) plus the Storybook build.
 
@@ -1471,6 +1496,9 @@ Editor focus (§54). Run it with the admin map editor (it holds both), or from a
     editor → `1`–`5` use hotbar items again. Hold `1` while opening the editor, release it after → nothing sticks.
 40. **Nothing survives a stop:** open the editor, then `restart admin` → HUD, radar, hotbar and keys all come back.
 
+Scene streaming (§55): steps 41 onward are in "Scene streaming (Core.Scene)" → "In-game checklist (scene streaming —
+not run yet)" at the end of this file, the `scene_probe` measurements first.
+
 ## Troubleshooting
 
 Read the server side with `fxserver logs --errors --resource <name>`, the client side with `F8`.
@@ -1509,8 +1537,8 @@ anything.
 per namespace (Utils, Math, Validate, Log, Callback, Net, Commands, Keys, Streaming, Anim, Audio,
 Locale, Player, UI, Markers, TextLabels, Blips, Interactions, Vehicles, Raycast, Spawn, World, Screen,
 Cron, DB, Money, Perms, Factions, Notify, Doors, Stats, Weapons, Native, Attachments, Waypoint,
-Screenshot, Globals, Services, Api, Chat, Http, Webhook, Security, Registry, and since §40–§53 Controls, Actions,
-Geometry, Zones, Points, Hooks, Schema, Settings, Audit, Bans, Buckets, Admin, Maps, MapRegions), typed option tables
+Screenshot, Globals, Services, Api, Chat, Http, Webhook, Security, Registry, and since §40–§55 Controls, Actions,
+Geometry, Zones, Points, Hooks, Schema, Settings, Audit, Bans, Buckets, Admin, Maps, Clock, Scene), typed option tables
 (`CoreMarkerOptions`, `CoreInteractionOptions`, `CoreVehicleProps`, `CoreMenuOptions`, …) and aliases
 for the enums (`CoreHook`, `CoreNotifyType`, `CorePageType`, `CoreWeather`, …). It is documentation
 only: it is **not** in `fxmanifest.lua`, is never loaded at runtime and never shipped to a client.
@@ -1908,32 +1936,31 @@ admin plugin's editor) checks its users' permissions.
 - Limits: settings `maps.limits.*` (elements 3000, perModel 300, uniqueModels 200, networked 20, networkedTotal 200,
   opsPerApply 200), `maps.journalMax` (5000 rows) and `maps.journalMaxOps` (20000 stored operations) per map; per map
   via `update(id, { limits })`. A `targetBucket` inside `Config.Buckets.Range` is refused.
-- Vehicles, peds and physics props are server entities (state bags `mapEl`, `mapCfg`); a move, rotation or field
-  change updates them in place (same entity and net id; the pose is applied by the client that owns the entity),
-  and a vehicle without a `color` gets a paint picked from its id, so it looks the same after every re-creation.
-  A model change, a destroyed entity or nobody near re-creates it; `respawn(id)` re-creates destroyed ones. Everything else streams to clients per region. Client side: `isAreaReady(coords, radius?)`,
-  `waitAreaReady(coords, timeoutMs?)`, `handleOf(uid)`, `uidOf(entity)`, `hold(uid)` / `release(uid)` (the runtime
-  leaves a dragged element alone), `setEditorView(on)`, `stats()`.
+- Every shown element is ONE `Core.Scene` node owned by core (since 2026-09-27): props, vehicles, peds, markers and
+  hides as their scene kinds, points / zones / placeholders as editors-only `map:data` nodes. Vehicles and physics
+  props are local copies that become networked only while the scene promotes them (someone gets in or damages them;
+  in a draft's editor bucket nothing promotes); a map vehicle always wears the paint of its uid (a set `color` goes on top). `respawn(id,
+  elementId?)` puts nodes back to their authored state (spawns missing ones, moves back and resets promoted, displaced
+  or changed ones) and returns how many it touched. Client side: `isAreaReady(coords, radius?)`,
+  `waitAreaReady(coords, timeoutMs?)`, `handleOf(uid)` (the local copy, else the promoted clone), `uidOf(entity)`,
+  `hold(uid)` / `release(uid)` (the runtime leaves a dragged element alone), `setEditorView(on)`, `stats()` — uids are
+  strings `'<mapId>:<elementId>'`.
 - Errors: `unavailable`, `not_found`, `input`, `name`, `mode`, `targetBucket`, `meta`, `expiresAt`, `limits`,
   `active`, `ops`, `too_many_ops`, `op`, `source`, `expect`, `conflict`, `type`, `position`, `bounds`, `rotation`,
   `fields`, `layer`, `model`, `no_validator`, `id`, `exists`, `restore`, `migrate`, `ref`, `referenced`, `parents`,
   `limit`, `validate`, `hook`, `db`, `bucket`, `note`, `version`.
 
-**Map content streams by region, not by broadcast (§52.3).** Published and live content is cut into
-`Config.Maps.RegionSize` (512 m) regions per routing bucket. A client asks for the 3×3 block around its camera
-through `core:maps:window` (≈ one small callback per 512 m of travel, 250 ms cooldown) and gets only the regions
-whose version it does not hold, as bandwidth-limited latent events (`Config.Maps.LatentBps`); each region is
-JSON-encoded once per version however many clients fetch it. Each player also has a pack budget
-(`PackBudgetBytes`, 2 MB, refilled over `PackBudgetWindowMs`, 10 s): a pack that does not fit is withheld and
-fetched again a moment later, so no client can make the server stream unbounded bytes. An edit reaches only the
-players holding that region: changes are coalesced per server tick into one delta (≤ `PushOpsMax` ops) or one
-"stale" notice per region, sent with `Core.Net.emitMany`. The bucket is always the one the server reads. Data kinds
-and editor helpers (points, zones, placeholders) reach editors only — Admin mode `editor` or an open draft's bucket —
-and losing that role downgrades a subscriber at once. Nothing
-loops over players and nothing runs while nobody edits. `Core.MapRegions` and `Core.MapsRuntime` are internal
-(blocked in the export). Map content missing on a client? `Core.Maps.stats()` there: `regions` / `bucket` (did the
-window answer?), `failed` (models that are not in the game files or did not load in 10 s are logged once),
-`capped` (`MaxLocalObjects` reached).
+**Map content streams as scene nodes (§55.21.1).** `server/maps_runtime.lua` projects every active context (a live
+map in its target bucket, a draft's published snapshot there, a draft's working copy in its editor bucket) onto
+`Core.Scene` nodes tagged `fields.mapEl = '<mapId>:<elementId>'` and `fields.mapType`; everything else — cells,
+journals, the per-player byte budget, the materialiser's radii, fades and caps — is the scene's (see "Scene
+streaming"). A change keeps the node (`Scene.move` / `Scene.set`); only another scene kind replaces it. Data kinds and
+editor helpers reach editors only (the scene audience `{ editors = true }`: Admin mode `editor` or an open draft's
+bucket). The old region runtime (`core:maps:window|pack|delta|stale`, `Core.MapRegions`, the `mapEl` / `mapCfg` state
+bags, `Config.Maps.RegionSize … PackBudgetWindowMs`) is gone; `Core.MapsRuntime` stays internal. Map content missing
+on a client? `/scene debug` shows the nodes near you and their state; `Core.Maps.stats()` there answers `{ elements,
+spawned, held, queued, models, failed, previews, dataNodes, types, editorView }` (`failed`: models that are not in the
+game files or did not load in 10 s, logged once).
 
 ### In-game checklist (admin platform — not run yet)
 
@@ -1965,5 +1992,340 @@ window answer?), `failed` (models that are not in the game files or did not load
    and echoes; with `Config.Admin.LegacyCommands = false` (and `restart core`) `/kick` does not exist.
 9. **Maps:** a live map's prop appears for everyone in its bucket while an admin places it; a hide over a world bench
    hides it and deleting the hide brings it back; a teleport onto an event platform lands on it (the 3 s wait);
-   resmon while flying through ≥ 1000 props stays within budget; a ped placed before a client joined gets its
-   `mapCfg` (scenario, invincible) once that client controls it.
+   resmon while flying through ≥ 1000 props stays within budget; a ped placed before a client joined plays its
+   scenario and stays invincible for that client too (scene ped fields since 2026-09-27; the scene checklist's steps
+   67, 68 and 74 cover the rest of maps on `Core.Scene`).
+
+## Scene streaming (Core.Scene, DESIGN §55)
+
+`Core.Scene` streams server-owned world content to the players who can see it (2026-09-27). A **node** is a server
+record — a prop, a vehicle, a ped, a light, a particle effect, a marker, a 3D text, a model hide, a trigger zone, a game
+sound, a positional audio emitter, a group, or a plugin's own kind — with a pose, an optional motion, kind fields and
+an optional audience. Every interested client **materialises it locally**: a non-networked entity, a draw call, a Web
+Audio voice. There is no OneSync entity, no relevance delay (up to ~6 s at 2,000 players) and no networked pool of
+80–250 objects to fill; a node becomes a networked entity only while it is **promoted** (somebody walks up to a parked
+car, shoots it, gets in, or a plugin asks) and goes back to a local copy when nobody needs it. The server cuts the
+world into 128 m cells, 512 m regions and a global set per routing bucket, encodes each change once per cell and
+sends one small reliable event per client per 50 ms tick (big snapshots latent, inside a per-player byte budget);
+the client picks radii, budgets, priorities and fades, and creates props *beyond* GTA's own fade band, so the engine
+reveals them the way it reveals map props — no pop-in, and nothing is deleted while you look at it. Motion (tweens,
+paths, spins, bobbing, orbits, keyframes, server-steered dead reckoning) and media play heads are descriptors
+evaluated on one shared clock, `Core.Clock`, so a moving or playing node costs no steady traffic.
+
+### Setup
+
+```cfg
+increase_pool_size "Object" 2000   # Config.Scene.Caps.props = 3000 assumes it (clients restart once on join)
+setr voice_useNativeAudio true     # only for voice through world speakers (Scene.voice): submix panning needs it
+```
+
+- With the pool raise set `Config.Scene.ObjectPool = 5300` (nil = the client learns the pool: 3,300 assumed, raised
+  by what it reads, lowered by a refused create). Without the raise, lower `Config.Scene.Caps.props` to 1,500.
+- Run the host's NTP in **slew mode** (chrony: `makestep` only at start). On Linux FXServer's `GetGameTimer()`
+  follows the system clock, so a clock step moves every motion plan and every play head.
+- Audio from the web plays only from hosts an admin allowed: setting `scene.audio.allowHosts` (admin panel →
+  Settings → Scene audio, or `Core.Settings.set`). Empty (the default) = only files shipped in resources.
+- `/scene` (F8) prints the client's counters, `/scene debug` draws the overlay (cell, node, byte and state counters;
+  the nearest 32 nodes with id, kind, state and distance) — for `Config.Scene.Debug`, the ACE `core.admin` or staff
+  on duty.
+  `Core.Scene.stats()` on the server has the flush times (`flushMs.p50/p99`), bytes per second and every module's
+  counters.
+
+### `Config.Scene` highlights
+
+| key | default | why you would change it |
+|---|---|---|
+| `Caps` | props 3000, peds 48, vehicles 64, lights 32, particles 32, markers 64, texts 64, sounds 24, hides 200, custom 64 (per plugin kind); distinct models props 150 / peds 20 / vehicles 32 (sized for parked player cars) | what ONE client materialises at most. When a cap is full the farthest node you cannot see goes first, a visible one never. `Caps.audio` (optional) caps audio emitters, else `custom` applies |
+| `ObjectPool` | `5300` (this server's `increase_pool_size "Object" 2000`) | no new props above 85 % of it — a full Object pool crashes the client; `nil` = learn it (3,300 assumed) for a server without the raise |
+| `Budgets` | 8 props, 1 ped or vehicle, 2 plugin-kind nodes, 32 deletes per frame; ×10 while the screen is faded out | creation work per frame |
+| `Fades` · `Visibility` | props 300 / 450 ms, peds 600, vehicles 400, ≤ 48 at once · unseen 1.5 s (peds, vehicles 4 s) before a delete | the anti-pop pipeline for late arrivals and in-view deletions |
+| `MaxNodes` · `MaxNodesPerOwner` · `MaxPersistent` · `Global.MaxNodes` · `Global.MaxPerOwner` · `MaxChildren` | 100000 · 20000 · 50000 · 256 · 64 · 64 | the server's limits (`'limit'`); `MaxChildren` counts every descendant of one root |
+| `OwnerCaps` | `{ core = 60000, inventory = 40000 }` | per-resource overrides of `MaxNodesPerOwner`. Core owns every map element, player attachment and parked car, so a server with huge maps may need more; the inventory has one node per ground drop; a plugin that legitimately needs more than 20,000 nodes gets its own entry |
+| `CoreReserve` | `{ nodes = 20000, persistent = 10000 }` | the part of `MaxNodes` / `MaxPersistent` only core may use: every other owner is refused `'limit'` before it, so plugins can never starve maps, attachments and parked cars |
+| `Promote` | MaxEntities 1000, MaxPropsPerArea 32 (per 256 m square), CloneWaitMs 10000, ProximityShare 0.7 | how many networked clones may exist; proximity promotions may hold at most `ProximityShare` of them — at the cap, getting in / damage / a manual promotion evicts the oldest idle proximity one |
+| `Audio` · `Voice` | 32 real voices, 4 stream decoders, 64 MB decoded clips, HRTF for ≤ 8 · 8 submixes, 64 listeners, 16 sessions | the shell audio engine · voice through speakers |
+| `Audio.AllowAac` | `true` | AAC / M4A sources and AAC-only HLS streams (probe P8 showed FiveM's CEF decodes AAC); `false` refuses them |
+| `Debug` | `false` | `/scene` for everyone |
+
+Most keys are read once when core starts: `restart core` after a change. The full block and what every key does is
+DESIGN §55.20.
+
+### API cheat sheet
+
+**Server** — trusted, plugins through the proxy. Everything a plugin creates is owner-tracked: its non-persistent
+nodes, kinds (their nodes stay as placeholders), hooks and focus pins go when it stops; persistent nodes stay.
+
+| function | what it does |
+|---|---|
+| `Core.Scene.spawn(def) -> id \| nil, err, detail` | `def = { kind, pos, rot?, bucket? = 0, parent?, offset?, offrot?, bone?, rotOrder?, motion?, fields?, model?, audience?, radius?, global?, persist?, interact?, authority?, allowChildren? }` — `model` is shorthand for `fields.model` (a name, an integer hash or `'0x%08X'`); a child (`parent`) rides its root, ≤ 4 deep; `rotOrder` 0..5 (default 2) is the order a child's `offrot` is applied in |
+| `set(id, patch, opts?) -> ok, err, detail` | merges `patch` into the fields (the result is checked whole); `opts = { remove = { names }, interact = list\|false, audience = t\|false, radius = m\|false, allowChildren = … }` |
+| `move(id, pos, rot?, { duration?, ease?, rotOrder? }?)` · `motion(id, desc\|nil)` | teleport, or a tween over `duration` ms · a motion descriptor (below); `t0` defaults to 200 ms ahead so every client starts together |
+| `attach(id, { node = id } \| { player = src } \| { net = netId }, { offset?, offrot?, bone?, rotOrder? }?)` · `detach(id)` | ride another node, a player's ped or a networked entity (bone index or name; `rotOrder` 0..5, default 2 — Core.Attachments uses 1) |
+| `drive(id, pos, vel, yaw) -> ok, sent` | server-steered dead reckoning (a boat, a train): a DR op only when the clients' extrapolation is off by > 0.25 m (far 1 m) or 3° |
+| `emit(id \| { pos, bucket? }, name, params?, { radius?, horizonMs? }?)` | a one-shot to the clients near it (`Scene.on('event')` on the client; `sound` nodes play on `play` / stop on `stop`) |
+| `remove(id, { fade? }?)` | the node and its subtree (a source takes its emitters) |
+| `get(id)` · `query({ pos, radius, bucket?, kind?, owner?, limit? })` · `list({ owner?, kind?, bucket? })` | a copy · copies, nearest first · ids |
+| `batch(fn, ...)` | every change inside `fn` reaches the same flush (fn must not yield) |
+| `on(event, kindOrId \| '*', fn(copy, …)) -> handle` · `off(handle)` | `spawned`, `changed (what)`, `removed (reason)`, `promoted (netId)`, `demoted (info)` — `info = { reason = 'rest'\|'manual'\|'forced'\|'evicted'\|'lost'\|'destroyed', destroyed, pos, rot, bucket, wear? }` |
+| `onInteract(kindOrId, fn(src, copy, action, data)) -> handle` | a press of an `interact` descriptor, after core checked bucket, audience, `perm`, distance and the cooldown |
+| `defineKind(def)` · `kinds()` · `setModelInfo(fn(kind, model) -> info \| nil)` | a plugin kind (id `'<resource>:<name>'`) · the public kind list · the one model-info provider (lod, radius, vehicle type) |
+| `setFocus(src, pos \| nil)` | pin a player's streaming focus (a cutscene camera far from the ped); nil clears |
+| `promote(id)` · `demote(id)` · `lease(id, src, ms?, seq?) -> seq` | force the networked clone · force the local copy back (`'occupied'` while someone sits in the vehicle) · reserve a promoted node for one player (other players' interactions are refused; `ms = 0` releases) |
+| `audio.play(def) -> id` · `audio.kill(id \| 'all', by?) -> true, n` · `audio.stats()` | an `audio.source` (spawn def, or `{ id, fields }` to change one; `by = src` = on a player's behalf: 1 per 5 s, audited) · the kill switch, whatever the owner |
+| `voice.start({ talker, speakers, fx?, range?, onEnd? }) -> sessionId` · `voice.stop(sessionId)` · `voice.list()` | the talker's voice from speaker nodes, panned per listener (`fx` = `megaphone` `pa` `phone` `radio` `none`) — the calling plugin authorises the talker |
+
+Errors are short codes: `unavailable def kind fields pos rot offset offrot bone motion motion_future model parent deps
+audience interact authority radius global persist bucket limit hook missing owner dependency attach duration ease
+name params horizonMs vel yaw allowChildren audio_disabled audio_streams audio_rate` (DESIGN §55.4 notes).
+
+**Client** — through the proxy; `handle`, `on` and `off` run in your own VM.
+
+| function | what it does |
+|---|---|
+| `Core.Scene.get(id)` | a copy `{ id, kind, pos, rot, fields, parent, state }` (`state` = known, warm, staged, live, retiring, failed, off) |
+| `handleOf(id)` · `idOf(entity)` | a node's entity on this client (the local copy, a plugin's entity, or the promoted clone) and back |
+| `isAreaReady(pos, radius? = 50)` · `waitAreaReady(pos, radius?, timeoutMs? = 5000)` | every node a camera there wants is materialised — and no large map change is still being projected there (maps pending) · the same, waiting in the calling thread |
+| `hold(id) -> entity` · `release(id)` | the runtime leaves the entity alone (an editor drags it); changes apply on release; owner-tracked |
+| `on(event, kindOrId \| '*', fn(id, info)) -> handle` · `off(handle)` | `live` (info.entity), `gone`, `changed` (info.changes, info.fields), `event` (info.name, params, age, pos), `enter` / `exit` (zones), `promoted` (info.netId), `demoted` |
+| `handle(kind, { create, update?, destroy?, event? }) -> ok` | draw a plugin kind (below) |
+| `stats()` | the materialiser's, the cache's and the focus reporter's counters |
+
+Every VM (lib, no hop): `Core.Scene.tierOf(radius, global?)`, `validKindId(id)`, `isPluginKind(id)`, `paintOf(id)`
+(the stable paint of a vehicle node, the same on the clone and on every local copy) and `PAINTS`; `Core.Clock.now()`
+(u32 ms: the server's game timer = the clients' network time), `diff(a, b)` (wrap-safe), `add(t, ms)`, `at(ms)`,
+`ready()`, `local2net` / `net2local`. `Core.Vehicles.setPropsLocal(veh, props)` (client) applies vehicle props to a
+LOCAL vehicle at once — no network-control wait, never yields. Vehicle wear (every VM): `Core.Scene.WEAR` (the damage /
+wear prop keys), `splitProps(props) -> cosmetic, wear` and `mergeWear(stored, readBack) -> merged` (only the WEAR keys
+of a read-back, clamped — what a clone's owner may change).
+
+**Built-in kinds** (fields in DESIGN §55.12; `*` required):
+
+| kind | fields (defaults) |
+|---|---|
+| `prop` | `model`*, `frozen` (true), `collision` (true), `invincible`, `visible` (true), `tint`, `physics` (`static` \| `local` \| `promote`), `snap = 'ground'`, `anim = { dict, clip, loop, rate, t0 }`, `room` |
+| `vehicle` | `model`*, `props` (CoreVehicleProps), `plate` (`^[%w %-]*$`), `locked`, `engine`, `lights` (0 off, 1 on, 2 full beam), `siren`, `doors`, `frozen` (true), `invincible`, `dirt`, `vtype` (automobile, bike, boat, heli, plane, submarine, trailer, train — or a vehicles.meta name mapped onto one; filled from the model when absent), `vehId` (a parked car's record) — no colours in `props` = the stable paint |
+| `ped` | `model`*, `appearance` or `variation`, `scenario`, `anim`, `weapon`, `invincible` (true), `frozen` (true), `blockEvents` (true), `health`, `room` |
+| `light` · `particle` · `marker` · `text` | a light (point / spot, colour, intensity, range, shadow, flicker) · a looped ptfx (`asset`*, `name`*) · a DrawMarker (`type`, `scale`, `color`, `drawDistance` 50) · 3D text (`text`* ≤ 128, `drawDistance` 25) |
+| `hide` · `zone` · `sound` · `group` | a world model hide (`model`*, `radius`) · a Core.Geometry shape with local `enter` / `exit` events (advisory) · a game sound (`name`*, `set`, `looped`, `range`) · nothing: its children stream with it |
+| `audio.source` · `audio` | a source (no pose: `type` clip \| loop \| timeline \| stream \| voice, `url` / `file` / `items`, `loop`, `t0`, `rate`, `paused`, `volume`, `category`) · an emitter (`source`*, `range` 40, `volume`, `curve` game \| inverse \| linear, `cone`, `priority`, `occlusion`, `zone`) |
+
+Prop, vehicle, ped, marker and hide nodes also take `mapEl` / `mapType` (what Core.Maps tags its nodes with). A
+`model` the admin catalogue does not know still spawns (with default `lod` / type); only a `Core.Scene.setModelInfo`
+provider answering `false` refuses one.
+
+**Motion descriptors** (validated on the server; times are `Core.Clock` ms): `{ t = 'tween', d, to, e }` ·
+`{ t = 'path', pts (≤ 64), sp = m/s | d, loop = 'once' | 'loop' | 'pingpong', curve = 'linear' | 'catmull', face =
+'fixed' | 'path' }` · `{ t = 'spin', axis, dps }` · `{ t = 'osc', dir, amp, period, phase }` (bob / sway) ·
+`{ t = 'orbit', c, r, period, a0, cw, face }` · `{ t = 'keys', keys (≤ 128, t relative to t0), loop, smooth }`. A
+plan more than 24 h ahead is refused.
+
+**Audiences** (a gated node never enters the public cell data; each subscriber is checked): `{ players = { src… } }`,
+`{ faction = id }`, `{ perm = 'x' }`, `{ editors = true }` (admin editor mode / draft buckets), `{ near = metres }`,
+`{ fn = function(src, nodeId) … end }` (synchronous — a yield counts as "no") — one key per table, combined with
+`{ any = { … } }` / `{ all = { … } }`. A child inherits every ancestor's audience. Persistent nodes cannot use
+`players` or `fn`.
+
+**Interactions**: `interact = { { action = 'use', label = 'Use', distance = 2.0, icon?, description?, perm?, cooldownMs
+= 500, data?, prompt = { world?, offsetZ?, range? } }, … }` (≤ 4) — one `Core.Interactions` entry per descriptor
+while the node exists; the press goes to `Scene.onInteract`.
+
+**Promotion policy** (`authority`, kind default or per node): `{ mode = 'local' | 'promote' | 'networked', proximity,
+enter, damage, actions = { … }, restMs = 3000, idleMs = 20000, onDestroyed = 'keep' | 'remove' }`. Vehicles default
+to `promote` with `proximity = 20` (players on foot), `enter` and `damage`; props and peds stay local (a prop with
+`physics = 'promote'` promotes on damage). Parked cars and map vehicles use `{ mode = 'local' }` (getting in, damage or
+an action promotes them, walking past does not). Moving or changing the fields of a promoted node demotes it first.
+
+### Examples
+
+A prop with an interaction:
+
+```lua
+-- server
+local atm = Core.Scene.spawn({
+    kind = 'prop', model = 'prop_atm_01', pos = vector3(147.4, -1035.8, 29.34), rot = vector3(0.0, 0.0, 160.0),
+    interact = { { action = 'use', label = 'Use ATM', distance = 1.5, prompt = { world = true, offsetZ = 1.0 } } },
+})
+Core.Scene.onInteract(atm, function(src, node, action)
+    -- core already checked the bucket, the audience, the distance to the node and the cooldown
+    Core.Notify.send(src, 'Welcome to Fleeca', 'info')
+end)
+```
+
+An audio source played through two emitters on a speaker prop (a radio on the beach):
+
+```lua
+-- server. Once, beforehand (admin panel → Settings → Scene audio, or the console):
+--   Core.Settings.set('scene.audio.allowHosts', { 'ice1.somafm.com' })
+local speaker = Core.Scene.spawn({ kind = 'prop', model = 'prop_speaker_06', pos = vector3(-1386.0, -618.5, 30.3) })
+local radio = Core.Scene.audio.play({ fields = { type = 'stream', url = 'https://ice1.somafm.com/groovesalad-128-mp3',
+    category = 'music', volume = 0.8 } })
+for _, side in ipairs({ -0.4, 0.4 }) do             -- children ride the speaker; tier and cell come from the root
+    Core.Scene.spawn({ kind = 'audio', parent = speaker, offset = vector3(side, 0.0, 1.0),
+        fields = { source = radio, range = 45, curve = 'game' } })
+end
+-- later: Core.Scene.audio.kill(radio) removes the source and both emitters
+```
+
+A plugin kind (`resources/fireworks`, owner-checked: the id prefix is the resource):
+
+```lua
+-- server
+Core.Scene.defineKind({ id = 'fireworks:battery', class = 'custom', handler = 'fireworks', radius = 250,
+    fields = { { name = 'shots', type = 'integer', min = 1, max = 100, default = 25 } } })
+local id = Core.Scene.spawn({ kind = 'fireworks:battery', pos = vector3(-1600.0, -1100.0, 13.0),
+    fields = { shots = 40 } })
+Core.Scene.emit(id, 'launch', { seed = 7 })          -- reaches the clients near it, once
+
+-- client: core decides WHEN (radius, budget, priority, fades, visibility-safe deletes), this decides WHAT
+Core.Scene.handle('fireworks:battery', {
+    create = function(node)                           -- may yield: core waits up to 5 s for the entity
+        local model = GetHashKey('ind_prop_firework_03')
+        if not Core.Streaming.requestModel(model, 3000) then return nil end
+        local entity = CreateObjectNoOffset(model, node.pos.x, node.pos.y, node.pos.z, false, false, false)
+        Core.Streaming.releaseModel(model)
+        return entity
+    end,
+    destroy = function(node, entity) if entity and DoesEntityExist(entity) then DeleteEntity(entity) end end,
+    event = function(node, entity, name, params, age)
+        if name == 'launch' and age < 2000 then --[[ start the particle show, seeded by params.seed ]] end
+    end,
+})
+```
+
+`create` returns a LOCAL entity (or nil); core then fades it, reports it through `handleOf` / `idOf`, attaches
+children to it, and asks `destroy` when the node is no longer wanted. A player ped, a networked entity or one core
+owns is refused. `restart fireworks` destroys its entities and claims again on start.
+
+### Settings, audio preferences, diagnostics
+
+- `scene.audio.enabled` (true, replicated): off = every client stops all world audio at once and new sources are
+  refused (`audio_disabled`); the nodes stay. `scene.audio.allowHosts` (empty, replicated): `host`, `*.domain`,
+  `*`; https only, redirects and HLS segments must stay inside the list. `scene.audio.maxStreams` (8): live stream
+  sources server-wide.
+- Codecs: MP3, Ogg / Opus / Vorbis, FLAC, WebM, AAC / M4A (probe P8, 2026-09-26: FiveM's CEF plays AAC —
+  `Config.Scene.Audio.AllowAac = true`, `false` refuses it again); WAV for clips, loops and timelines; `http://` never
+  plays in the CEF (mixed content). Playlists (m3u, m3u8, pls, xspf) resolve on the server for streams. Icecast
+  titles land in the source's `title` field every 20 s.
+- `/audio volume <0-100> [master|music|sfx|ambience|voice]`, `/audio hrtf on|off`, `/audio streams on|off`,
+  `/audio offset <-1000..1000 ms>`, `/audio voices <1-64>`, `/audio debug on|off`, `/audio` (stats) — kept per player
+  in the client KVP; the game's own SFX / music sliders are mirrored on top, and the pause menu ducks everything.
+  `/audiodebug` toggles the engine's once-a-second stats (voices real / virtual, decoders, drift, clock offset).
+
+### In-game checklist (scene streaming — not run yet)
+
+Probes first (`resources/scene_probe`, dev-only — its `README.md` has the exact lines to read and what each result
+decides; ≈ 45 minutes, a second client for 44, 51 and optionally 48). Every result prints in F8 as `[scene_probe] …`
+and on the server console; `RESULT` lines are the answers. **Run once on 2026-09-26** (report
+`scene_probe/data/report_20260926_222136.txt`, results in DESIGN §55.24): the fade band, the clock, the alpha slots,
+the pools, the clone ceiling (≈ 80 networked objects per client), AAC and the submixes are settled. **Still to re-run:**
+43 (P2 in the slider / scope / first-person / vehicle / aircraft contexts — only on foot was sampled), 47 (P6, which
+crashed on the client's missing `os` and is fixed now) and 49 (P8's https live-stream row with another stream — the
+test stream answered 403).
+
+41. **Deploy the probes:** `fxserver deploy scene_probe --no-ensure`, then `refresh` and `ensure scene_probe` on the
+    console (never add it to server.cfg); give yourself the ACE `scene_probe.use` (or `command`); `/sprobe list`.
+42. **P1 engine fade:** in an open flat area `/sprobe p1` and walk straight to the bench, again driving; then
+    `/sprobe p1 in` (expect a pop there).
+43. **P2 LOD scale:** `/sprobe p2 120` — for two minutes move the Extended Distance Scaling slider (0 / 50 / 100 %),
+    aim a sniper scope, go first person, sit in a car, fly a helicopter.
+44. **P3 clock:** `/sprobe p3 600` (ten minutes of normal play), then `/sprobe p3flash` with two clients side by side,
+    filmed with one camera.
+45. **P4 alpha slots:** `/sprobe p4`, count the translucent cones when asked; `/sprobe p4 steps` with a screenshot per
+    alpha level. Late in a session (it may keep slots until the game restarts).
+46. **P5 pools:** `/sprobe p5 baseline` at Legion Square, Del Perro pier and the Vinewood hills, then `/sprobe p5` in
+    an open area; after adding `increase_pool_size "Object" 2000` again as `/sprobe p5 objects 4000 5300`. It can
+    crash the game at a full pool — that is then the answer.
+47. **P6 costs:** `/sprobe p6`, standing still in an open area.
+48. **P7 clones:** `/sprobe p7`, standing still (the Adder's clone delay, then 50 / 80 / 120 networked cones);
+    repeat with more players online if you can.
+49. **P8 NUI codecs:** `/sprobe p8` (or with an `http://` and an `https://` Icecast URL) — nothing to do.
+50. **P9 NUI audio vs the game:** `/sprobe p9 tone 60` while moving the pause-menu audio sliders, opening the pause
+    menu and alt-tabbing; then `/sprobe p9 hrtf` watching the frame rate.
+51. **P10 submixes:** `/sprobe p10` once per game session, then `/sprobe p10 order <id>` and `/sprobe p10 pan <id>`
+    with a second player talking (`setr voice_useNativeAudio true`): which phase was hard left, smooth or choppy?
+52. **P11 collision:** `/sprobe p11` outside and inside a shop, `/sprobe p11 far`, `/sprobe p11 far nofreeze`; again
+    right after a 1–3 km teleport.
+53. **P12 ordering:** `/sprobe p12` (optionally `/sprobe p12 512`, and with 2 % packet loss).
+54. **Report:** `/sprobe report` (or `fxclient exec --server sprobe_report`) saves `scene_probe/data/report_<time>.txt`
+    — hand it back; DESIGN §55.24 records the first run's results, the re-runs above complete them.
+
+Core.Scene itself (throwaway server commands in `core_example` call the API; a second client where it says so):
+
+55. **Start:** the two server.cfg lines above and `Config.Scene.ObjectPool = 5300`, `refresh`, `restart core`,
+    `ensure core_example` → no scene error on either console; `/scene` prints counters, `/scene debug` shows the
+    overlay.
+56. **No pop-in:** spawn 300 `prop` nodes along a road (benches, bins, cones) and drive past at speed, then walk →
+    props appear through the engine's own fade, never pop at a visible distance, never vanish in view; turn around →
+    what you just saw is still there for a moment (visibility-safe deletes). The same with the Extended Distance
+    Scaling slider at 100 %.
+57. **Interaction:** the ATM example → the world dot, `E` fires the handler exactly once; from 10 m away
+    `TriggerServerEvent('core:scene:interact', <id>, 'use')` in F8 does nothing (the reach is `distance` + 2 m);
+    spamming `E` respects the 500 ms cooldown.
+58. **Everyone sees the same:** with a second client, a `spin` sign, a bobbing buoy (`osc`) and a looping `path`
+    (a small tram) — both screens show the same pose at the same time (film them); `Scene.drive` a boat in a circle →
+    the second client sees it glide, no jumps.
+59. **Gated nodes:** a prop with `audience = { faction = '<your faction>' }` → only members see it and can use it;
+    leave the faction → it disappears at once; `audience = { editors = true }` → only in the admin editor.
+60. **Buckets:** `Core.Player.setBucket(<id>, 5)` next to your props → they vanish, bucket 5's content appears;
+    back to 0 → everything returns, nothing from bucket 5 lingers.
+61. **Teleport:** `Core.Player.setCoords` onto a spot surrounded by nodes → you land after the area is ready, the
+    props are there, nothing pops in around you.
+62. **Promotion:** a `vehicle` node with the class default authority (`Core.Scene.spawn({ kind = 'vehicle', … })`);
+    walk up → it turns networked (same look, same paint, no blink) and the second client still sees it; get in and
+    drive; park it, walk 30 m away → after ~20 s it is a local copy again, where you left it. Shoot a parked one → it
+    promotes too.
+63. **Plugin kind:** the fireworks example → the battery appears in range, `launch` fires once; `restart fireworks`
+    → its entities go and come back; `restart core` → the kind is claimed again.
+64. **World audio:** the radio example → music from the speaker; turn around → the stereo image follows; behind a
+    wall / in a closed car / under water it is muffled; the second client hears the same song at the same position
+    (± a fraction of a second); `/audio volume music 30` and the game's music slider both lower it; the pause menu
+    ducks it; `scene.audio.enabled = false` silences everyone at once. `/audiodebug` shows the voices.
+65. **Voice through speakers:** with pma-voice and `setr voice_useNativeAudio true`, `Core.Scene.voice.start({ talker
+    = <A>, speakers = { <speaker id> }, fx = 'megaphone' })` → B hears A from the speaker, panned as B turns, with the
+    megaphone filter; B walks beyond range + 30 m → silent; `voice.stop` → A's voice is normal again for B.
+66. **resmon:** standing still among 2,000 cached nodes, `resmon 1` on core stays at the idle `0.00–0.01 ms`; flying
+    through dense content stays within budget; `Core.Scene.stats().flushMs` on the server stays low.
+
+Phase D — map content, inventory drops, player attachments and parked vehicles on Core.Scene (2026-09-27):
+
+67. **Maps in the editor:** open a draft in the admin editor and place a prop, a vehicle, a ped, a marker, a hide and a
+    zone → each appears at once for you; `/scene debug` lists their nodes. A second player in the target bucket sees
+    nothing until you publish, then everything but the zone (an editors-only preview). Drag the vehicle → it moves in
+    place and keeps its paint; `Core.Maps.stats()` in F8 counts the elements and previews.
+68. **A map vehicle promotes:** walk up to a published map vehicle → it stays a local copy; get in → it turns
+    networked with the same look (no blink); drive a bit, then `Core.Maps.respawn(<mapId>)` from a throwaway command →
+    it is back at its authored spot as a local copy. A map hide over a world bench still hides it, and deleting the
+    hide brings the bench back.
+69. **Inventory drops:** drop an item → it lands on the ground and shows the `<label> x<count>` world prompt; a
+    second player sees it at the same spot; pick it up → it fades for both. Drop a weapon → its own weapon object
+    shows (not the fallback model). `restart inventory` → the drops come back where they were.
+70. **Attachments:** `Core.Attachments.add(<id>, { model = 'prop_cs_beer_bot_01' })` → a bottle in your right hand,
+    seen by a second player too; die and respawn, change your model, switch the bucket → it stays on your hand;
+    `restart core` → it comes back after the load; `Core.Attachments.remove` → it fades.
+71. **Parked cars:** persist a car (`Core.Vehicles.persist(netId)` from a throwaway command), get out, walk 60 m away
+    and wait ~40 s → it parks (`Core.Vehicles.getInfoByRecord(<vehId>).parked` is a node id; `/scene debug` shows a
+    vehicle node). Walk back → it stays a local copy (parked cars do not promote on proximity). Press `U` next to
+    the parked copy → the lock toggles (a second player without keys gets "You have no keys for this vehicle"); try
+    to get in → it promotes and you are tasked into it. `restart core` with parked cars around → they stand where
+    they were, nothing spawns twice, and a `restoreRecord` of one answers `'parked'`.
+
+Final review round (RV4–RV6, fix runs FX1a–FX4):
+
+72. **A damaged parked car is silent:** crash a persisted car (burst two tyres, break a window), get out and let it
+    park (~40 s, 60 m away). Walk back and forth so it streams out and in several times → it comes back with FLAT
+    tyres and the missing window, and no glass-shatter or tyre-burst sound plays as it appears. Get in → the clone
+    keeps the damage; a second player who takes it over later does not see it repaired or refuelled.
+73. **Attachment look (`isPed`):** `Core.Attachments.add(<id>, { model = 'prop_cs_beer_bot_01' })` (and one prop with a
+    non-zero `rotation`) → the object sits in the hand at the same angle as before phase D (compare an old screenshot;
+    the attach now passes `isPed = true`). Fill the scene (a test server with a tiny `OwnerCaps.core`) → `add` still
+    answers an id and the prop appears once there is room.
+74. **A large map activation:** activate a map with several thousand elements while standing inside it → the server
+    does not hitch (resmon / `fxserver logs`: no long tick), the content fills in over a few seconds, and a teleport
+    into the area waits until it is there (`Core.Scene.waitAreaReady` answers not-ready while the map is pending).
+75. **A parked car taken into an instance:** get into a parked car (it promotes), then
+    `Core.Player.setCoords(<id>, <coords>, nil, { withVehicle = true, bucket = 7 })` → you and the car arrive in
+    bucket 7; leave it and walk away → it parks in bucket 7 (never back in its old bucket); `getInfoByRecord` shows
+    `position.bucket = 7`.
+76. **A wrecked parked car does not come back:** blow up a promoted parked car → after the wreck is gone it does NOT
+    reappear at its parking spot; `getInfoByRecord(<vehId>).destroyed` is true, `restoreRecord` answers
+    `'destroyed'`, and `spawnRecord` brings it back (the mark clears).

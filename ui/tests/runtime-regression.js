@@ -804,6 +804,121 @@
     m = mark(); startCheck('c40-close'); await frame(); send({ action: 'skillcheck:close', id: 'c40-close' }); await sleep(600)
     check('host close stops animation and late result', !store.skillcheck.visible && !find(m, 'skillcheck_result'))
 
+    // ================================================================= 15. scene audio engine (§55.16)
+    // The REAL Web Audio engine of the built shell, driven through the same `audio:*` messages Lua
+    // sends. The tone is a WAV generated here and handed over as a blob: URL (dev pages accept it).
+    // Signal-level checks need a RUNNING context: FiveM's CEF has autoplay-policy=no-user-gesture-
+    // required; a stock headless Chrome holds the context suspended, so run the suites with
+    // AGENT_BROWSER_ARGS=--autoplay-policy=no-user-gesture-required to include them.
+    {
+      const A = window.__core.audio
+      check('audio: the dev seam exists', !!A)
+      check('audio: no engine and no AudioContext before the first audio:* message', !!A && A.stats().context === null)
+      const toneUrl = (() => {
+        const sr = 48000
+        const n = sr
+        const buf = new ArrayBuffer(44 + n * 2)
+        const v = new DataView(buf)
+        const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)) }
+        w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ')
+        v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, sr, true)
+        v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true)
+        for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.round(Math.sin((2 * Math.PI * 440 * i) / sr) * 0.5 * 32767), true)
+        return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }))
+      })()
+      const NET = 7000000
+      const net = () => Math.floor(NET + performance.now())
+      const afeed = (extra) => send(Object.assign({
+        action: 'audio:feed', t: net(), lx: 0, ly: 0, lz: 0, fx: 0, fy: 1, fz: 0, ux: 0, uy: 0, uz: 1,
+        master: 1, music: 1, sfx: 1, ambience: 1, paused: false,
+      }, extra || {}))
+      const aloop = (id) => send({ action: 'audio:source', id, type: 'loop', url: toneUrl, t0: net(), category: 'sfx' })
+      const aemit = (id, source, x, y) => send({ action: 'audio:emitter', id, source, x, y, z: 0, range: 40, curve: 'linear', ref: 1 })
+      afeed()
+      aloop(9001)
+      aemit(9101, 9001, 2, 3)
+      check('audio: the engine chunk loads on the first message', (await A.ready()) === true)
+      const first = A.stats()
+      check('audio: one AudioContext after the first source', !!first.context, JSON.stringify(first))
+      check('audio: a real sample rate', !!first.context && first.context.sampleRate >= 22050)
+      const running = !!first.context && first.context.state === 'running'
+      if (!running) note('AudioContext is ' + (first.context && first.context.state) + ' — the browser holds autoplay; signal checks skipped (FiveM: autoplay-policy=no-user-gesture-required)')
+      check('audio: the decoded tone becomes a real voice', await waitFor(() => A.stats().voices.real === 1, 5000), JSON.stringify(A.stats().voices))
+      const info = A.inspect(9101)
+      check('audio: every panner param is k-rate', !!info && !!info.voice && info.voice.pannerRates.length === 6 && info.voice.pannerRates.every((r) => r === 'k-rate'), JSON.stringify(info && info.voice))
+      check('audio: every listener param is k-rate', !!info && info.listenerRates.length === 9 && info.listenerRates.every((r) => r === 'k-rate'), JSON.stringify(info && info.listenerRates))
+      check('audio: the panner only pans (rolloffFactor 0, equal-power)', !!info && !!info.voice && info.voice.rolloff === 0 && info.voice.model === 'equalpower')
+      check('audio: the occlusion/air lowpass is k-rate', !!info && !!info.voice && info.voice.filterRates.every((r) => r === 'k-rate'))
+      check('audio: the voice level follows the linear curve (5 m of 40, ref 1)', !!info && Math.abs(info.level - (1 - (Math.hypot(2, 3) - 1) / 39)) < 1e-6, info && String(info.level))
+      if (running) {
+        // a new context's output clock needs ~0.2–0.4 s before a loop is scheduled on it
+        let peak = 0
+        const heard = await waitFor(async () => { peak = await A.level(120); return peak > 0.02 }, 3000)
+        check('audio: the tone reaches the output (limiter tap)', heard, 'peak ' + peak)
+      }
+      send({ action: 'audio:prefs', maxVoices: 2 })
+      for (let i = 0; i < 4; i++) {
+        aloop(9002 + i)
+        aemit(9102 + i, 9002 + i, 4 + i * 3, 0)
+      }
+      check('audio: maxVoices 2 — two real voices, three virtual', await waitFor(() => { const v = A.stats().voices; return v.real === 2 && v.virtual === 3 }, 4000), JSON.stringify(A.stats().voices))
+      check('audio: the nearest emitters are the real ones', A.inspect(9101).real && A.inspect(9102).real && !A.inspect(9105).real)
+      send({ action: 'audio:prefs', maxVoices: 32 })
+      check('audio: lifting the budget makes all five real', await waitFor(() => A.stats().voices.real === 5, 3000), JSON.stringify(A.stats().voices))
+      send({ action: 'audio:remove', ids: [9101], fadeMs: 300 })
+      await sleep(80)
+      const mid = A.stats().voices
+      check('audio: remove fades — the chain is still alive 80 ms into a 300 ms fade', mid.fading >= 1 && mid.real === 4, JSON.stringify(mid))
+      check('audio: remove — released after the fade', await waitFor(() => A.stats().voices.fading === 0, 1500), JSON.stringify(A.stats().voices))
+      const am = mark()
+      send({ action: 'audio:source', id: 9200, type: 'clip', url: 'ftp://example.com/x.mp3' })
+      check('audio: a bad URL reaches Lua as ui_event audio:error { id, code }', await waitFor(() => find(am, 'ui_event', (b) => b.page === 'audio' && b.event === 'error' && !!b.data && b.data.id === 9200 && b.data.code === 'bad_url'), 1000))
+      send({ action: 'audio:remove', ids: [9001, 9002, 9003, 9004, 9005, 9102, 9103, 9104, 9105], fadeMs: 20 })
+      check('audio: everything removed', await waitFor(() => { const st = A.stats(); return st.voices.real === 0 && st.voices.fading === 0 && st.sources.total === 0 && st.emitters === 0 }, 2000), JSON.stringify(A.stats()))
+      // RV3 F9, the decode bound: 60 s of 8 kHz 8-bit mono is only 480 KB, but would decode to 23 MB of float
+      // PCM. The browser's own demuxer measures it (a metadata-only probe) and it plays through an element.
+      const longUrl = (() => {
+        const sr = 8000
+        const n = sr * 60
+        const buf = new ArrayBuffer(44 + n)
+        const v = new DataView(buf)
+        const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)) }
+        w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ')
+        v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, sr, true)
+        v.setUint32(28, sr, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true); w(36, 'data'); v.setUint32(40, n, true)
+        for (let i = 0; i < n; i++) v.setUint8(44 + i, 128 + Math.round(Math.sin((2 * Math.PI * 330 * i) / sr) * 60))
+        return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }))
+      })()
+      const decodesBefore = A.stats().loader.decodes
+      send({ action: 'audio:source', id: 9300, type: 'loop', url: longUrl, t0: net(), category: 'sfx' })
+      send({ action: 'audio:emitter', id: 9400, source: 9300, x: 2, y: 2, z: 0, range: 40, curve: 'linear', ref: 1 })
+      check('audio: a short file that is 60 s long is measured and routed to a media element', await waitFor(() => A.stats().sources.large === 1, 4000), JSON.stringify(A.stats().sources))
+      check('audio: … never through decodeAudioData', A.stats().loader.decodes === decodesBefore, JSON.stringify(A.stats().loader))
+      check('audio: … and still becomes a real voice (decoder granted)', await waitFor(() => !!A.inspect(9400) && A.inspect(9400).real, 4000), JSON.stringify(A.inspect(9400)))
+      if (running) {
+        let longPeak = 0
+        const heardLong = await waitFor(async () => { longPeak = await A.level(120); return longPeak > 0.02 }, 4000)
+        check('audio: the element-played file reaches the output', heardLong, 'peak ' + longPeak)
+      }
+      send({ action: 'audio:remove', ids: [9400, 9300], fadeMs: 20 })
+      check('audio: the element source is released', await waitFor(() => A.stats().sources.total === 0, 2000))
+      // trusted = false (a play on a player's behalf): never decoded, whatever its size — an element plays it
+      const decodesUntrusted = A.stats().loader.decodes
+      send({ action: 'audio:source', id: 9310, type: 'loop', url: toneUrl, t0: net(), category: 'sfx', trusted: false })
+      send({ action: 'audio:emitter', id: 9410, source: 9310, x: 2, y: 2, z: 0, range: 40, curve: 'linear', ref: 1 })
+      check('audio: an untrusted source becomes a real voice through a media element', await waitFor(() => !!A.inspect(9410) && A.inspect(9410).real, 4000), JSON.stringify(A.inspect(9410)))
+      check('audio: … without decodeAudioData', A.stats().loader.decodes === decodesUntrusted && A.stats().sources.decoders >= 1, JSON.stringify(A.stats()))
+      if (running) {
+        let untrustedPeak = 0
+        const heardUntrusted = await waitFor(async () => { untrustedPeak = await A.level(120); return untrustedPeak > 0.02 }, 4000)
+        check('audio: the untrusted element reaches the output', heardUntrusted, 'peak ' + untrustedPeak)
+      }
+      send({ action: 'audio:remove', ids: [9410, 9310], fadeMs: 20 })
+      check('audio: the untrusted source is released', await waitFor(() => A.stats().sources.total === 0, 2000))
+      URL.revokeObjectURL(longUrl)
+      URL.revokeObjectURL(toneUrl)
+    }
+
     say('PASS ' + pass + '/' + total)
     return out.join('\n')
   } finally {

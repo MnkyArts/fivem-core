@@ -832,3 +832,86 @@ Verification (orchestrator, 2026-09-26, after the hotfix and the review fixes): 
 Deploy: `refresh`, `restart core`, then `ensure admin` and restart every resource that uses `Core.Keys` (inventory …) —
 the key lib is compiled into each VM, an old copy never checks the capture. In-game checklist: core README items 38–40
 (§54) and admin README §3 / §6 / §7 / §10.
+
+## Core.Scene build (DESIGN §55) — 2026-09-26/27
+
+Liam (2026-09-26): "an entity streaming system … objects, vehicles, peds, audio" — researched first (R1–R9 +
+RESEARCH.md in `resources/research/entity-streaming/`, outside this repository), then built in one run as phases
+0 + A + B + C + D; his decisions are at the top of DESIGN §55. The binding interfaces between the files lived in
+`<SCRATCH>/scene-build/INTERFACES.md`, every accepted deviation in `PENDING-DOCS.md`; each §55 subsection ends in
+"Implementation notes (2026-09-27 …)". Every implementer owned its files exactly (`AGENTS-MAP.md`); the orchestrator
+integrated the shared files and re-ran every gate itself.
+
+| run | scope | files | final tests |
+|---|---|---|---|
+| M0 | §55.22 fade-band fix of the old map runtime + the editor live-update bug | `client/maps_spawn.lua`, `client/maps.lua`, `server/maps_regions.lua` (sent-memory reset on an audience change), `tests/client_maps_tests.lua`, `tests/maps_regions_tests.lua` | client_maps 294, maps_regions 288 — superseded by phase D |
+| P0 | in-game probes P1–P12 (dev-only, standalone) | `resources/scene_probe/**` | probe_tests 134, fxlint 0/0/0; deployed as a symlink, not in server.cfg |
+| A1 | Clock, codec (+ RESET 0x06), motion (+ `ph`, `a0`, rebase) | `lib/clock/shared.lua`, `shared/scene_codec.lua`, `shared/scene_motion.lua`, `tests/run_tests.lua`, `tests/scene_codec_tests.lua`, `tests/scene_motion_tests.lua` | run_tests 468, scene_codec 262, scene_motion 328 |
+| A2 | server kinds, store, API | `server/scene_kinds.lua`, `server/scene_store.lua` (split), `server/scene.lua`, `tests/scene_server_tests.lua`, `tests/scene_server_harness.lua` | scene_server 766 (937 after I1) |
+| A3a | server index | `server/scene_index.lua`, `tests/scene_index_tests.lua` | scene_index 818 (830 after I1) |
+| A3b | interest, gated audiences, flush, benchmark | `server/scene_interest.lua`, `server/scene_gated.lua` (split), `server/scene_flush.lua`, `server/playergrid.lua` (`positionOf`), `tests/scene_interest_tests.lua`, `tests/scene_bench.lua` | scene_interest 582 (fuzz 0 problems); bench 2000 players / 50k nodes: p50 1.50 / p99 7.55 ms per tick, 1,617 B/s per client |
+| A4 | client cache, focus reporter, API, libs | `client/scene_cache.lua`, `client/scene_focus.lua` (split), `client/scene.lua`, `lib/scene/client.lua`, `lib/scene/shared.lua`, `tests/client_scene_cache_tests.lua` | client_scene_cache 611 (624 after I1) |
+| A5 | materialiser, assets + fades, movers | `client/scene_mat_assets.lua` (split), `client/scene_materializer.lua`, `client/scene_movers.lua`, `tests/client_scene_mat_tests.lua`, `tests/client_scene_harness.lua` | client_scene_mat 631 (633 after I1) |
+| A6 | built-in client kinds | `client/scene_kinds.lua`, `client/scene_fx.lua`, `client/scene_world.lua` (split), `client/vehicles.lua` (`setPropsLocal`), `tests/client_scene_kinds_tests.lua` | client_scene_kinds 535 (588 after I1) |
+| B1 | shell audio engine | `ui/src/runtime/audio/*`, `ui/src/shell.ts`, `ui/tests/unit/audio-*.test.ts` + `audio-fakes.ts`, `ui/tests/runtime-regression.js` (section 15), `ui/package.json` (`hls.js`) | node units `# pass 377`, runtime browser 240, vue-tsc clean |
+| B2 | audio server policy + client bridge | `server/scene_audio.lua`, `client/scene_audio.lua`, `tests/scene_audio_tests.lua` | scene_audio 240 |
+| B3 | voice through world speakers | `server/scene_voice.lua`, `client/scene_voice.lua`, `tests/scene_voice_tests.lua` | scene_voice 290 |
+| C1 | promotion, demotion, leases | `server/scene_promote.lua`, `client/scene_promote.lua`, `tests/scene_promote_tests.lua` | scene_promote 298 (344 after D4+) |
+| D1s | Core.Maps server → projector onto scene nodes | `server/maps_runtime.lua` (rewrite), `server/maps_types.lua`, `server/maps.lua`, `server/maps_apply.lua` (API kept), `server/maps_regions.lua` + its suite deleted, `tests/maps_tests.lua`, `tests/maps_store_tests.lua`, `tests/maps_harness.lua` | maps 328, maps_store 200 (after the orchestrator's paint follow-up) |
+| D1c | Core.Maps client → facade + editor view | `client/maps.lua` (263), `client/maps_preview.lua` (446, new), `client/maps_spawn.lua` + `client/maps_view.lua` deleted, `tests/client_maps_tests.lua` | client_maps 257 |
+| D1a | admin editor cleanup (`mapEl` path, drag ghosts) | `resources/admin` (client/editor/*, overlay, server/actions_world, ui refs, tests, DESIGN) — recorded in its own PLAN | admin runner 3772 / 0 (by report) |
+| D2 | inventory drops as scene nodes | `resources/inventory` (server/drops, client/drops retired, manifest, config, tests, docs) | inventory runner 1995 / 0, fxlint 0/0/0 |
+| D3 | player attachments as scene nodes | `server/remote.lua` (Attachments), `client/remote.lua` (applier removed), `tests/scene_attach_tests.lua` | scene_attach 248 (259 after I1) |
+| D4 | parked vehicles | `server/vehicles.lua`, `server/vehicles_park.lua` (new), `client/vehicles.lua`, `tests/scene_parked_tests.lua`, the vehicle section of `tests/server_tests.lua` | scene_parked 332, server 1129 |
+| D4+ | parked-car follow-ups: one-shot `snCfg`, `U` on a parked copy, clone model / vtype, explicit stop order | `server/vehicles.lua`, `server/vehicles_park.lua`, `client/vehicles.lua`, `server/scene_promote.lua`, `client/scene_promote.lua`, tests scene_parked / scene_promote / server_tests | scene_parked 370, scene_promote 344, server 1129 |
+| I1 | integration fixes: `mapEl` / `mapType` fields, model-info policy, `rotOrder`, `'0x'` hashes, dead Maps sampling, hook-handle leak, `OwnerCaps`, vehicle prop removal | `server/scene_{kinds,store,index}.lua`, `server/scene.lua`, `server/remote.lua` (Attachments), `client/scene_{cache,kinds,materializer,world}.lua`, tests scene_server (+ harness) / scene_index / scene_attach / client_scene_{cache,mat,kinds} (+ harness) | the counts in the verification below |
+| DOC | documentation of runs A–C | DESIGN §55 notes (+ §52 M0 notes, §6.8), README "Scene streaming (Core.Scene)" + checklist 41–66, `types/core.lua`, AGENTS §1 / §2 / §5 / §8 | — |
+| DOC+ | phase-D doc pass + this section | DESIGN §4.6 / §6.8 / §20 / §52 / §55 notes, README (config keys, API rows, maps text, checklist 67–71), `types/core.lua` (MapRegions removed, Maps / Vehicles / Attachments / rotOrder), AGENTS §1 / §2 / §5 / §8, PLAN.md | `luac5.4 -p types/core.lua` ok; `fxref core build` (647 functions, 62 namespaces) resolves `Core.Scene.spawn` |
+| orchestrator | integration | `fxmanifest.lua`, `server/api.lua` / `client/api.lua` (internal namespaces, `Scene.prefetch`, `MapRegions` removed), `import.lua` (libs `Clock` / `Scene`, sub-namespaces), `shared/config.lua` (`Config.Scene`, `OwnerCaps`, `Config.Maps` trimmed, AutoPark keys), `scripts/check.sh`, `server/player.lua` (teleport prefetch), `client/spawn.lua` (Scene wait), the D1s paint follow-up in `server/maps_runtime.lua`, admin_probe's maps listener retired, the alpha-slot correction in DESIGN §55.11 / AGENTS §8, `html/` rebuilt | — |
+
+Review rounds (read-only, every finding demonstrated or read end to end; fixes re-tested by the owner and re-run by
+the orchestrator):
+
+| review | scope | findings | routed to |
+|---|---|---|---|
+| RV1 | server (kinds → voice files, codec, motion, clock, wiring) | 22: BLOCKER 1, HIGH 8, MEDIUM 7, LOW 6 | A2: F2, F3, F6, F8, F10, F11, F13, F20 (+ the C1 / B2 hooks); A3a: F1, F3, F6, F9, F12, F19; A3b: F2, F4, F5, F7, F9, F11, F12, F14, F15, F16, F17, F18, F21, F22; A1: the RESET op behind F17 / F18 |
+| RV2 | client (cache → scene.lua, libs, setPropsLocal, the M0 map changes) | 21: BLOCKER 1, HIGH 2, MEDIUM 8, LOW 10 | A5: F2, F3, F4, F5 (+ the maps_spawn rescale), F7, F11, F12, F16, F18, F20; A4: F1, F3, F6, F7, F8, F9, F10, F14, F15, F17; A6: F13, F19, F20, F21; A3b: the server half of F14 (RESET on a bucket change) |
+| RV3 | shell audio engine | 20: BLOCKER 1 (F9, the decode bomb), HIGH 7, MEDIUM 8, LOW 4 | B1: all twenty in the engine; B2: the Lua halves of F9 (`trusted`), F10 (`hosts`), F11 (emitter rotation), F12 (voice sources not sent) |
+| RV4 | phase-D server (projector, attachments, parked cars, drops) + the I1 changes | 14: BLOCKER 1 (F1: any clone owner rewrote a parked car's persisted props), HIGH 3, MEDIUM 6, LOW 4 | FX1a: F1 (park read-back), F5, F8, F9 (parked nodes local), F13, F14; FX1b: F1 (demotion read-back, snCfg split), F5, F6, F9, F12; FX2: F1 (kind clamps), F3 (CoreReserve), F7, F11; FX3: F2, F3 (limit retry); FX4: F4; orchestrator: F10 (Caps.vehicles 64 / modelsVehicles 32), F4 (OwnerCaps.inventory) |
+| RV5 | phase-D client | 4: HIGH 1 (F1: the `applied` report lost behind the shared cooldown), MEDIUM 2, LOW 1 | FX1b: F1; FX2: F2, F4; FX3: F3; FX1a: the silent-damage question |
+| RV6 | lifecycles end to end (maps, parked cars, attachments, drops; manifest, exports, config) | 13: HIGH 2 (F7, F13), MEDIUM 10, LOW 1 | FX1b: F1, F7, F12, F13 (with FX1a); FX1a: F2, F9, F11; FX2: F3, F4, F10; FX3: F6, F8; FX4: F5 (and F4 verified after FX2) |
+
+Verification (orchestrator, 2026-09-27, after I1 and D4+; `scripts/check.sh` exit 0): run_tests 468 · scene_codec 262 ·
+scene_motion 328 · scene_server 937 · scene_index 830 · scene_interest 582 · scene_audio 240 · scene_voice 290 ·
+scene_promote 344 · client_scene_cache 624 · client_scene_mat 633 · client_scene_kinds 588 · scene_attach 259 ·
+scene_parked 370 · maps 328 · maps_store 200 · client_maps 257 · server 1129 · client_ui 795 — all 0 failed; node units
+`# pass 377`, `# fail 0` (a single `# fail 1` DOC saw once did not come back in 10 runs); browser suites shell 125,
+kit 312, runtime 240; `fxlint core` 0 errors, 0 warnings (34 infos); scene_probe 134 / 0; inventory runner 1995 / 0;
+admin runner 3772 / 0 (by report). Known limitation: a 2,000-player join storm grows the server heap by 377 MiB with one
+~200 ms GC cycle (DESIGN §55.7 notes; the planned fix is multi-part payloads). Open: the in-game checklists — README
+steps 41–54 (scene_probe P1–P12, whose results finalise the numbers in §55.11 / §55.16 / §55.17 / §55.20) and 55–71
+(Core.Scene and phase D) — and `vehicle_system` against the new vehicle contract (DESIGN §4.6 notes).
+
+
+Final fix round (2026-09-27, after RV4–RV6; decisions D-A … D-E and the interfaces I-1 / I-2 in
+`<SCRATCH>/scene-build/BRIEF-FIX2.md`; every CONFIRMED scenario became a regression check that failed before the fix):
+
+| run | scope | files | tests after |
+|---|---|---|---|
+| FX1a | vehicles domain: wear-only read-backs (`mergeWear`) + `cleanProps`, parked authority local, wrecks (`destroyed`), `scene_clone`, vehId setters, park-at-stop + boot check, MaxParked + `vehicleAutoStored`, the live-car hand-off, silent damage on local copies, 12 wrong native names | `server/vehicles.lua` (777), `server/vehicles_park.lua` (758), `server/vehicles_fleet.lua` (557, new), `client/vehicles.lua` (667), `tests/scene_parked_tests.lua`, the vehicle section of `tests/server_tests.lua` | scene_parked 583, server 1166 |
+| FX1b | promotion engine: snCfg split (cosmetic / `once`) + `core:scene:applied`, `Scene.WEAR` / `splitProps` / `mergeWear`, ProximityShare + eviction, nodes follow clones (`R.store.follow`, `onEntityBucketChange`), lost / wrecked clones, `'occupied'`, `demoted` info, RV6 F7 / F12 client fixes | `server/scene_promote.lua` (1003), `server/scene_promote_api.lua` (344, new), `client/scene_promote.lua` (891), `lib/scene/shared.lua` (174), `tests/scene_promote_tests.lua` | scene_promote 424 |
+| FX2 | scene core: `R.store.follow`, CoreReserve, reserved fields, riders, movers sleep, the `'world'` removal, prompt clearing, props clamps, `isPed`, the maps-pending readiness hand-off | `server/scene_{kinds,store,index}.lua`, `server/scene.lua`, `client/scene_{cache,kinds,materializer,movers,world,fx}.lua`, `client/scene.lua`, tests scene_server (+ harness) / scene_index / client_scene_{cache,mat,kinds} (+ harness) | scene_server 1061, scene_index 851, client_scene_cache 636, client_scene_mat 661, client_scene_kinds 600 |
+| FX3 | maps + attachments: sliced projection worker, 'limit' retry with backoff, fading removals, local authority, `core:mapsPending` readiness; `Attachments.add` stores on a full scene | `server/maps_runtime.lua` (886), `server/maps_types.lua` (713), `client/maps.lua` (346), `server/remote.lua` (902), tests maps / maps_harness / client_maps / scene_attach | maps 442, maps_store 200, client_maps 291, scene_attach 283; admin runner 3772 |
+| FX4 | inventory drops: sliced retry with backoff, per-bucket drops, `drops_jobs.lua` split | `resources/inventory` (server/drops.lua, drops_jobs.lua, main.lua, ops.lua, api, config, tests, docs) | inventory runner 2127 / 0, fxlint 0/0/0 |
+| orchestrator | config D-E + the probe decision | `shared/config.lua` (`OwnerCaps.inventory`, `CoreReserve`, `Caps.vehicles` 64, `Caps.modelsVehicles` 32, `Promote.ProximityShare`, `Vehicles.MaxParked`, `Audio.AllowAac = true` after probe P8), `fxmanifest.lua` (the two new files), `scripts/check.sh` | scene_audio 241 (after `AllowAac`) |
+| DOC++ | final doc pass | DESIGN (§4.6, §20, §55.x "final review round" notes, §55.24 probe results), README (config keys, API rows, readiness, checklist 72–76, probe status), `types/core.lua`, AGENTS §1 / §2 / §5 / §8, this section | `luac5.4 -p types/core.lua` ok; `fxref core build` resolves `Core.Scene.mergeWear`, `Core.Vehicles.setLocked` |
+
+Final verification (orchestrator, 2026-09-27, after the fix round; `scripts/check.sh` exit 0): run_tests 468 ·
+client_ui 795 · maps 442 · maps_store 200 · client_maps 291 · scene_codec 262 · scene_motion 328 · scene_server 1061 ·
+scene_index 851 · scene_interest 582 · client_scene_cache 636 · client_scene_mat 661 · client_scene_kinds 600 ·
+scene_audio 240 (241 once `AllowAac = true` shipped after probe P8) · scene_voice 290 · scene_promote 424 ·
+scene_attach 283 · scene_parked 583 · server 1166 — all 0 failed; node units `# pass 377`; `fxlint core` 0 errors,
+0 warnings (34 infos); inventory runner 2127 / 0. In game (Liam, 2026-09-26 22:21 UTC): scene_probe P1–P12 ran once —
+the fade band, the clock (p95 11.5 ms), the alpha slots, the pools, the ≈ 80 networked-object ceiling per client, AAC
+and the submixes are settled (DESIGN §55.24); P2 (contexts), P6 (fixed) and P8's https stream row are to be re-run.
+Open: the README in-game checklist steps 55–76.

@@ -9,7 +9,7 @@ on `core`. This file is the working agreement for anyone (human or agent) changi
 
 | file | role |
 |---|---|
-| `DESIGN.md` | **The binding contract.** ~5,200 lines, sections §0–§53. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes; **§37 is the design system** (tokens, classes, the component catalogue — it replaces the old §7.2 look); **§38 is the runtime UI platform** and supersedes §7.1, §7.4, §6.10's focus paragraph and §9's message budget; **§39 is the vitals HUD** (the bottom-left strip: mic tile, HEALTH / ARMOR plates, food / drink bars) and supersedes the HUD of §7.2 / §21 and the `Hud` / `StatsBars` rows of §37.6; **§41–§53 are the admin platform** (each section ends in "Implementation notes (2026-09-26)" — the deviations are stated there). Read the section you touch before editing code, and update it *with* the code — never after, never not. |
+| `DESIGN.md` | **The binding contract.** ~7,450 lines, sections §0–§55. Later sections override earlier ones; §14, §29, §30, §30.1 are implementation notes and review-driven changes; **§37 is the design system** (tokens, classes, the component catalogue — it replaces the old §7.2 look); **§38 is the runtime UI platform** and supersedes §7.1, §7.4, §6.10's focus paragraph and §9's message budget; **§39 is the vitals HUD** (the bottom-left strip: mic tile, HEALTH / ARMOR plates, food / drink bars) and supersedes the HUD of §7.2 / §21 and the `Hud` / `StatsBars` rows of §37.6; **§41–§53 are the admin platform** (each section ends in "Implementation notes (2026-09-26)" — the deviations are stated there); **§54 is editor focus** (HUD hiding, key capture); **§55 is scene streaming** (`Core.Scene`, `Core.Clock`; each subsection ends in "Implementation notes (2026-09-27 …)", and §55.21 phase D — done 2026-09-27 — supersedes the §52.3 / §52.4 region runtime and parts of §20 and §4.6). Read the section you touch before editing code, and update it *with* the code — never after, never not. |
 | `ui/sdk/src/contract.ts` | **The TypeScript half of the contract** (§38.6): `API_VERSION`, `CoreUIHost` and every type the shell and a plugin share. Both sides import it, so the compiler proves the shell implements what the SDK calls. Change it and DESIGN §38 in the same commit; a breaking change bumps `API_VERSION`. |
 | `README.md` | Integrator guide: install, config keys, API cheat sheet, plugin how-to, in-game checklist, troubleshooting. Update it whenever an API, config key or command changes. |
 | `PLAN.md` | History of the build runs (who owned which file). Append a run table for multi-agent work. |
@@ -24,8 +24,15 @@ DESIGN §41–§53 add the admin platform that every plugin can use: page input 
 rendered-camera raycasts (§42), `Core.Schema` (§43), permissions v2 with ranked groups in `perm_groups` (§44),
 `Core.Settings` (§45), `Core.Audit` (§46), `Core.Bans` (§47), sticky player states + teleport options + account
 reader (§48), target selectors (§49), `Core.Buckets` (§50), `Core.Admin` contributions and the one dispatch path
-(§51), `Core.Maps` with region streaming (§52) and seven kit components (§53). The admin plugin itself — panel,
-editor, sanctions, reports — is `resources/admin` with its own `DESIGN.md`; core never depends on it.
+(§51), `Core.Maps` (§52; since phase D an authoring layer on Core.Scene) and seven kit components (§53). The admin
+plugin itself — panel, editor, sanctions, reports — is `resources/admin` with its own `DESIGN.md`; core never depends
+on it.
+
+DESIGN §55 adds `Core.Scene`: server-owned nodes (props, vehicles, peds, lights, particles, markers, texts, hides,
+zones, sounds, positional audio, voice speakers, plugin kinds) streamed by interest cells and materialised LOCALLY on
+each client (non-networked entities; OneSync only while a node is promoted), motion and media on one clock
+(`Core.Clock`), a binary wire, budgets from FiveM's pools. Phase D (2026-09-27) moved `Core.Maps`, inventory drops,
+player attachments and parked vehicles onto it (§55.21).
 
 ## 2. Layout
 
@@ -42,16 +49,38 @@ server/bans_identity.lua internal Core.BanIdentity (§47): identity reads, onlin
 server/buckets.lua      Core.Buckets (§50); server/settings.lua = Core.Settings (§45) + core's maps/audit sections
 server/adminapi.lua     Core.Admin (§51): registry, snapshot, duty/modes/staff/echo; adminapi_dispatch.lua = Admin.run,
                         core:admin:run, chat commands — the two MUST stay adjacent in the manifest (private hand-off)
-server/maps_*.lua       Core.Maps (§52): maps_types → maps_runtime → maps → maps_apply (order required; they share the
-                        internal Core.MapsRuntime); maps_regions.lua = Core.MapRegions (§52.3, internal: regions/packs)
+server/maps_*.lua       Core.Maps (§52, §55.21.1): maps_types → maps_runtime (the PROJECTOR: every shown element is one
+                        Core.Scene node owned by core, fields.mapEl = the uid) → maps → maps_apply (order required; they
+                        share the internal Core.MapsRuntime). maps_regions.lua / Core.MapRegions are gone
+server/vehicles_park.lua parked vehicles (§4.6 notes, §55.21.4): loads RIGHT AFTER server/vehicles.lua and takes its
+                        live maps through the one-shot global CoreVehiclesPark (asserted) — park, getInfoByRecord, the
+                        vehId setters, the wrapped record calls, core:server:parkedLock — and passes the global on to
+server/vehicles_fleet.lua (right after it; clears the global): AutoPark, MaxParked, the boot check, park-at-stop
+server/scene_*.lua      Core.Scene (§55), ORDER REQUIRED (each asserts its predecessor): scene_kinds (creates the
+                        internal Core.SceneRuntime: kinds, validators) → scene_index (cells, versions, journals, packs,
+                        movers) → scene_interest (focus, windows) → scene_gated (audiences, PRIV) → scene_flush (the
+                        20 Hz flush) → scene_store (records, hooks, persistence; hands over once via R.storeInternal)
+                        → scene (the API) → scene_promote (the promotion engine) → scene_promote_api (its entry points:
+                        takes R.promoteInternal once) → scene_audio → scene_voice; all right after maps_apply.lua
 server/ui_plugins.lua   start-up validation of every resource's ui/dist, printed to the SERVER console
 client/*.lua            world scan, interactions, markers, doors, ui shell bridge, blur, visibility, …
 client/ui_plugins.lua   discovery (core_ui metadata → manifest.json), plugin:register/unregister, /uiplugins /uidev /uiinspect
 client/settings.lua     the replicated read side of Core.Settings (GlobalState cs:<key>, hook settingChanged)
 client/adminstate.lua   the private staff state (§51): core:admin:self/staffState(s) → Core.Admin.getSelf/getStaffStates,
                         hooks staffSelfChanged/staffStateChanged; loads right after shared/hooks.lua (before its readers)
-client/maps*.lua        the map runtime (§52.4): maps_spawn (engine) → maps_view (draw loop, hides, editor view) → maps
-                        (wire, regions, window, API); one-shot global hand-off, nothing internal on Core
+client/maps*.lua        the map client (§55.21.1): maps_preview (the map:data editor view) → maps (the §52.4 API as a
+                        facade over Core.Scene); both sit INSIDE the scene block (between scene_voice and scene: they
+                        use CoreSceneRuntime). maps_spawn.lua / maps_view.lua are gone
+client/scene_*.lua      the client half of Core.Scene (§55.10–§55.17), ORDER REQUIRED: scene_cache (creates the one-shot
+                        global CoreSceneRuntime) → scene_focus → scene_mat_assets → scene_materializer → scene_kinds →
+                        scene_fx → scene_world → scene_movers → scene_promote → scene_audio → scene_voice →
+                        maps_preview → maps → scene (API, /scene, plugin-kind bridge; clears the global); all right
+                        after client/spawn.lua
+shared/scene_codec.lua  Core.SceneCodec (§55.8, the binary wire) + shared/scene_motion.lua = Core.SceneMotion (§55.9,
+                        pure motion maths): internal, both core VMs, block-listed in server/api.lua and client/api.lua
+lib/clock/shared.lua    Core.Clock (§55.2): one u32 ms timeline — server GetGameTimer = client network time; every VM
+lib/scene/              shared.lua (kind-id / tier / stable-paint helpers, every VM) + client.lua (Scene.handle / on /
+                        off in the CALLER's VM); the rest of Core.Scene is proxied
 lib/schema/shared.lua   Core.Schema (§43): the field vocabulary of settings, admin args and map elements; pure, every VM
 server/pg/index.js      Node source of the Postgres bridge → bundled into server/db_pg.js (committed)
 ui/                     Vite 7 + Vue 3.5 + Tailwind v4 shell, Storybook 10, the SDK, the browser suites
@@ -60,6 +89,9 @@ ui/sdk/                 npm workspace package `@core/ui` (§38.7): src/contract.
                         theme.css (THE @theme token file), reference.css, tsconfig.plugin.json, templates/
 ui/src/runtime/*.ts     the platform (§38.6): protocol, transport, scope, plugins, pages, layers, feeds, errors,
                         host, inspector; `ui/src/shell.ts` = createShell(), `ui/src/main.ts` = the entry
+ui/src/runtime/audio/   the Core.Scene audio engine (§55.16): index (installAudio, `audio:*` messages) → the lazy chunk
+                        scene-audio.ts (engine, mixer, arbiter, spatial, curves, sources, loader, cache, deck, media,
+                        streams, icy, net, sync, validate, debug, types); hls.js/light is its own lazy chunk
 ui/src/shell/           the Lua-driven widgets (HUD, toasts, prompts, menu/input/alert…) as kit compositions — no drawing of their own
 ui/src/kit/             the design system (§37): css/*.css classes → components/Core*.vue (globally registered),
                         plus icons.js, use.js, fonts/ (bundled Barlow, OFL); the tokens live in ui/sdk/theme.css
@@ -74,8 +106,12 @@ tests/                  offline suites: run_tests.lua (libs/loader), server_test
                         (focus stack, discovery, requests, patches, feeds), client_chat_tests.lua, pg_smoke.js;
                         §41–§53: raycast, schema, settings, perms, buckets, audit, bans, targets, admin_api,
                         registry_caller, client_registry_caller, client_adminstate, callback, maps, maps_store,
-                        maps_regions, client_maps, chat_hook (<name>_tests.lua, each on its own); admin_harness.lua and
-                        maps_harness.lua are shared harnesses, not suites
+                        client_maps, chat_hook (<name>_tests.lua, each on its own); admin_harness.lua and
+                        maps_harness.lua are shared harnesses, not suites; §55: scene_codec, scene_motion, scene_server,
+                        scene_index, scene_interest, scene_audio, scene_voice, scene_promote, client_scene_cache,
+                        client_scene_mat, client_scene_kinds, scene_attach, scene_parked; scene_server_harness.lua and
+                        client_scene_harness.lua are
+                        harnesses; scene_bench.lua is the server benchmark (by hand, not in check.sh)
 scripts/                check.sh (offline gate), new-plugin.sh, pg-import.js, build-font-gfx.sh + font-to-gfx.java
                         (Barlow -> stream/barlow_condensed.gfx), build-hint-gfx.sh + hint-to-gfx.java + hint.as
                         (the world-prompt key hint -> stream/core_hint.gfx); FFDec is build-time only, never shipped
@@ -86,7 +122,11 @@ data/                   runtime files (exports); ignored except .gitkeep
 ```
 
 Neighbours in `resources/`: `core_example` (the reference plugin — copy its patterns), the npm workspace root
-`package.json` (`core/ui`, `core/ui/sdk`, every `*/ui`; scripts `build:ui`, `check:ui`), `.luarc.json`.
+`package.json` (`core/ui`, `core/ui/sdk`, every `*/ui`; scripts `build:ui`, `check:ui`), `.luarc.json`;
+`scene_probe` (DEV-ONLY in-game probes for §55.24 — standalone, its own never-focused `ui_page`, never in server.cfg;
+Liam runs `/sprobe <n>` in the order of its README; offline suite `tests/probe_tests.lua`); `research/entity-streaming/`
+(RESEARCH.md + R1–R9, the findings behind §55 — kept OUTSIDE the core repository because two reports cite Rockstar
+source paths; core's docs cite them by report and section, e.g. "R3 §1").
 
 ## 3. Non-negotiable rules
 
@@ -198,13 +238,16 @@ interaction, door, cron, locale, a compiled page).
 | what | command | expect |
 |---|---|---|
 | the whole offline gate (9 steps) | `scripts/check.sh` (`--full` adds the browser suites + Storybook) | exits 0 |
-| libs and loader | `lua5.4 tests/run_tests.lua` | `417 passed, 0 failed` |
+| libs and loader (suite `clock` included) | `lua5.4 tests/run_tests.lua` | `468 passed, 0 failed` |
 | development services | `lua5.4 tests/{geometry,client_zones,client_actions,context_streaming,hooks,ui_forms}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 190, 36, 74, 122, 94, 98 passed; 0 failed |
-| admin platform (§41–§53) | `lua5.4 tests/{raycast,schema,settings,perms,buckets,audit,bans,targets,admin_api,registry_caller,client_registry_caller,client_adminstate,callback,maps,maps_store,maps_regions,client_maps,chat_hook}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 100, 338, 149, 241, 48, 140, 193, 154, 349, 26, 31, 34, 34, 409, 72, 272, 250, 52 passed; 0 failed |
-| server modules | `lua5.4 tests/server_tests.lua` | `1112 passed, 0 failed` |
+| admin platform (§41–§53) | `lua5.4 tests/{raycast,schema,settings,perms,buckets,audit,bans,targets,admin_api,registry_caller,client_registry_caller,client_adminstate,callback,maps,maps_store,client_maps,chat_hook}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 100, 338, 149, 241, 48, 140, 193, 154, 349, 26, 31, 34, 34, 442, 200, 291, 52 passed; 0 failed (maps / maps_store / client_maps as rewritten by phase D, DESIGN §55.21.1; maps_regions_tests.lua is deleted) |
+| scene streaming (§55) | `lua5.4 tests/{scene_codec,scene_motion,scene_server,scene_index,scene_interest,scene_audio,scene_voice,scene_promote,client_scene_cache,client_scene_mat,client_scene_kinds,scene_attach,scene_parked}_tests.lua` (run each separately; `scripts/check.sh` does this) | respectively 262, 328, 1061, 851, 582, 241, 290, 424, 636, 661, 600, 283, 583 passed; 0 failed |
+| scene benchmark (by hand) | `lua5.4 tests/scene_bench.lua [players] [nodes] [seconds] [nogc]` (defaults 2000 50000 30; `nogc` = a join storm's heap growth) | a result table, exit 0 — compare with DESIGN §55.7 notes (p50 1.50 / p99 7.55 ms per tick) |
+| the scene probes, offline | `cd ../scene_probe && lua5.4 tests/probe_tests.lua`; `fxlint resources/scene_probe` | `scene_probe: 134 passed, 0 failed`; `0 error(s), 0 warning(s), 0 info(s)` |
+| server modules | `lua5.4 tests/server_tests.lua` | `1166 passed, 0 failed` |
 | client UI (focus stack, discovery, requests, patches, feeds, world prompts, HUD keys + feed, §41 input modes + hide policy + plain ids, §54 HUD hiding + key capture) | `lua5.4 tests/client_ui_tests.lua` | `client ui: 795 passed, 0 failed` |
 | chat client | `lua5.4 tests/client_chat_tests.lua` | `client chat: 40 passed, 0 failed` |
-| runtime + SDK units | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 216`, `# fail 0` |
+| runtime + SDK units (the §55.16 audio engine's `audio-*.test.ts` included) | `node --test 'ui/tests/unit/**/*.test.ts' 'ui/sdk/tests/*.test.mjs'` (globs, never directories) | `# pass 377`, `# fail 0` |
 | types | `npx vue-tsc --noEmit -p ui/tsconfig.json` | no output, exit 0 |
 | generated kit tags | `node ui/scripts/gen-kit-types.mjs --check` | `up to date (71 kit components)` |
 | every plugin's dist | `node ui/scripts/check-plugins.mjs` | `0 error(s), 0 warning(s)` for every discovered plugin |
@@ -212,7 +255,7 @@ interaction, door, cron, locale, a compiled page).
 | shell bundle | `cd ui && npm run build` | writes `html/`, no CSS warnings |
 | a plugin's bundle | `npm run build -w <resource>-ui` (from `resources/`) | writes `<plugin>/ui/dist`, ~1 s |
 | kit compile check | `node ui/tests/kit-compile-check.mjs` | `0 error(s)` |
-| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 312/312`, `PASS 212/212` (shell, kit, runtime) |
+| the three browser suites | `node ui/tests/run-browser-suites.mjs` (builds the fixtures, starts one origin per fixture resource, drives agent-browser; the servers must stay in its process tree) | `PASS 125/125`, `PASS 312/312`, `PASS 240/240` (shell, kit, runtime — section 15 of the runtime suite drives the real Web Audio engine) |
 | Storybook | `cd ui && npm run build-storybook` | builds; play functions green |
 | Postgres bridge | `cd ui && npm run build:server`; `CORE_PG_URL=… node tests/pg_smoke.js` | `pg_smoke: PASS` |
 | benchmarks | `node ui/tests/bench.mjs` | rewrites `ui/tests/BENCH.md` (never hand-edit it) |
@@ -221,7 +264,11 @@ interaction, door, cron, locale, a compiled page).
 In-game diagnostics that exist for a reason: `/uiplugins` (every UI plugin's state — the first thing to look
 at when a page stays blank), `/uidev <res> <origin|off>` and `/uiinspect` (both need `Config.UI.Dev.Enabled`),
 `/uiblur diag` / `/uiblur test` (game blur state and hook recipes), `/doorfind` (door models, registered
-doors), `/dbexport` and `/dbimport` (console), `/id`. Inside the CEF: `nui_devtools` / `localhost:13172`.
+doors), `/dbexport` and `/dbimport` (console), `/id`, `/scene` and `/scene debug` (Core.Scene counters and the overlay:
+the nearest nodes with their state — `Config.Scene.Debug`, ACE `core.admin` or staff on duty), `/audio` and
+`/audiodebug` (world-audio preferences, the audio engine's voices, decoders and drift). Server side:
+`Core.Scene.stats()` (flush ms p50 / p99, bytes per second, every module's counters). Inside the CEF: `nui_devtools` /
+`localhost:13172`.
 
 ## 6. Change protocol
 
@@ -339,3 +386,73 @@ never manual edits of live rows.
 - `IsHudHidden()` / `IsRadarHidden()` are pure read-backs of the `DISPLAY_HUD` / `DISPLAY_RADAR` flags (GTA
   `commands_hud.cpp`), so core's own `DisplayHud(false)` (§54 `Core.UI.hideHud`) reads as "the game hid the HUD": the §31
   `hud` watcher excludes it, or `Config.UI.AutoHide.HudHidden = true` would hide the whole shell and close the editor.
+- GTA fades EVERY entity over the 20 m just past `lodDist × GetLodscale()` (5 m when lodDist ≤ 20) — script objects
+  included; creating one only switches its CREATION fade off. An object created inside that band shows at the band's
+  alpha (a pop), one deleted inside it vanishes at ≈ 25 % alpha. Create beyond `lod·S + 20 m + margin`, delete beyond
+  that + hysteresis, and the engine fades for free (DESIGN §55.0, §55.22; research R3 §1 / R9 §5.3; probe P1).
+- `SetEntityAlpha` holds one of **256 alpha-override slots game-wide** (shared with every script and the netcode) until
+  `ResetEntityAlpha`; below alpha 50 nothing is drawn (ramps start at 51); props and peds fade screen-door, vehicles in
+  true alpha. Budget the fades (`Fades.Max` 48) and end a fade-in with `ResetEntityAlpha` (R2 §C11). The entity's
+  deletion frees its slot as well (engine behaviour, research R5 §1), so a fade-out may end in a plain delete — never
+  reset the alpha of an entity that is still drawn for another frame (it flashes opaque); probe P4 confirms it in game.
+  `NetworkFadeInEntity` / `NetworkFadeOutEntity` do NOTHING on local entities.
+- `GetNetworkTimeAccurate()` (client) is OneSync's network time on the server's `GetGameTimer()` timeline (±5–20 ms):
+  the one shared clock, `Core.Clock`. It reads 0 until the first sync (`Core.Clock.ready()`), and the Lua values go
+  negative after 24.9 days and wrap at 2^32 — mask with `& 0xFFFFFFFF` and compare only with `Core.Clock.diff`
+  (signed 32-bit), never `<`. Scene node and cell versions wrap too (to 1) and use the same serial arithmetic.
+- Latent events (`TriggerLatentClientEvent`) are paced and UNORDERED relative to reliable events: a big pack can land
+  before the reliable SUB that announced it, or long after newer changes. Version everything and let versions decide
+  (the scene client parks a pack that beats its SUB). Probe P12 measures it.
+- The scene stream's `RESET` op inside an unfinished CELL / PRIV section makes the decoder answer `'truncated'` (the
+  rest of the section would land on dropped state): the flush puts RESET FIRST and clears that client's queued outbox.
+- FiveM's `msgpack` packs a sequence with an `n` key (the `table.pack` shape) as an ARRAY and DROPS `n`, and packs the
+  empty table `{}` as an empty ARRAY (0x90) — an empty map arrives as an array. Never mix a sequence with `n` in a blob;
+  read `{}` and `[]` alike (shared/scene_codec.lua's pure-Lua fallback writes the same bytes).
+- Lua 5.4 allows at most 200 local variables per function, and a big module's main chunk counts every top-level
+  `local`: past it the file stops compiling ("too many local variables (limit is 200) in main function"). Group settings
+  and cold-path lookups into one table (`K`, `T` in client/scene_materializer.lua) or split the file along a one-shot
+  hand-off (DESIGN §55.1 notes).
+- `AttachEntityToEntity` takes 16 arguments (the last three: rotationOrder, fixedRot, p15) — pass all of them: core runs
+  `use_experimental_fxv2_oal`, and `tests/client_scene_harness.lua` asserts exactly 16.
+- Voice (client/scene_voice.lua, from the FiveM and pma-voice sources, R2 §B6–§B8; probe P10 confirms in game): a
+  talker's Mumble volume override or submix that CHANGES recreates his voice (a 20–40 ms dropout; the same value is a
+  no-op) — set both ONCE per session and animate only `SetAudioSubmixOutputVolumes`. `AddAudioSubmixOutput(id, 0)` must
+  come BEFORE the first `SetAudioSubmixOutputVolumes` (pma-voice has the order backwards, so its volumes never apply); a
+  submix routes a voice only with `setr voice_useNativeAudio true`; submix ids are never freed (no destroy native) —
+  create one fixed pool at start and cache it by name.
+- `GetAnimDuration` answers SECONDS (the Rockstar header), not milliseconds. Server `GetEntityHealth` answers 0 until a
+  client has synced the entity — a "destroyed" check on a fresh clone must wait for the first sync.
+- `PerformHttpRequest` buffers the whole response: pointed at a live stream it never completes and grows without end.
+  The server never fetches a stream body — the codec comes from the extension or the Icecast `status-json.xsl`.
+- Chromium's `decodeAudioData` allocates float PCM for the file's WHOLE duration at the context rate, whatever the
+  compressed size (1 MB of 6 kbps Opus = ~550 MB): bound the DECODED size before decoding, never trust a byte cap
+  (ui/src/runtime/audio/loader.ts, review RV3 F9).
+- Core code that creates scene nodes for core (the maps projector, Core.Attachments, parked cars) calls Core.Scene
+  AS CORE — `Registry.withCaller('core', Scene.spawn, …)`. Called plainly, the node belongs to whichever plugin's
+  export call triggered it and is swept (or refused as `'owner'`) when that plugin stops. Core's node budget is
+  `Config.Scene.OwnerCaps.core`.
+- Since phase D a persisted car's netId is NOT stable: parking deletes the entity (a scene node takes over) and every
+  promotion makes a new clone. Key cars by `vehId`; `vehicleDeleted` / `vehicleSpawned` fire at every park and
+  promotion; a plain `DeleteEntity` on a clone brings the car back at its parking spot (use `Vehicles.delete` /
+  `store`); entity state bags set on a clone are gone after it parks (DESIGN §4.6 notes).
+- Config that "whoever owns the entity" applies from a state bag is applied again at EVERY owner change. Split it: the
+  cosmetic part is idempotent and every owner re-applies it; the one-shot part (a vehicle clone's wear, lock and dirt,
+  `snCfg.once`) is applied once and acknowledged on its OWN event (`core:scene:applied(id)` — never behind a cooldown
+  shared with other reports, which silently drops it; the client re-sends while the bag still carries it) and the
+  server strips it — or the next owner resets damage, fuel and a lock that changed since.
+- A model hash comes as a SIGNED int (`GetHashKey`), an unsigned u32 or a `'0x%08X'` string (the scene's string
+  form): normalise before creating or comparing (`R.promote.modelHash` server side, `hashOf` in client/scene_kinds.lua).
+- The admin catalogue (the Maps model validator) is not a list of every model: weapon objects and addon models are
+  missing. It must never gate a scene spawn — only a `Scene.setModelInfo` provider answering `false` refuses a model;
+  Maps enforces its allow-list when an admin applies an element (DESIGN §55.12 notes).
+- Work that needs promoted clones alive when core stops registers `R.promote.beforeStop(fn)` — never rely on the order
+  of core's own `onResourceStop` handlers (parked cars hand their clones' poses to their nodes there).
+- Native NAMES: fxref (nativedb) prints names the FiveM runtime never generates — client/vehicles.lua called 12 of them
+  (`GetVehicleExtraColour_5`, `GetVehicleLivery2`, the xenon and neon colour names, …) and `getProps` raised in game
+  while every offline suite passed (the stubs define whatever you call). Check the name against
+  `fivem-dev-kit/data/cache/natives.json` / `natives_cfx.json` (the runtime's Lua names and aliases), not only fxref.
+- `GetEntityAlpha` shows the engine's LOD fade only for an entity the engine SCANS (on screen, inside `lodDist × S` +
+  the band); a culled or off-screen entity keeps its last value — 255 from its creation. Probe P1 read that stale 255 as
+  a "pop"; count only frames where the entity is in view and inside the band.
+- The CLIENT Lua VM has no `os` library at all (`os.clock`, `os.time` are nil — the server has them): time client code
+  with `GetGameTimer()` / `Core.Clock` (probe P6 crashed on `os`).

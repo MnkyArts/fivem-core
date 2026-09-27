@@ -39,7 +39,7 @@ local Log = Core.Log
 local Utils = Core.Utils
 
 local FADE_MS <const> = 500
-local MAPS_WAIT_MS <const> = 3000    -- §48/§52: how long a teleport waits for the map region
+local MAPS_WAIT_MS <const> = 3000    -- §48/§55.10: how long a teleport waits for the destination's nodes
 local CONTROL_WAIT_MS <const> = 1000 -- §48 withVehicle: how long to ask for the car's network control
 local MAX_COMPONENT <const> = 11
 local MAX_PROP <const> = 8
@@ -254,13 +254,13 @@ local function reapplyStates(ped)
     if Utils.isCallable(reapply) then reapply(ped) end
 end
 
---- §52: waits (bounded) until the map runtime has the destination region ready — only once
---- client/maps.lua exists; without it the collision wait above is all there is.
+--- §55.10: waits (bounded) until the scene has the destination's nodes (map elements, props, NPCs, …)
+--- before the reveal. Core.Maps.waitAreaReady is the same check since maps stream as scene nodes (§55.21.1).
 local function waitMaps(coords)
-    local maps = Core.Maps
-    if type(maps) ~= 'table' or not Utils.isCallable(maps.waitAreaReady) then return end
-    local ok, err = pcall(maps.waitAreaReady, coords, MAPS_WAIT_MS)
-    if not ok then Log.warn('Spawn.teleport: Maps.waitAreaReady failed: %s', tostring(err)) end
+    local scene = Core.Scene
+    if type(scene) ~= 'table' or not Utils.isCallable(scene.waitAreaReady) then return end
+    local sok, serr = pcall(scene.waitAreaReady, coords, 50.0, MAPS_WAIT_MS)
+    if not sok then Log.warn('Spawn.teleport: Scene.waitAreaReady failed: %s', tostring(serr)) end
 end
 
 --- §48 withVehicle: the car the local ped DRIVES, once we hold its network control; else 0.

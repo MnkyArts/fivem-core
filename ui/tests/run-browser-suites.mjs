@@ -55,6 +55,8 @@ function run(cmd, argv, opts) {
   })
 }
 
+// FiveM's CEF autoplays without a gesture (R2: NUIApp.cpp:199); the audio section measures a real signal with it
+if (!process.env.AGENT_BROWSER_ARGS) process.env.AGENT_BROWSER_ARGS = '--autoplay-policy=no-user-gesture-required'
 const browser = (argv, opts) => run('agent-browser', ['--session', SESSION].concat(argv), opts)
 
 async function main() {

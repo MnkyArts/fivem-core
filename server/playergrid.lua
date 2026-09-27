@@ -10,6 +10,7 @@
         PlayerGrid.candidates(coords, range, out) -> count   -- out[1..count]; the tail stays stale
         PlayerGrid.count()  -> integer                       -- players held by the grid
         PlayerGrid.cellOf(src) -> key|nil                    -- tests and debug only
+        PlayerGrid.positionOf(src) -> x, y, z, at | nil      -- the cached record (Core.Scene, §55.6)
 
     INTERNAL: `PlayerGrid` is in INTERNAL_NAMESPACES (server/api.lua), so it is not reachable through
     exports.core:call — plugins get the benefit through Core.Player.getInRange/getClosest and chat.
@@ -201,6 +202,15 @@ end
 function PlayerGrid.cellOf(src)
     local rec = where[src]
     return rec and rec.key or nil
+end
+
+--- The last indexed position of `src` and when it was read (GetGameTimer ms): x, y, z, at — or nil when
+--- the grid holds no record (no ped yet, dropped). No natives, no allocation: it reads the reused record,
+--- so the answer is up to REFRESH_MS old. Core.Scene's backstop and attachments read it (DESIGN §55.5/§55.6).
+function PlayerGrid.positionOf(src)
+    local rec = where[src]
+    if not rec or not rec.key then return nil end
+    return rec.x, rec.y, rec.z, rec.at
 end
 
 --------------------------------------------------------------------------------

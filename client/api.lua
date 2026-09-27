@@ -31,7 +31,8 @@ local removers = {}
 -- be able to set a caller name or replace a kind's remover) and the seam
 -- client/ui.lua and client/ui_plugins.lua share (DESIGN §38.4: it can send raw
 -- NUI messages and answer held page requests).
-local INTERNAL_NS <const> = { World = true, Registry = true, UIInternal = true, UIForms = true }
+local INTERNAL_NS <const> = { World = true, Registry = true, UIInternal = true, UIForms = true, SceneCodec = true,
+    SceneMotion = true }
 
 local Registry = {}
 

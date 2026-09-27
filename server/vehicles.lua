@@ -1,9 +1,20 @@
 --- core/server/vehicles.lua — Core.Vehicles (server).
 --- Server-owned vehicle spawning, ownership/keys, lock state, and the `vehicles` document
 --- records. DESIGN §4.6 (API), §5 (vehicleLock / vehicleProps net events), §8 (state bags).
---- Adoption natives added/verified 2026-09-15: NetworkGetEntityFromNetworkId, DoesEntityExist, GetEntityType,
---- GetEntityModel, GetVehicleNumberPlateText, GetVehicleType, SetVehicleNumberPlateText,
---- SetVehicleDoorsLocked, SetEntityOrphanMode, GetEntityCoords and GetEntityHeading.
+--- Parking (§55.21.4: park, the scene hooks, AutoPark, getInfoByRecord, the parked branches of spawnRecord /
+--- restoreRecord / store / delete / deleteRecord) is server/vehicles_park.lua, which loads RIGHT AFTER this file
+--- and takes the live maps and helpers once through the one-shot global `CoreVehiclesPark` (P); server/
+--- vehicles_fleet.lua (AutoPark, boot / stop reconciliation, MaxParked) follows it and adds P.wake (a record
+--- appeared: AutoPark) and P.beforeStop (core stops: clones hand their poses to their nodes, live cars park).
+--- Props (review RV4 F1): every write goes through cleanProps — the JSON-safe copy with every known key clamped to
+--- its native range (colour / mod indexes, healths 0..1000, fuel 0..100, dirt 0..15) and props.plate = the plate.
+--- Records: spawnRecord answers 'already_spawned' only while the record's car is live (an out record with nothing
+--- in the world is spawned: review RV6 F2); restoreRecord refuses a `destroyed` record (§55.21.4 notes, D-C).
+--- Natives (fxref + natives_cfx.json, server / CFX forms): CreateVehicleServerSetter, DoesEntityExist, DeleteEntity,
+--- NetworkGetNetworkIdFromEntity, NetworkGetEntityFromNetworkId, GetEntityType, GetEntityModel, GetEntityCoords,
+--- GetEntityHeading, GetEntityRoutingBucket, GetVehicleNumberPlateText, GetVehicleType, SetVehicleNumberPlateText,
+--- SetVehicleDoorsLocked, SetEntityRoutingBucket, SetEntityOrphanMode, GetHashKey, GetGameTimer.
+--- Runtime: Entity(e).state, Wait.
 
 local Vehicles = {}
 Core.Vehicles = Vehicles
@@ -27,6 +38,20 @@ local PROPS_MAX_MAP_INDEX <const> = 64
 local PROPS_DISTANCE <const> = 10.0
 local COLLECTION <const> = 'vehicles'
 local RECORDS_COOLDOWN_MS <const> = 1000
+local MODEL_NAME <const> = '^[%w_%-]+$'   -- a model name the scene's vehicle kind takes (§55.21.4 node fields)
+
+-- The native ranges of the props keys (fxref: SET_VEHICLE_COLOURS / _EXTRA_COLOURS / interior / dashboard paint
+-- indexes are u8, NUMBER_PLATE_TEXT_INDEX 0..12 (b3095), WHEEL_TYPE 0..12, WINDOW_TINT -1..6, LIVERY / roof livery
+-- -1 = none, SET_VEHICLE_MOD index -1..254, XENON 0..12 or 255 = stock; healths 0..1000 (a restored car never
+-- burns: review RV4 F1), fuel 0..100, dirt 0..15). Values outside are clamped; a known key of the wrong type drops.
+local PROP_INT <const> = { plateIndex = { 0, 12 }, colorPrimary = { 0, 255 }, colorSecondary = { 0, 255 },
+    pearlescentColor = { 0, 255 }, wheelColor = { 0, 255 }, interiorColor = { 0, 255 }, dashboardColor = { 0, 255 },
+    wheels = { 0, 12 }, windowTint = { -1, 6 }, livery = { -1, 127 }, livery2 = { -1, 127 } }
+local PROP_FLOAT <const> = { engineHealth = { 0, 1000 }, bodyHealth = { 0, 1000 }, tankHealth = { 0, 1000 },
+    fuelLevel = { 0, 100 }, dirtLevel = { 0, 15 } }
+local PROP_RGB <const> = { neonColor = true, tyreSmokeColor = true, customPrimary = true, customSecondary = true }
+local MOD_INDEX_MIN <const>, MOD_INDEX_MAX <const> = -1, 254
+local XENON_MAX <const>, XENON_STOCK <const> = 12, 255
 
 local SPAWN_SCHEMA <const> = {
     model = 'any',
@@ -55,6 +80,11 @@ local ADOPT_SCHEMA <const> = {
 local spawned = {}      -- [netId] = info (live, includes the entity handle)
 local byEntity = {}     -- [entity handle] = netId
 local usedPlates = {}   -- [plate] = netId
+local byVehId = {}      -- [vehId] = netId of the record's live vehicle (a parked car's adopted clone included)
+local clones = {}       -- [nodeId] = netId: the adopted clone of a promoted parked car (server/vehicles_park.lua)
+local rest = {}         -- [netId] = AutoPark's rest stamp (server/vehicles_park.lua)
+-- The maps above are shared with server/vehicles_park.lua (P): they are cleared in place, never replaced.
+local P = { spawned = spawned, byVehId = byVehId, clones = clones, rest = rest }
 
 --- Resolves a **tracked** netId to a live entity handle (0 when untracked or gone).
 --- Deliberately no NetworkGetEntityFromNetworkId fallback: the exported API acts only on an entity core
@@ -73,7 +103,9 @@ local function forget(netId)
     if not info then return false end
     if info.entity then byEntity[info.entity] = nil end
     if info.plate and usedPlates[info.plate] == netId then usedPlates[info.plate] = nil end
-    spawned[netId] = nil
+    if info.vehId and byVehId[info.vehId] == netId then byVehId[info.vehId] = nil end
+    if info.parked and clones[info.parked] == netId then clones[info.parked] = nil end
+    spawned[netId], rest[netId] = nil, nil
     Core.Registry.untrack('vehicle', netId)
     return true
 end
@@ -113,13 +145,14 @@ local function charIdOf(src)
     return info and info.charId or nil
 end
 
---- Public (copied) view of a tracked vehicle — never hands out the entity handle.
+--- Public (copied) view of a tracked vehicle — never hands out the entity handle. `parked` = the scene node id
+--- while the vehicle is the adopted clone of a parked car (§55.21.4).
 local function publicInfo(info)
     return {
         netId = info.netId, model = info.model, plate = info.plate,
         ownerCharId = info.ownerCharId, keys = Utils.deepCopy(info.keys), keyMode = info.keyMode,
         locked = info.locked, vehId = info.vehId, spawnedBy = info.spawnedBy,
-        createdAt = info.createdAt,
+        createdAt = info.createdAt, parked = info.parked,
     }
 end
 
@@ -164,6 +197,91 @@ local function validateProps(props)
         return false, 'props too large'
     end
     return true
+end
+
+local function clampInt(v, lo, hi)
+    if type(v) ~= 'number' or v ~= v then return nil end
+    v = math.floor(v)
+    return v < lo and lo or (v > hi and hi or v)
+end
+
+local function clampNum(v, lo, hi)
+    if type(v) ~= 'number' or v ~= v then return nil end
+    return v < lo and lo or (v > hi and hi or v)
+end
+
+--- Clamps every number of a map (integer or digit-string keys) in place; other entries stay.
+local function clampMap(t, lo, hi, int)
+    for k, v in pairs(t) do
+        if type(v) == 'number' then t[k] = int and clampInt(v, lo, hi) or clampNum(v, lo, hi) end
+    end
+end
+
+--- The props every write stores (review RV4 F1): a JSON-safe COPY with each known key clamped to its native range
+--- (PROP_* above; a known key of the wrong type is dropped) and, with `plate`, props.plate = plate (the record's —
+--- a props table never renames a car). Unknown keys pass as validateProps left them.
+local function cleanProps(props, plate)
+    local p = type(props) == 'table' and Utils.jsonSafe(props) or {}
+    for key, r in pairs(PROP_INT) do p[key] = clampInt(p[key], r[1], r[2]) end
+    for key, r in pairs(PROP_FLOAT) do p[key] = clampNum(p[key], r[1], r[2]) end
+    for key in pairs(PROP_RGB) do
+        local v = p[key]
+        if type(v) == 'table' then
+            p[key] = { clampInt(v[1], 0, 255) or 0, clampInt(v[2], 0, 255) or 0, clampInt(v[3], 0, 255) or 0 }
+        elseif v ~= nil and not (v == false and (key == 'customPrimary' or key == 'customSecondary')) then
+            p[key] = nil
+        end
+    end
+    local xenon = p.xenonColor
+    if xenon ~= nil then
+        xenon = clampInt(xenon, -1, XENON_STOCK)
+        p.xenonColor = (xenon and (xenon <= XENON_MAX or xenon == XENON_STOCK)) and xenon or nil
+    end
+    if type(p.mods) == 'table' then clampMap(p.mods, MOD_INDEX_MIN, MOD_INDEX_MAX, true) end
+    if type(p.tyreHealth) == 'table' then clampMap(p.tyreHealth, 0, 1000, false) end
+    if type(p.lights) == 'table' and p.lights[3] ~= nil then p.lights[3] = clampInt(p.lights[3], 0, 3) end
+    if type(plate) == 'string' then p.plate = plate end
+    return p
+end
+
+--- The record position of an entity: { x, y, z, heading, bucket? } (bucket only when not 0, review RV4 F6).
+local function positionOf(entity)
+    local coords = GetEntityCoords(entity)
+    local bucket = GetEntityRoutingBucket(entity)
+    return { x = coords.x, y = coords.y, z = coords.z, heading = GetEntityHeading(entity),
+        bucket = (math.type(bucket) == 'integer' and bucket ~= 0) and bucket or nil }
+end
+
+--- The §8 state bags of a tracked vehicle: vehId once persisted, coreProps unless it is a parked car's clone
+--- (the scene's snCfg carries its props to the owner client).
+local function writeState(entity, info)
+    local state = Entity(entity).state
+    state:set('coreVeh', true, true)
+    state:set('locked', info.locked, true)
+    state:set('owner', info.ownerCharId or false, true)
+    state:set('keys', info.keys, true)
+    state:set('keyMode', info.keyMode, true)
+    state:set('plate', info.plate, true)
+    if info.vehId then state:set('vehId', info.vehId, true) end
+    if info.props and next(info.props) and not info.parked then state:set('coreProps', info.props, true) end
+    return state
+end
+
+local function track(info)
+    local netId = info.netId
+    spawned[netId], byEntity[info.entity], usedPlates[info.plate] = info, netId, netId
+    if info.vehId then byVehId[info.vehId] = netId end
+    if info.parked then clones[info.parked] = netId end
+    Core.Registry.track('vehicle', netId, info.spawnedBy)
+end
+
+--- A tracked vehicle has its record now (persist, spawnRecord): the vehId state key, the index, AutoPark.
+local function setVehId(info, vehId)
+    info.vehId = vehId
+    byVehId[vehId] = info.netId
+    local entity = entityOf(info.netId)
+    if entity ~= 0 then Entity(entity).state:set('vehId', vehId, true) end
+    if P.wake then P.wake() end
 end
 
 --- Spawns a vehicle server-side and tracks it. Yields while the entity materialises,
@@ -230,30 +348,21 @@ local function spawn(opts, restoreRecordId)
     end
     SetVehicleNumberPlateText(entity, plate)
 
+    local name = opts.model
     local info = {
         netId = netId, entity = entity, model = model, plate = plate,
         ownerCharId = ownerCharId, keys = keys, keyMode = keyMode, locked = opts.locked == true,
         vehId = nil, spawnedBy = owner, createdAt = os.time(),
-        vehType = vehType, props = opts.props and Utils.jsonSafe(opts.props) or nil,
+        vehType = vehType, props = opts.props and cleanProps(opts.props, plate) or nil,
+        modelName = type(name) == 'string' and name:find(MODEL_NAME) and name:lower() or nil,
     }
-    spawned[netId] = info
-    byEntity[entity] = netId
-    usedPlates[plate] = netId
-
-    local state = Entity(entity).state
-    state:set('coreVeh', true, true)
-    state:set('locked', info.locked, true)
-    state:set('owner', ownerCharId or false, true)
-    state:set('keys', keys, true)
-    state:set('keyMode', keyMode, true)
-    state:set('plate', plate, true)
-    if info.props and next(info.props) then state:set('coreProps', info.props, true) end
+    track(info)
+    writeState(entity, info)
 
     if opts.bucket then SetEntityRoutingBucket(entity, opts.bucket) end
     if opts.persistent or ownerCharId then SetEntityOrphanMode(entity, ORPHAN_KEEP_ENTITY) end
     if info.locked then SetVehicleDoorsLocked(entity, LOCK_LOCKED) end
 
-    Core.Registry.track('vehicle', netId, owner)
     if opts.ownerSrc and info.props then
         TriggerClientEvent('core:client:applyVehicleProps', opts.ownerSrc, netId, info.props)
     end
@@ -382,11 +491,6 @@ function Vehicles.list()
     return list
 end
 
-local function positionOf(entity)
-    local coords = GetEntityCoords(entity)
-    return { x = coords.x, y = coords.y, z = coords.z, heading = GetEntityHeading(entity) }
-end
-
 --- Creates the `vehicles` document for an already spawned vehicle. Returns vehId | nil.
 function Vehicles.persist(netId)
     local info = spawned[netId]
@@ -395,13 +499,12 @@ function Vehicles.persist(netId)
     local entity = entityOf(netId)
     if entity == 0 then return nil end
     local vehId = Core.DB.create(COLLECTION, {
-        ownerCharId = info.ownerCharId or false, model = info.model, plate = info.plate,
+        ownerCharId = info.ownerCharId or false, model = info.model, modelName = info.modelName, plate = info.plate,
         props = info.props or {}, stored = false, position = positionOf(entity),
         meta = { vehType = info.vehType, keyMode = info.keyMode },
     })
     if not vehId then return nil end
-    info.vehId = vehId
-    Entity(entity).state:set('vehId', vehId, true)
+    setVehId(info, vehId)
     return vehId
 end
 
@@ -415,53 +518,69 @@ function Vehicles.getRecord(vehId)
     return Core.DB.get(COLLECTION, vehId)
 end
 
-local function spawnFromRecord(record, coords, heading, ownerSrc)
-    for _, tracked in pairs(spawned) do
-        if tracked.vehId == record.id then return nil, 'already_spawned' end
+--- The record's keys as spawn's `keys` option (an array of charIds ≤ 32; anything else: none).
+local function recordKeys(record)
+    local list, out = record.keys, {}
+    if type(list) ~= 'table' or #list > 32 then return nil end
+    for i = 1, #list do
+        if Validate.value('id', list[i]) then out[#out + 1] = list[i] end
     end
+    return #out > 0 and out or nil
+end
+
+local function spawnFromRecord(record, coords, heading, ownerSrc, bucket)
+    if byVehId[record.id] then return nil, 'already_spawned' end
     local netId, err = spawn({
-        model = record.model, coords = coords, heading = heading or 0.0,
+        model = record.modelName or record.model, coords = coords, heading = heading or 0.0,
         type = record.meta and record.meta.vehType or nil, keyMode = record.meta and record.meta.keyMode or nil,
         plate = record.plate, ownerCharId = record.ownerCharId or nil, ownerSrc = ownerSrc,
-        props = record.props, persistent = true,
+        props = record.props, persistent = true, keys = recordKeys(record), locked = record.locked == true,
+        bucket = bucket,
     }, record.id)
     if not netId then return nil, err end
-    local info = spawned[netId]
-    info.vehId = record.id
-    local entity = entityOf(netId)
-    if entity ~= 0 then Entity(entity).state:set('vehId', record.id, true) end
-    Core.DB.update(COLLECTION, record.id, { stored = false })
+    setVehId(spawned[netId], record.id)
+    local patch = { stored = false }
+    if record.destroyed == true then patch.destroyed = false end     -- the domain brought a wreck back
+    Core.DB.update(COLLECTION, record.id, patch)
     return netId
 end
 
---- Spawns a deliberately garaged record at a garage exit. Returns netId | nil, err.
+--- Spawns a record at a garage exit: a garaged one, or an out one with nothing in the world (no live car, no parked
+--- node — review RV6 F2: never 'already_spawned' for ever). Returns netId | nil, err.
 function Vehicles.spawnRecord(vehId, coords, heading, ownerSrc)
     local record = Vehicles.getRecord(vehId)
     if not record then return nil, 'no_record' end
     if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
-    if record.stored == false then return nil, 'already_spawned' end
     return spawnFromRecord(record, coords, heading, ownerSrc)
 end
 
---- Restores an out-of-garage record into the world, normally after a server restart. Unlike spawnRecord this
---- refuses stored vehicles, so boot recovery can never duplicate something deliberately parked in a garage.
+--- Restores an out-of-garage record into the world at its saved position (and bucket), e.g. after a server
+--- restart. Unlike spawnRecord this refuses stored vehicles, so boot recovery can never duplicate something
+--- deliberately parked in a garage, and a `destroyed` record (a wrecked clone, §55.21.4 notes): only a domain's
+--- spawnRecord brings a wreck back.
 function Vehicles.restoreRecord(vehId, coords, heading, ownerSrc)
     local record = Vehicles.getRecord(vehId)
     if not record then return nil, 'no_record' end
     if record.stored ~= false then return nil, 'record_stored' end
+    if record.destroyed == true then return nil, 'destroyed' end
+    local bucket
     if coords == nil and type(record.position) == 'table' then
         local p = record.position
         if type(p.x) == 'number' and type(p.y) == 'number' and type(p.z) == 'number' then
             coords = vector3(p.x, p.y, p.z)
             heading = heading == nil and p.heading or heading
+            bucket = math.tointeger(p.bucket)
+            if bucket and (bucket < 1 or bucket > 65535) then bucket = nil end
         end
     end
     if not Validate.value('vector3', coords) then return nil, 'bad_coords' end
-    return spawnFromRecord(record, coords, heading, ownerSrc)
+    return spawnFromRecord(record, coords, heading, ownerSrc, bucket)
 end
 
 --- Promotes one existing networked GTA vehicle (for example a validated, hotwired ambient car) into a
 --- server-owned persistent Core vehicle. The caller is a trusted server resource; no net event exposes this API.
+--- A Core.Scene clone (state `sn`: a map / plugin vehicle node's promoted entity) is refused 'scene_clone' — the
+--- scene deletes it at its demotion, the record would be orphaned (review RV4 F8).
 function Vehicles.adopt(netId, opts)
     if not Validate.value('netId', netId) or type(opts) ~= 'table' then return nil, 'bad_opts' end
     local valid, validationErr = Validate.checkTable(ADOPT_SCHEMA, opts)
@@ -475,6 +594,7 @@ function Vehicles.adopt(netId, opts)
     if entity == 0 or not DoesEntityExist(entity) or GetEntityType(entity) ~= ENTITY_TYPE_VEHICLE then
         return nil, 'no_vehicle'
     end
+    if Entity(entity).state.sn ~= nil then return nil, 'scene_clone' end
     local ownerSrc = opts.ownerSrc
     local ownerCharId = opts.ownerCharId or (ownerSrc and charIdOf(ownerSrc)) or nil
     if ownerSrc ~= nil and not Validate.value('src', ownerSrc) then return nil, 'bad_owner' end
@@ -494,20 +614,12 @@ function Vehicles.adopt(netId, opts)
         netId = netId, entity = entity, model = GetEntityModel(entity), plate = plate,
         ownerCharId = ownerCharId, keys = keys, keyMode = keyMode, locked = opts.locked == true,
         vehId = nil, spawnedBy = Core.Registry.getCaller(), createdAt = os.time(),
-        vehType = GetVehicleType(entity), props = type(opts.props) == 'table' and Utils.jsonSafe(opts.props) or nil,
+        vehType = GetVehicleType(entity), props = type(opts.props) == 'table' and cleanProps(opts.props, plate) or nil,
     }
-    spawned[netId], byEntity[entity], usedPlates[plate] = info, netId, netId
-    local state = Entity(entity).state
-    state:set('coreVeh', true, true)
-    state:set('locked', info.locked, true)
-    state:set('owner', ownerCharId or false, true)
-    state:set('keys', keys, true)
-    state:set('keyMode', keyMode, true)
-    state:set('plate', plate, true)
-    if info.props and next(info.props) then state:set('coreProps', info.props, true) end
+    track(info)
+    local state = writeState(entity, info)
     SetVehicleDoorsLocked(entity, info.locked and LOCK_LOCKED or LOCK_UNLOCKED)
     SetEntityOrphanMode(entity, ORPHAN_KEEP_ENTITY)
-    Core.Registry.track('vehicle', netId, info.spawnedBy)
 
     local vehId = Vehicles.persist(netId)
     if not vehId then
@@ -533,7 +645,9 @@ function Vehicles.store(netId)
     return true
 end
 
---- Accepts a validated props table (client route goes through `core:server:vehicleProps`).
+--- Accepts a validated props table (client route goes through `core:server:vehicleProps`): clamped to the native
+--- ranges, props.plate = the car's plate (cleanProps). A parked car's clone does not project coreProps: its node
+--- takes them when it is demoted (server/vehicles_park.lua).
 function Vehicles.saveProps(netId, props)
     local info = spawned[netId]
     if not info then return false end
@@ -542,11 +656,15 @@ function Vehicles.saveProps(netId, props)
         Log.debug('vehicles: rejected props for netId %s (%s)', tostring(netId), tostring(err))
         return false
     end
-    local nextProps = Utils.jsonSafe(props)
+    local nextProps = cleanProps(props, info.plate)
     if json.encode(info.props or {}) == json.encode(nextProps) then return true end
     info.props = nextProps
     local entity = entityOf(netId)
-    if entity ~= 0 then Entity(entity).state:set('coreProps', info.props, true) end
+    if info.parked then
+        info.propsSaved = true                     -- a parked car's clone: its node takes them at the demotion
+    elseif entity ~= 0 then
+        Entity(entity).state:set('coreProps', info.props, true)
+    end
     if info.vehId then Core.DB.update(COLLECTION, info.vehId, { props = info.props }) end
     return true
 end
@@ -613,19 +731,31 @@ AddEventHandler('playerDropped', function()
     recordsCooldown[src] = nil
 end)
 
---- The world lost the entity (culled, deleted elsewhere): drop our book-keeping.
+--- The world lost the entity (culled, deleted elsewhere): drop our book-keeping. A parked car's clone also tells
+--- the domain (vehicleDeleted): its node lives on, the scene demotes it.
 AddEventHandler('entityRemoved', function(entity)
     local netId = byEntity[entity]
     if not netId then return end
+    local clone = spawned[netId] and spawned[netId].parked
     forget(netId)
+    if clone then Core.emitHook('vehicleDeleted', netId) end
     Log.debug('vehicles: untracked netId %s (entity removed)', tostring(netId))
 end)
 
+local function clear(t) for k in pairs(t) do t[k] = nil end end
+
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= Core.name then return end
-    -- Synchronous teardown: no Wait. A live persistent vehicle remains logically `stored = false`; its domain
-    -- plugin restores that out record at this final position when core/server starts again. A vehicle explicitly
-    -- garaged earlier has no live entity here and remains `stored = true`.
+    -- Synchronous teardown: no Wait. With Core.Scene every live persisted car is PARKED here first (P.beforeStop,
+    -- server/vehicles_fleet.lua: clones hand their final pose to their nodes, other live cars become parked nodes
+    -- at their pose — review RV4 F14 / RV6 F2), so the boot has nothing to spawn. Without it (or when a node was
+    -- refused) a live persistent vehicle remains logically `stored = false` at its final position (the boot check
+    -- re-parks it); a vehicle explicitly garaged earlier has no live entity here and remains `stored = true`.
+    P.stopped = true
+    if P.beforeStop then
+        local ok, err = pcall(P.beforeStop)
+        if not ok then Log.error('vehicles: parking teardown failed: %s', tostring(err)) end
+    end
     for _, info in pairs(spawned) do
         local entity = info.entity
         if info.vehId then
@@ -635,7 +765,13 @@ AddEventHandler('onResourceStop', function(resource)
         end
         if entity and DoesEntityExist(entity) then DeleteEntity(entity) end
     end
-    spawned = {}
-    byEntity = {}
-    usedPlates = {}
+    for _, t in ipairs({ spawned, byEntity, usedPlates, byVehId, clones, rest }) do clear(t) end
+    Core.DB.flush()
 end)
+
+-- The one-shot hand-off to server/vehicles_park.lua (it adds its helpers and passes P on to
+-- server/vehicles_fleet.lua, which clears the global).
+P.entityOf, P.forget, P.track, P.writeState, P.publicInfo = entityOf, forget, track, writeState, publicInfo
+P.validateProps, P.cleanProps, P.positionOf = validateProps, cleanProps, positionOf
+-- fxlint-disable-next-line C003 -- one-shot hand-off to server/vehicles_park.lua (then vehicles_fleet.lua clears it)
+CoreVehiclesPark = P

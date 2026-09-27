@@ -673,6 +673,57 @@ when a validated saved-property payload changes), allowing whichever client stre
 damage even when the owner is offline. `entityRemoved`
 (`AddEventHandler`) only drops live bookkeeping: it never silently changes the persistent garage/world decision.
 
+**Addition (2026-09-27, phase D runs D4 / D4+ — parked vehicles on Core.Scene, §55.21.4).** `server/vehicles_park.lua`
+loads right after this file and takes its live maps and helpers once through the one-shot global `CoreVehiclesPark`.
+- `Vehicles.park(netId | vehId) -> nodeId | nil, err` (persisted vehicles only; yields ≤ 1 s): the car becomes a
+  PERSISTENT scene `vehicle` node owned by core — fields `{ model (the name when known, else the hash), props (the
+  owner client's through the callback `core:vehicles:props`, else the cached / record props), plate, locked, vehId,
+  vtype }`, the entity's pose and bucket, the class default authority (promote on proximity / enter / damage) — and
+  the entity goes. A parked car's clone is demoted instead (refused with someone inside); a parked record answers its
+  node; an out record without a live car parks at its saved position. Errors: `unavailable bad_target missing
+  not_persisted no_record record_stored occupied busy gone no_entity bad_coords db` + Scene's.
+- `Vehicles.getInfoByRecord(vehId) -> info | nil`: getInfo's fields (netId only while a car is live — a promoted
+  parked car's clone included) + `parked` (node id), `stored`, `position`. `getInfo` also carries `parked` while the
+  vehicle is the adopted clone of a parked car.
+- Records gain `parked` (node id | false), `locked`, `keys`, `modelName` and `position.bucket`.
+- Wrapped: `spawnRecord` on a parked record PROMOTES its node in place (coords ignored) and returns the clone's netId
+  after a bounded wait (SpawnTimeoutMs + 6 s); `restoreRecord` on one answers `nil, 'parked'` (a boot restore never
+  duplicates it); `store(netId | vehId)` also garages a parked node or a record with nothing in the world; `delete` of
+  a clone removes its node (not while core stops); `deleteRecord` removes the node.
+- Promotion of a core node naming a record: the clone is ADOPTED (the §8 bags, `spawned`, hook `vehicleSpawned`);
+  demotion: props, pose, lock and keys into the record, hook `vehicleDeleted`; `saveProps` on a clone writes no
+  `coreProps` bag (the node takes the props at the demotion).
+- AutoPark (`Config.Vehicles.AutoPark = true`, `AutoParkIdleMs 30000`, `AutoParkRadius 50`, `AutoParkSweepMs 10000`):
+  a sweep (only while persisted cars exist, 10 slices) parks a car at rest (< 0.1 m/s) for AutoParkIdleMs with
+  nobody inside and nobody of its bucket within AutoParkRadius; ≤ 64 per sweep, one park worker re-checks each.
+- The lock key on a parked car's LOCAL copy (no state bags): client/vehicles.lua sends its node id,
+  `core:server:parkedLock(nodeId)` → schema → 500 ms → loaded → distance from the server's ped ≤ LockDistance → the
+  node parks a record of the player's bucket → the record's virtual keys (item-key cars ignored silently) → the
+  record's `locked` and the node field toggle.
+- Boot: parked cars are persistent nodes (no spawn storm); a parked record whose node vanished is re-parked; a core
+  vehicle node naming a record nobody parks is adopted by that record or removed. Core stop: every adopted clone
+  hands its final pose to its node through `R.promote.beforeStop` BEFORE any clone is deleted.
+- **Compatibility** (plugins, e.g. `vehicle_system`): netIds of persisted cars are NOT stable any more — key by
+  `vehId`; `vehicleDeleted` fires at every park / demotion and `vehicleSpawned` at every promotion; a boot restore
+  gets `'parked'`; AutoPark parks cars a plugin spawned and persisted; `list` / `getPlayerVehicles` / `getInRange`
+  skip parked cars; a direct `DeleteEntity` on a clone makes the car reappear at its spot (use `delete` / `store`);
+  entity state bags are lost at park.
+
+**Addition (2026-09-27, final fix round FX1a / FX1b — review RV4–RV6).** `server/vehicles_fleet.lua` now holds AutoPark,
+MaxParked and the boot / stop reconciliation (§55.21.4 final notes).
+- `setLocked` / `giveKeys` / `removeKeys` / `setOwner` take a netId OR a vehId: a vehId acts on its live car, else on
+  the record (and a parked node's `locked` field) — no promotion needed.
+- Records gain `destroyed`: a wrecked clone leaves the record at its last saved state with `destroyed = true` (the node
+  is removed); `restoreRecord` and `park` answer `'destroyed'`, the boot check skips it, `spawnRecord` brings it back
+  and clears the mark; `getInfoByRecord(vehId).destroyed` tells. `adopt` refuses a scene clone (`'scene_clone'`).
+- **Park at stop**: core's stop parks every live persisted car at its pose (instead of leaving it for a boot-time
+  spawn); the **boot check** parks out-records that have neither a node nor a live car and retries a `'limit'` with
+  backoff; `spawnRecord` answers `'already_spawned'` only while the record's car is live.
+- **MaxParked** (`Config.Vehicles.MaxParked`, 20,000): past it the longest-unused parked car that is not promoted is
+  garaged (node removed, `stored = true`) and the hook `vehicleAutoStored (vehId, 'max_parked')` fires.
+- A read-back from a clone's owner changes only wear (`Core.Scene.mergeWear`); every props write re-imposes the
+  record's plate; a live car parks through the promotion engine's hand-off (no blink for watchers).
+
 ### 4.7 `Core.Notify` server (`server/notify.lua`)
 
 `Notify.send(src, message, type = 'info', duration?)` → `TriggerClientEvent('core:client:notify', src, {
@@ -1053,6 +1104,17 @@ when the player tries to enter: a 500 ms guard that only runs while `GetVehicleP
 Key `Config.Vehicles.LockKey` (`U`) via `Core.Keys.register` → `toggleLock()`. For `keyMode = 'item'`, this
 intentionally no-ops (without a false "no keys" message) so the owning domain plugin can bind the same UX key and
 validate its physical inventory item server-side.
+
+**Addition (2026-09-27, scene build run A6).** `Vehicles.setPropsLocal(veh, props) -> bool`: the same apply body as
+`setProps` (only the keys present, `SetVehicleModKit` first) with NO network-control request and no yield, so it runs
+inside a creation frame — for LOCAL (non-networked) vehicles this client created itself, the `Core.Scene` vehicle
+copies (§55.12). On a networked vehicle this client does not control, the calls only touch its local copy until the
+owner syncs over it; use `setProps` there.
+
+**Addition (2026-09-27, phase D run D4 / D4+).** The client answers the callback `core:vehicles:props (netId)` with
+`getProps` of a `coreVeh` entity it controls (the network-id guard first; nil otherwise) — the server reads the props
+before it parks a car (§4.6 notes). `toggleLock` on a parked car's LOCAL copy (no state bags) sends its scene node id
+(`Core.Scene.idOf` / `get`, a vehicle node with `fields.vehId`) as `core:server:parkedLock`; the server decides.
 
 ### 6.9 `Core.Raycast` (`client/raycast.lua`)
 
@@ -1704,6 +1766,17 @@ Player.setReplicated(src, key, value)                -- Player(src).state[key] f
 
 Client `lib/audio/client.lua`: `Audio.playFrontend(name, set)`, `Audio.playAt(coords, name, set)` (`PlaySoundFromCoord`),
 `Audio.stop(id)`.
+
+**Superseded (2026-09-27, phase D run D3) — attachments are Core.Scene nodes (§55.21.3).** The API and the storage
+(`data.attachments`) stay; the `attachments` state bag is no longer written (the key stays reserved) and
+client/remote.lua has no applier any more. Each entry is ONE scene `prop` node owned by core in the player's routing
+bucket, spawned at the ped and attached to the player (`Scene.attach(id, { player = src }, { bone, offset, offrot =
+rotation, rotOrder = 1 })`); every client near the player materialises the object on that ped and re-attaches it
+when the ped changes. `add` validates `model` (a name `^[%w_%-]+$` ≤ 64 or an integer hash), `bone` (a tag 0..65535 or
+a bone name, else 28422 = PH_R_Hand) and `offset` (each component ≤ 1000 m), keeps ≤ 12 entries per player, and
+answers `nil, 'scene refused the prop (<code>)'` when the scene refuses it (the entry is not stored). Final round
+(2026-09-27, RV4 F3): when the scene is FULL (`'limit'`) `add` stores the entry and returns its id — the node follows
+by retry. Details in the §55.21.3 notes.
 
 ## 21. Server-side UI API and new built-ins — Rebar `useWebview`, `useNotify.showShard/showSpinner`, instructional buttons
 
@@ -4988,6 +5061,11 @@ Files: `server/maps.lua` (types, documents, apply, publish, journal, networked e
 admins — permanent maps and **live event maps** — for every player, at 1,000–2,000 players. Designed from scratch for
 low-churn, high-volume content (research §3.3g); it does not reuse the inventory's drop scoping.
 
+**Since 2026-09-27 (phase D, §55.21.1)** Core.Maps is an authoring layer on `Core.Scene`: §52.1 and §52.2's API stand;
+the networked-entity part of §52.2 and the whole region runtime of §52.3–§52.4a are superseded (each section says so).
+Files now: server/maps_types.lua → maps_runtime.lua (the projector onto scene nodes) → maps.lua → maps_apply.lua;
+client/maps_preview.lua (the editor view) → client/maps.lua (the facade).
+
 ### 52.1 Element types (the EDF successor)
 
 ```lua
@@ -5183,6 +5261,15 @@ Maps.records(typeId) -> array                         -- active world content of
   19b2 the pose event). Harness: `H.owners[e]` /
   `H.owner` (NetworkGetEntityOwner), `H.rpcs` + `H.rpcCalls(name)`, `H.poses(from)`.
 
+**Superseded (2026-09-27) by §55.21.1 — the networked-entity machinery.** Documents, modes, apply / invert / journal,
+publish / rollback, drafts, limits and the events above stay. What went: the server's networked-entity worker, the
+`mapEl` / `mapCfg` state bags, the in-place update (`updateNet` / `moveInPlace`), `core:maps:pose` and its 2 s
+verification. Every shown element — vehicles, peds and networked props included — is now ONE `Core.Scene` node
+(server/maps_runtime.lua is a projector); vehicles and physics props become networked only while the scene promotes
+them (§55.15), and a move of a promoted node demotes it at the new pose. The stable paint survives: a map vehicle
+takes `Scene.PAINTS[joaat(uid) % 22 + 1]` (the same list as above). `Maps.respawn` puts nodes back to their authored
+state (§55.21.1 notes). The `networked` / `networkedTotal` limits still count vehicle, ped and networked-prop elements.
+
 ### 52.3 Server regions
 
 - The world is cut into **regions** of `Config.Maps.RegionSize` (512 m), integer key `(rx + 32768) * 65536 + (ry + 32768)`.
@@ -5242,6 +5329,18 @@ Maps.records(typeId) -> array                         -- active world content of
   `reaudience(src, modeOn?)`; `stats().hidden`; `put` also requires an integer `flags`.
 - Risks: the budget bounds each client, not the server total; latent events need `sv_enableNetEventReassembly`
   (default true) or packs never arrive. Tests: `tests/maps_regions_tests.lua` (272).
+
+**Implementation notes (2026-09-27, run M0 — the editor live-update bug).** The per-subscription pack memory is also
+dropped on an AUDIENCE change — when a window request subscribes a src as the other audience, and when
+`reaudience` downgrades an editor — so the new audience's packs are sendable again (before, the memory of what went
+to the OLD audience could hold back the packs of the new one). Tests: `tests/maps_regions_tests.lua` 288.
+
+**Superseded (2026-09-27) by §55.21.1.** The region runtime is gone: server/maps_regions.lua (`Core.MapRegions`,
+also removed from the export block-list), the `core:maps:window` callback, the `core:maps:pack|delta|stale` events,
+the region packs, the per-src pack budget and `Config.Maps.RegionSize … PackBudgetWindowMs`, and
+`tests/maps_regions_tests.lua`. Map content streams as `Core.Scene` nodes (§55.5–§55.7: cells, journals, the
+per-player pack budget); the editors-only audience of data kinds and helpers is the scene audience `{ editors =
+true }` on `map:data` nodes. This section is kept as the record of the region design.
 
 ### 52.4 Client runtime (client/maps.lua)
 
@@ -5326,6 +5425,27 @@ Maps.records(typeId) -> array                         -- active world content of
   previews: marker/sphere 1, box 12 `DrawLine`, label 10. `stats()` returns more fields than the contract listed
   (`CoreMapsClientStats` in types/core.lua). Tests: `tests/client_maps_tests.lua` (239).
 
+**Implementation notes (2026-09-27, run M0 — the §55.22 fade-band fix applied, and the editor live-update bug).**
+- **The radius bullet above is replaced** by the fade-band rule of §55.22: `S = GetLodscale()` (sampled once a second,
+  clamped 0.1–20), `B = 20` (5 when lod ≤ 20), `r = lod·S + B + 10` capped at `MaxSpawnRadius` (now 500; an object
+  over the cap gets `SetEntityLodDist(e, floor((cap − B − 10) / S))`), despawn beyond `r + max(20, 0.25·r)`. The
+  30 m minimum radius is gone. Radii are re-derived on a > 5 % change of `S`, in slices of 500 props per frame (RV2
+  F5). The evaluation's scan limit is the cap plus its despawn margin (625 m), and a cell out of range is judged by
+  the LARGEST despawn radius.
+- **Editor audience** (the bug: an `editor` flip could leave the view stale): the regions' versions are KEPT across
+  a flip; the old audience's pending / wanted requests are voided, packs are parked until the new audience's window
+  answer, and a version announced in that answer is accepted even when it is lower than the one held (the audiences
+  have different versions, §52.3 notes).
+- Budgets: + 1 `GetLodscale` per second; the worst spawn frame is 41 natives (was 39). `stats()` gains `lodScale` and
+  `rescales`. Tests: `tests/client_maps_tests.lua` 294 (the allocation section's camera path moved 35 m for the new
+  radii).
+
+**Superseded (2026-09-27) by §55.21.1.** client/maps_spawn.lua and client/maps_view.lua are deleted and the runtime
+above with them (window, regions, grid, queues, models, hides, the `mapCfg` / pose handlers, the M0 radius rule —
+props follow §55.11 now). client/maps.lua is a facade over `Core.Scene` that keeps the §52.4 client API (§55.21.1
+notes list what changed: string uids, the new `stats()` shape, a `waitAreaReady` that moves no window);
+client/maps_preview.lua draws the editor view from `map:data` nodes. This section is kept as the record of the design.
+
 ### 52.4a Wire format and the internal region interface (binding for server/maps*.lua and client/maps.lua)
 
 - Kind codes in tuples: `1` prop · `2` marker · `3` hide · `4` point · `5` zone (vehicles, peds and networked props are
@@ -5368,6 +5488,13 @@ Maps.records(typeId) -> array                         -- active world content of
   (after the `NetworkDoesEntityExistWithNetworkId` guard); vehicles/peds take `rz` as heading, props the full
   rotation (order 2). Not state: a client that takes control later never re-applies it.
 
+**Superseded (2026-09-27) by §55.21.1.** None of this wire exists any more: no tuples, packs, `core:maps:window` /
+`pack` / `delta` / `stale` / `pose`, no `mapEl` / `mapCfg` state bags, no `Core.MapRegions`. What remains of it: the
+callback `core:maps:types` (the public type list for the editor view) and `core:client:bucketChanged` (§48). The
+editor extras live on as the fields of the core-internal scene kind `map:data` (`t` type id, `k` element kind,
+`size`, `f` label values), and every node a map projects carries `fields.mapEl = '<mapId>:<elementId>'` and
+`fields.mapType`.
+
 ### 52.5 Config, scale, tests
 
 `Config.Maps = { RegionSize = 512, WindowHysteresis = 64, CacheRegions = 25, LatentBps = 250000, PushOpsMax = 32,
@@ -5386,6 +5513,17 @@ as run: `tests/maps_tests.lua` 409 (was 301 before run UX C2) + `tests/maps_stor
 `tests/client_maps_tests.lua` 250 (two `[bench]` lines).
 In game (open): resmon flying through ≥ 1000 props within 400 m, DLC prop streaming, a teleport onto an event
 platform, a hide over a world bench (it must come back), `mapCfg` on an entity placed before a client joined.
+
+**Implementation notes (2026-09-27, run M0).** `Config.Maps.MaxSpawnRadius` is 500 (§52.4 M0 notes). Tests as run
+after M0 (2026-09-27, before phase D): `tests/maps_tests.lua` 409, `tests/maps_store_tests.lua` 72,
+`tests/maps_regions_tests.lua` 288, `tests/client_maps_tests.lua` 294.
+
+**Superseded (2026-09-27) by §55.21.1 — config, scale and tests after phase D.** `Config.Maps = { MaxMarkers = 64 }`
+(the editor view's preview budget) is all that is left; streaming, caps and budgets are `Config.Scene`'s, and core's
+map nodes count against `Config.Scene.OwnerCaps.core` (60,000). Scale is §55's. Tests: `tests/maps_tests.lua` 328
+(the projector against a recording fake Scene), `tests/maps_store_tests.lua` 200 (documents, apply validation and
+limits, expect / events / restore), `tests/client_maps_tests.lua` 257 (the facade and the preview handler);
+`tests/maps_regions_tests.lua` is deleted.
 
 ## 53. Kit additions (catalogue entries in §37.5; the §6 kit protocol applies to each)
 
@@ -5552,3 +5690,1759 @@ While ≥ 1 hideHud reason is held:
   chat / owner stop / core down / a SPOOFED caller refused) — 795 total with the other packages' suites; `run_tests.lua` keys suite (+15: lib-side proxy use, cheap checks first,
   failure = not captured) — 417; `ui/tests/unit/layers.test.ts` (+2) — `# pass 216`; `runtime-regression.js` section
   9b (+11) — `PASS 212/212`; Storybook `Shell/HUD hidden (editor focus)` with a play function.
+
+---
+
+# Scene streaming (§55, 2026-09-26 — Liam: "an entity streaming system … objects, vehicles, NPCs, audio, live audio … fully synced … without destroying performance … without ugly plopping in / out … the best system in the world")
+
+Research: `resources/research/entity-streaming/RESEARCH.md` (+ R1–R9; kept OUTSIDE this repository because two reports
+cite Rockstar source paths). Decisions (Liam, 2026-09-26): name `Core.Scene`; build phases 0 + A + B + C + D in one run;
+`increase_pool_size "Object" 2000` in server.cfg; the §52 fade-band fix now. Defaults he accepted: https-only audio with
+an admin allow-list, no YouTube in core, voice speakers on Mumble with a pma-voice adapter, host NTP in slew mode.
+
+## 55. Scene streaming (`Core.Scene`, `Core.Clock`)
+
+### 55.0 Principles (each one is a research finding — do not trade them away)
+
+1. **The server owns records, clients own presentation.** A *node* is a server record (`id, kind, owner, bucket, pose,
+   parent, motion, fields, audience, ver`). Every interested client *materialises* it LOCALLY (a non-networked entity,
+   an audio voice, a draw call, a trigger volume). OneSync is used only while a node is *promoted* (§55.15). Reason:
+   OneSync makes a new entity relevant to a client only on that client's relevance pass — up to ~6.3 s at 2,000 players
+   — with no fade, from pools of 80–250 (R1 §5, R8 §1).
+2. **Interest is coarse and event-driven on the server, exact on the client.** Cells of 128 m (near grid) and 512 m
+   (far grid) plus a per-bucket global set; membership changes only on focus crossings and node changes; one
+   serialisation per cell change; the client does exact distances, hysteresis, caps, priorities and fades (R4 §11).
+3. **Exist before visible.** GTA fades every entity over the 20 m past `lodDist × GetLodscale()` (5 m when lodDist ≤ 20),
+   script objects included; only the creation fade is disabled for script objects. The materialiser creates beyond that
+   band and deletes beyond it + hysteresis, so the engine reveals and hides props; explicit fades only for late arrivals
+   (R3 §1, R9 §5.3, R5 §9).
+4. **Motion and media are functions of one clock.** `Core.Clock` = OneSync's network time (client) = `GetGameTimer()`
+   (server), ±5–20 ms. Paths, tweens, spins, keyframes, animation phases and audio play heads are descriptors evaluated
+   locally; steady traffic ≈ 0 (R1 §3, R7 §2).
+5. **One small reliable message per client per tick.** Script traffic is reliable-ordered only; latent events are paced
+   and unordered; server Lua runs at 20 Hz. So: cell blobs encoded once, one coalesced event per client per 50 ms tick
+   ≤ 16 KiB, versions on everything, big snapshots latent inside a byte budget, latest-state-wins (R1 §1, R7 §0.2).
+6. **Never pop in view, never delete in view.** Late arrivals fade (props 0.3 s, peds 0.6 s); deletions wait until the
+   thing is invisible or unseen for 1.5 s; peds and vehicles prefer out-of-view creation (Rockstar's own rules and
+   `net_peds`, R3 §3, §9.3).
+7. **Budgets come from FiveM's pools.** Object 3,300 (+2,000 via `increase_pool_size`), Peds 256, Vehicles 300 (not
+   raisable), 256 game-wide alpha-override slots; a full pool is a client crash (R8 §1, R2 §C10–C11).
+
+### 55.1 Files, load order, internal hand-offs
+
+```
+lib/clock/shared.lua              Core.Clock (lib, every VM: plugins too)
+lib/scene/shared.lua              pure helpers every VM needs (kind id rules, radius-tier maths) — tiny
+lib/scene/client.lua              plugin side of Core.Scene: handle(kind, handlers), on(...), off(...) (in-VM); the
+                                  proxy fills handleOf/idOf/get/stats/isAreaReady/waitAreaReady/hold/release
+shared/scene_codec.lua            Core.SceneCodec (internal, both core VMs): binary ops, quantisation (§55.8)
+shared/scene_motion.lua           Core.SceneMotion (internal, both core VMs): motion descriptors (§55.9)
+server/scene_kinds.lua            kind registry + the built-in kinds (§55.3, §55.12 fields)
+server/scene_index.lua            cells, tiers, versions, journals, packs, movers re-cell (§55.5)
+server/scene_interest.lua         focus, windows, rings, hysteresis, gated audiences (§55.6)
+server/scene_flush.lua            the 20 Hz flush: outboxes, one event per client, latent packs, budgets (§55.7)
+server/scene.lua                  Core.Scene server API, node store, persistence, owner cleanup, interact dispatch (§55.4)
+server/scene_promote.lua          promotion / demotion / leases (§55.15)          -- phase C
+server/scene_audio.lua            audio sources: URL resolution, allow-list, titles, cooldowns (§55.16)   -- phase B
+server/scene_voice.lua            voice speaker sessions + adapter (§55.17)         -- phase B
+client/scene_cache.lua            receive + decode, cells, nodes, LRU, focus reporter, resync (§55.10)
+client/scene_materializer.lua     the engine: states, radii, priority, budgets, fades, visibility, caps (§55.11)
+client/scene_kinds.lua            built-in entity kinds: prop, vehicle, ped (§55.12)
+client/scene_fx.lua               built-in non-entity kinds: light, particle, marker, text, hide, zone, sound, group (§55.12)
+client/scene_movers.lua           per-frame / tiered evaluation of LIVE movers (§55.9)
+client/scene_promote.lua          hand-off local copy ↔ networked clone (§55.15)    -- phase C
+client/scene_audio.lua            listener feed, occlusion probes, emitter bridge to the shell (§55.16)  -- phase B
+client/scene_voice.lua            submix pool, speaker panning (§55.17)             -- phase B
+client/scene.lua                  Core.Scene client API, plugin-kind bridge, hooks, /scene commands (§55.10, §55.13)
+ui/src/runtime/audio/*.ts         the shell audio engine (§55.16)                   -- phase B
+```
+
+- **Manifest order** (fxmanifest.lua): `shared_scripts` gains `shared/scene_codec.lua`, `shared/scene_motion.lua`
+  after `shared/ui_forms.lua`; `server_scripts` gains `server/scene_kinds.lua`, `server/scene_index.lua`,
+  `server/scene_interest.lua`, `server/scene_flush.lua`, `server/scene.lua`, `server/scene_promote.lua`,
+  `server/scene_audio.lua`, `server/scene_voice.lua` **right after `server/maps_apply.lua`** (Scene reads the Maps model
+  validator lazily, never at load); `client_scripts` gains `client/scene_cache.lua`, `client/scene_materializer.lua`,
+  `client/scene_kinds.lua`, `client/scene_fx.lua`, `client/scene_movers.lua`, `client/scene_promote.lua`,
+  `client/scene_audio.lua`, `client/scene_voice.lua`, `client/scene.lua` **right after `client/maps.lua`**. The ORDER is
+  load-bearing (AGENTS §8): each file asserts its predecessor.
+- **Server hand-off**: `Core.SceneRuntime` (one table, created by scene_kinds.lua, filled by each file: `R.kinds`,
+  `R.index`, `R.interest`, `R.flush`, `R.store`, later `R.promote`, `R.audio`, `R.voice`) — added to
+  `INTERNAL_NAMESPACES` in server/api.lua together with `SceneCodec` and `SceneMotion`. Plugins reach only `Core.Scene`.
+- **Client hand-off**: the one-shot global `CoreSceneRuntime` (created by client/scene_cache.lua, filled by each file,
+  cleared by client/scene.lua — the §52 `CoreMapsEngine` pattern); `SceneCodec`, `SceneMotion` join `INTERNAL_NS` in
+  client/api.lua. Nothing internal is reachable through the export.
+- **Libs**: `LIB_MODULES` in import.lua gains `Clock = 'clock'` and `Scene = 'scene'` (the lib part of Scene is the
+  in-VM registration; everything else is proxied, the `Core.UI` pattern).
+- **Registry kinds** (owner-tracked, §2.3): `sceneNode` (non-persistent nodes of a stopped owner are removed; persistent
+  ones stay), `sceneKind` (a stopped owner's kinds go; their nodes stay as placeholders), `sceneListener` (Scene.on),
+  `sceneInteract` (onInteract handlers), `sceneModelInfo` (the model-info provider), `sceneHold` (client holds),
+  `sceneVoice` (voice sessions).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Deviation — five more files** (Lua's 200-locals limit and file size forced the splits; each is internal):
+  `server/scene_store.lua` (records, pose, parent / child sets, dependency bookkeeping, `Scene.on/onInteract/off`,
+  persistence, the load barrier; it hands its internals ONCE to server/scene.lua through `R.storeInternal`, which
+  scene.lua takes and clears) · `server/scene_gated.lua` (the audience half of `R.interest`: allows, gatedTargets,
+  holders, PRIV sections) · `client/scene_focus.lua` (`C.focus`: focus reporter, resync requests, bucket changes) ·
+  `client/scene_mat_assets.lua` (`C.assets`: ref-counted models / anim dicts / ptfx assets and interiors; `C.fades`:
+  the slot-budgeted fade manager) · `client/scene_world.lua` (hide, zone, sound, group — it extends scene_fx.lua's
+  `C.fx`, which keeps light, particle, marker, text and the draw loop).
+- **Manifest order as built** (each file asserts its predecessor): shared `shared/scene_codec.lua`,
+  `shared/scene_motion.lua` after `shared/ui_forms.lua`; server `scene_kinds → scene_index → scene_interest →
+  scene_gated → scene_flush → scene_store → scene → scene_promote → scene_audio → scene_voice` right after
+  `server/maps_apply.lua`; client `scene_cache → scene_focus → scene_mat_assets → scene_materializer → scene_kinds →
+  scene_fx → scene_world → scene_movers → scene_promote → scene_audio → scene_voice → maps_preview → maps → scene`
+  right after `client/spawn.lua` (phase D: client/maps_spawn.lua and maps_view.lua are gone; the map facade and its
+  editor view sit INSIDE the scene block because they use `CoreSceneRuntime`, which client/scene.lua clears last);
+  `server/vehicles_park.lua` right after `server/vehicles.lua` (one-shot global `CoreVehiclesPark`, §4.6 notes). The
+  phase B/C server files assert only what they use (scene_audio: `R.store`, `R.kinds`); until they load,
+  `Scene.promote / demote / lease / voice.* / audio.kill` answer `nil, 'unavailable'`.
+- **Registry kinds** beyond the list: `sceneFocus` (server, `Scene.setFocus` pins) and `sceneHandler` (client,
+  plugin-kind claims). Server `Scene.on` / `onInteract` handles are strings (`'sl:<n>'`, `'si:<n>'`), client handles
+  integers.
+- `server/api.lua` also block-lists the FUNCTION `Scene.prefetch` (Player.setCoords' own); `import.lua` gains
+  `SUB_NAMESPACES.Scene = { voice, audio }`, so the proxy reaches `Core.Scene.voice.start` and `Core.Scene.audio.play`.
+- `lib/scene/shared.lua` also carries `PAINTS` (22 stable vehicle paints) and `paintOf(id)`: one list for the
+  server's promoted clones and every client's local copy. The shell audio engine is `ui/src/runtime/audio/*.ts`
+  (§55.16 notes lists the modules).
+- The research reports live in `resources/research/entity-streaming/` (outside the core repository); the dev-only
+  probes are `resources/scene_probe` (§55.24 notes).
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+Two more splits, each with a one-shot hand-off and a
+load-bearing manifest order: `server/scene_promote_api.lua` loads right after `server/scene_promote.lua` and takes its
+internals once through `R.promoteInternal` (the entry points: `Scene.promote / demote / lease`, `R.promote.adopt`,
+`beforeChange`, the report and applied events, interactions, `onEntityBucketChange`, player drops, the core stop);
+`server/vehicles_fleet.lua` loads right after `server/vehicles_park.lua`, which now passes the one-shot global
+`CoreVehiclesPark` on — vehicles_fleet.lua clears it (AutoPark, MaxParked, the boot and core-stop reconciliation).
+Server order now: `… vehicles → vehicles_park → vehicles_fleet …` and `… scene_store → scene → scene_promote →
+scene_promote_api → scene_audio → scene_voice`.
+
+### 55.2 `Core.Clock` (lib `lib/clock/shared.lua`, every VM)
+
+```lua
+Clock.now() -> integer        -- u32 milliseconds: server GetGameTimer() & 0xFFFFFFFF;
+                              -- client GetNetworkTimeAccurate() & 0xFFFFFFFF (OneSync's netTimeSync clock)
+Clock.diff(a, b) -> integer   -- a - b as a signed 32-bit difference (wrap-safe; Lua values go negative after 24.9 days)
+Clock.add(t, ms) -> integer   -- (t + ms) & 0xFFFFFFFF
+Clock.at(ms) -> integer       -- Clock.add(Clock.now(), ms): future-stamped plans
+Clock.ready() -> boolean      -- client: the network clock has synced once (non-zero and advancing); server: true
+Clock.local2net(localMs) / Clock.net2local(netMs)   -- client only: map GetGameTimer() <-> network time (offset
+                              -- sampled on each call to now(), filtered: max over the last 10 s)
+```
+- The client latches the value once per frame (`GetNetworkTimeAccurate` is frame-locked in GTA, R3 §5); `now()` costs
+  one native at most once per frame (a frame counter from `GetFrameCount()` caches it).
+- No sync protocol of our own. Probe P3 (§55.24) measures the error; if it shows > 50 ms p95, a min-RTT Cristian
+  exchange over `Core.Callback` becomes the fallback (a `Config.Scene.ClockMode = 'network'|'callback'` switch).
+- Ops rule (README): run the host's NTP in slew mode — FXServer's `GetGameTimer()` follows the system clock on Linux
+  (R7 §3.3).
+- Tests: `tests/run_tests.lua` suite `clock` (wrap-safe diff across 2^31 and 2^32, add/at, latch per frame, ready).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- While the network time reads 0 — before the first sync, or again later — or the native is missing, `now()` answers
+  `GetGameTimer() & 0xFFFFFFFF` plus the LAST known offset (0 until a network sample was seen), so the timeline
+  stays continuous. `ready()` is sticky: true after two non-zero, advancing network samples, never false again.
+- The offset filter is ten one-second slots (allocation-free, sampled once per frame through the latch); a slot from
+  the future (a wrapped game timer) or older than 10 s no longer counts. `Clock.add` floors a fractional ms.
+- Server: `local2net` / `net2local` are the identity, masked to u32.
+- `Config.Scene.ClockMode` is in the config but nothing reads it yet: the `'callback'` fallback waits for probe P3.
+- Tests: `run_tests.lua` 468 in all (suite `clock` included).
+
+**In-game probe results (Liam, 2026-09-26 22:21 UTC, `scene_probe/data/report_20260926_222136.txt`).**
+Probe P3: client network time − server time,
+corrected by ping / 2 — mean 0.9 ms, p95 11.5 ms, max 24.5 ms, largest step 29.5 ms, inside the 50 ms p95 alarm:
+`Config.Scene.ClockMode = 'network'` is confirmed and the callback fallback stays unbuilt.
+
+### 55.3 Nodes and kinds
+
+**Node** (server record; the client sees the same fields minus `owner`, `persist`, `audience`):
+
+| field | type | notes |
+|---|---|---|
+| `id` | integer 1..2^31-1 | from one counter; persistent nodes keep theirs across restarts (the counter is stored) |
+| `kind` | kind id | `'prop'`, `'vehicle'`, … (built-ins, no prefix) or `'<resource>:<name>'` (plugins) |
+| `owner` | resource name | the creating resource (`Registry.getCaller()`); core for core's own |
+| `bucket` | integer ≥ 0 | routing bucket; default 0 |
+| `pos`, `rot` | vector3 / Euler degrees (order 2) | quantised on the wire to cm and centi-degrees (§55.8) |
+| `parent` | node id or nil | a child rides with its root: no index entry, packed after the root, created after it, revealed with it; `offset`/`offrot` relative to the parent (or its bone: `bone`) |
+| `motion` | descriptor or nil | §55.9; the node's pose at time t is `SceneMotion.pose(node, t)` |
+| `fields` | table | kind fields, checked by the kind schema (§55.12) |
+| `audience` | nil or table | nil = public in its bucket; otherwise gated (§55.6): `{ players = { src… } }`, `{ faction = id }`, `{ perm = 'x' }`, `{ editors = true }`, `{ near = radius }`, `{ fn = callable }` — combinable with `any`/`all` |
+| `radius` | number (m) | stream radius; nil = computed by the kind (§55.12) |
+| `tier` | `'S'`/`'M'`/`'L'`/`'G'` | derived from `radius`: S ≤ `TierS` (160), M ≤ `TierM` (448), L ≤ `TierL` (1500), G = `global = true` |
+| `persist` | boolean | stored in Core.DB (§55.18); survives restarts and owner stops |
+| `interact` | array or nil | interaction descriptors (§55.14) |
+| `authority` | policy or nil | overrides the kind's promotion policy (§55.15) |
+| `ver` | integer | bumps on every change (module-wide counter) |
+
+**Kinds** (`server/scene_kinds.lua`):
+```lua
+Scene.defineKind({
+    id = 'fireworks:battery',        -- '^[%w_%-]+:[%w_%-%.]+$' for plugins; built-ins are reserved plain ids
+    class = 'custom',                -- 'prop'|'vehicle'|'ped'|'fx'|'audio'|'data'|'custom'
+    fields = { Schema fields … },    -- Core.Schema list; a field may be { name, type = 'table', validate = fn } (free-form,
+                                     -- JSON-safe, ≤ Config.Scene.MaxFieldBytes encoded), checked by `validate` only
+    nearFields = { 'label' },        -- optional: sent to near-ring subscribers only (BigWorld detail levels)
+    radius = 250 | fn(node) -> m,    -- optional; default by class (§55.11)
+    handler = 'fireworks',           -- client handler resource (custom kinds); core for built-ins
+    authority = { … },               -- default promotion policy (§55.15)
+    budget = 'custom',               -- client cap bucket (Config.Scene.Caps key) — custom kinds get their own
+}) -> ok, err
+Scene.kinds() -> public list (no functions)
+```
+Owner-tracked (`sceneKind`). A node of an undefined kind is kept and delivered as a placeholder (kind index 0, never
+materialised; the editor view may draw it) — the §52 rule. Kind indexes are per server session: the wire carries a
+`u16` index and the client learns the table through `KINDS` ops (§55.8).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Deviation — `ver` is PER NODE** (RV1 F6), not a module-wide counter: 1 on spawn / load, +1 per change, a u32
+  that wraps 4294967295 → 1 (never 0). Two versions of one node are compared with serial arithmetic
+  (`d = ((new − old + 2^31) % 2^32) − 2^31`, newer iff `d > 0`), never with `<` / `<=` (the client does the same
+  for cell versions, §55.10 notes).
+- **Audiences as built**: exactly ONE key per table — `players` (1..256 srcs) | `faction` | `perm` | `editors =
+  true` | `near` (0..200 m) | `fn` — composed with `any` / `all` (1..8 entries, nesting ≤ 3); anything else is
+  `'audience'`. The EFFECTIVE audience is every level of the node's path (its own and each ancestor's must admit a
+  player): `R.store.audienceOf(node)` → nil (public) | the one table (live) | `{ all = { root…node } }` (fresh). A
+  child with its own audience is a gate head (§55.5 notes). Persistent nodes refuse `players` (server ids are per
+  session, RV1 F8) and `fn` anywhere in the tree.
+- **Quotas** (RV1 F3, F13; all `'limit'`): a root carries ≤ `Config.Scene.MaxChildren` (64) descendants; a plugin
+  ≤ `Global.MaxPerOwner` (64) global nodes; a plugin introduces ≤ 256 distinct kind ids per server session (a kind
+  id keeps its index for the session, so a restarted plugin gets its index back); ≤ 1,024 kinds at once.
+- **Foreign parents** (RV1 F13): a node hangs under another resource's node only when that node allows it —
+  `allowChildren = true | { resource… }` (≤ 16 names; a spawn / set option, server-side only, never sent); its
+  owner and core always may; else `'owner'`.
+- The kind table as built: `{ id, idx, class, classCode, fields, tables, names, nearFields, nearList, radius,
+  handler, authority, budget, owner, builtin, dependency, filled, derived, clock, post, hasModel, intModel }` —
+  `filled` = the server-filled fields (`lod`, `r`, `resolved`), `derived` = model-derived INPUT fields kept when
+  given and filled when absent (the vehicle's `vtype`, run I1), `clock` = Clock-valued field paths (`anim.t0`, `t0`,
+  `pausedAt`) that persist as phases (§55.18 notes), `post` = a built-in cross-field rule (the `audio.source` shape,
+  the vehicle's vtype mapping), `intModel` = `model` also takes an integer hash.
+
+### 55.4 Server API (`server/scene.lua`, proxy for plugins)
+
+```lua
+Scene.spawn(def) -> id | nil, err
+--  def = { kind, pos, rot?, bucket? = 0, parent? , offset?, offrot?, bone?, motion?, fields?, audience?, radius?,
+--          global? = false, persist? = false, interact?, authority?, model? (shorthand for fields.model) }
+Scene.set(id, patch) -> ok, err            -- partial fields update (C1); nil values in patch delete optional fields
+Scene.move(id, pos, rot?, opts?) -> ok     -- opts = { duration?, ease? } → a tween descriptor (C3); none → teleport
+Scene.motion(id, descriptor | nil) -> ok   -- C3; t0 defaults to Clock.at(Config.Scene.Motion.PlanLeadMs)
+Scene.attach(id, target, opts?) / Scene.detach(id)   -- target = { node = id } | { player = src } | { net = netId }
+Scene.emit(id | { pos, bucket }, name, params?, opts?) -> ok   -- C4 one-shot; opts = { radius?, horizonMs? }
+Scene.remove(id, opts?) -> ok              -- opts = { fade = true } (clients delete visibility-safely either way)
+Scene.get(id) -> node copy | nil
+Scene.query({ pos, radius, bucket? = 0, kind?, owner?, limit? = 256 }) -> array of node copies (index cells + exact test)
+Scene.list({ owner?, kind?, bucket? }) -> array of ids
+Scene.batch(fn) -> ...                     -- every change inside fn is flushed together (one version per cell)
+Scene.on(event, kindOrId, fn) -> handle    -- server hooks: 'spawned'|'changed'|'removed'|'promoted'|'demoted'; off(handle)
+Scene.onInteract(kindOrId, fn(src, nodeCopy, action, data)) -> handle
+Scene.setModelInfo(fn(kind, model) -> { lod?, radius?, bbox?, vehicleType?, class? } | nil)   -- one provider, owner-tracked
+Scene.stats() -> { nodes, byKind, cells, subscribers, bytesPerSecond, flushMs, … }
+-- phase B/C (§55.15–§55.17): Scene.promote(id), Scene.demote(id), Scene.lease(id, src), Scene.voice.start/stop/list
+```
+- Validation order: kind known → fields (`Schema.checkAll`, then `validate` of `table` fields) → pose finite and inside
+  the world (x/y ±10000, z −1000..3000) → rotation finite → model through the model-info chain (§55.12) → parent exists,
+  same bucket, depth ≤ 4, no cycle → audience shape → limits (`MaxNodes` 100,000 server-wide, `MaxNodesPerOwner`
+  20,000, `Global.MaxNodes` 256 global nodes) → `Core.Hooks.run('scene:beforeSpawn', …)` (spawn only).
+- Owner rules: `set/move/motion/attach/detach/remove/emit` by the node's owner or core; everyone may read. The owner
+  of a persistent node that stopped is still the owner (it may come back); `Scene.adopt(id)` (core only) re-owns.
+- Hooks are observers; handlers get copies. Server-side cost of an API call is O(1) plus the node's cell work.
+- The public client API and the proxy's plugin surface are in §55.10 and §55.13.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Signatures as built** (server/scene.lua; `on` / `onInteract` / `off` are server/scene_store.lua's):
+  `spawn(def) -> id | nil, err, detail` (def also takes `allowChildren`; a child defaults to its parent's bucket) ·
+  `set(id, patch, opts?) -> ok, err, detail` (patch merges into the fields and the result is checked whole; `opts =
+  { remove = { names }, interact = list|false, audience = t|false, radius = m|false, allowChildren = … }`) ·
+  `move(id, pos, rot?, { duration = 1..600000, ease = 'inout' }?)` (a teleport ends absolute motions, spin / osc
+  survive; for a child or an attached node pos / rot are its offset / offrot, no tween) · `motion(id, desc|nil)`
+  (roots only) · `attach(id, { node } | { player } | { net }, { offset?, offrot?, bone? }?)` · `remove(id,
+  { fade? }?)` (a source's emitters go with it) · `emit(id | { pos, bucket? }, name, params?, { radius? = 1..TierL,
+  horizonMs? = 0..30000 (2000) }?)` (name `^[%w_%-:%.]+$` ≤ 32, params ≤ 1 KiB, a positional event reaches 150 m by
+  default) · `drive(id, pos, vel, yaw) -> ok, sent` (roots only, |vel| ≤ 300 m/s; §55.9 notes) · `query(q)`
+  nearest first (radius ≤ 10,000, ≤ 4,096 results, gated nodes included) · `list(filter)` ascending ids ·
+  `batch(fn, ...)` → fn's results | `nil, 'error'` (fn must not yield: a Wait splits the batch) · `adopt(id, owner?
+  = 'core')` core only · `setFocus(src, pos|nil)` / `prefetch(src, pos)` refuse a src nobody is connected as
+  (`GetPlayerName`, RV1 F11) · `stats()` adds `promote`, `audio`, `voice`, `persistent`, `global`, `loaded`.
+- **Errors**: `'unavailable'` (not loaded yet) `'def'` `'kind'` `'fields'` (+ the Schema errors as detail) `'pos'`
+  `'rot'` `'offset'` `'offrot'` `'bone'` `'motion'` `'motion_future'` (a plan whose t0 lies more than 24 h ahead:
+  rebase could never move it) `'model'` `'parent'` `'deps'` `'audience'` `'interact'` `'authority'` `'radius'`
+  `'global'` `'persist'` `'bucket'` `'limit'` `'hook'` (+ reason) `'missing'` `'owner'` `'dependency'` `'attach'`
+  `'duration'` `'ease'` `'name'` `'params'` `'horizonMs'` `'vel'` `'yaw'` `'allowChildren'` `'rotOrder'`, and
+  `R.audio.admit`'s `'audio_disabled'` | `'audio_streams'` | `'audio_rate'` — asked LAST for an `audio.source`, after
+  `scene:beforeSpawn` (every pass costs a flood-guard token; §55.16 notes).
+- **Addition (run I1) — `rotOrder`**: an optional integer 0..5 (default 2 = EULER_YXZ, GTA's) on a CHILD's spawn def,
+  in `attach` opts and in `move` opts (kept when absent): the rotation order the clients apply `offrot` in
+  (`AttachEntityToEntity`). Ignored on roots, persisted for children, copied by `Scene.get`, cleared on detach;
+  `'rotOrder'` for anything else. Core.Attachments sends 1 (the pre-scene applier's and the community prop tables'
+  order, §55.21.3).
+- **Addition (run I1) — `Config.Scene.OwnerCaps[owner]`** overrides `MaxNodesPerOwner` for that owner: `{ core =
+  60000 }` — core owns every map node, player attachment and parked car. The store drops a hook key's container once
+  its last handle is gone (a leak fix; `R.store.hookStats()` is internal, for the tests).
+- **Addition — `{ net }` attachments** keep the entity and its model; a sliced watcher (≤ 256 per second, only while
+  such attachments exist) ends one whose net id no longer names that entity, at its last pose (RV1 F20). A dropped
+  player's attachments end at their last pose too.
+- Removals rebuild the children list of the root they hung under once per operation (an owner sweep once after the
+  sweep): O(subtree), never per removed child (RV1 F3).
+- Phase C is wired: `R.promote.beforeChange(node, what)` runs before move / motion / drive / attach / detach and a
+  fields `set`; `R.promote.refuses(src, node, action)` before an interaction's dispatch; a promoted node's pose
+  (`R.store.pose`) is its clone's.
+- Internals beyond INTERFACES §4: `R.store.audienceOf(node)`, `kids(id)` (direct children, live), `copy`, `bump(node)
+  -> ver`, `notify`, `each`, `loaded`, `flush`, `settle(node, x, y, z, rx, ry, rz)` (the index folds a finished plan
+  into the base pose).
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+- **Core's reserve** (RV4 F3): `Config.Scene.CoreReserve = { nodes = 20000, persistent = 10000 }` — every owner but
+  core is refused `'limit'` once the total reaches `MaxNodes − nodes` / `MaxPersistent − persistent`, so plugins can
+  never starve maps, attachments and parked cars. `OwnerCaps` gained `inventory = 40000` (one node per ground drop).
+- **Reserved fields** (RV4 F11): `mapEl`, `mapType` and `vehId` mean "core made this node". Only core may set, change or
+  remove them — anyone else gets `'fields'` with the detail `{ [name] = 'reserved' }` — and no plugin kind may declare
+  them (`defineKind` → `'fields:reserved:<name>'`).
+- `R.store.follow(node, pos, rot, bucket, persistNow)` (internal, the promotion engine's only — never on Core.Scene):
+  a promoted root's base pose follows its clone (index change `'follow'`, re-celled with the 8 m tolerance); a bucket
+  move is a DEL in the old bucket and a PUT in the new one, children included, ids kept; moves under 5 cm and 1° are
+  ignored; persisted at most once per 30 s, at once with `persistNow` or on a bucket move. No motion, no
+  beforeChange, no hooks.
+
+### 55.5 Index: grids, tiers, versions, journals, packs (`server/scene_index.lua`)
+
+- **Grids**. `grid 0` = near cells of `Config.Scene.CellSize` (128 m), key `(cx + 32768) * 65536 + (cy + 32768)`,
+  `cx = floor(x / 128)` — the player-grid encoding (§22.1); `grid 1` = far regions of `RegionSize` (512 m), same
+  encoding; `grid 2` = the bucket's global set (key 0). Both sizes are read ONCE at start.
+- **Membership by tier**: S and M nodes live in the near cell of their (root) position; L nodes in the far region; G in
+  the global set. Children never have an entry: they are stored with their root (`root.children`, depth ≤ 4) and every
+  op of a child is emitted in the root's cell right after the root's.
+- **Variants** of a near cell: `near` (every node, every field) and `far` (M-tier nodes only, without `nearFields`).
+  Each variant has its own version (`vNear`, `vFar`); regions and the global set have one (`v`). Versions come from ONE
+  module-wide counter (never repeat, 0 = empty — the §52 rule). A change to an S node bumps `vNear` only.
+- **Journal** per variant: the last `JournalOps` (64) entries or `JournalMs` (10 s), whichever is smaller; an entry is
+  `{ from, to, blob }` where `blob = CELL(grid, key, variant, from, to, n) .. ops` (§55.8). Consecutive entries chain
+  (`to` of one = `from` of the next), so "everything since version V" is a concatenation.
+- **Pack** per variant: `CELL(grid, key, variant, 0, v, n) .. PUT…` for every node (roots + children, parent first),
+  built lazily on first request after a change and cached until the next; a pose-only C2 change invalidates the cache
+  without a version bump (clients converge through DR ops).
+- **Ops per tick are coalesced per node** (latest wins): PUT absorbs later SET/MOVE/MOTION of the same node; SET merges
+  field patches; MOVE/MOTION keep the last; DEL wins over everything and cancels a PUT of a node created and removed in
+  the same tick (nothing is sent). A node moving to another cell emits `DEL(how = handover)` in the old cell and `PUT` in
+  the new one in the SAME tick (the client keeps its entity).
+- **Movers**: nodes with a motion descriptor or an attachment are re-evaluated at `Motion.ServerHz` (2 Hz) in one thread
+  that exists only while movers exist: pose from `SceneMotion.pose(node, Clock.now())` (attachments: the target's
+  server-known position — players through `PlayerGrid.positionOf`, net entities with `GetEntityCoords`) and re-celled
+  only when ≥ `RecellTolerance` (8 m) past the cell border. A re-cell is a handover, never delete + create.
+- Internal interface (`R.index`, used by scene.lua, scene_interest.lua, scene_flush.lua only):
+```lua
+R.index.put(node)                           -- insert or re-index (tier/cell from node.tier/pos); queues PUT
+R.index.changed(node, what, data)           -- what = 'set'(patch) | 'move' | 'motion' | 'promote'(netId) | 'demote'
+R.index.remove(node, how)                   -- queues DEL; how = 'normal'|'fade'
+R.index.event(node|nil, pos, name, params, t, radius)   -- C4; not journaled; stored for this tick's flush
+R.index.dr(node, t, x, y, z, vx, vy, vz, yaw)          -- C2; not journaled; latest per node per tick
+R.index.drain() -> entries                  -- { bucket, grid, key, variant, from, to, blob } for every changed variant
+R.index.pack(bucket, grid, key, variant) -> blob, v    -- cached
+R.index.since(bucket, grid, key, variant, fromV) -> blob|nil   -- journal concatenation, nil when not covered
+R.index.version(bucket, grid, key, variant) -> v       -- 0 when empty
+R.index.gated(bucket, grid, key) -> array of gated nodes in that cell (§55.6)
+R.index.transient() -> events, drs          -- this tick's C4/C2 items (drained by flush)
+R.index.stats() -> table
+```
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **The interface as built** (INTERFACES §4 wins over the block above): `drain() -> entries, gated, events, drs` —
+  entries `{ bucket, grid, key, variant, from, to, blob, n, at, big? }`, gated items `{ node (the unit head), id, op,
+  blob, n, public? }`, events and DR items carry `node` and `gate`; `event(node|nil, x, y, z, bucket, name, params, t,
+  radius, horizonMs)`; `gatedIn(bucket, grid, key)`, `nodesIn` (roots only), `cellsNear`, `keyOf(grid, x, y)`,
+  `gatedPut(head) -> blob, n` (deps, head, subtree; `'', 0` for a non-head), `pending()`. The file is 2,053 lines —
+  accepted: one module of shared mutable state.
+- **Versions move lazily**: the first change after the content was observed (drained, packed, `version()`) takes a
+  fresh number and later changes of the tick reuse it, so one number names one content; masked to u32, the counter
+  wraps to 1 (the index compares versions for equality only). A C2 pose change drops the pack but keeps the version.
+- Coalescing as built: one op per node per entry — two or more kinds of change collapse into one PUT; a node created
+  and removed in one tick sends nothing; `attach` (and a `set` whose patch names `a`) re-sends the whole node as PUT
+  (offset / offrot / bone cannot ride a SET patch). Nodes cache their PUT ops (`node.opN` / `opF`, keyed by the flags
+  byte) in place of `extraNear` / `extraFar`.
+- **Gating (RV1 F1)** goes through `R.store.audienceOf`: a child with its own audience is a GATE HEAD — a gated unit
+  with its subtree, registered in its root's cell (nested heads own their units). Public packs and entries never
+  contain a unit's nodes; DELs go to the head the node was published under.
+- **Tree (RV1 F3)**: direct-children sets, every walk O(subtree) — a root with 2,000 children: handover 356 → 2.3 ms,
+  pack 215 → 0.8 ms, owner sweep 315 → 2.4 ms. More than 65,535 ops in one entry chain CELL sections.
+- A variant nobody subscribes to on its ring skips the encode and clears its journal (`since()` → nil → the pack
+  serves). An entry over MaxEventBytes is marked `big` and never goes out as one reliable event (RV1 F9, §55.7).
+- **Movers (RV1 F19)**: a plan whose bounding box stays inside its cell ± RecellTolerance (spin, osc, orbit, bounded
+  paths / keys / tweens) is PARKED in a heap and only woken at its finish or rebase time (sweep of 2,000 bobbing
+  roots 8.8 ms → 0). A finished plan goes to `R.store.settle` (folded into the base pose); a `dr` plan only after 6
+  heartbeats without a sample (≥ 10 s, 30 s by default); a plan near the end of Clock.diff's window is rebased (a
+  `'motion'` change); every `dr()` sample re-cells a driven root.
+- True idle: the first item a tick queues calls `R.flush.wake()` once (reset by the drain). Every encode is pcall'ed
+  (a failing node is logged once and skipped).
+- Bench (host Lua, pure-Lua msgpack): 50,000 nodes in 4,338 cells, 1,000 changes per tick ≈ 10 ms per drain,
+  ≈ 750 B per node; packing all 4,336 cells once (a join storm) allocates 4.3 MB where it allocated 16.8 MB before
+  RV1 F12.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+Player-attached roots are grouped per player ("riders", RV4 F7):
+one position read per player per sweep, and no work while the player stays inside the group's safe box; stats
+`riders` / `riding` / `ridePasses`. Bench, 1,000 players × 12 attachments standing still: 29.6 → 1.7 ms per second.
+
+### 55.6 Interest: focus, windows, rings, gated audiences (`server/scene_interest.lua`)
+
+- **Focus report** (client → server, `core:scene:focus`, via `Core.Net.on`, schema-checked, cooldown
+  `Focus.MinIntervalMs` 250): `(x, y, z, vx, vy, vz, seq, held)` — camera position, camera velocity (m/s), a sequence,
+  and `held = { [gridKeyString] = version }` for cells the client still caches (≤ 48 entries). Sent when the focus moved
+  ≥ `Focus.MinMove` (16 m), crossed a cell border, the bucket changed, or 5 s passed while moving.
+- **Validation** (server): the server-known position `P` = `GetEntityCoords(GetPlayerPed(src))`; when the player is in
+  an admin free-camera mode (`Core.Admin.getModes(src)` has `noclip`, `spectate` or `editor`) also
+  `GetPlayerFocusPos(src)`; a server script may pin a focus with `Scene.setFocus(src, pos|nil)` (trusted, owner-tracked).
+  A report farther than `slack = Focus.Slack (50 m) + Focus.MaxSpeed (90 m/s) × min(2 s, Δt)` from every allowed
+  point is CLAMPED to the nearest allowed point (anti-scrape: a client cannot pull the content of a far area). The
+  bucket always comes from `GetPlayerRoutingBucket(src)`.
+- **Window** around the validated focus `F` and a lead point `L = F + clamp(v × Lead.Seconds (1.5 s), Lead.Max 150 m)`:
+  near cells whose nearest point is ≤ `NearRing` (160 m) from F → ring 1; else ≤ `FarRing` (448 m) from F or L → ring 2;
+  far regions ≤ `FarRegions` (1,024 m) from F or L; the bucket's global set always. Leaving: a cell drops a ring (or out)
+  only when it is ≥ `LeaveMargin` (64 m) past the entry distance AND has been past it for `LeaveDwellMs` (3 s) — both
+  timestamps kept per (src, cell).
+- **Changes of the window** → for each added cell/variant: `SUB` + (`R.index.since(…, held)` when the client reported
+  that variant's version and the journal covers it, else `R.index.pack`); for each removed one: `UNSUB`; a ring change
+  = `UNSUB` + `SUB` of the other variant (+ its pack or journal). The server remembers per (src, cell) the version it
+  last sent (`sent`), so a repeated report never resends bytes (§52's anti-amplification rule).
+- **Backstop**: one thread slices the loaded players (every player once per `BackstopMs` 5 s, ≤ 2 natives each via
+  `PlayerGrid.positionOf`, a new accessor on server/playergrid.lua): a player whose server position left the window's
+  slack (lost or lying reports) gets a window computed from the server position.
+- **Teleports**: `Scene.prefetch(src, pos)` (core-internal, called by `Player.setCoords` before it moves the player)
+  subscribes the destination window at once; `Scene.waitAreaReady` on the client (§55.10) then gates the reveal (§48).
+- **Bucket change** (`core:client:bucketChanged`, §48, or a different bucket at the next report): unsubscribe all,
+  subscribe the new window, reset `sent`.
+- **Gated audiences** never enter cell blobs. For each gated node in a subscribed near cell the audience is evaluated
+  per subscriber: `players`, `faction` (`Core.Factions` of the character), `perm` (`Core.Perms.has`), `editors` (Admin
+  mode `editor` or the player's bucket is an open draft's editor bucket, §52), `near = r` (exact distance from the
+  server-known position ≤ r, re-checked by the backstop and on focus reports), `fn` (a callable from the owner,
+  pcall'ed, ≤ 0.2 ms budget each). Matching subscribers get the node in the `PRIV` section of their stream; re-evaluated
+  on node change, subscription change, and the hooks `factionChanged`, `permsChanged`, `staffModeChanged`,
+  `bucketChanged`.
+- Internal interface: `R.interest.subscribers(bucket, grid, key) -> map src → ring` (live table, never mutated by
+  callers), `R.interest.sentVersion(src, grid, key)` / `setSent`, `R.interest.gatedTargets(node) -> array of srcs`,
+  `R.interest.prefetch(src, pos)`, `R.interest.drop(src)`, `R.interest.stats()`.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Deviation — the audience half is its own file**, `server/scene_gated.lua` (loads between scene_interest.lua and
+  scene_flush.lua and defines `allows`, `gatedTargets`, `gated(items)`, `syncCell`, `syncWindow`, `holders`,
+  `privFlush`, `forgetGated`, `forgetHeld`, `gatedStats` on `R.interest`). Every Config key is read ONCE at load,
+  clamped. Allowed focus points: the ped, `GetPlayerFocusPos` in the admin modes noclip / spectate / editor, a pin
+  (`Scene.setFocus`), a prefetch target (for 10 s).
+- **`sent = PENDING`**: an added cell/variant queues its SUB at once; its content (nothing when the held version is
+  current, else the journal from it, else the pack) is filled by `R.interest.fill` right after the next drain (the
+  index moves versions lazily), and the fill budget is asked after EVERY cell (≤ 4 ms of fills per tick; the rest
+  resumes next tick). Journal answers spend the per-player pack budget like a pack; one over MaxEventBytes or the
+  budget becomes the pack (RV1 F5).
+- **Bucket change**: ANY change — Player.setBucket, the raw native (`onPlayerBucketChange`), or a report / backstop
+  visit that reads another bucket — calls `R.flush.reset(src)`: everything queued for the old bucket (items and
+  waiting packs) is purged, RESET (§55.8 notes) goes first in the next event and the new window subscribes from
+  scratch — no UNSUBs, no held hints, gated holdings forgotten without DELs (RV1 F17, F18).
+- **Resync** answers only a subscribed cell in its current variant, at most once per cell per 2 s, budgeted; a cell
+  that became empty answers `SUB(grid, key, variant, 0)` to a client asking with v 0 (else a pending cell would
+  re-ask every 15 s).
+- **Gated delivery as built**: a unit's targets are the subscribers of its cell (a far-ring subscriber of a near cell
+  only when the ROOT is M-tier) whose effective audience admits them (several keys in one table must all hold; fail
+  closed on an unknown key, a malformed value or nesting > 8). `fn` MUST be synchronous: it runs in a runner
+  coroutine, a yield counts as NOT allowed and is logged once per owner (RV1 F4); over 0.2 ms it is counted and
+  logged once a minute. **Holders are tracked per node** (RV1 F15): a DEL reaches every src holding what was
+  published, whatever head the node belongs to now (re-parent, reveal, detach). PRIV(n) counts OPS, not blobs (RV1
+  F16); big PUT-only blobs are cut at op boundaries. `near` heads are indexed per cell, so focus reports and
+  backstop visits re-gate O(window), never the bucket (RV1 F7); a global `permsChanged` re-gates 50 windows per
+  frame. Hooks: `factionChanged`, `permsChanged`, `playerLoaded` (scene_gated.lua), `staffModeChanged`
+  (scene_interest.lua); audience counters in `R.interest.stats()`.
+
+### 55.7 Flush and transport (`server/scene_flush.lua`)
+
+- One thread; while nothing is pending it sleeps 250 ms and does no work; otherwise it runs every `FlushMs` (50 ms =
+  the server Lua tick).
+- Per tick: `R.index.drain()` → for every entry, every subscriber whose ring matches the variant (near entries → ring
+  1, far entries → ring 2, region/global → all) and whose `sent` version equals the entry's `from` gets the entry blob
+  appended to its outbox (and `sent` = `to`); a subscriber that is behind or ahead gets the pack instead (resync).
+  Then gated-node ops (`PRIV`), C4 events (subscribers of the event's cell within its radius, dropped when older than
+  their horizon), C2 DR ops (rate-limited per node and ring: near 10 Hz, far 1 Hz), `KINDS` deltas for clients whose
+  kind table is older than the server's.
+- **One reliable event per client per tick**: `TriggerClientEventInternal('core:scene:s', src, payload, #payload)`
+  with `payload = msgpack.pack_args(header .. outbox)`; `Config.Scene.MaxEventBytes` (16,384) per event — the rest waits
+  for the next tick in priority order: UNSUB/SUB and DEL, then PUT of near rings, near updates, far updates, events.
+  A client whose backlog exceeds `MaxBacklogBytes` (256 KiB) has its pending entries dropped and its subscriptions
+  marked for resync (packs through the latent path) — never an unbounded queue.
+- **Snapshots > MaxEventBytes go latent**: `TriggerLatentClientEvent('core:scene:p', src, LatentBps, blob)` (750,000
+  B/s) within a per-player token bucket (`PackBudgetBytes` 2 MB, refilled over `PackBudgetWindowMs` 10 s — §52's
+  anti-abuse budget); withheld packs are retried when the budget allows; the client queues ops of a cell whose pack is in
+  flight (versions decide, latent events are unordered — R1 §1.3).
+- Budget: the whole flush ≤ 2 ms per tick at 2,000 players (instrumented: `Scene.stats().flushMs` p50/p99; a tick over
+  5 ms logs its counters once per minute).
+- Internal: `R.flush.queue(src, blob, prio)`, `R.flush.queueLatent(src, blob)`, `R.flush.wake()`, `R.flush.stats()`.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Deviation — no idle sleep**: the thread exists only while something is pending (a queued item, a waiting pack, a
+  capped DR op, `R.index.pending()`); `wake()` / `queue` / `queuePack` start it (its first step waits a frame, so a
+  wake from inside an index call never runs a tick re-entrantly) and it ends after the first idle check — 0 natives
+  while idle. `stats().running` tells.
+- **Five queues per client**, in send order: control (SUB, UNSUB, KINDS), PRIV (`queuePriv`: gated sections, FIFO,
+  never dropped and never counted by the backlog guard — a lost PRIV DEL would leak a gated node, RV1 F14), near,
+  far, transient (expiring). `queue(src, blob, prio)`'s priorities 1..4 map onto control / near / far / transient.
+  The event: header, RESET first after `R.flush.reset`, a KINDS delta when the client's table is older, then the
+  queues in order up to MaxEventBytes (an item larger than that goes alone and counts as `oversized`); the payload is
+  msgpack-packed once for `TriggerClientEventInternal`.
+- **Packs**: `queuePack(src, blob, prio, key, latent?)` spends the per-player token bucket (a pack larger than the
+  whole budget goes when it is full and leaves it in debt); `spend(src, bytes, force?)` charges journal answers and
+  PRIV grants (forced: DELs are never held back). Small packs ride the reliable stream while its backlog stays under
+  2 × MaxEventBytes; the rest leave as ONE `core:scene:p` latent event per client per tick (≤ 512 KiB), never before
+  their SUB left; ≤ 1 MiB of pack bytes per tick server-wide, clients from a rotating start (bounds a join storm's
+  frame). A newer pack of a key replaces a waiting one; `cancel` drops one whose cell left the window.
+- An entry larger than MaxEventBytes is never one giant reliable event: its subscribers get `SUB(to)` and the
+  cell's cached pack, forced latent (RV1 F9). C4 events and C2 DR ops of a node with an effective audience reach only
+  the holders of its unit. Internal API as built: `queue`, `queuePriv`, `queuePack`, `queueLatent(src, blob, key)`,
+  `spend`, `reset`, `cancel`, `cancelAll`, `drop`, `backlog`, `wake`, `stats`, `tickNow` (the bench).
+- **Bench** (`tests/scene_bench.lua`, 2,000 players and 50,000 nodes offline, pure-Lua msgpack): steady state p50
+  1.50 / p99 7.55 ms per tick, 1,617 B/s per client (mean).
+- **Known limitation — join-storm garbage.** 2,000 simultaneous joins grow the Lua heap by 377 MiB (≈ 650 MiB before
+  RV1 F12): join ticks p99 8.8 ms, the worst one a single ~200 ms GC cycle. Most of it (≈ 266 MiB) is the
+  server-side concatenation of header and parts per recipient; the planned fix is multi-part payloads
+  `(header, ...parts)` for `core:scene:s` / `core:scene:p` (the runtime msgpacks the varargs in C), dropping that
+  concatenation.
+
+### 55.8 Wire format (`shared/scene_codec.lua`, both core VMs)
+
+Little-endian `string.pack` (Lua 5.4). A stream payload is `header .. op*`, header `<B I4` = format version 1, server
+`Clock.now()` at the flush. Positions are `i4` centimetres, rotations `i2` centi-degrees normalised to (-180, 180],
+velocities `i2` cm/s, times `I4` ms. `s1`/`s2` are length-prefixed strings; `extra`/`patch`/`params`/`meta` are
+msgpack blobs (encoded once per change and cached on the node).
+
+| op | code | layout after the opcode byte |
+|---|---|---|
+| `KINDS` | 0x01 | `H n`, n × (`H idx`, `s1 id`, `B class`, `s2 meta`) — meta = `{ near = {…}, budget, handler }` |
+| `SUB` | 0x02 | `B grid`, `I4 key`, `B variant`, `I4 v` — subscribed; the content follows (CELL) or is in flight (latent) |
+| `UNSUB` | 0x03 | `B grid`, `I4 key` — keep the content in the LRU (§55.10), stop expecting updates |
+| `CELL` | 0x04 | `B grid`, `I4 key`, `B variant`, `I4 from` (0 = snapshot: replace), `I4 to`, `H n` — the next n node ops belong to it |
+| `PRIV` | 0x05 | `H n` — the next n node ops are gated nodes (no cell version) |
+| `PUT` | 0x10 | `I4 id`, `H kind`, `I4 ver`, `I4 parent`, `B flags`, `i4 x y z`, `i2 rx ry rz`, `H radius`, `s2 extra` |
+| `SET` | 0x11 | `I4 id`, `I4 ver`, `s2 patch` |
+| `MOVE` | 0x12 | `I4 id`, `I4 ver`, `i4 x y z`, `i2 rx ry rz` |
+| `MOTION` | 0x13 | `I4 id`, `I4 ver`, `s2 motion` (empty = static) |
+| `DEL` | 0x14 | `I4 id`, `I4 ver`, `B how` (0 normal, 1 handover, 2 fade) |
+| `EVENT` | 0x15 | `I4 id` (0 = positional), `I4 t`, `i4 x y z`, `s1 name`, `s2 params` |
+| `DR` | 0x16 | `I4 id`, `I4 t`, `i4 x y z`, `i2 vx vy vz`, `i2 yaw` |
+| `PROMOTE` | 0x17 | `I4 id`, `I4 ver`, `H netId` |
+| `DEMOTE` | 0x18 | `I4 id`, `I4 ver`, `i4 x y z`, `i2 rx ry rz` |
+
+- `PUT.flags`: 1 motion present · 2 promoted · 4 placeholder (unknown kind) · 8 far variant (near fields omitted) ·
+  16 interact present · 32 gated · 64 has children (they follow). `extra` = `{ f = fields, m = motion?, o = offset?,
+  r = offrot?, b = bone?, a = attach?, i = interact?, n = netId? }`.
+- Client → server: `core:scene:focus` (§55.6), `core:scene:resync (grid, key, variant, v)` (cooldown 100 ms, ≤ 16/s),
+  `core:scene:interact (id, action, data?)` (§55.14), `core:scene:report (id, what, data?)` (§55.15). All through
+  `Core.Net.on` (schema → cooldown → loaded → permission → distance).
+- Codec API: `Codec.writer()` (buffer + `u8/u16/u32/i16/i32/s1/s2/done`), one encoder per op
+  (`Codec.put(node, variant) -> string`, `Codec.set(id, ver, patchBlob)`, …), `Codec.header(now)`,
+  `Codec.decode(blob, handler)` (calls `handler.kinds/sub/unsub/cell/priv/put/set/move/motion/del/event/dr/promote/
+  demote` with decoded values; stops safely on a truncated or unknown op and reports `false, err`), `Codec.qpos(v)`,
+  `Codec.qrot(deg)`, `Codec.upos(i)`, `Codec.urot(i)`. Round-trip identical in both VMs (suite `scene_codec_tests.lua`).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Addition — `RESET` 0x06, `B reason`** (`Codec.RESET`: 1 BUCKET, 2 EPOCH = the server restarted, 3 RESYNC =
+  resync-all): the client drops everything it holds (LRU and parked packs included) and reports its focus at once.
+  A control op like SUB — not one of a section's n; inside an unfinished CELL / PRIV section the decoder answers
+  `'truncated'` (the rest of the section would land on dropped state), so the flush sends RESET FIRST and clears that
+  client's queued outbox. `h.reset(reason)` gets the byte as sent (no ctx).
+- **Encoders take scalars** (INTERFACES §2), not nodes: `Codec.put(id, kindIdx, ver, parent, flags, x, y, z, rx, ry,
+  rz, radius, extraBlob)`, `set(id, ver, patchBlob)`, `move(id, ver, x, y, z, rx, ry, rz)`, `motion(id, ver,
+  motionBlob)` (`''` = static), `del(id, ver, how)` (the names `'normal' | 'handover' | 'fade'` are accepted),
+  `event(id, t, x, y, z, name, paramsBlob)` (id 0 = positional), `dr(id, t, x, y, z, vx, vy, vz, yaw)`, `promote(id,
+  ver, netId)`, `demote(id, ver, x, y, z, rx, ry, rz)`, `sub`, `unsub`, `cell`, `priv(n)`, `kinds(list)` (a removed
+  kind travels as `{ idx, id = '' }`), `reset(reason)`, `header(now)`. Also `Codec.writer()` (`u8 u16 u32 i16 i32 s1
+  s2 raw done`), `OP_NAME`, `CLASS_NAME`, `uvel`/`qvel`, `msgpackLua` (the built-in subset) and `nativeMsgpack`.
+- Quantisation clamps and never raises (NaN / ±inf → 0; radius → u16 whole metres); INTEGER fields go to
+  `string.pack` unchanged and RAISE when out of range (a server bug is loud; an id is never rewritten into another);
+  clock stamps wrap to u32. An `s1` string over 255 bytes is cut; an `s2` blob over 65,535 bytes RAISES (a cut
+  msgpack blob would be garbage).
+- **Blobs**: FiveM's `msgpack` when the VM has it, else a pure-Lua subset writing the same bytes (lua-cmsgpack's
+  defaults: integers in the smallest form, every float as float64, a 1..n table as an array, the EMPTY table as an
+  empty ARRAY 0x90, deeper than 16 levels = nil). FiveM's packer drops an `n` key next to a sequence (the
+  `table.pack` form): never mix them in a scene blob. `Codec.pack(v) -> blob | nil, err` never raises (nil → `''`);
+  `Codec.unpack('')` is nil.
+- **Decoder**: bounds-checked before every read, never raises on hostile or truncated input (`false, 'header' |
+  'version:<n>' | 'truncated' | 'unknown_op:<n>'`; the ops before the bad one were delivered); an error raised by a
+  HANDLER propagates. Node ops get a reused `ctx = { section, grid, key, variant, from, to }` as their LAST argument
+  (never keep it); blob arguments arrive decoded, and only when they decode to a table.
+- `extra` keys as built: `f` fields · `m` motion · `o` offset · `r` offrot · `b` bone · `q` rotOrder (run I1: only
+  when set and ≠ 2; the client's `node.rotOrder`, a change of it is an `'attach'` update, and both
+  `AttachEntityToEntity` sites — kinds and the materialiser's `attachTo` — pass `rotOrder or 2`) · `a` attach
+  (`{ p = src }` | `{ n = netId }`) · `i` interact · `n` netId (promoted) · `d` deps; `patch`: `f` changed fields · `x`
+  removed names · `i` interact (whole) · `a` attach (false = detached) · `d` deps.
+- Events as built: client → server `core:scene:focus`, `core:scene:resync` (server cooldown 62 ms ≈ 16/s; the
+  client sends ≤ 1 per 110 ms), `core:scene:interact`, `core:scene:report`, `core:scene:voice:report` (§55.19 notes);
+  server → client `core:scene:s`, `core:scene:p`, `core:scene:voice:targets | listen | unlisten`; the callback
+  `core:scene:props` (server → the clone's owner); LOCAL client events `core:scene:kind (op, kind, id, view,
+  target)` and `core:scene:ev (event, id, info)` (§55.13).
+
+### 55.9 Motion (`shared/scene_motion.lua`, both core VMs; client movers in `client/scene_movers.lua`)
+
+Descriptors (msgpack on the wire, validated by the server on `Scene.motion`, bounded sizes):
+```lua
+{ t = 'tween', t0, d, to = { x, y, z, rx?, ry?, rz? }, from? , e = 'linear'|'in'|'out'|'inout' }      -- from = pose at t0
+{ t = 'path', t0, pts = { {x,y,z}, … ≤ 64 }, sp = m/s | d = ms, loop = 'once'|'loop'|'pingpong',
+  curve = 'linear'|'catmull', face = 'path'|'fixed' }                                                  -- centripetal CR, arc-length LUT
+{ t = 'spin', t0, axis = 'x'|'y'|'z', dps }                                                            -- relative to the base rotation
+{ t = 'osc', t0, dir = {x,y,z}, amp, period, phase? }                                                  -- bob / sway, relative
+{ t = 'orbit', t0, c = {x,y,z}, r, period, face? }
+{ t = 'keys', t0, keys = { { t, x, y, z, rx?, ry?, rz? }, … ≤ 128 }, loop = bool, smooth = bool }
+{ t = 'dr', t, p = {x,y,z}, v = {x,y,z}, yaw }                                                         -- C2 state (server-steered)
+```
+- `SceneMotion.pose(node, t) -> x, y, z, rx, ry, rz, moving` — pure, identical results in both VMs for quantised
+  inputs; arc-length tables cached in a weak table keyed by the descriptor; `dr` extrapolates ≤ 1 s then holds.
+- Plans are future-stamped: `t0` defaults to `Clock.at(Motion.PlanLeadMs)` (200 ms) so every client starts the same
+  plan at the same time; a client that receives a plan late starts at the current phase with a 200 ms positional blend.
+- **Client evaluation budget**: LIVE movers within `Motion.NearRadius` (50 m) and on screen every frame; other LIVE
+  movers at `Motion.MidHz` (15 Hz); off-screen movers not at all (re-placed on their next evaluated frame). Entities are
+  placed with `SetEntityCoordsNoOffset` + `SetEntityRotation` (kinematic, frozen); a per-frame loop exists only while
+  movers are LIVE (§9 rule).
+- **Server-steered movers (C2)**: `Scene.drive(id, pos, vel, yaw)` (server scripts) keeps the server's own
+  dead-reckoned copy and sends a DR op only when that copy errs > 0.25 m (near) / 1 m (far) or > 3°, heartbeat 5 s,
+  rate caps 10 Hz near / 1 Hz far; clients blend with projective velocity blending over the nominal interval and snap
+  above 5 m (GTA's own threshold).
+- **Platforms carrying players are promoted while occupied** (§55.15): GTA syncs riders only relative to networked
+  objects (R7 §2.4).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **API as built** (pure, no natives, no allocation once a path's table exists): `Motion.validate(desc) -> true,
+  normalized | false, err`; `pose(bx, by, bz, brx, bry, brz, desc, t) -> x, y, z, rx, ry, rz, moving` (the scalar
+  form, not `pose(node, t)`); `velocity(desc, t, bx?, by?, bz?)`; `finished(desc, t)`; `needsRebase(desc, t)`
+  (|Clock.diff(t, t0)| > 2^30 ms ≈ 12.4 days) and `rebase(desc, t)` → a NEW descriptor with t0 = t and the same
+  future: periodic phases move into `ph` (loop / pingpong paths, looping keys; ms), `phase` (osc; degrees) or `a0`
+  (orbit; a spin folds the angle it turned into its `a0`); a finished tween / once path / non-looping keys becomes a
+  1 ms tween that ended at t − 1 on the exact end pose; a `dr` past its 1 s horizon becomes its held point (v = 0).
+- Descriptor details as built: `dr` keeps its sample time in `t0` (`t` is the type tag; default Clock.now());
+  orbit `{ c, r, period, a0 (a GTA heading around c, 0 = north), cw, face = 'fixed'|'path'|'center' }`; osc `phase`
+  in degrees, `dir` a unit vector; spin `axis` (default 'z') and `a0`; path defaults `loop = 'once'`, `curve =
+  'linear'`, `face = 'fixed'`, `'loop'` CLOSES the path, `d` = the time of ONE pass, points closer than 1 mm merged,
+  16 arc-length samples per segment (cached per descriptor, weak keys); keys: times relative to t0, strictly
+  increasing, a missing key angle = the base angle, `smooth` = time-scaled Catmull-Rom. Durations, periods and key
+  times ≤ 2^30 ms; before t0 every motion holds its Δt = 0 pose with `moving = false`.
+- Server: a plan stamped more than 24 h ahead is refused (`'motion_future'`: rebase could never move it). The index's
+  movers sweep rebases live descriptors and settles finished ones (§55.5 notes); `Scene.drive` makes the node's
+  motion a `dr` on its first call (a MOTION op), then sends DR ops only past the thresholds (roots only).
+- **Client movers as built** (client/scene_movers.lua, `C.movers.track(node, handle, handler, retarget?)`): "on
+  screen" uses THIS frame's rendered camera against the materialiser's widened cone — one coord and one rotation read
+  per frame while a mover is tracked (RV2 F11); an entity with an attach target rides it through
+  `AttachEntityToEntity` (re-attached within 500 ms when the target entity changes: respawn, model swap, a
+  re-created clone). **Blending** (RV2 F12): a new DR sample, a motion change or a late plan of a mover already on
+  screen blends from what is rendered (pose and velocity) by projective velocity blending over the nominal interval
+  (DR: 1000 / NearHz = 100 ms within NearRing, else 1000 / FarHz = 1 s; plans 200 ms), snapped beyond
+  `DeadReckoning.Snap` (5 m). Each mover runs in its own pcall (a failing one is logged once and untracked); a motion
+  that `finished()` is untracked once its blend ended. DR ticks never reach plugins or `changed` listeners.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+The client movers loop sleeps 500 ms while it tracks only
+engine-attached riders — one pass checks them all (RV5 F4: every Core.Attachments prop used to hold it at Wait(0));
+`track()` starts a fresh loop (per-frame waits in 10 s: 625 → 0).
+
+### 55.10 Client cache and API (`client/scene_cache.lua`, `client/scene.lua`)
+
+- **Receive**: `core:scene:s` (one binary string per tick) and `core:scene:p` (latent packs) are decoded with
+  `Codec.decode` in the event handler (never per frame). Per cell the client keeps `{ grid, key, variant, v, state =
+  'pending'|'live'|'lru', nodes = { [id] = true } }`; per node the decoded record plus `ver`.
+  - `CELL` with `from = 0` replaces the cell's content (nodes not in the snapshot leave the cell; a node that went to
+    another cell is kept if that cell has it); `from = v` applies and sets `v = to`; any other `from` discards the ops
+    and asks `core:scene:resync` (≤ 16/s, coalesced per cell). A node op with `ver ≤` the node's `ver` is ignored
+    (out-of-order safe). `DEL(handover)` keeps the entity for a `PUT` of the same id later in the same payload.
+  - Newest state per node per payload wins (head-of-line bursts, R7 §0.2); decoding a 16 KiB payload is ~20 µs of Lua
+    (R1 §8).
+- **LRU**: an `UNSUB`bed cell keeps its nodes (not materialised: the materialiser treats them as unwanted) for up to
+  `ClientLruMs` (120 s), at most `ClientLruCells` (48) cells; the focus report lists their versions so a return costs a
+  journal, not a pack.
+- **Focus reporter** (one thread): samples `GetFinalRenderedCamCoord()` every 250 ms while moving, 1000 ms still, never
+  before `LocalPlayer.state.loaded`; velocity from successive samples; sends per §55.6.
+- **Public client API** (`client/scene.lua`; plugins reach it through the proxy, handlers through the lib):
+```lua
+Scene.get(id) -> read-only copy { id, kind, pos, rot, fields, parent, state } | nil
+Scene.handleOf(id) -> entity | nil          Scene.idOf(entity) -> id | nil
+Scene.isAreaReady(pos, radius = 50) -> bool  Scene.waitAreaReady(pos, radius, timeoutMs) -> bool   -- from a thread
+Scene.hold(id) / Scene.release(id)           -- the runtime leaves the node's entity alone (editor drag); owner-tracked
+Scene.on(event, kindOrId, fn) -> handle / Scene.off(handle)   -- 'live' | 'gone' | 'changed' | 'event' | 'enter' | 'exit'
+Scene.stats() -> { cells, nodes, live, byState, byBudget, queued, fades, models, voices, bytesIn, … }
+```
+  Plugin `Scene.on` handlers run in the plugin's VM: the lib registers one local event handler and tells core (proxy
+  `Scene.listen(kindOrId, event)`) that someone listens, so core triggers `core:scene:ev` only for listened
+  kinds/ids — zero cost otherwise.
+- Commands: `/scene` (stats), `/scene debug` (overlay: subscribed cells and rings, the nearest 32 nodes with their
+  state and radii, queues, fades, budgets) — `Config.Scene.Debug` or ACE `core.admin`.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Deviation — the reporter is client/scene_focus.lua** (`C.focus`): samples at 250 ms moving / 1000 ms still, a
+  jump of ≥ 150 m is a teleport (no velocity); reports go ≥ MinIntervalMs + 30 ms apart; `held` = the LRU cells'
+  versions, newest first, ≤ 48, keyed `'<grid>:<key>:<variant>'` (the variant of the content held). Resync requests:
+  ≤ 1 per 110 ms, ≤ 1 per cell per 2 s, deferred, never dropped (RV2 F10); a pending cell whose content never came
+  re-asks every 15 s. A REAL `core:client:bucketChanged` (a known bucket, another one) drops the whole cache and
+  reports at once — the first notice only seeds the bucket (RV2 F1); a change nobody told the client about arrives as
+  the stream's RESET (`C.focus.onReset`, RV2 F14).
+- **Cells** keep the cached content's variant and version (`cv`, `v`) next to the subscribed `variant`: a SUB at the
+  held version is live at once; a newer one stays pending until its journal or pack lands; an older one is live
+  (journal entries up to the held version are skipped); late packs of another variant are ignored. A latent
+  snapshot stamped > 25 ms before its cell's SUB is ignored; one arriving BEFORE its SUB is parked (≤ 3 s, ≤ 16
+  packs; RV2 F6). Live cells awaiting a resync buffer journal entries like pending ones.
+- **Versions** of nodes and cells are compared wrap-aware (`vdiff` / `vnewer` / `vreached`, never `<`); a fresh node
+  record has ver 0. A near PUT over a record that came from the far variant applies at the same ver (its near
+  fields, RV2 F15); a PRIV DEL applies whatever its ver.
+- Payloads over 16 KiB — and whatever arrives while one is in work — go to a worker that applies 256 node ops per
+  frame in stream order (RV2 F17).
+- **The C.mat protocol**: `add(node)` = the node entered the wanted set (subscribed or gated-and-present, kind known
+  and handled, parent here), `remove(node, how)` = it left it (`how` 1 = handover: the entity is kept 1 s for a PUT
+  of the same id), `update(node, what, data)` once per payload, `event(...)` after the node work; a subtree goes root
+  first, links intact (RV2 F3). Dependency nodes never reach C.mat (a change is `update(node, 'dep')` of every
+  dependent). A plugin kind is wanted only after the resource its `meta.handler` names has claimed it.
+- **Public API as built**: `get(id)` (a copy; `state` = known | warm | staged | live | retiring | failed | off),
+  `handleOf(id)` (the local copy → a plugin's late-bound entity → the promoted clone), `idOf(entity)` (+ clones),
+  `isAreaReady(pos, radius = 50, ≤ 500)`, `waitAreaReady(pos, radius?, timeoutMs = 5000, ≤ 60000)` — it only waits
+  (the teleport budgets follow the faded screen, RV2 F7), `hold(id) -> entity|nil`, `release(id) -> boolean`,
+  `on` / `off` (core's VM: direct listeners), `listen` / `unlisten`, `claim` / `bind` (§55.13), `stats()` (the
+  materialiser's, the cache's and the reporter's counters plus `plugin = { claims, waiting, bound, listens }`); lib
+  helpers `validKindId`, `isPluginKind`, `tierOf`, `PAINTS`, `paintOf`. Listener events add `promoted` / `demoted`;
+  `info = { event, kind, entity? (live), changes + fields (changed), name, params, age, pos (event), netId
+  (promoted) }`.
+- `/scene` also answers staff on duty (`Core.Admin.getSelf().duty`); the overlay refreshes at 2 Hz and only draws
+  per frame, while it is on.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+`Scene.isAreaReady` / `waitAreaReady` first ask the maps hand-off
+`C.mapsPending(x, y, r)` (client/maps.lua, read at call time; absent or erroring = ignored): while the server still
+projects a large map change around the point (§55.21.1 notes) the area is not ready — teleports wait for it; then the
+cache and materialiser checks as before, with the same poll and timeout.
+
+### 55.11 Materialiser (`client/scene_materializer.lua`)
+
+The §52.4 engine generalised (zero-allocation evaluation, 64 m client cells with conservative bounds, rings, queues,
+ref-counted assets), plus the anti-pop pipeline of R5 §9.
+
+- **States**: `KNOWN` (cached, no game cost) → `WARM` (assets requested: model, anim dict, ptfx asset, audio preload) →
+  `STAGED` (created; either beyond its visible range, or inside it at alpha 0 waiting for its fade slot) → `LIVE` →
+  `RETIRING` (deletion wanted but deferred: visible and seen recently, or fading out) → `GONE` (entity deleted, assets
+  released after `ModelLingerMs` 30 s). Counts per state and per budget class are kept incrementally.
+- **Radii** (per node, recomputed when `GetLodscale()` — sampled every 1 s — changes by > 5 %, or the node changes):
+  | class | `R_vis` | `R_in` (create) | `R_out` (delete) |
+  |---|---|---|---|
+  | prop | `L·S + B` (B = 20 m; 5 m when L ≤ 20) | `R_vis + 10 + lead` | `R_in(no lead) + max(20, 0.25·R_in)` |
+  | vehicle | 500 (engine) | 255 | 311 |
+  | ped | 240 (engine) | 130 in view / 75 out of view | 140 / 90 |
+  | audio | range | range + 20 (enters silent) | range + 40 |
+  | light | range × 3 | min(range × 3 + 50, 300) | R_in + 30 |
+  | particle, marker, text | drawDistance | drawDistance + 10 | + 20 |
+  | hide | — | radius + 150 | + 50 |
+  | zone | — | bounding radius + 20 | + 20 |
+  | custom | node radius | node radius | + max(20, 0.25·r) |
+  `L` = the prop's lodDist (`fields.lod`, filled by the server's model-info chain, default 100), `S` = the LOD scale,
+  `lead` = camera speed × `Lead.Seconds` (1.5 s) for nodes within ±60° of the velocity, ≤ 150 m. `R_warm = R_in + 50`.
+  Props whose `R_in` exceeds `Radii.PropCap` (500 m) get `SetEntityLodDist(e, floor((cap − B − 10) / S))` so the engine
+  band still lands inside our radius (a slightly shorter draw distance that fades beats a longer one that pops).
+- **Priority**: late first (inside `R_vis` and not LIVE), then ascending `k = (d / R_in)² × (0.35 + 0.65 · f)` with
+  `f = 0.5 − 0.5·cos α`, α between the camera forward (or the velocity above 8 m/s) and the node; bucketed into 32
+  bins, no sort, no allocation.
+- **Per-frame budgets** (`Wait(0)` only while a queue holds work, else 100 ms moving / 500 ms still):
+  `Budgets.PropsPerFrame` 8 creations, `EntityPerFrame` 1 ped-or-vehicle, `CustomPerFrame` 2, `DeletesPerFrame` 32,
+  `ModelRequestsPerFrame` 2 new requests, `ModelsInFlight` 30; ×`TeleportMultiplier` (10) while the screen is faded
+  (`IsScreenFadedOut()` or a core teleport in progress).
+- **Caps** (`Config.Scene.Caps`): props 3,000 (the server.cfg pool raise is part of this build; 1,500 without it),
+  peds 48 (hard 64), vehicles 32 (hard 48), lights 32, particles 32, markers 64, texts 64, sounds 24, hides 200, custom
+  64 per kind; distinct models: props 150, peds 20, vehicles 20. Core.Maps' objects count against the props cap until
+  phase D. When a cap is full the farthest UNSEEN node is evicted; a visible one never; if every candidate is visible,
+  creation stops. A swap needs the newcomer ≥ 10 m closer and ≥ 100 ms since the evicted node's release (MTA).
+- **Pool guard**: own counters always; `#GetGamePool('CObject')` only after a failed create or while own props > 60 %
+  of the cap, at most every 10 s; no new props above 85 % of the object pool (3,300; 5,300 raised). A refused create
+  pauses that class for 1 s (§52).
+- **Visibility-safe deletes**: per LIVE node `seenAt` (in the frustum — one camera read per evaluation, Lua dot
+  products — and within `R_vis`). A wanted deletion runs at once when `d > R_vis` or unseen for `Visibility.UnseenMs`
+  (1.5 s; 4 s for peds and vehicles); otherwise the node is `RETIRING` for up to `DeferMaxMs` (10 s), then fades out.
+- **Fades** (explicit, only for late arrivals and in-view deletions): props 300 ms in / 450 ms out (screen-door),
+  peds 600 ms, vehicles 400 ms (true alpha, ≤ 8 at once); stepped by frame time in one loop that exists only while a
+  fade runs; `SetEntityAlpha(e, a, false)`, ended with `ResetEntityAlpha` (in) or `DeleteEntity` (out); at most
+  `Fades.Max` (48) at once — a non-urgent late arrival WAITS for a slot; ramps start at 51 (below 50 nothing is drawn).
+  Above `Speed.NoFadeAbove` (80 m/s) no fades (GTA does the same); above `Speed.SkipSmallAbove` (50 m/s) props whose
+  projected size at `R_vis` is under 4 px are not created.
+- **Physics and collision**: static props frozen (`fields.frozen`); `physics = 'local'` props are created frozen and
+  unfrozen when `HasCollisionLoadedAroundEntity` and the camera is within 30 m; script peds/vehicles freeze themselves
+  while ground collision is missing (R3 §6.4). `SetEntityLoadCollisionFlag` is never used.
+- **Interiors**: nodes carry `fields.room = { interior, key }` when an editor placed them; otherwise
+  `GetInteriorAtCoords` once per node. An interior node is created only after `IsInteriorReady(interior)` (polled at
+  4 Hz while pending), then `ForceRoomForEntity(e, interior, key)` when a key is known.
+- **Holds**: a held node's entity is never moved, re-created or deleted by the runtime; changes apply on release (§52).
+- **Handover**: a node that changed cell keeps its entity; a node whose model/kind changed is re-created through the
+  queues (fade rules apply).
+- Internal interface (`C.mat`, used by the cache, kinds, movers, promote, audio): `add(node)`, `update(node, what)`,
+  `remove(node, how)`, `event(node, name, params, age)`, `registerKind(kindClass, handler)`, `handleOf(id)`,
+  `idOf(entity)`, `hold/release`, `areaReady(x, y, z, r)`, `setTeleport(on)`, `stats()`. Handler shape:
+```lua
+{ class = 'prop'|'vehicle'|'ped'|'fx'|'data'|'audio'|'custom', budget = 'props'|…,
+  assets = fn(node) -> list of { type = 'model'|'anim'|'ptfx'|'audio', name|hash },   -- WARM
+  radii = fn(node, S) -> rVis, rIn, rOut        -- optional (else the table above)
+  create = fn(node, ctx) -> handle|true|nil     -- nil = failed (logged once per model)
+  update = fn(node, handle, what), destroy = fn(node, handle),
+  place = fn(node, handle, x, y, z, rx, ry, rz),  -- movers
+  event = fn(node, handle, name, params, age),
+  fade = 'engine'|'alpha'|'none'|'self' }        -- 'self': the handler fades (lights, particles, audio)
+```
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Deviation — client/scene_mat_assets.lua** holds the resources the materialiser drives: `C.assets` (models, anim
+  dicts, ptfx assets requested once, ref-counted, polled at 20 Hz, failed after 10 s once per session with one log
+  line, released ModelLingerMs after the last use; distinct models per class; model sanity and class checks;
+  interiors) and `C.fades` (≤ Fades.Max at once, ≤ Fades.MaxVehicles vehicles, one loop only while a fade runs,
+  ramps from alpha 51, a reversal continues from the current alpha). A fade-out ends in the owner's deletion or
+  `DeleteEntity` without `ResetEntityAlpha`: the engine frees an override slot when its entity is deleted (research
+  R5 §1, from the engine source), and a reset before a deletion that lands a frame later would flash the entity
+  opaque. Probe P4 confirms the release in game.
+- **States** add `FAILED` (an asset failed, create refused 3 times, or no bind within 5 s: never again this session)
+  and `OFF` (no handler, placeholder kind). **Late binds**: a create may answer `C.mat.PENDING` (the plugin-kind
+  bridge); the record stays STAGED until `C.mat.bound(node, entity | 0)`, 5 s at most. Update vocabulary: `'fields'`
+  (data = the changed names) `'move'` `'motion'` `'dr'` `'kind'` `'radius'` `'attach'` `'interact'` `'dep'`;
+  `update() == false` = re-create; handlers never hear `'dr'` (the movers place the entity).
+- **Budget as built**: nothing known = a bare 500 ms sleep; otherwise one camera check (coord, rotation, screen fade)
+  per 100 ms moving / 500 ms still, and the FULL evaluation only after ≥ 4 m or ≥ 10° or a content change (a thread
+  evaluation yields a frame per 2,000 records). Movers and retiring records alone get a LIGHT pass — O(movers +
+  retiring), no grid walk (RV2 F4). Priority: 2 × 16 bins (late arrivals first, then the rest), no sort.
+  `GetLodscale` + `GetFinalRenderedCamFov` + `GetAspectRatio` once per second; a scale change re-derives the radii
+  in slices of 500 records per frame (RV2 F5; the old client/maps_spawn.lua had it too until phase D), and the cell
+  bounds / `maxReach` are rebuilt the same way, also when the widest record left (RV2 F18, at most once per 5 s).
+- **Teleport mode** (×10 budgets, no fades, no deferred deletes) = the screen is faded out; `C.mat.setTeleport` only
+  marks a core teleport in progress, and `Scene.waitAreaReady` never switches it on (RV2 F7).
+- **Pool guard (RV2 F16)**: `Config.Scene.ObjectPool` (nil = learn it: 3,300 assumed, raised by a larger pool read,
+  lowered by a create refused below it, each logged once; 5,300 with the server.cfg raise). No new props above 85 %
+  of it; `GetGamePool('CObject')` is read at most every 10 s, only after a refused create or while own props are over
+  60 % of the props cap.
+- Caps are per budget key; a key without its own cap (`audio`) falls back to `Caps.custom` (64). Since phase D (run
+  I1) the caps, budgets and the pool guard count nothing of Core.Maps any more: map props ARE scene nodes and count
+  as props (the once-a-second `Core.Maps.stats()` sampling and `mapsHides` in the stats are gone).
+- `C.mat` as built: `registerKind add update remove event bound PENDING handleOf idOf hold release areaReady
+  setTeleport camera lodScale cone inView fadeIn fadeOut setListener targetOf attachTo compose evaluate stats shutdown
+  isStopped` (`setListener` carries live / gone to `Scene.on`). Fades and movers run in their own guarded per-frame
+  loops (a pcall per fade and per mover, RV2 F20).
+- Bench (client_scene_mat's `[bench]` line, host Lua): 2,000 nodes along a 3 km road at 50 m/s — 0.079 ms per
+  evaluation, 33 creations/s; 0 bytes allocated over 100 steady evaluations; the worst rescale frame (5,000 records)
+  ≈ 1 ms.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+- New client-only removal flavour `'world'` (3, never on the wire; RV6 F3): on a bucket change or a RESET(BUCKET) the
+  old world's copies lose collision and are hidden the same frame, and are deleted at the next wake;
+  `C.mat.worldReset()` also purges copies that were already fading out.
+- Prompts clear the moment a node leaves (except on a hand-over) and come back if the node is revived (RV6 F4: a
+  retiring entity's prompt stayed pressable, and `restart inventory` doubled every drop prompt).
+- New natives: `SetEntityCollision`, `SetEntityVisible` (materialiser); client/scene_kinds.lua uses `GetEntityType`.
+
+**In-game probe results (Liam, 2026-09-26 22:21 UTC, `scene_probe/data/report_20260926_222136.txt`).**
+- **The fade band is CONFIRMED for script objects** (P1): `prop_bench_01a`, lodDist 120, S 1.0 — the engine's alpha
+  rose linearly from 0 at ~140 m to 255 at ~120 m (32 @ 137.5 m … 235 @ 121.6 m) and the reverse walk faded out the
+  same way, so creating beyond `lod·S + band` and letting the engine fade is right. (The probe's own "POP" verdict was
+  wrong: it read the creation value 255 of an entity the engine had not scanned yet — AGENTS §8; fixed in the probe.)
+- Alpha slots (P4): 256 granted to 300 props; `ResetEntityAlpha` frees a slot, `DeleteEntity` frees it (20 / 20 each),
+  `SetEntityAlpha(e, 255)` does NOT — the §55.11 / AGENTS §8 rule stands.
+- Pools (P5): 2,000 local objects created (CObject 456 → 2,473), 64 local peds (CPed 45 → 111), 48 local vehicles
+  (CVehicle 136 → 181 with an ambient baseline of 136 of 300, so `Caps.vehicles` 64 leaves ~100 of headroom); ~45–54 ms
+  per 100 objects created at once — why creation is budgeted per frame.
+- P2 sampled only one context (on foot, third person: S = 1.0) and P6 crashed on the client's missing `os` library
+  (fixed in the probe): both are to be re-run; the design (S sampled once a second) is unchanged.
+
+### 55.12 Built-in kinds (fields; `server/scene_kinds.lua` schemas, client handlers in scene_kinds.lua / scene_fx.lua)
+
+| kind | class / budget | fields (Schema; defaults) | client |
+|---|---|---|---|
+| `prop` | prop / props | `model`*, `frozen` = true, `collision` = true, `invincible` = false, `visible` = true, `tint` 0..15, `physics` = 'static' \| 'local' \| 'promote', `anim` = { dict, clip, loop = true, rate = 1, t0 }, `room`, server-filled `lod`, `r` | `CreateObjectNoOffset(hash, x, y, z, false, false, false)`, rotation order 2, `SetEntityLodDist`, freeze / collision / invincible + `SetDisableFragDamage`, `SetObjectTextureVariation`, entity anim phase = `(Clock.now() − t0) × rate` |
+| `vehicle` | vehicle / vehicles | `model`*, `props` (CoreVehicleProps, validated like `Vehicles.saveProps`), `plate`, `locked` = false, `engine` = false, `lights` 0..2, `siren` = false, `doors` = { [door] = 0..1 }, `frozen` = true, `invincible` = false, `dirt` 0..15, server-filled `vtype` | local `CreateVehicle(hash, x, y, z, heading, false, false)`, pitch/roll by rotation, props through core's internal apply (no network-control wait), doors locked for the LOCAL copy (entering goes through promotion, §55.15), engine/lights/siren/doors, frozen while parked |
+| `ped` | ped / peds | `model`*, `appearance` (§34 CoreAppearance) or `variation` = { components, props }, `scenario`, `anim` = { dict, clip, flag, loop, rate, t0 }, `weapon`, `invincible` = true, `frozen` = true, `blockEvents` = true, `health`, `room` | local `CreatePed(4, hash, x, y, z, heading, false, false)`, appearance via `Spawn.applyAppearance`, scenario or anim with clock phase, weapon, blocking events, no ragdoll while frozen+invincible |
+| `light` | fx / lights | `type` = 'point' \| 'spot', `color`, `intensity` 0..100, `range` 0.1..100, `shadow` = false, `dir`, `falloff`, `inner`, `outer`, `flicker` = 'none' \| 'candle' \| 'neon' \| 'strobe', `seed` | one per-frame draw loop while any light is LIVE (`DrawLightWithRangeAndShadow` / `DrawSpotLightWithShadow`); intensity × fade × flicker(`Clock.now()`, seed) |
+| `particle` | fx / particles | `asset`*, `name`*, `scale` = 1, `color`, `alpha` = 1, `drawDistance` = 150 | `RequestNamedPtfxAsset` in WARM, `UseParticleFxAsset` + `StartParticleFxLoopedAtCoord` (on the parent entity for children), alpha ramp with `SetParticleFxLoopedAlpha`, `StopParticleFxLooped` |
+| `marker` | fx / markers | `type` 0..43, `scale`, `color`, `bob`, `face`, `rotate`, `drawDistance` = 50 | `DrawMarker` in the fx draw loop; alpha by the last 10 m of `drawDistance` |
+| `text` | fx / texts | `text`* ≤ 128, `scale`, `font`, `color`, `outline`, `drawDistance` = 25 | `SetDrawOrigin` + text natives in the fx draw loop (the §6.5 text-label recipe) |
+| `hide` | fx / hides | `model`*, `radius` 0.5..50 | `CreateModelHideExcludingScriptObjects` on LIVE, `RemoveModelHide` on GONE (the 256 map-change cap is shared: ≤ 200) |
+| `zone` | data | `shape` (a `Core.Geometry` definition), `events` = true | containment against the player ped at 4 Hz while LIVE → local `enter`/`exit` events (advisory, never authority) |
+| `sound` | fx / sounds | `name`*, `set`, `looped` = true, `range` = 30 | `GetSoundId` + `PlaySoundFromCoord` (`PlaySoundFromEntity` for children), `StopSound` + `ReleaseSoundId` |
+| `group` | data | — | nothing; its children stream with it atomically |
+| `audio.source`, `audio` | audio | §55.16 | §55.16 |
+
+`*` = required. **Server model-info chain** for `prop`/`vehicle`/`ped`: `Scene.setModelInfo` provider → the §52 Maps
+model validator (lazily, when registered) → defaults (prop `lod` 100, `r` 2; vehicle `vtype` 'automobile'). Results
+cached per `<kind>:<model>` (≤ 4,096). The server cannot check that a model exists; the client fails a missing or
+wrong-type model once per session and logs it (§52 rule).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Handler contract as built**: `create` → entity | `true` (a non-entity kind keeps its record itself: a handle
+  the materialiser sees is always an entity) | nil (failed); `update` re-reads `node.fields` and diffs them against
+  what the handler applied, so it does not depend on the exact `what` / `data` — `false` = re-create (a model
+  change, a particle's asset / name, a text that lost its text); `destroy` tolerates an entity a fade-out already
+  deleted. Handlers attach children and attach targets themselves (`AttachEntityToEntity` with all 16 arguments);
+  player attachments are adopted and re-attached by the movers when the ped handle changes (§55.21.3).
+- Every entity is created FROZEN; an unfrozen one wakes once its collision is loaded and the camera is within 100 m
+  (`physics = 'local'` props: 30 m); movers stay frozen; the 30 s give-up counts only time near the camera (RV2 F19).
+  One maintenance thread (250 ms, only while work is pending, pcall per tick, `warnOnce` per site) does the wakes,
+  the ped anim-phase fix-ups and the ground snaps.
+- **prop**: `snap = 'ground'` (§55.21.2) → `PlaceObjectOnGroundProperly` after create and after every re-placement,
+  retried ≤ 5 times while the camera is within 20 m and the collision streams. **vehicle**: `lights` 0 / 1 / 2 = off /
+  on / on + full beam; a local copy without `props.colorPrimary` gets `Scene.paintOf(id)` (the promoted clone gets
+  the same paint, §55.15); props through `Core.Vehicles.setPropsLocal(veh, props) -> bool` (§6.8: the `setProps`
+  apply without the network-control request, never yields).
+- **fx** (client/scene_fx.lua: light, particle, marker, text): one draw loop, alive only while one of them is live or
+  a fade runs, and per frame only while one is within its draw range (range × 3 / drawDistance; RV2 F21); ≤ 20
+  text draw-origin groups and ≤ 4 shadowed spot lights per frame; a text over 99 bytes goes out as up to three
+  `CELL_EMAIL_BCON` components (≤ 297 bytes); a spot light points along `dir`, else along the rotation, where
+  (0, 0, yaw) points straight DOWN and pitch tilts it up; markers and texts fade `'self'` over the last 10 m of
+  drawDistance. Every pass runs under pcall: the record that fails is dropped (and re-created by the materialiser).
+- **world** (client/scene_world.lua: hide, zone, sound, group; `fade = 'none'`): zones test the player ped at 4 Hz
+  and raise enter / exit through `C.emit` (`Scene.on`) and `C.fx.onZone` — never bridge both; a sphere / box
+  without `coords` is centred on the node and follows movers; sound ids ≤ Caps.sounds; model hides ≤ Caps.hides —
+  the game's 256 map-change slots are one budget for core (RV2 F13), and since phase D Core.Maps' hides are scene
+  `hide` nodes, so Caps.hides covers them all; an over-budget record waits (FIFO) — a hide takes a slot only when
+  another is released (run I1 removed the hides' 1-per-second retry), a waiting sound is also offered one at most
+  once a second (the game can refuse sound ids); sounds hear the C4 events `play` / `stop`.
+- Interactions are added at create (STAGED, not LIVE); a descriptor's `prompt = { world, offsetZ, range }` picks the
+  world dot or the text UI; a new list that differs only in labels (a drop's count) relabels the live prompts
+  (`Interactions.setLabel`). A `perm` descriptor's prompt shows for everyone — the server refuses the press.
+- Server schema additions: prop `snap` (`'ground'`), `interact[].prompt` `{ world = bool, offsetZ = −5..5, range =
+  1..50 }`. The fields and defaults as built are `BUILTIN` in server/scene_kinds.lua.
+- Open in game: `CELL_EMAIL_BCON` for texts over 99 bytes; `SetVehicleDoorControl` partial ratios.
+- **Phase D (run I1) — the model-info chain**: only a `Scene.setModelInfo` provider answering `false` REFUSES a model.
+  The §52 Maps validator (the admin catalogue) is an info source only — a model it knows gives its `lod` /
+  `vehicleType`, one it does not know gets the defaults — so addon / streamed models and weapon objects spawn with
+  the admin plugin running; Maps enforces its allow-list itself at apply (`checkModelOf` on create, update and
+  rollback). `model` of prop / vehicle / ped also takes an INTEGER hash (kept as is; it skips the Maps validator,
+  which knows names only) and a `'0x%08X'` string, which clients decode to the signed hash.
+- **Phase D (run I1) — fields**: prop, vehicle, ped, marker and hide gain `mapEl` (≤ 48) and `mapType` (≤ 64) —
+  ordinary fields, never near-only, so every variant carries them (client/maps.lua indexes by `mapEl`). The vehicle
+  gains `vehId` (≤ 64, `^[%w_%-:]+$`, parked cars), its `plate` pattern is `^[%w %-]*$`, and `vtype` is an INPUT: one
+  of the 8 CreateVehicleServerSetter types (automobile, bike, boat, heli, plane, submarine, trailer, train) or a
+  vehicles.meta name mapped onto one (quadbike / amphibious_* / submarinecar → automobile, blimp → heli); the model
+  info fills it only when absent, and a model change re-derives it unless the same patch names one.
+- **Phase D (run I1) — removing vehicle fields**: a local copy cannot take back what `setPropsLocal` applied, so
+  removing `plate` or `dirt`, or a `props` key the copy already applied, answers `update() == false` and the local
+  vehicle is re-created; colours and a props plate that the node's own `plate` covers are restored in place, and a
+  plate change stays in place.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+- The vehicle kind's `props` are clamped with the vehicles domain's `cleanProps` rules (`R.vehiclePropsNorm`: colour
+  and mod indexes, healths, dirt and fuel in their native ranges; RV4 F1).
+- `K.attach` passes `isPed = true` when the anchor is a ped — the retired applier's value (RV6 F10; one in-game probe
+  decides the look, README checklist).
+- A custom colour cleared with `false` (or already clear) no longer re-creates the car (RV5 F2).
+
+### 55.13 Plugin kinds (`lib/scene/client.lua`)
+
+```lua
+-- server (the plugin): Core.Scene.defineKind({ id = 'fireworks:battery', class = 'custom', handler = 'fireworks', … })
+-- client (the plugin's own VM):
+Core.Scene.handle('fireworks:battery', {
+    create = function(node) return entityOrNil end,   -- runs when core decides the node is wanted
+    update = function(node, entityOrNil, changed) end,
+    destroy = function(node, entityOrNil) end,
+    event = function(node, entityOrNil, name, params, age) end,   -- optional
+})
+```
+Core decides *when* (radius, budget, priority, fades via `fade = 'alpha'` on the returned entity, visibility-safe
+deletes); the plugin decides *what*. One local event `core:scene:kind (op, kind, id, view)` per state change — never per
+frame; the lib calls the handler and reports the returned entity with the proxy call `Scene.bind(id, entity|0)`, so
+fades, `handleOf` and children work. A kind whose handler resource is not running stays `KNOWN`. Owner stop removes the
+handler registration (Registry kind `sceneHandler`, client).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- The local event is `core:scene:kind (op, kind, id, view, target)`: `target` = the claiming resource (every other
+  VM ignores it); `op` = `create | update | destroy | event`; `view` = a copy `{ id, kind, pos, rot, fields, parent,
+  radius, motion, interact, attach, offset, offrot, bone, netId, changed?, changedFields? }` (+ `event = { name,
+  params, age }`). DR ticks are not forwarded (the movers place the bound entity).
+- **Late binds**: a handler may yield (model streaming); create then answers `C.mat.PENDING`, the node stays STAGED,
+  and core waits ≤ 5 s for `Scene.bind` (then `destroy(node, nil)` and the node fails once). `Scene.bind(id,
+  entity | 0) -> true | false | false, 'refused'`: `'refused'` for a player ped, a networked entity or one core owns
+  (RV2 F8; logged once per kind — the node counts as created without an entity and the plugin keeps its own);
+  `false` = core no longer wants it (the lib destroys the entity itself).
+- `Scene.claim(kind)`: a second resource is refused while the first runs. A core restart makes every VM claim and
+  listen again; a core stop destroys that VM's plugin-kind entities through their handlers. The claim is what makes
+  the kind wanted — a kind whose `meta.handler` resource never claims it stays KNOWN.
+
+### 55.14 Interactions on nodes
+
+`interact = { { action = 'use', label = 'Use', distance = 2.0, icon?, description?, perm?, cooldownMs = 500, data? }, … }`
+(≤ 4 per node). While a node is LIVE the client adds one `Core.Interactions` entry per descriptor (entity target for
+entity kinds, coords otherwise, the world prompt per `Config.Interactions.WorldPrompt`); a press sends
+`core:scene:interact (id, action)`. Server: schema → cooldown (250 ms) → loaded → the node exists, is in the player's
+bucket and not gated away from them → the descriptor exists → `perm` (`Core.Perms.has`) → distance from the server-known
+player position to the node's server-evaluated pose ≤ `distance + 2 m` → `Scene.onInteract` handlers of the id, then of
+the kind (pcall, copies). Promotion triggers (§55.15) listen to the same path (`enter`, `use`).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Descriptor as built**: `{ action (≤ 32, [%w_-], unique per node), label (≤ 64, default the action), distance
+  (0.5..20, 2.0), icon?, description? (≤ 256), perm?, cooldownMs (0..60000, 500), data? (≤ 1 KiB), prompt? = {
+  world?, offsetZ? (−5..5 m), range? (1..50 m) } }`, 1..4 per node; an empty list clears.
+- **Server order as built**: `Core.Net.on` (schema: id 1..2^31−1, action `^[%w_%-]+$` ≤ 32, data any; 250 ms per
+  player; loaded) → the node exists, is no dependency, is in the player's bucket → EVERY audience level of its path
+  admits the player (RV1 F2) → the descriptor → `perm` → server distance to the node's pose (a promoted node: its
+  clone's) ≤ distance + 2 m → the descriptor's cooldown (expiry stamps, ≤ 64 running per player; a full map
+  refuses, never forgets — RV1 F10) → `R.promote.refuses` (a lease, §55.15) → data ≤ 1 KiB (last: the cheap checks
+  decide first) → handlers of the id, then of the kind (copies, pcall) → `R.promote.onInteract` (action triggers).
+- Client: entries are added while the node is STAGED or LIVE (§55.12 notes); on a promoted node the prompts follow
+  the clone.
+
+### 55.15 Promotion, demotion, leases (`server/scene_promote.lua`, `client/scene_promote.lua`) — phase C
+
+- **Policy** (kind default, node override): `authority = { mode = 'local' | 'promote' | 'networked', proximity = m?,
+  enter = bool, damage = bool, actions = { 'use', … }, restMs = 3000, idleMs = 20000, onDestroyed = 'remove' | 'keep' }`.
+  Defaults: `prop` local; `vehicle` promote with `proximity = 20` (walking players), `enter`, `damage`; `ped` local
+  (plugins opt in with `actions`). `networked` = promoted while any player is within `proximity` (platforms that carry
+  players, R7 §2.4).
+- **Triggers** (server): proximity — once per second, for promotable nodes in near cells that have near-ring
+  subscribers, `PlayerGrid.candidates(nodePos, proximity)` + exact distance on foot; `enter` — client report
+  `core:scene:report(id, 'enter')` when `GetVehiclePedIsTryingToEnter(ped)` is our local copy (checked at 4 Hz only while
+  a local vehicle is within 6 m of the ped), distance ≤ 6 m; `damage` — the client's `gameEventTriggered`
+  `CEventNetworkEntityDamage` naming a local copy (event-driven, no polling), distance ≤ 60 m; `actions` — the
+  interaction path (§55.14); manual — `Scene.promote(id)`. Reports: cooldown 500 ms, ≤ 4/s per player.
+- **Promote** (server): create by class — `CreateVehicleServerSetter(hash, vtype, x, y, z, heading)`,
+  `CreatePed(4, hash, x, y, z, heading, true, true)`, `CreateObjectNoOffset(hash, x, y, z, true, true, dynamic)` +
+  rotation; one spawn worker, 5 s existence wait (§52 pattern); `SetEntityRoutingBucket`, `SetEntityOrphanMode(e, 2)`,
+  state bags `sn = id`, `snv = ver`, `snCfg = { props?, locked?, … }` (the owner client applies cosmetic config, the
+  §52 `mapCfg` pattern); `node.promoted = { netId, entity, since }`; op `PROMOTE(id, ver, netId)`. Budgets:
+  `Promote.MaxEntities` (1,000 server-wide), ≤ `Promote.MaxPropsPerArea` (32 per 256 m) — beyond that, refused and
+  logged. Every server-side entity check uses `ours(e) = DoesEntityExist(e) and Entity(e).state.sn == id` (handles are
+  reused, §52 review F1).
+- **Hand-off** (client): the local copy stays LIVE until the clone exists (`NetworkDoesEntityExistWithNetworkId` →
+  entity whose `sn` equals the id; polled at 10 Hz only while promotions are pending; up to `CloneWaitMs` 10 s — OneSync
+  may need ~6 s at 2,000 players). Then: within 5 cm / 2° → delete the local copy in the same frame; otherwise fade the
+  local copy out (300 ms) over the clone. An `enter` trigger then tasks the ped into the clone (`TaskEnterVehicle`).
+- **Demote** (server, checked at 1 Hz per promoted node): no occupant (`GetPedInVehicleSeat` −1..15), speed <
+  `RestSpeed` (0.05 m/s) for `restMs`, no player within `proximity` for `idleMs`, no lease → read pose
+  (`GetEntityCoords`, `GetEntityRotation`); vehicles ask the owner client for props (`Callback.awaitClientTimeout`,
+  1 s, validated like `saveProps`); snap to the authored pose if within 0.2 m / 2°; `ver + 1`; op `DEMOTE(id, ver,
+  pose)`; clients create the local copy hidden (`SetEntityVisible(e, false)`) and reveal it the frame the clone is gone;
+  the server deletes the clone `DeleteDelayMs` (500 ms) after the op. A destroyed clone applies `onDestroyed`.
+- **Leases**: `Scene.lease(id, src, ms = 10000) -> seq | nil` (first request wins, renewable by the holder, stale
+  sequence numbers refused); promoted-node interactions of other players are refused while leased.
+- Hooks: server `promoted (id, netId)`, `demoted (id)`; client events `promoted`/`demoted` through `Scene.on`.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **API as built** (`R.promote`, delegated from server/scene.lua): `promote(id) -> true | nil, err` (owner or core,
+  queued; a gated node too), `demote(id) -> true | nil, 'not_promoted'` (forced, whatever the rest conditions),
+  `lease(id, src, ms = LeaseMs, seq?) -> seq | nil, err` (the holder renews with its seq; `ms = 0` releases; errors
+  `'missing' 'owner' 'src' 'ms' 'leased' 'stale' 'none'`; leased nodes never demote), `beforeChange(node, what) ->
+  demoted?`, `refuses(src, node, action)`, `onInteract`, `policy(node)`, `get(id)`, `stats()`, `ours`. Server hooks
+  (`Scene.on`) get the node copy: `promoted (copy, netId)`, `demoted (copy)`.
+- **Policy defaults as built**: vehicle `{ promote, proximity 20, enter, damage }`; prop and ped `{ local }`; a prop
+  with `physics = 'promote'` `{ local, damage }`; `restMs` 3000, `idleMs` 20000, **`onDestroyed = 'keep'`** (it
+  demotes at the stored pose; `'remove'` removes the node). `enter`, `damage` and `actions` trigger in every mode;
+  proximity needs `'promote'` (players on foot) or `'networked'` (any player). Gated nodes are promoted only manually
+  (a clone reaches everyone).
+- The proximity sweep runs at 1 Hz in 10 slices over nodes with a proximity policy (near cells with near-ring
+  subscribers, PlayerGrid candidates + an exact distance). The server WRAPS `R.index.put` / `remove`: every root
+  placement (spawn, load, kind change, re-parent) re-evaluates the policy; removing a promoted root drops its clone.
+- Reports: 250 ms per player (≤ 4/s, Core.Net.on) + 500 ms per (player, node, what); `rest` counts only from the
+  clone's owner (an early demote check — the server decides); enter ≤ 6 m, damaged ≤ 60 m. A motion node never rests
+  (its descriptor is its own authority); the clone's owner drives it per frame.
+- **`beforeChange` (the §55.21.1 rule)**: move / motion / drive / attach / detach and a fields `set` DEMOTE a promoted
+  node first, synchronously (no props from the owner: the stored props stay); `set` / `motion` start from the clone's
+  pose (the 0.2 m / 2° snap applies), the others bring their own pose; a queued promotion is cancelled; any other
+  change (interact, audience, radius …) keeps the promotion. `stats().forced` counts them.
+- **Client as built** (client/scene_promote.lua): the prop / vehicle / ped handlers are re-registered WRAPPED — a
+  promoted root whose clone is here is LIVE without a local entity (the clone stands in: prompts, entity children);
+  while a demotion waits for the clone to go, the new local copy is created hidden and revealed the frame it is gone;
+  a stand-in whose clone leaves this client falls back to a local copy at the 1 s sweep; clones are polled at 10 Hz
+  for CloneWaitMs, then at 1 Hz (a late clone still swaps). `C.promote.cloneOf(id)` / `idOfClone(entity)` feed
+  `Scene.handleOf` / `idOf`. Triggers: enter (`GetVehiclePedIsTryingToEnter` at 4 Hz only while a local vehicle copy
+  is within 6 m) and damage (`CEventNetworkEntityDamage` naming a local copy), each ≤ once per 2 s per node; the
+  damage handler fails safe. The clone's owner applies `snCfg` once per control period (state-bag handler + a
+  16-per-second sweep) and answers `core:scene:props` with `Vehicles.getProps` of the clone it controls; clones get
+  the node's stable paint (`Scene.paintOf`) unless the props carry colours.
+- Open in game: the victim argument of `CEventNetworkEntityDamage` for local entities; fx children of a promoted root.
+- **Phase D (run D4+) — one-shot vehicle config**: a vehicle clone's props, lock, dirt and paint are applied ONCE —
+  by its first owner, which then reports `core:scene:report(id, 'applied')`; the server checks that the sender owns
+  the clone (`ours` + `NetworkGetEntityOwner`) and trims `snCfg` to `{ plate, invincible, frozen, applied = true }`,
+  which every later owner applies. So an owner change never resets damage, fuel or a lock that changed since (a keys
+  unlock survives). Core vehicle clones (§4.6 parked cars) take `locked` from their own bag, never from `snCfg`; map
+  vehicles follow the same one-shot rule.
+- **Phase D (run D4+) — the clone's model and type**: the spawn worker resolves the model from an integer (u32 or
+  signed), a `'0x%08X'` string (any case) or a name (`R.promote.modelHash`, the signed form `GetHashKey` answers); the
+  `CreateVehicleServerSetter` type is the node's `vtype`, else the model info, else automobile; an unusable model is
+  refused.
+- **Phase D (run D4+) — stop order**: `R.promote.beforeStop(fn)` registers core-internal work that must run when core
+  stops BEFORE any clone is deleted (server/vehicles_park.lua hands every parked car's clone pose to its node there);
+  explicit, idempotent, never an assumption about handler order.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+FX1b; where the D4+ bullets above differ, these win.
+- **Vehicle config split** (D-A): `snCfg = { props (COSMETIC), plate, paint?, invincible?, frozen?, once = { wear,
+  locked, dirt } }`. EVERY new owner re-applies the cosmetic part (idempotent); only `once` is one-shot: the owner that
+  applied it sends the new net event `core:scene:applied(id)` — its own event, no cooldown shared with the reports,
+  500 ms guard per player + node, the sender must own the clone — the server strips `once`, and the client's 1 s sweep
+  re-sends while the live bag still carries it (RV5 F1 / RV6 F1: a lost report no longer lets the next owner reset
+  damage, fuel or a lock). `core:scene:report` is `enter` / `damaged` only; the dead `'rest'` path is gone (the 1 Hz
+  monitor decides rest).
+- **Wear** (D-A, RV4 F1): `Core.Scene.WEAR` / `splitProps` / `mergeWear` (lib/scene/shared.lua, every VM). A props
+  read-back from a clone's network owner — the demotion's `core:scene:props`, the park-time `core:vehicles:props` —
+  may change only the WEAR keys (engineHealth, bodyHealth, tankHealth 0..1000, dirtLevel 0..15, fuelLevel 0..100, the
+  doors / windows / burstTyres / tyreHealth maps), merged over the stored props, for EVERY vehicle node; the plate
+  comes from the node. Server wear samples (healths, dirt, burst tyres) count only once `once` was applied plus 1 s of
+  sync grace; windows, doors and fuel come only from the owner's read-back.
+- **Reserved share** (D-B, RV4 F9): proximity promotions may hold at most `Promote.ProximityShare` (0.7) of
+  `MaxEntities`; at the cap an enter / manual / action promotion evicts the oldest proximity promotion that is at
+  rest, unleased and empty.
+- **Following** (D-C / D-D, RV4 F5 / F6): the 1 Hz monitor samples the clone's pose and bucket, and the node follows
+  (`R.store.follow`) past 1 m / 5° or into another bucket, snapping back to its pre-promotion pose within 0.2 m / 2°;
+  FXServer's `onEntityBucketChange(entity, bucket, oldBucket)` follows at once; the idle check uses the clone's
+  bucket. A lost clone (gone or wrecked) demotes where it was last seen, with its last wear. Core stop: every clone's
+  pose followed → the store and Core.DB flushed → the pre-stop hooks → the clones deleted.
+- Hook `demoted (copy, info)`, `info = { reason = 'rest'|'manual'|'forced'|'evicted'|'lost'|'destroyed', destroyed,
+  pos, rot, bucket, wear? }`.
+- `Scene.demote` answers `'occupied'` for a vehicle clone with someone inside; a demotion aborts if someone got in
+  during the props wait; someone getting in during the delete window keeps the clone and re-promotes the node with it
+  (RV4 F12). `R.promote.adopt(id, entity)` (core-internal) makes an existing networked entity of the node's class its
+  clone — how a live car is parked through the hand-off (RV6 F11).
+- Client (RV6 F7, F12): a stand-in whose clone left this client shows nothing (phase `lost`); the local copy returns
+  only through DEMOTE and a MOVE never re-creates it; the hidden demotion copy's fade-in is ended at once, so it is
+  revealed opaque when the clone goes.
+- Stats keys `lost`, `evicted`, `rescued`, `adopted`, `follows`, `refused.share`, `proximitySlots`. Accepted residuals:
+  under fade-slot pressure a copy can still arrive late with a fade; the clone's owner can repair within the wear
+  whitelist; a copy for a clone this client never saw is kept past CloneWaitMs.
+- New natives: server `GetEntityRoutingBucket`, `GetVehicleEngineHealth`, `GetVehicleBodyHealth`,
+  `GetVehiclePetrolTankHealth`, `GetVehicleDirtLevel`, `IsVehicleTyreBurst`, `GetEntityType`; client
+  `ResetEntityAlpha`; the server event `onEntityBucketChange`.
+
+**In-game probe results (Liam, 2026-09-26 22:21 UTC, `scene_probe/data/report_20260926_222136.txt`).**
+Probe P7: a vehicle clone exists on the client 89 ms after
+the event (148 ms after the server created it); 50 and 80 networked props all resolved, but of 120 only 80 did — a
+client holds **≈ 80 networked OBJECT clones** (the CNetObjObject pool), so promoted props must stay rare
+(`Promote.MaxPropsPerArea` 32 per 256 m area is inside it). P11: props 2 m above the ground landed on collision
+(`HasCollisionLoadedAroundEntity` true after 0 ms near the player): the physics rule stands.
+
+### 55.16 Audio (`server/scene_audio.lua`, `client/scene_audio.lua`, `ui/src/runtime/audio/*`) — phase B
+
+- **Sources** are *dependency nodes* of kind `audio.source`: no pose, no index entry; a source's `PUT`/`SET` is emitted
+  into every cell that holds one of its emitters (the index keeps `dependents[sourceId]`), before the emitter; the
+  client ref-counts sources by their emitters. Fields: `type` = 'clip' | 'loop' | 'timeline' | 'stream' | 'voice',
+  `url` (https) or `file` (`'@<resource>/<path>'`, served from `https://cfx-nui-<resource>/<path>`, must be in that
+  resource's `files {}`), `items = { { url|file, duration } … ≤ 200 }` (timeline), `loop`, `t0` (default
+  `Clock.at(200)`), `rate` = 1, `paused` + `pausedAt`, `offset`, `volume` 0..2, `category` = 'music' | 'sfx' | 'ambience'
+  | 'voice', `title`; resolved stream info `{ url, codec, kind = 'mp3'|'ogg'|'hls' }` is filled by the server.
+- **Emitters** are nodes of kind `audio` (tier by `range`): `source`* (an `audio.source` id), `range` 1..600 = 40,
+  `volume` 0..2 = 1, `curve` = 'game' (GTA's table: 0 dB ≤ 5 m, −14 at 10, −31 at 20, −49 at 40, −62 at 64, −76 at 100,
+  silent at `range`, R3 §8) | 'inverse' | 'linear', `ref` = 2 m, `cone` = { inner, outer, outerGain }, `priority` 1..5
+  = 3, `occlusion` = true, `zone` (a `Core.Geometry` shape: inside → constant loudness, "fills the room"), attach or
+  parent for moving emitters.
+- **Server policy**: `url` must be https and its host must match `scene.audio.allowHosts` (a `Core.Settings` list the
+  admins edit; empty = only `file` sources); playlists (m3u/pls/xspf) are resolved by the server through `Core.Http`
+  (first entry, https, same host rules); the content type decides the codec — MP3, Ogg/Opus/Vorbis/FLAC and HLS (m3u8)
+  pass, and AAC/M4A too: probe P8 (2026-09-26) showed FiveM's CEF plays AAC, so `Config.Scene.Audio.AllowAac = true` is
+  the shipped default (false refuses AAC / M4A and AAC-only HLS masters again); synced content must
+  be CBR MP3 or Opus/Vorbis (VBR MP3 seeks up to 0.6 s wrong, R6 §4). Titles of active streams are polled server-side
+  (Icecast `status-json.xsl`, 20 s, only while the source has dependents in subscribed cells). `Scene.audio.kill(id|'all')`
+  stops sources; plays created on behalf of a player (`by = src`) are rate-limited (1 per 5 s) and audited.
+- **Client Lua** (`client/scene_audio.lua`): the materialiser handler of class `audio` (no entity, `fade = 'self'`)
+  forwards sources and emitters to the shell (`audio:source`, `audio:emitter`, `audio:remove` messages, only on change);
+  the **listener feed** (camera position, forward, up, velocity, `Clock.now()`, moving emitters' positions) is one
+  pre-encoded `SendNuiMessage` string at 0–20 Hz — only while ≥ 1 emitter is materialised, only when the camera moved
+  ≥ 0.25 m or turned ≥ 2°; **occlusion** = rules (listener vs emitter interior/room, in a closed vehicle, underwater) +
+  ≤ 8 async LOS probes per second (`StartShapeTestLosProbe`, results polled, never the synchronous probe) for the
+  nearest audible emitters; **volume** = `GetProfileSetting(Audio.ProfileSfx 300 | ProfileMusic 306) / 10` × the
+  player's prefs (client KVP `core:audio:prefs`, `/audio` command); duck to 0 over 200 ms on the pause menu and §31 hide.
+- **Shell engine** (`ui/src/runtime/audio/`: `index.ts` install + messages, `engine.ts` context/buses/arbiter,
+  `sources.ts` decoders, `spatial.ts` per-voice graph, `sync.ts` clock + drift, `icy.ts` ICY/MSE MP3 streamer; hls.js
+  loaded lazily as its own chunk): one `AudioContext` (`latencyHint: 'playback'`), buses music/sfx/ambience/voice →
+  master → limiter; per voice `fan-out → Biquad (occlusion + air) → Gain (curve × occlusion × fade × volume) → Panner
+  (equal-power; HRTF for ≤ 8 nearest when the player enables it) → bus (+ reverb send)`, every panner and listener param
+  `automationRate = 'k-rate'` driven by `linearRampToValueAtTime` over the feed interval (15× cheaper, R6 §1.2),
+  `rolloffFactor = 0`; two procedural reverb impulse responses (small room / large space) crossfaded by environment.
+  Budgets: `Audio.Voices` 32 real (priority = audibility × priority class, +3 dB / 1 s hysteresis), the rest virtual with
+  a clock-derived play head; `Audio.Decoders` 4 concurrent streams/timelines; `Audio.ClipCacheMb` 64 decoded clips (LRU);
+  one decoder per source fanned out to every emitter. **Sync**: play head = `(netNow − t0) × rate + offset`, the page's
+  `netNow` from the feed with a max-filter over 10 s; drift: dead band 25 ms, `playbackRate` 1 ± ≤ 0.02 below 750 ms,
+  re-seek behind a 100 ms fade above; muted until the first lock. Gains ramp ≥ 5 ms (cuts), 30–100 ms (music edges),
+  300–500 ms (LOD/steal); `stop()` after the ramp. Streams: MP3 Icecast via fetch + ICY demux + MSE (`audio/mpeg`), Ogg
+  via `<audio>`, HLS via hls.js; `crossOrigin = 'anonymous'` on every media element; reconnect with backoff 1–30 s.
+- Diagnostics: `/audiodebug` (voices real/virtual, decoders, per-timeline drift, clock offset).
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **Server policy as built** (`R.audio.check(fields)`, the `audio.source` post-check of every spawn / set): https
+  only; the host must match `scene.audio.allowHosts` (`host`, `*.domain` = its subdomains, `*` = any); `file =
+  '@<started resource>/<path>'` inside that resource's `files {}`; codec by extension — MP3, Ogg / Opus / Vorbis,
+  FLAC, WebM pass, WAV for clips / loops / timelines, AAC / M4A while `AllowAac` (true since probe P8); playlists (m3u,
+  m3u8, pls, xspf) only for `stream`, recognised by their content; an HLS master with only AAC variants is refused only
+  with `AllowAac = false`; timeline
+  items need a duration. It never blocks: `resolved = { url, codec, kind }` at once, or `{ pending = true }` answered
+  later through `Scene.set` as core, or `{ error = code }`. The allow-list is checked when a source is created or
+  changed, not again when the list changes (playing sources keep playing).
+- **The server never fetches a stream body** (PerformHttpRequest would buffer a live stream for ever): a URL without
+  a telling extension takes its codec from the origin's Icecast `status-json.xsl`, else MP3 is assumed; playlists are
+  fetched (≤ 64 KiB, ≤ 2 requests at a time, answers cached: unused 10 min, failures 1 min). Titles: every 20 s, only
+  for stream sources with an emitter in a subscribed cell, one status-json per origin (backed off 5 min after a
+  failure).
+- **`resolved.trusted`** (server-owned): false for remote URLs and for anything played on a player's behalf (kept
+  while that content plays), true for resource files chosen by server code. The page decodes only trusted sources
+  into PCM; untrusted clips / loops play through media elements (RV3 F9, the "decode bomb").
+- **API as built**: `Scene.audio.play(def) -> id | nil, err, detail` (a spawn def of an `audio.source`, kind implied,
+  or `{ id = sourceId, fields = patch }` to retarget; `by = src` = on that player's behalf: 1 play per 5 s per
+  player, audited `scene.audio.play`; errors `'def' 'by' 'rate_limit' 'missing'` plus the spawn / set errors);
+  `Scene.audio.kill(id | 'all', by?) -> true, n | false, 'missing'` (sources with their emitters, or emitters,
+  whatever their owner; audited `scene.audio.kill`); `Scene.audio.stats()`. **Admission**: `R.audio.admit(def,
+  owner) -> true | false, code`, called by Scene.spawn directly (not a hook) — `scene.audio.enabled` →
+  `'audio_disabled'`, `scene.audio.maxStreams` stream sources server-wide → `'audio_streams'`, a flood guard per
+  owning resource (a bucket of 120 spawns, 20 per second back; core exempt) → `'audio_rate'`.
+- Settings section `scene` (group Audio): `scene.audio.enabled` (true, replicated: off = the clients drop all page
+  audio, the nodes stay), `scene.audio.allowHosts` (≤ 64 patterns, replicated: sent as `hosts` with every
+  `audio:source`, so redirects and HLS variants / segments / keys stay inside it), `scene.audio.maxStreams` (8, 0..64).
+- **Client Lua as built** (client/scene_audio.lua): the `'audio'` handler (class audio, budget `'audio'` → Caps.audio
+  or Caps.custom, radii range / +20 / +40); messages encoded with a fixed key order, sent only when their text
+  changed; sources still resolving, failed ones and `'voice'` sources are not sent, nor their emitters. The feed
+  goes out right after the first emitter reached the page, then on change (camera ≥ 0.25 m / ≥ 2°, a moving emitter
+  ≥ 0.1 m, an occlusion value ≥ 0.02, environment, volumes, pause) and at least once a second (the page's clock
+  mapping needs `t`), only while an emitter is materialised; map keys are `'n<id>'` (AGENTS §8). Occlusion is
+  additive — another room .45, inside ↔ outside .85, line of sight .55 × the blocked fraction, a closed vehicle +.35,
+  under water +.8, capped at 1 — with LOS probes from an 8-per-second token bucket, round-robin over the nearest
+  audible outdoor emitters, smoothed (α 0.5). `/audio volume|hrtf|streams|offset|voices|debug|stats`,
+  `/audiodebug`; a reloaded shell (hook `uiReady`) gets everything again. `C.audio.positionOf / occlusionOf /
+  listener` serve client/scene_voice.lua.
+- **Shell as built** (`ui/src/runtime/audio/`): `index.ts` (`installAudio()` subscribes the `audio:*` actions; the
+  engine is its own chunk, `scene-audio.ts` → `html/assets/scene-audio.js`, imported on the first message; no
+  AudioContext before the first source or emitter), `engine.ts` (context, buses → master → duck → limiter; suspended
+  after 15 s with nothing in it; errors rate-limited), `mixer.ts` (the mixing pass), `arbiter.ts` (virtual → real
+  voices: score = dB audibility + 6 dB × (priority − 3), floor −60 dB (−57 to enter), ≤ 4 real voices per source,
+  +3 dB / 1 s incumbency; decoders +3 dB / 3 s), `spatial.ts` (the per-voice graph, k-rate panners, reverb),
+  `curves.ts`, `sources.ts` (one decoder per source), `loader.ts` (a clip is decoded only when its DECODED size is
+  bounded first), `cache.ts` (the clip LRU with pins), `deck.ts` + `media.ts` (media elements on the clock, drift
+  control, retries with backoff), `streams.ts` + `icy.ts` (Icecast MP3 through fetch + ICY + MSE with paced reads and
+  a stall watchdog; HLS through `hls.js/light`, a lazy chunk `html/assets/hls.light.js`; the rest through
+  `<audio>`), `net.ts` (bounded fetches; the host rule applied to the FINAL URL after redirects), `sync.ts` (clock +
+  drift; the lock = |e| ≤ 75 ms on 2 polls, fail-open after 4 s), `validate.ts`, `debug.ts`, `types.ts`. Dependency
+  `hls.js` ^1.7.3 in ui/package.json.
+- Wire additions to INTERFACES §6: `audio:source` + `hosts?`, `trusted?`; `audio:emitter` + `rx?, ry?, rz?` (a cone
+  faces its node's rotation, RV3 F11); feed `moving` entries may carry `rx` / `rz`. NUI → Lua: page `audio`, events
+  `error { id, code }` and `stats` through the `ui_event` bridge (`Core.UI.on('audio', …)`).
+
+**In-game probe results (Liam, 2026-09-26 22:21 UTC, `scene_probe/data/report_20260926_222136.txt`).**
+Probe P8: `http://` fails in the CEF (mixed content) —
+https-only confirmed; **AAC IS SUPPORTED** (`audio/aac` and `audio/mp4; codecs="mp4a.40.2"` answer canPlay `probably`
+with MSE, `AudioDecoder` takes mp4a.40.2; Opus, FLAC and WebM too; Ogg / FLAC / WAV without MSE) →
+`Config.Scene.Audio.AllowAac = true` is the shipped default (the refusal path stays tested with the gate off:
+scene_audio 241). The research's "no AAC in FiveM's CEF" is superseded. The https live-stream row was inconclusive
+(the test stream answered 403 text/html) — re-run with another stream. P9: `outputLatency` 40 ms, audio clock −
+wall clock 2.6 ms, `setInterval(200)` lateness p95 0.7 ms.
+
+### 55.17 Voice through world speakers (`server/scene_voice.lua`, `client/scene_voice.lua`) — phase B
+
+- `Scene.voice.start({ talker = src, speakers = { nodeIds }, fx = 'megaphone'|'pa'|'phone'|'radio'|'none', range = 60 })
+  -> sessionId | nil, err`, `Scene.voice.stop(sessionId)`, `Scene.voice.list()`; trusted server API (plugins authorise);
+  ≤ `Voice.MaxSessions` (16) server-wide, ≤ 1 per talker; audited; owner-tracked (`sceneVoice`).
+- Server, every 500 ms per session: listeners = loaded players in the speakers' bucket within `range + 20 m` of any
+  speaker (player grid), ≤ `Voice.MaxListeners` (64), minus the talker; the talker's client gets the add/remove list
+  (`core:scene:voice:targets`), each listener `core:scene:voice:listen / unlisten (sessionId, talker, speakers, fx,
+  range)`.
+- Talker client: a **voice adapter** adds the listeners to the voice target of the running voice resource
+  (`Scene.voice.setAdapter({ add = fn(list), remove = fn(list) })`; built-in adapter for pma-voice: its voice target
+  (1) with `MumbleAddVoiceTargetPlayerByServerId` / `MumbleRemoveVoiceTargetPlayerByServerId`, re-applied after the
+  resource rebuilds its targets). Without a voice resource the feature reports `'no_voice'`.
+- Listener client: a fixed pool of `Voice.Submixes` (8) created once at core start (`CreateAudioSubmix('core_vs_<n>')`,
+  then `AddAudioSubmixOutput(id, 0)` BEFORE any `SetAudioSubmixOutputVolumes` — pma-voice has the order backwards,
+  R2 §B8), RadioFX parameters per `fx` preset (megaphone band 400–3,500 Hz + drive; phone 300–3,400 Hz; pa light
+  band-pass; radio = the default preset). Per session, ONCE: `MumbleSetVolumeOverrideByServerId(talker, 1.0)` +
+  `MumbleSetSubmixForServerId(talker, submix)`; then only `SetAudioSubmixOutputVolumes(submix, 0, fl, fr, rl, rr, c, 0)`
+  at `Voice.PanHz` (15 Hz, a loop that exists only while a session is heard) with equal-power gains × the emitter curve
+  summed over the speakers + the audio occlusion; end: override −1, submix −1. Never animate the override or flip the
+  submix (the voice is rebuilt and drops out, R2 §B7). No free submix → volume-only fallback (no panning).
+- Needs `setr voice_useNativeAudio true` (README). City-wide announcements are recorded clips (§55.16), not live voice.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- **API as built** (`R.voice`, delegated from `Scene.voice.*`): `start({ talker = src, speakers = { nodeIds }, fx =
+  'none', range = 60, onEnd? }) -> sessionId | nil, err` (range 1..600 m; 1..32 distinct speaker nodes of ONE
+  bucket; `onEnd(sessionId, reason)` is called once for an end the owner did not ask for); `stop(sessionId) -> true |
+  false, err` (the session's owner or core); `list()` (`{ id, owner, talker, speakers, fx, range, bucket, listeners,
+  startedAt }`); `stats()` (`{ sessions, listeners }`). Errors: `'def' 'talker'` (not loaded) `'fx' 'range'
+  'speakers' 'missing'` (no such node, or a dependency node) `'bucket' 'busy'` (≤ 1 per talker) `'limit'`
+  (MaxSessions) `'owner'`. End reasons: `'stopped' 'owner' 'talker' 'dropped' 'speakers'` (every speaker removed)
+  `'no_voice'`. Audit rows `scene.voice.start` / `scene.voice.stop`.
+- Listeners (every 500 ms, one thread only while a session exists): hysteresis — join within range + 20 m, leave
+  beyond range + 30 m; loaded players in the speakers' bucket, allowed by a gated speaker's audience, minus the
+  talker, the nearest MaxListeners; candidates from Core.PlayerGrid (no natives), the bucket read only for players
+  inside the distance; events through `Core.Net.emitMany`; `listen` is sent again when a speaker moved ≥ 1 m or went
+  away (speaker positions in cm). `start()` runs the first selection at once, so the talker's client can answer
+  `core:scene:voice:report (sessionId, 'no_voice')` when `MumbleIsConnected()` is false — that ends the session.
+- **Deviation — the adapter is internal** (`C.voice.setAdapter`), not on `Scene.voice`: `'pma-voice'` when it runs
+  (voice target 1, its `voiceTarget`; the listeners are added again right after its local `pma-voice:radioActive`
+  (false) event and every second, because its radio / call / reconnect paths clear the target's players), else
+  `'raw'` (`MumbleAddVoiceTargetPlayerByServerId` on `Config.Scene.Voice.Target`, default 1, re-applied every second);
+  the re-apply loop exists only while a listener is held.
+- **Listener side as built**: the submix pool is created once at start and cached by name (a core restart gets the
+  same ids; there is no destroy native); RadioFX sits in effect slot 0, disabled until a session wants a preset; per
+  heard session ONCE `MumbleSetVolumeOverrideByServerId(talker, 1.0)` + `MumbleSetSubmixForServerId(talker, submix)`,
+  then only output volumes at PanHz, and only when a gain moved > 0.002. Gains per speaker: the camera-relative
+  direction (read once per pan tick) → equal-power L/R × equal-power front / rear, × the §55.16 `'game'` curve, ×
+  the node's occlusion (`C.audio.occlusionOf`, 0 … −15 dB); energies power-summed per channel, each ≤ 1. A moving
+  speaker materialised here is read from its entity, every other one from the server's pose. pma-voice resets a
+  talker's override / submix when he stops talking on its radio or leaves a radio / call: every heard session is
+  routed again 300 ms after those events (the same values — a no-op where nothing was reset), except a talker on
+  its radio right now. No free submix, or no `voice_useNativeAudio` (a submix routes voice only with it) → volume
+  only: the override set ONCE to the summed gain of that moment (0.1..1), no panning.
+- Open: the talker's own ped as an extra point for nearby listeners; a pma-voice call-routing override; the RadioFX
+  presets by ear (probe P10).
+
+**In-game probe results (Liam, 2026-09-26 22:21 UTC, `scene_probe/data/report_20260926_222136.txt`).**
+Probe P10: 12 free submix ids (28..39) — the
+`Voice.Submixes = 8` pool fits.
+
+### 55.18 Persistence
+
+`persist = true` nodes are stored in collection `scene_nodes`, one document per node, id `n<id>` (Core.DB id rules):
+`{ id, kind, owner, bucket, pos, rot, parent, offset, offrot, bone, attach? (node targets only), motion (t0 stored as a
+phase, re-anchored at load), fields, audience (serialisable forms only — `fn` audiences are not persistable), radius,
+global, interact, authority }`; the id counter lives in `scene_meta:counter`. Writes are coalesced per node (≤ 1 per
+second), loaded at start behind one barrier before `Core.onReady` listeners run; undefined kinds stay placeholders.
+`MaxPersistent` 50,000. `/dbexport` covers the collection like any other.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+- A motion is stored REBASED (`Motion.rebase` at the write: periodic phases folded in, a finished plan an ended tween)
+  without its t0, the time phase in `mphase`; Clock-valued fields (`kind.clock`: `anim.t0`, a source's `t0` /
+  `pausedAt`) are stored as phases in `clk`; both are re-anchored at load. Player / net attachments and `dr` motions
+  are transient. A persistent node needs a persistent parent (and a persistent emitter a persistent source).
+- Writes: one thread, only while something is dirty, ≤ 1 write per node per second, a final write on core stop.
+- The barrier is a promise every API call passes: the first caller loads, callers meanwhile wait on it, one that
+  cannot wait (or a failed load) gets `'unavailable'`; a failed load is retried at most every 10 s and leaves no half
+  state. A stored audience that cannot be restored loads as `{ editors = true }` (logged).
+
+### 55.19 Security table (all through `Core.Net.on` / `Core.Callback.register`, AGENTS §3 order)
+
+| entry | schema | cooldown / rate | extra checks |
+|---|---|---|---|
+| `core:scene:focus` | 6 numbers finite, seq integer, `held` ≤ 48 integer pairs | 250 ms | bucket from the server; clamped to server-known positions + slack (§55.6) |
+| `core:scene:resync` | grid 0..2, key u32, variant 1..3, v u32 | 100 ms, ≤ 16/s | only subscribed cells; answers ride the normal budget |
+| `core:scene:interact` | id integer, action ≤ 32 chars, data ≤ 1 KiB | 250 ms | node exists, bucket, audience, descriptor, `perm`, server-side distance |
+| `core:scene:report` | id integer, what ∈ {enter, damaged, rest}, data ≤ 256 B | 500 ms, ≤ 4/s | node promotable, distance (enter 6 m, damage 60 m), policy allows |
+| `core:scene:props` (callback, server → owner) | CoreVehicleProps | 1 s timeout | validated like `saveProps`, only from the clone's owner |
+
+Server-only APIs never have a client entry point. Every client-visible node is public in its bucket unless gated; the
+subscription window cannot be moved far from the server-known position; per-player byte budgets and per-subscription
+version memory bound amplification; audio URLs are server-resolved, https, allow-listed; clients never contact a host
+a player supplied.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).** As built (every
+row through `Core.Net.on`: schema → cooldown → loaded, then the handler's checks):
+
+| entry | schema | cooldown / rate | extra checks |
+|---|---|---|---|
+| `core:scene:focus` | 6 numbers, seq integer 0..u32, `held` table ≤ 48 entries (optional) | 250 ms | as above; a report whose bucket differs resets the window (§55.6 notes) |
+| `core:scene:resync` | grid 0..2, key u32, variant 1..3, v u32 | 62 ms per player (≈ 16/s); one answer per cell per 2 s | subscribed cell in its current variant; journal or pack, budgeted |
+| `core:scene:interact` | id 1..2^31−1, action `^[%w_%-]+$` ≤ 32, data any (≤ 1 KiB, checked last) | 250 ms + the descriptor's `cooldownMs` (≤ 64 running) | every audience level of the path, a lease (§55.14 notes) |
+| `core:scene:report` | id 1..2^31−1, what `^%a+$` ≤ 8 ∈ {enter, damaged, rest, applied}, data ≤ 256 B | 250 ms per player (≤ 4/s) + 500 ms per (player, node, what) | bucket, audience, distance, policy; `rest` and `applied` (phase D, §55.15 notes) only from the clone's owner |
+| `core:scene:voice:report` | sessionId 1..2^31−1, `'no_voice'` | 1000 ms | the session exists and the sender is its talker → it ends |
+| `core:scene:props` (callback, server → owner) | CoreVehicleProps | 1 s timeout | validated by the vehicle kind like `saveProps` |
+| `core:server:parkedLock` (phase D, §4.6 notes) | node id 1..2^31−1 | 500 ms, loaded | distance from the server's ped to the node (or its clone) ≤ `Vehicles.LockDistance`; the node parks a record in the player's bucket; the record's virtual keys; item-key cars ignored |
+| `core:vehicles:props` (callback, server → the owning client, phase D) | netId | 1 s timeout (`awaitClientTimeout`) | answered only for a `coreVeh` entity the client controls; the answer is validated like `saveProps` before parking |
+
+The audio page's NUI → Lua events (`audio` / `error`, `stats`) ride the `ui_event` bridge and change nothing on the
+server.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+These rows supersede the `core:scene:report` row above:
+
+| entry | schema | cooldown / rate | extra checks |
+|---|---|---|---|
+| `core:scene:report` | id 1..2^31−1, what ∈ {enter, damaged}, data ≤ 256 B | 250 ms per player (≤ 4/s) + 500 ms per (player, node, what) | bucket, audience, distance (enter 6 m, damaged 60 m), policy |
+| `core:scene:applied` | id 1..2^31−1 | 500 ms per (player, node); no cooldown shared with the reports | a live vehicle promotion not applied yet; `ours(clone)`; the sender owns the clone → `once` stripped from `snCfg` |
+
+### 55.20 Config (`Config.Scene`) and settings
+
+```lua
+Scene = {
+    CellSize = 128, RegionSize = 512,                        -- read once (key encoding)
+    NearRing = 160, FarRing = 448, FarRegions = 1024, LeaveMargin = 64, LeaveDwellMs = 3000,
+    TierS = 160, TierM = 448, TierL = 1500,
+    FlushMs = 50, MaxEventBytes = 16384, MaxBacklogBytes = 262144, LatentBps = 750000,
+    PackBudgetBytes = 2000000, PackBudgetWindowMs = 10000, JournalOps = 64, JournalMs = 10000,
+    Focus = { MinMove = 16, MinIntervalMs = 250, Slack = 50, MaxSpeed = 90 }, BackstopMs = 5000,
+    Lead = { Seconds = 1.5, Max = 150 },
+    ClientLruCells = 48, ClientLruMs = 120000, ModelLingerMs = 30000,
+    Caps = { props = 3000, peds = 48, vehicles = 32, lights = 32, particles = 32, markers = 64, texts = 64, sounds = 24,
+             hides = 200, custom = 64, modelsProps = 150, modelsPeds = 20, modelsVehicles = 20 },
+    Budgets = { PropsPerFrame = 8, EntityPerFrame = 1, CustomPerFrame = 2, DeletesPerFrame = 32,
+                ModelRequestsPerFrame = 2, ModelsInFlight = 30, TeleportMultiplier = 10 },
+    Radii = { Band = 20, SmallBand = 5, Margin = 10, Warm = 50, OutMin = 20, OutFactor = 0.25, PropCap = 500 },
+    Fades = { PropInMs = 300, PropOutMs = 450, PedMs = 600, VehicleMs = 400, Max = 48, MaxVehicles = 8 },
+    Visibility = { UnseenMs = 1500, ImportantUnseenMs = 4000, DeferMaxMs = 10000, SwapMargin = 10, SwapCooldownMs = 100 },
+    Speed = { SkipSmallAbove = 50, NoFadeAbove = 80 },
+    Motion = { NearRadius = 50, MidHz = 15, ServerHz = 2, RecellTolerance = 8, PlanLeadMs = 200 },
+    DeadReckoning = { Near = 0.25, Far = 1.0, Degrees = 3, NearHz = 10, FarHz = 1, HeartbeatMs = 5000, Snap = 5 },
+    Promote = { MaxEntities = 1000, MaxPropsPerArea = 32, CloneWaitMs = 10000, DeleteDelayMs = 500, RestSpeed = 0.05,
+                LeaseMs = 10000, SwapDist = 0.05, SwapDeg = 2 },
+    Audio = { Voices = 32, Decoders = 4, ClipCacheMb = 64, HrtfVoices = 8, ListenerHz = 20, LosProbesPerSecond = 8,
+              ProfileSfx = 300, ProfileMusic = 306, AllowAac = true },   -- true since probe P8 (2026-09-26)
+    Voice = { Submixes = 8, PanHz = 15, MaxListeners = 64, MaxSessions = 16 },
+    Global = { MaxNodes = 256 }, MaxNodes = 100000, MaxNodesPerOwner = 20000, MaxPersistent = 50000,
+    MaxFieldBytes = 8192, ClockMode = 'network', Debug = false,
+}
+```
+Settings (`Core.Settings`, server): `scene.audio.enabled` (true), `scene.audio.allowHosts` (list of host patterns),
+`scene.audio.maxStreams` (8 server-wide stream sources). server.cfg (README): `increase_pool_size "Object" 2000`,
+`setr voice_useNativeAudio true` when voice speakers are used.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1 and review rounds RV1–RV3).**
+`shared/config.lua` has the block above plus `Global.MaxPerOwner = 64` (global nodes per plugin), `MaxChildren = 64`
+(descendants per root) and `ObjectPool = 5300` (shipped 2026-09-27 to match the dev server.cfg raise; nil = learn it, 3,300 assumed;
+§55.11 notes). Keys the code reads with a default although the config does not list them: `Caps.audio` (falls back
+to `Caps.custom`, 64) and `Voice.Target` (1: the raw voice adapter's target). `ClockMode` is not read yet. Most keys
+are read ONCE when core starts (clamped), so a change needs `restart core`. The settings section is `scene` (group
+Audio; §55.16 notes): `scene.audio.enabled` and `scene.audio.allowHosts` replicate to clients,
+`scene.audio.maxStreams` is 0..64.
+Phase D added `OwnerCaps = { core = 60000 }` (per-owner overrides of `MaxNodesPerOwner`: map elements, player
+attachments and parked cars all count as core), trimmed `Config.Maps` to `{ MaxMarkers = 64 }` (the editor view's
+preview budget) and added `Config.Vehicles.AutoPark = true`, `AutoParkIdleMs = 30000`, `AutoParkRadius = 50`,
+`AutoParkSweepMs = 10000` (§4.6 notes).
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+`Promote.ProximityShare = 0.7`, `CoreReserve = { nodes =
+20000, persistent = 10000 }`, `OwnerCaps = { core = 60000, inventory = 40000 }`, `Caps.vehicles` 32 → 64 and
+`Caps.modelsVehicles` 20 → 32 (parked-car density, RV4 F10; the probe measures dense lots), and
+`Config.Vehicles.MaxParked = 20000`.
+
+### 55.21 Migrations onto Core.Scene — phase D (addenda binding for the migration runs)
+
+Liam (2026-09-27): "You can replace / remove Core.Maps if it's cleaner." Everything below keeps the PUBLIC surface
+the admin editor and plugins use where that is cheap, and removes the old machinery.
+
+#### 55.21.1 Core.Maps becomes an authoring layer on Core.Scene (supersedes §52.3, §52.4, §52.4a, §55.22)
+
+- **What stays**: element types (`Maps.defineType`, §52.1), documents, draft/live modes, `Maps.apply` / `invert` /
+  `publish` / `rollback` / `openDraft` / `closeDraft` / `clear` / `journal` / `versions`, editor buckets, expiry, the
+  model validator, `Maps.on` / `Maps.records` (active-content events), audits and limits (§52.2). server/maps_types.lua,
+  server/maps.lua, server/maps_apply.lua keep their API.
+- **What goes**: server/maps_regions.lua (MapRegions, the `core:maps:window` callback, `core:maps:pack|delta|stale`),
+  the networked-entity worker, `mapCfg`, `core:maps:pose` and the in-place pose checks in server/maps_runtime.lua,
+  client/maps_spawn.lua and client/maps_view.lua, and their suites' sections. `MapRegions` / region settings leave
+  config and api.lua.
+- **server/maps_runtime.lua = a projector.** Each active context (map, bucket) projects each element onto ONE scene
+  node, owner core, `persist = false` (maps persist their own documents; nodes are rebuilt at start), bucket = the
+  context's bucket, `fields.mapEl = '<mapId>:<elementId>'`, `fields.mapType = typeId`. Kind mapping:
+  | element kind | scene node |
+  |---|---|
+  | prop | `prop` { model, frozen, collision, invincible (= unbreakable), lod (info.lod) }; a networked prop type (`core:physprop`) gets `physics = 'promote'` |
+  | vehicle | `vehicle` { model, plate, locked, props (color → custom colours), frozen = true } with the class default authority (promote on proximity/enter/damage) |
+  | ped | `ped` { model, scenario, invincible, frozen, blockEvents }, authority local |
+  | marker | `marker` { type, scale, color, bob, face, drawDistance } |
+  | hide | `hide` { model, radius } |
+  | point, zone, placeholder, editor helper | `map:data` (core-internal kind, class `data`) { t = type id, k = element kind, size?, f? = preview label fields }, `audience = { editors = true }` |
+  `show` = spawn or `Scene.set`/`move` (same node id kept per (bucket, uid)); `hide` = `Scene.remove`; a context
+  swap (publish/rollback) diffs by (uid, updatedAt) as today. `Maps.respawn(mapId, elementId?)` re-spawns the element's
+  node (a promoted clone is demoted first). The `networked` / `networkedTotal` limits keep bounding vehicle and ped
+  elements (they are local copies now; the client caps still apply).
+- **Moving a promoted node** (an editor drags a map vehicle somebody walked up to): `Scene.move` / `Scene.set` on a
+  promoted node demotes it at the NEW pose first (R.promote handles it; no clone is ever moved by the server).
+- **client/maps.lua = a facade** (≤ ~250 lines) keeping the §52.4 client API for the admin editor: `handleOf(uid)`,
+  `uidOf(entity)` (a local copy OR a promoted clone → node → `fields.mapEl`), `hold(uid)` / `release(uid)` (→
+  `Scene.hold` / `release`, owner-tracked `mapHold` as today), `setEditorView(on)` (owner-tracked; turns the
+  `map:data` previews on), `isAreaReady` / `waitAreaReady` (→ Scene), `stats()` (→ a Scene subset). The uid ↔ node map
+  is kept from Scene `live`/`gone` of nodes that carry `fields.mapEl`.
+- **client/maps_preview.lua** (new, loads after client/scene_movers.lua): the `map:data` handler — draws the type's
+  `preview` descriptors (marker, sphere, box lines, label) only while the editor view is on, per-frame only while
+  something is in range (the §52 editor view budgets); the type list comes from `core:maps:types` as today.
+- **Admin editor (resources/admin)**: selection keeps `Core.Maps.uidOf`; the `mapEl` state-bag path and the drag
+  ghosts for networked types are removed (every element is a local copy the editor moves while it holds it); anything
+  that listened to `core:maps:pose` goes. The admin suites follow.
+- Tests: maps_tests.lua (projector against a recording fake Scene: every kind mapping, contexts, swaps, respawn,
+  limits), maps_store_tests.lua (unchanged), maps_regions_tests.lua deleted, client_maps_tests.lua rewritten (facade +
+  preview handler), admin suites updated.
+
+**Implementation notes (2026-09-27, phase D runs D1s, D1c, D1a and the orchestrator's follow-up).**
+- **Server (D1s)** — server/maps_runtime.lua is the projector (`server/maps_regions.lua` and its suite are deleted,
+  `MapRegions` left the export block-list). Deviations from the table above: a prop's `lod` is not passed — the
+  scene's model-info chain fills it (§55.12); `map:data` is defined as core at core's `onResourceStart` (again on the
+  first spawn if that failed), `k` ∈ `point` | `zone` | `placeholder`, fields `t`, `k`, `size`, `f` (≤ 16 label
+  values), `mapEl`, `mapType`, radius 150 m; types without `invincible` / `frozen` / `blockEvents` fields give peds
+  `true` (the old default was false). **Paint** (orchestrator follow-up): every map vehicle's props carry the paint of
+  its UID, `Scene.PAINTS[R.joaat(uid) % #PAINTS + 1]` (the pre-migration formula, the same list as
+  lib/scene/shared.lua; pinned: `m1:1` → 50, `m1:2` → 3, `m7:42` → 89, `m12:3` → 70, `event_arena:999` → 4) — the
+  same across node re-creations, restarts and buckets; a set `color` is custom RGB on top (with the uid paint
+  underneath), no `color` clears the custom colours explicitly.
+- Every Scene call runs AS CORE (`Registry.withCaller('core', …)`), whoever called Core.Maps; refusals are logged at
+  most once a minute per kind of failure. Nothing is projected before the scene store is loaded: one waiter thread
+  (bounded waits, only while something waits) projects every context then. A change keeps the node id per (bucket,
+  uid) — `Scene.move` for the pose, `Scene.set` for the changed fields (a promoted node is demoted by Scene first);
+  another scene kind is remove + spawn (a new node id); closing a context removes its nodes one by one. A refused
+  spawn is logged and stays missing until the element changes or `Maps.respawn`, which puts nodes back to their
+  authored state (a missing node is spawned, a promoted, displaced or changed one is moved / reset) and returns how
+  many it touched. `R.stats()` → `{ contexts, networked, nodes, waiting, listeners }`.
+- Core owns every map node, so `Config.Scene.OwnerCaps.core = 60000` lifts core above `MaxNodesPerOwner`. Models
+  stay validated at authoring time (maps_apply's `checkModelOf` on create, update and rollback); the scene itself no
+  longer refuses a model the Maps validator does not know (§55.12 notes).
+- **Client (D1c)** — client/maps.lua (263 lines) is the facade, client/maps_preview.lua (446) the editor view;
+  client/maps_spawn.lua and client/maps_view.lua are deleted. The uid index is fed by WRAPPING `C.mat.add / update /
+  remove` (the one seam every wanted node passes), not by `Scene.on` live / gone; holds go to `C.mat.hold / release`
+  under the owner key `'maps:<resource>'` (a resource's Scene holds and Maps holds never release each other; a hold
+  taken before the node arrives applies when it comes); uids are STRINGS (≤ 128); `handleOf(uid)` answers the local
+  copy, else the promoted clone, else a copy a holder keeps; readiness is `cache.areaReady` + `mat.areaReady`, and
+  `waitAreaReady` asks the focus reporter for a report but moves no window. `Maps.stats()` → `{ elements, spawned,
+  held, queued, models, failed, previews, dataNodes, types, editorView }` (no objects / hides any more).
+- **Previews** (client/maps_preview.lua, the `map:data` handler, class data, `fade = 'self'`): records within 160 m
+  (let go past 190 m); drawn only while the editor view is on and a record is within 150 m, ≤ `Config.Maps.MaxMarkers`
+  nearest first, ≤ 10 labels per frame, previews behind the camera skipped. The type list comes from
+  `core:maps:types` when the view turns on (again once it is older than 60 s) and once for each unknown type id,
+  attempts ≥ 1.5 s apart, 3 per fetch; `$size` and `#RRGGBBAA` colours work (the old view drew `core:zone` as a 1 m
+  box).
+- `Config.Maps` is `{ MaxMarkers = 64 }` only. `Spawn.teleport` waits on `Scene.waitAreaReady` (the same check
+  `Maps.waitAreaReady` makes now). admin_probe's maps listener (the `core:maps:*` pushes) is retired. **Admin (D1a)**:
+  the editor's `mapEl` state-bag path and the drag ghosts of networked types are gone (every element is a local copy
+  it holds and moves); resources/admin records its side in its own DESIGN / PLAN (admin runner 3772 / 0).
+- Tests: maps 328, maps_store 200 (apply validation, limits, expect / events / restore moved there), client_maps 257.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).** FX3.
+- **Slicing** (RV4 F2, RV6 F6): what is shown, the counts and the events change synchronously; the NODES follow. A
+  change of ≤ 200 elements is reconciled inline; anything larger (an activation, a first publish, openDraft, a
+  context closing, the boot projection, a type refresh, a clear) is queued per (context, element) — a later apply or
+  deactivation supersedes a queued entry — and ONE worker thread makes ≤ 200 Scene calls per `Scene.batch`, then
+  `Wait(0)`. Re-opening a closing context adopts its standing nodes; core stopping ends the threads; `R.stats()`
+  gains `closing` / `pending` / `retrying` / `projecting`. Measured: a 3,000-element `setActive` costs 9–16 ms in the
+  caller's tick (was 102–123 ms), then ~6–7 ms per slice. The node definitions and the `Maps.on` event queue moved to
+  server/maps_types.lua (no manifest change). Known cost: server/maps.lua's activation limit check still walks every
+  element (~25 ms per 20,000 elements, an admin action).
+- **'limit' retry** (RV4 F3): a refused element is kept and retried — 5 s, doubling to 60 s while nothing gets placed;
+  after a `'limit'` answer new spawns pause 1 s unless one of our nodes was removed. `Maps.respawn` retries at once:
+  it still examines every element synchronously, only missing nodes past 200 queue, and its count includes the
+  queued ones.
+- **Fades** (RV5 F3): an apply's deletes, everything in an editor bucket and kind changes fade out; deactivations and
+  publish swaps stay visibility-safe; client `uidOf` / `handleOf` keep answering while a removed copy still stands
+  (`handleOf` only when no node carries the uid any more).
+- **Authority** (RV6 F8): props, vehicles and peds in a draft's editor bucket get `{ mode = 'local', enter = false,
+  damage = false }` (the editor never promotes); map vehicles in the target bucket get `{ mode = 'local' }` (enter,
+  damage and actions still promote).
+- **Readiness**: while a worker run lasts ≥ 3 slices, `GlobalState['core:mapsPending']` holds per-bucket boxes of the
+  queued work (admin-triggered, rare and small — the one GlobalState write of the system); client `isAreaReady` /
+  `waitAreaReady` (and through the hand-off `C.mapsPending`, `Scene.isAreaReady` / `waitAreaReady`) answer not-ready
+  inside a box of the player's bucket.
+- Natives: `GetGameTimer` (server/remote.lua), `AddStateBagChangeHandler` (client/maps.lua). Tests: maps 442,
+  maps_store 200, client_maps 291; `tests/maps_harness.lua` lost its inert `mapEl` emulation.
+
+#### 55.21.2 Inventory drops (resources/inventory, inventory DESIGN §3.4)
+
+- server/drops.lua keeps documents, merging, the ground panel, the sweep and the admin index; the scoped delivery
+  (§3.4.1: scope cells, subscriptions, `dropsAdd`/`dropsRemove`, the `inventory:drops` paging callback) is replaced by
+  ONE scene node per drop: `kind = 'prop'`, owner inventory, bucket = the drop's bucket (0 when drops have none),
+  `rot = { 0, 0, heading }`, `fields = { model, frozen = true, collision = false, snap = 'ground' }`, `interact = { {
+  action = 'pickup', label = '<label> x<count>', distance = GroundRadius + PickupReach, prompt = { world = true,
+  offsetZ = <model centre height>, range = PromptRange } } }`; pickup = `Scene.onInteract(nodeId, …)` → the existing
+  pickup path; a count change = `Scene.set(id, {}, { interact = … })`; removal = `Scene.remove`. Nodes are rebuilt
+  from `inventory_drops` at start (persist = false).
+- client/drops.lua retires (the local objects, prompts and scope fetch are core's now).
+- Core additions (§55.12 / §55.14): prop field `snap = 'ground'` (the client places the object on the ground after
+  create — `PlaceObjectOnGroundProperly`, retried ≤ 5 times within 20 m while collision streams); interaction
+  descriptor `prompt = { world, offsetZ, range }` (world prompt on/off per descriptor, §6.7).
+
+**Implementation notes (2026-09-27, phase D run D2 and the integration).** Built as specified; resources/inventory
+documents its side (its DESIGN §3.4.1, README). The nodes are rebuilt from the documents on every `Core.onReady`;
+a node core refuses (its store still loading, a limit) is retried by the inventory's minute job; the ground panel,
+merging and the sweep stay the inventory's. Gone: the `inventory:drops` paging callback, the scope subscriptions and
+`dropsAdd` / `dropsRemove`, client/drops.lua and its shims. Weapon drops: the scene's model chain no longer refuses
+models the admin catalogue lacks (run I1, §55.12 notes); the inventory's `Config.Drops.DefaultModel` fallback stays
+as a safety net. Tests: the inventory runner 1995 / 0, fxlint 0 / 0 / 0.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+FX4 (resources/inventory documents the details in its own
+DESIGN §2.5, §3.4, §3.4.1). **Buckets** (RV6 F5): a drop lives in an explicit bucket, else the dropper's current one
+when he is within 10 m, else 0; nodes, merging, the grid, the GROUND panel and the pushes are per bucket, and a pickup
+of another bucket's drop answers `no_item`; old documents migrate to bucket 0. **Retry** (RV4 F4): the minute job
+retries a queue of node-less drops, 50 per tick, stops a pass at the first `limit` / `unavailable`, and backs off 1 →
+2 → 4 → 8 min (reset by an accepted node or a removed node of the inventory's), logging at most once a minute;
+node-less drops stay pickable from the GROUND panel. Inventory runner 2127 / 0 (drops.lua split into drops.lua and
+drops_jobs.lua).
+
+#### 55.21.3 Player attachments (§20)
+
+`Attachments.add/remove/clear/list` keep their API and persistence (`data.attachments`). Each attachment is one scene
+`prop` node owned by core: `attach = { player = src }`, `bone`, `offset`, `offrot`, `fields = { model, collision =
+false }`; created on `playerLoaded` (from the character data) and on `add`, removed on `remove` / `clear` /
+`playerDropped`. The `attachments` player state bag is no longer written (the key stays reserved); client/remote.lua's
+applier (state-bag handler + 2 s sweep) retires. The materialiser re-attaches when the target ped handle changes
+(model swap, respawn).
+
+**Implementation notes (2026-09-27, phase D run D3 and run I1).** server/remote.lua (836 lines) holds it;
+client/remote.lua lost the applier.
+1. Each node is spawned at the ped's position and attached with `Scene.attach(id, { player = src }, { bone, offset,
+   offrot = rotation, rotOrder = 1 })` in the same synchronous run (the index coalesces both into one PUT); every
+   Scene call runs AS CORE.
+2. Fields `{ model, collision = false, frozen = false }`.
+3. Nodes live in the player's routing bucket; `onPlayerBucketChange` makes them again in the new bucket.
+4. An integer model hash is sent as `'0x%08X'` (clients decode it to the signed hash; since I1 the scene also takes
+   integers).
+5. Re-adding an id changes its node in place (a model change is `Scene.set`, a bone / offset / rotation change
+   `Scene.attach` again).
+6. Removals fade (`Scene.remove(id, { fade = true })`).
+7. A refusal makes `add` answer `nil, 'scene refused the prop (<code>)'` and the entry is not stored; `unavailable`
+   (the scene store still loading) or `attach` (no ped on the server yet) store the entry and queue the player for
+   ONE retry thread (1 s pace, 32 players per server tick, alive only while somebody waits).
+8. Validation: `model` a name `^[%w_%-]+$` ≤ 64 or an integer hash; `bone` a tag 0..65535 or a bone name, anything
+   else 28422 (PH_R_Hand); each offset component ≤ 1000 m; ≤ 12 entries per player; readiness from
+   `SceneRuntime.store.loaded()`.
+Rotation order 1 (the old applier's and the community prop tables' `…, true, true, false, true, 1, true`) is kept
+through the node's `rotOrder` (run I1) so stored offsets look the same; the scene's attach passes `detachWhenDead` /
+`detachWhenRagdoll` = false (the node stays attached; the materialiser re-attaches on a new ped). Tests:
+`tests/scene_attach_tests.lua` 259.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).**
+FX3. **Decision 7 changed** (RV4 F3): a `'limit'` refusal
+(the scene is full: core's owner cap, the global node cap) no longer fails `add` — the entry is STORED, `add` returns
+its id, and the node follows through the retry thread (5 s backoff doubling to 60 s while nothing gets placed; for 1 s
+after a `'limit'` answer no new node is tried unless one of ours was removed). Other refusals still answer `nil,
+'scene refused the prop (<code>)'`. `isPed = true` for ped anchors (§55.12 notes). Tests: `tests/scene_attach_tests.lua`
+283.
+
+#### 55.21.4 Parked vehicles (§4.6 persistence)
+
+- `Vehicles.park(netId) -> nodeId | nil, err` (new): for a persisted vehicle — props from the owner client (or the
+  record), delete the entity, create a persistent scene `vehicle` node (owner core, `fields = { model, props, plate,
+  locked, vehId }`, the class default authority); the record gets `parked = nodeId` and stays `stored = false`.
+- On promotion of a node with `fields.vehId` (hook `promoted`): Core.Vehicles adopts the clone — the §8 vehicle
+  state bags (`coreVeh`, `locked`, `owner`, `keys`, `keyMode`, `plate`, `vehId`), `spawned[netId]`, hook
+  `vehicleSpawned`; on demotion: props into the record, untrack, hook `vehicleDeleted`. netId-keyed APIs work while
+  promoted; `Vehicles.getInfoByRecord(vehId)` answers either way.
+- `Vehicles.spawnRecord(vehId, …)` on a parked record promotes its node instead of creating a second car;
+  `Vehicles.store(netId | vehId)` (garage) removes the node. Automatic parking (`Config.Vehicles.AutoPark = true`): a
+  10 s sweep parks persisted vehicles that are unoccupied, at rest for 30 s and have nobody within 50 m. Parked cars
+  survive restarts as persistent nodes — no spawn storm at boot.
+- Risk: `vehicle_system` (ensured in server.cfg, not in this workspace) may assume netIds stay stable for persistent
+  vehicles; it must listen to `vehicleSpawned`/`vehicleDeleted` or key by `vehId`.
+
+**Implementation notes (2026-09-27, phase D runs D4 and D4+).** The API, the record fields, AutoPark, the lock key on
+a parked copy and the compatibility list are in §4.6's addition; the security rows (`core:server:parkedLock`,
+`core:vehicles:props`, `core:scene:report 'applied'`) in §55.19's notes.
+- **Deviation — a second file**: server/vehicles_park.lua (787 lines) loads right after server/vehicles.lua (685)
+  and takes the live maps and helpers once through the one-shot global `CoreVehiclesPark` (asserted, then cleared);
+  it wraps `spawnRecord`, `restoreRecord`, `store`, `delete` and `deleteRecord`. client/vehicles.lua (615) answers the
+  callback `core:vehicles:props` and sends `core:server:parkedLock` for a parked car's local copy.
+- `park` also takes a `vehId`; node fields add `vtype` (the record's `meta.vehType`); the model is the NAME when
+  core knows it (`record.modelName`), else the hash. The scene hooks act only on core-owned `vehicle` nodes whose
+  record parks them: promoted → the clone is adopted; demoted → props (the owner's, read at the demotion, else what
+  `saveProps` took while promoted), pose, lock and keys go into the record and the node's fields follow; removed by
+  anyone else → the record is out again.
+- **One-shot `snCfg`** (D4+, §55.15 notes): only the clone's first owner applied props / lock / dirt / paint (the final
+  round split it: cosmetics are re-applied by every owner, only wear / lock / dirt are one-shot — §55.15 final notes);
+  core vehicle clones take `locked` from their own bag. **Stop order** (D4+): the clones' final poses go to their
+  nodes through `R.promote.beforeStop` before any clone is deleted.
+- The vehicle kind gained `vehId`, the `'0x%08X'` / integer model forms and the `vtype` input (run I1, §55.12 notes);
+  a clone's model and type resolve through `R.promote.modelHash` and the node's `vtype`.
+- Open: `vehicle_system` is not in this workspace (its dev-server symlink dangles), so nothing verified it against the
+  new contract. Tests: `tests/scene_parked_tests.lua` 370, `tests/server_tests.lua` 1129 (vehicle section),
+  `tests/scene_promote_tests.lua` 344.
+
+**Implementation notes (2026-09-27, final review round RV4–RV6 / fix runs FX1a–FX4).** FX1a.
+- **Deviation — a third file**: `server/vehicles_fleet.lua` (557 lines) loads right after `server/vehicles_park.lua`
+  (758) and holds AutoPark, `MaxParked`, the boot check and park-at-stop; vehicles_park.lua passes the one-shot global
+  `CoreVehiclesPark` on, vehicles_fleet.lua clears it. server/vehicles.lua is 777 lines, client/vehicles.lua 667.
+- **Wear only** (RV4 F1): the park and demotion read-backs change only wear (`Scene.mergeWear`); every props write
+  goes through `cleanProps` (native-range clamps, `props.plate` = the record's plate); cosmetics a key holder saved
+  while the car was promoted win over the demotion read-back.
+- Parked nodes spawn with `authority = { mode = 'local' }` (D-B: no proximity promotion; enter, damage and actions
+  still promote); the boot check re-spawns older parked nodes with it.
+- **Wrecks** (D-C, RV4 F5): a wrecked clone → the node is removed and the record keeps its last saved state marked
+  `destroyed = true`; `restoreRecord`, `park` and the boot check refuse it (`'destroyed'`); `spawnRecord` brings it
+  back and clears the mark. A lost (not wrecked) clone → the node and the record at its last pose with its last wear.
+- `adopt` refuses an entity carrying `sn` (a scene clone) with `'scene_clone'` (RV4 F8). `setLocked` / `giveKeys` /
+  `removeKeys` / `setOwner` accept a vehId: its live car, else the record and the parked node's lock (RV4 F13).
+- **Stop and boot** (RV4 F14, RV6 F2): every live persisted car is parked at core stop (no spawn storm at boot, no car
+  lost in limbo); the boot check parks out-records that have neither a node nor a car (not destroyed ones) and retries
+  `'limit'` with backoff (10 s doubling to 5 min); `spawnRecord` answers `'already_spawned'` only while the record's
+  car is live. A boot race is fixed (a car promoted during the boot check lost its node); records restore keys, lock
+  and bucket, and positions carry the bucket.
+- **MaxParked** (RV6 F9): past `Config.Vehicles.MaxParked` (20,000) the longest-unused parked car that is not
+  promoted is garaged (node removed, record stored) and the hook `vehicleAutoStored (vehId, 'max_parked')` fires.
+- **Live hand-off** (RV6 F11): a live car parks through `R.promote.adopt` + `Scene.demote` — the watchers' car never
+  blinks out (fallback: frozen and locked for DeleteDelayMs + 500 ms, then gone).
+- **Silent damage** (RV5): a parked car's local copy is created each time it streams in, so damage is applied quietly
+  — a broken window is removed (`RemoveVehicleWindow`, not `SmashVehicleWindow`), a burst tyre gets `SetTyreHealth(veh,
+  wheel, 0.0)` (flat, no burst), only listed entries that differ. client/vehicles.lua used 12 native names the runtime
+  never generates (`GetVehicleExtraColour_5`, `GetVehicleLivery2`, …): `getProps` crashed in game; fixed (AGENTS §8).
+- New natives: server `FreezeEntityPosition`, `GetEntityRoutingBucket`, `NetworkGetNetworkIdFromEntity`; client
+  `RemoveVehicleWindow`, `SetTyreHealth` (+ the corrected names). Tests: `tests/scene_parked_tests.lua` 583,
+  `tests/server_tests.lua` 1166.
+
+### 55.22 Phase 0 — the §52 fade-band fix (amends §52.4)
+
+`client/maps_spawn.lua`: element radius `r = clamp(lod, 30, 400)` / despawn `r + 15` is replaced by the §55.11 prop
+rule: `S = GetLodscale()` (sampled every 1 s, radii recomputed on a > 5 % change), `B = 20` (5 when lod ≤ 20),
+`r = lod·S + B + 10`, capped at `MaxSpawnRadius` (raised to 500; entities over the cap get `SetEntityLodDist(e,
+floor((cap − B − 10) / S))`), despawn at `r + max(20, 0.25·r)`. The objects then exist before the camera reaches the
+engine's fade band and leave only after it (research R3/R5/R9: today's radii create inside the visible range and
+delete at ≈ 25 % alpha). Same change, same tests file: `tests/client_maps_tests.lua`.
+
+**Implementation notes (2026-09-27, run M0).** Applied as written; the details (the 30 m minimum radius is gone, `S`
+clamped 0.1–20, the scan limit = the cap + its despawn margin = 625 m, radii re-derived in slices of 500 per frame)
+and the counts are in §52.4's M0 notes. **Superseded (2026-09-27) by §55.21.1**: client/maps_spawn.lua is deleted
+and this rule with it — map props are `prop` nodes under §55.11's radii.
+
+### 55.23 Tests, benchmarks, docs
+
+- Suites (each on its own, `scripts/check.sh` runs them): `run_tests.lua` (`clock` + lib loader entries),
+  `scene_codec_tests.lua`, `scene_motion_tests.lua` (identical results server/client), `scene_server_tests.lua` (API,
+  kinds, validation, owners, persistence, audiences), `scene_index_tests.lua` (tiers, cells, versions, journals, packs,
+  coalescing, handover, movers), `scene_interest_tests.lua` (focus validation, windows, rings, hysteresis, resync,
+  flush budgets, latent), `client_scene_tests.lua` (decode/apply/versions/LRU, materialiser states, radii, priorities,
+  budgets, caps, fades, visibility, kinds with native stubs; allocations per evaluation = 0), `scene_promote_tests.lua`,
+  `scene_audio_tests.lua` (server policy + client Lua), `scene_voice_tests.lua`; node units
+  `ui/tests/unit/audio-*.test.ts` (arbiter, curves, drift controller, ICY parser, sync) and a runtime-regression section
+  (real Web Audio in Chromium 103).
+- Benchmarks (`tests/scene_bench.lua`, numbers go to PLAN.md): server — 50,000 nodes, 2,000 simulated players (random
+  walks + a 200-player hot spot), flush ms per tick p50/p99, crossings/s, bytes/s per client; client — 2,000 cached
+  nodes along a camera path, ms and allocations per evaluation, creations per second.
+- Docs with the code: README (API cheat sheet, server.cfg lines, in-game checklist), `types/core.lua` stubs for every
+  public function, AGENTS §2 layout and §5 verification rows, PLAN.md run table.
+
+**Implementation notes (2026-09-27, scene build runs A1–A6, B1–B3, C1, D1–D4, I1, FX1a–FX4 and review rounds RV1–RV6).**
+The suites as run at the end of the build, after the final fix round (each on its own; `scripts/check.sh` runs them
+all):
+
+| suite | checks | covers |
+|---|---|---|
+| `run_tests.lua` | 468 | libs and loader, suite `clock` |
+| `scene_codec_tests.lua` | 262 | every op both ways, quantisation, msgpack subset = runtime bytes, hostile input, RESET |
+| `scene_motion_tests.lua` | 328 | every descriptor, velocity, finished, rebase / needsRebase |
+| `scene_server_tests.lua` | 1061 | API, kinds, validation, owners, quotas, audiences, persistence, interact, drive, phase-D fields, rotOrder, OwnerCaps (over `tests/scene_server_harness.lua`: the real store and API, recording fakes of index / interest / flush) |
+| `scene_index_tests.lua` | 851 | tiers, cells, lazy versions, journals, packs, coalescing, gate heads, handover, parked movers, benches |
+| `scene_interest_tests.lua` | 582 | focus validation, windows, rings, hysteresis, resync, gated delivery, flush queues and budgets, RESET, the RV1 differential fuzz |
+| `scene_audio_tests.lua` | 241 | server policy, admission, trusted, titles, client bridge, feed, occlusion |
+| `scene_voice_tests.lua` | 290 | sessions, listener selection, adapters, submix pool, panning |
+| `scene_promote_tests.lua` | 424 | policies, triggers, spawn worker, demotion, leases, beforeChange, the client hand-off, one-shot snCfg, clone model / vtype, beforeStop |
+| `client_scene_cache_tests.lua` | 636 | decode / apply / versions / LRU / parked packs / worker, focus reporter, the public API, plugin bridge |
+| `client_scene_mat_tests.lua` | 661 | states, radii, priorities, budgets, caps, pool guard, fades, visibility, movers, light pass, sliced rescale, `[bench]` |
+| `client_scene_kinds_tests.lua` | 600 | prop / vehicle / ped, fx, world kinds, interactions, attachments, snap, paint |
+| `scene_attach_tests.lua` | 283 | phase D: Core.Attachments on scene nodes (§55.21.3) |
+| `scene_parked_tests.lua` | 583 | phase D: parked vehicles, AutoPark, the lock key on a parked copy (§55.21.4) |
+| `maps_tests.lua` · `maps_store_tests.lua` · `client_maps_tests.lua` | 442 · 200 · 291 | phase D: the map projector, the documents / apply rules, the facade and the preview handler (§55.21.1); `maps_regions_tests.lua` is deleted |
+
+`client_scene_tests.lua` became the three `client_scene_*` suites over the shared `tests/client_scene_harness.lua`.
+With them: `server_tests.lua` 1166, `client_ui_tests.lua` 795, node units `# pass 377` (the audio units:
+`ui/tests/unit/audio-{arbiter,cache,curves,engine,icy,loader,media,mixer,streams,sync,validate}.test.ts` +
+`audio-fakes.ts`), browser suites shell 125 / kit 312 / runtime 240 (the runtime suite's section 15 drives the real
+Web Audio engine). Benchmarks: `lua5.4 tests/scene_bench.lua [players] [nodes] [seconds] [nogc]` (defaults 2000
+50000 30; `nogc` measures a join storm's heap growth) — the numbers in §55.7 notes; the client numbers are
+client_scene_mat's `[bench]` line (§55.11 notes).
+
+### 55.24 In-game probes (`resources/scene_probe`, dev-only — Liam runs `/sprobe <n>`, results go to the server console)
+
+P1 engine fade of an existing script prop (create at `L·S + 40`, walk/drive in; again at `L·S − 10`) · P2
+`GetLodscale()` across slider/scope/first person/aircraft · P3 clock alignment (two clients flash at server T+5 s) · P4
+alpha slots (256, freeing, screen-door steps, vehicle pass) · P5 pools (local objects in steps of 100, with/without the
+raise) · P6 create/delete cost per kind, model load latency · P7 clone arrival delay and `CNetObjObject` size · P8 NUI
+codec matrix, `http://` and no-CORS streams · P9 NUI audio vs game sliders/pause/alt-tab, HRTF cost · P10 submix count,
+output-volume ordering, 20 Hz panning without dropouts · P11 collision/interior after teleports · P12 latent vs
+reliable ordering. Each has a fallback in RESEARCH.md §5.
+
+**Implementation notes (2026-09-27, run P0).** Built as a STANDALONE resource (no dependency on core: it measures
+engine facts) with a documented exception to AGENTS §3 "UI": its own never-focused plain-HTML `ui_page` for P8 / P9.
+Deployed to the dev server as a symlink, never in server.cfg; access needs the ACE `scene_probe.use` or `command`.
+`resources/scene_probe/README.md` is the operator's sheet: the run order (≈ 45 min, a second client for P3, P10 and
+optionally P7), the safety notes (P5 can crash the game at a full Object pool; P4 and P10 consume game-session
+resources), and a table of what each `RESULT` line decides here and in §55.11 / §55.16 / §55.17 / §55.20.
+`/sprobe report` saves every player's lines to `scene_probe/data/`. Offline: `lua5.4 tests/probe_tests.lua` in the
+resource → 134 passed; fxlint 0 / 0 / 0.
+
+**In-game probe results (Liam, 2026-09-26 22:21 UTC, `scene_probe/data/report_20260926_222136.txt`).**
+One run of every probe (a second
+client for P3 / P10 where needed); the decisions landed in the sections named:
+
+| probe | result | decision |
+|---|---|---|
+| P1 fade band | the engine faded the existing script prop in linearly over ~140 → 120 m (lodDist 120, S 1.0) and out the same way; the probe's "POP" read a stale, unscanned alpha (fixed in the probe; a replay gives FADE) | the fade band is confirmed for script objects (§55.11 notes); AGENTS §8 `GetEntityAlpha` gotcha |
+| P2 LOD scale | S = 1.0000 in the one context sampled (on foot, third person) | unchanged (S sampled ≤ 1/s); **re-run** with the slider / scope / first-person / vehicle / aircraft contexts |
+| P3 clock | network − server time, ping-corrected: mean 0.9 ms, p95 11.5 ms, max 24.5 ms; largest step 29.5 ms | `ClockMode = 'network'` confirmed (§55.2 notes) |
+| P4 alpha slots | 256 granted to 300 props; `ResetEntityAlpha` and `DeleteEntity` free a slot, `SetEntityAlpha 255` does not | the §55.11 / AGENTS §8 rule confirmed |
+| P5 pools | 2,000 local objects, 64 peds, 48 vehicles created (ambient vehicle baseline 136 of 300); ~45–54 ms per 100 objects in one go | caps hold; creation stays budgeted per frame (§55.11 notes) |
+| P6 costs | crashed on `os` (the client VM has none) — fixed in the probe | **re-run**; AGENTS §8 `os` gotcha |
+| P7 clones | a vehicle clone 89 ms after the event; 80 of 120 networked props resolved | ≈ 80 networked object clones per client (§55.15 notes) |
+| P8 NUI codecs | `http://` fails (mixed content); AAC plays (MSE and `AudioDecoder`); the https test stream answered 403 | https-only confirmed; `AllowAac = true` (§55.16 notes); **re-run** the https stream row with another stream |
+| P9 NUI audio | outputLatency 40 ms, audio − wall clock 2.6 ms, timer lateness p95 0.7 ms | the sync design stands (§55.16 notes) |
+| P10 submixes | 12 free ids (28..39) | `Voice.Submixes = 8` fits (§55.17 notes) |
+| P11 collision | props 2 m up landed on collision at once near the player | the physics rule stands (§55.15 notes) |
+| P12 events | 9 / 9 arrived; a big reliable event delays its markers (head-of-line) | the byte budgets of §55.7 stand |
+

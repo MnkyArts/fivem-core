@@ -98,7 +98,7 @@ end
 local SERVER_FILES <const> = {
     'shared/ui_forms.lua', 'server/api.lua', 'shared/hooks.lua', 'server/db.lua', 'server/db_mysql.lua', 'server/globals.lua', 'server/notify.lua',
     'server/perms.lua', 'server/player.lua', 'server/playergrid.lua', 'server/money.lua', 'server/factions.lua',
-    'server/vehicles.lua',
+    'server/vehicles.lua', 'server/vehicles_park.lua', 'server/vehicles_fleet.lua',
 }
 
 --- A fresh core VM with import.lua, shared/config.lua and the server modules loaded.
@@ -1454,6 +1454,7 @@ local function suiteVehicles()
     suite('vehicles')
     stubs.resetServer()
     local env, Core = newServer()
+    env.GetEntityRoutingBucket = function(e) return stubs.entities[e] and stubs.entities[e].bucket or 0 end  -- CFX
     local V = Core.Vehicles
     stubs.connectPlayer(env, 1, { license = 'license:v1', name = 'Driver', coords = vector3(100.0, 100.0, 20.0) })
     local charId = Core.Player.getInfo(1).charId
@@ -1661,6 +1662,32 @@ local function suiteVehicles()
     eq(V.getRecord(vehId).props.tyreHealth[0], 850.0, 'wheel health survives the props validator')
     check(V.getRecord(vehId).props.windows['0'] == false or V.getRecord(vehId).props.windows[0] == false,
         'window condition survives JSON-safe props')
+    -- review RV4 F1: every value is clamped to its native range and the props never rename the car
+    eq(V.saveProps(respawned, { tankHealth = -1000.0, engineHealth = -4000.0, bodyHealth = 1500.0, fuelLevel = 250.0,
+        dirtLevel = -3.0, colorPrimary = 999, colorSecondary = 7.6, windowTint = 42, wheels = -5, plateIndex = 99,
+        xenonColor = 200, neonColor = { 300, -1, 20 }, customPrimary = true, mods = { [11] = 900, [12] = -9 },
+        tyreHealth = { [0] = -5.0 }, lights = { true, false, 9 }, plate = 'HACKED', modEngine = 3 }), true,
+        'saveProps takes out-of-range values ...')
+    local clamped = V.getRecord(vehId).props
+    eq(clamped.tankHealth, 0, '... a tank below 0 (a burning car) becomes 0')
+    eq(clamped.engineHealth, 0, '... engine health 0..1000')
+    eq(clamped.bodyHealth, 1000, '... body health at most 1000')
+    eq(clamped.fuelLevel, 100, '... fuel 0..100')
+    eq(clamped.dirtLevel, 0, '... dirt 0..15')
+    eq(clamped.colorPrimary, 255, '... a paint index 0..255')
+    eq(clamped.colorSecondary, 7, '... paint indexes are integers')
+    eq(clamped.windowTint, 6, '... window tint -1..6')
+    eq(clamped.wheels, 0, '... wheel type 0..12')
+    eq(clamped.plateIndex, 12, '... plate style 0..12')
+    eq(clamped.xenonColor, nil, '... a xenon colour outside 0..12 / 255 is dropped')
+    eq(clamped.neonColor[1] .. ',' .. clamped.neonColor[2], '255,0', '... RGB 0..255')
+    eq(clamped.customPrimary, nil, '... a custom colour that is neither false nor RGB is dropped')
+    eq(clamped.mods[11] or clamped.mods['11'], 254, '... a mod index -1..254')
+    eq(clamped.mods[12] or clamped.mods['12'], -1, '... (stock is -1)')
+    eq(clamped.tyreHealth[0] or clamped.tyreHealth['0'], 0, '... wheel health 0..1000')
+    eq(clamped.lights[3], 3, '... indicators 0..3')
+    eq(clamped.plate, 'LSTEST1', '... and props.plate is always the car plate (never "HACKED")')
+    eq(stubs.entityState(env, V.getEntity(respawned)).coreProps.plate, 'LSTEST1', 'the projected bag too')
     eq(V.saveProps(respawned, { [1] = 'no numeric keys' }), false, 'a numeric prop key is refused')
     eq(V.saveProps(respawned, { bad = { 'not a number' } }), false, 'a non-numeric array value is refused')
     eq(V.saveProps(respawned, { bad = print }), false, 'a function value is refused')
@@ -1692,6 +1719,30 @@ local function suiteVehicles()
     eq(stubs.entityState(env, V.getEntity(restoredNetId)).coreProps.colour, 'green',
         'world restore projects props for whichever client streams it')
     eq(V.delete(restoredNetId), true, 'restored world test entity is removed')
+    -- review RV6 F2: an out record with nothing in the world (a restart without the scene, a deleted car) is not
+    -- 'already_spawned' for ever — the garage spawns it; a live one still refuses
+    eq(V.getRecord(restartVehId).stored, false, 'the deleted car left its record out ...')
+    local fromGarage, garageErr = V.spawnRecord(restartVehId, vector3(78.0, 88.0, 20.0), 0.0, 1)
+    check(math.type(fromGarage) == 'integer', 'RV6 F2: ... and spawnRecord brings it back', tostring(garageErr))
+    eq(errOf(V.spawnRecord(restartVehId, vector3(78.0, 88.0, 20.0))), 'already_spawned', 'while it is live: refused')
+    eq(V.delete(fromGarage), true, 'garage test entity is removed')
+    -- a record the scene marked destroyed (a wrecked parked clone, §55.21.4 D-C) is never restored into the world;
+    -- a garage spawn brings it back and clears the mark
+    Core.DB.update('vehicles', restartVehId, { destroyed = true })
+    eq(errOf(V.restoreRecord(restartVehId)), 'destroyed', 'restoreRecord refuses a wreck')
+    local rebuilt = V.spawnRecord(restartVehId, vector3(79.0, 88.0, 20.0), 0.0, 1)
+    check(math.type(rebuilt) == 'integer', 'spawnRecord brings a wreck back')
+    eq(V.getRecord(restartVehId).destroyed, false, '... and clears the mark')
+    eq(V.delete(rebuilt), true, 'rebuilt test entity is removed')
+    -- the record's keys, lock and bucket come back with it (review RV4 F13 / F6)
+    Core.DB.update('vehicles', restartVehId, { keys = { 'friend-7' }, locked = true,
+        position = { x = 80.0, y = 88.0, z = 20.0, heading = 0.0, bucket = 6 } })
+    local keyed = V.restoreRecord(restartVehId)
+    eq(V.getInfo(keyed).keys['friend-7'], true, 'a restored car carries the record keys')
+    eq(V.getInfo(keyed).locked, true, '... its lock')
+    eq(stubs.entities[V.getEntity(keyed)].bucket, 6, '... and its bucket')
+    eq(V.getInfoByRecord(restartVehId).position.bucket, 6, 'positionOf reports the bucket')
+    eq(V.delete(keyed), true, 'keyed test entity is removed')
 
     -- A validated server plugin can adopt an existing ambient vehicle without trusting a client-created record.
     local ambient = stubs.newEntity(2, { model = env.GetHashKey('blista'), vehType = 'automobile', plate = 'NPC123' })
@@ -1709,6 +1760,32 @@ local function suiteVehicles()
     eq(errOf(V.adopt(ambientNetId, { ownerSrc = 1 })), 'already_tracked', 'the same ambient entity cannot be adopted twice')
     eq(V.delete(ambientNetId), true, 'adopted ambient test entity is removed')
     eq(V.deleteRecord(adoptedVehId), true, 'adopted ambient test record is removed')
+    -- review RV4 F8: a Core.Scene clone (state sn: a map / plugin vehicle node's promoted entity) is not adoptable —
+    -- the scene deletes it at its demotion and the record would be orphaned / duplicated
+    local sceneClone = stubs.newEntity(2, { model = env.GetHashKey('adder'), vehType = 'automobile', plate = 'MAP1' })
+    stubs.coords[sceneClone] = vector3(40.0, 40.0, 20.0)
+    stubs.entityState(env, sceneClone).sn = 77
+    local recordsBefore = #Core.DB.find('vehicles', function() return true end)
+    eq(errOf(V.adopt(env.NetworkGetNetworkIdFromEntity(sceneClone), { ownerSrc = 1 })), 'scene_clone',
+        'RV4 F8: adopt refuses a scene clone')
+    eq(V.getInfo(env.NetworkGetNetworkIdFromEntity(sceneClone)), nil, '... it is not tracked')
+    eq(#Core.DB.find('vehicles', function() return true end), recordsBefore, '... and no record is created')
+    eq(stubs.entities[sceneClone].plate, 'MAP1', '... nor its plate touched')
+
+    -- §55.21.4 without Core.Scene (tests/scene_parked_tests.lua covers parking): the §4.6 behaviour stays
+    local parkNetId = V.spawn({ model = 'Adder', coords = vector3(60.0, 60.0, 20.0), ownerSrc = 1 })
+    local parkVehId = V.persist(parkNetId)
+    eq(V.getRecord(parkVehId).modelName, 'adder', 'persist keeps the model name the vehicle was spawned by')
+    eq(V.getInfo(parkNetId).parked, nil, 'a normal vehicle is no parked clone')
+    eq(errOf(V.park(parkNetId)), 'unavailable', 'park needs Core.Scene')
+    eq(V.getInfoByRecord(parkVehId).netId, parkNetId, 'getInfoByRecord answers a live vehicle')
+    eq(V.store(parkVehId), true, 'store takes a vehId too')
+    eq(V.exists(parkNetId), false, 'the live vehicle of that record left')
+    eq(V.getInfoByRecord(parkVehId).stored, true, 'getInfoByRecord answers a garaged record')
+    local parkBack = V.spawnRecord(parkVehId, vector3(61.0, 61.0, 20.0))
+    eq(stubs.entities[V.getEntity(parkBack)].model, env.GetHashKey('adder'), 'spawnRecord spawns by the model name')
+    eq(V.delete(parkBack), true, 'parking test entity is removed')
+    eq(V.deleteRecord(parkVehId), true, 'parking test record is removed')
     eq(#stubs.failures, 0, 'nothing escaped as an uncaught error')
 end
 
@@ -2414,6 +2491,18 @@ local function suitePlayerGrid()
     check(Grid.cellOf(1) ~= before, 'the refresh moves the player into their new cell')
     seen = candidateSet(Core, vector3(600.0, 0.0, 0.0), 20.0, out)
     eq(seen[1], true, 'and the new cell answers the query')
+
+    -- 5b. positionOf (DESIGN §55.6 backstop): the cached record, read without natives
+    local coordReads, timerReads = stubs.entityCoordReads, stubs.gameTimerReads
+    local px, py, pz, pat = Grid.positionOf(1)
+    eq(px, 600.0, 'positionOf answers the refreshed x')
+    check(py == 0.0 and pz == 0.0, 'and y / z of the same record')
+    check(math.type(pat) == 'integer' and pat > 0 and pat <= stubs.now(), 'and when it was read')
+    eq(stubs.entityCoordReads, coordReads, 'positionOf reads no coordinates')
+    eq(stubs.gameTimerReads, timerReads, 'and no timer')
+    eq(Grid.positionOf(9999), nil, 'an unknown src has no position')
+    stubs.dropPlayer(env, 4)
+    eq(Grid.positionOf(4), nil, 'a dropped player has no position')
 
     -- 6. slice maths: every player refreshed within REFRESH_MS, whatever the population
     for _, total in ipairs({ 1, 7, 500 }) do

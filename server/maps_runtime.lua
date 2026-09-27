@@ -1,623 +1,624 @@
 --[[
-    core/server/maps_runtime.lua — the world side of Core.Maps (DESIGN §52.2, §52.4a). Internal: extends
-    `Core.MapsRuntime` (R, created by maps_types.lua, which loads first).
+    core/server/maps_runtime.lua — the world side of Core.Maps (DESIGN §52.2, §55.21.1): a PROJECTOR onto Core.Scene.
+    Internal: extends `Core.MapsRuntime` (R, created by maps_types.lua, which loads first and holds the node
+    definitions: R.nodeDef — the kind mapping, the per-uid paint, the promotion policy of editor / target buckets).
 
-      contexts         one per (map, bucket) whose content is ACTIVE: a live map's elements or a draft's
-                       published snapshot in its targetBucket, a draft's working copy in its editor bucket
-      representation   client-rendered kinds (prop, marker, hide, point, zone, and placeholders of undefined
-                       types) become §52.4a tuples for Core.MapRegions.put/remove/clearBucket; networked
-                       kinds (vehicle, ped, networked prop) become server entities, created by ONE worker
-                       thread that exists only while its queue is non-empty
-      in place         a changed networked element keeps its entity (and net id) when type, kind, model and
-                       bucket are the same and a client owns the living entity: the config goes out as RPCs
-                       + the `mapCfg` bag, the pose as `core:maps:pose` to the owning client (SET_ENTITY_COORDS
-                       offsets peds and vehicles; client/maps.lua applies it with the no-offset native); ~2 s
-                       later an entity still at its pre-move pose is re-created at the target. Everything else
-                       is re-created as before. Handles are reused: only an entity whose `mapEl` is the uid is
-                       ever deleted or treated as alive.
-      paint            a vehicle without a `color` field gets a paint pair picked from its uid (stable across
-                       re-creations and between the editor bucket and the target bucket)
-      events           Maps.on(typeId|'*', fn) listeners get 'added'|'changed'|'removed' for active content,
-                       delivered in order by one drain thread (handlers may Wait); Maps.records(typeId)
+      contexts     one per (map, bucket) whose content is ACTIVE: a live map's elements or a draft's published
+                   snapshot in its targetBucket, a draft's working copy in its editor bucket
+      projection   every shown element is ONE Core.Scene node owned by core, persist = false (the map documents
+                   are the truth; nodes are rebuilt at start), in the context's bucket, fields.mapEl = the uid
+                   '<mapId>:<elementId>', fields.mapType = the type id. A change keeps the node id per (bucket,
+                   uid): Scene.move when the pose changed, Scene.set with the changed fields (a promoted node is
+                   demoted by Scene first); only another scene kind (or policy) re-creates it (remove + spawn).
+                   Every Scene call runs AS CORE (Registry.withCaller), whoever called Core.Maps.
+      slicing      what is shown, the counts and the events change synchronously; the NODES follow through
+                   reconcile(ctx, id) — idempotent: the element as it is now against the node that exists. A change
+                   of <= SLICE elements (an apply, a small swap or context) is reconciled inline; anything larger (an
+                   activation, a first publish, openDraft, a context closing, the boot projection, a type refresh,
+                   a clear) is queued per (context, element id) — a later change or a deactivation supersedes a
+                   queued entry — and ONE worker thread (alive only while the queue holds work) makes <= SLICE Scene
+                   calls per server tick inside Scene.batch, Wait(0) between slices. A closed context keeps its
+                   nodes until the worker removed them; re-opening it (same map and bucket) adopts the nodes still
+                   standing instead of making them again. R.stats() counts what exists and what is queued.
+      removals     an element an apply deleted, everything of a draft's editor bucket and a node re-created for
+                   another kind fade out on the clients (Scene.remove(id, { fade = true })); a live / published
+                   context switched off, expired or swapped by a publish leaves visibility-safely (the default)
+      capacity     a spawn refused 'limit' (core's owner cap, the global node cap) waits in its context's retry
+                   set: one thread (alive only while something waits) queues them again after 5 s, doubling to
+                   60 s while nothing gets placed (back to 5 s once something is); for 1 s after a 'limit' answer
+                   spawns are not tried (they would be refused too) unless one of our nodes was removed meanwhile
+      readiness    nothing is projected before the Scene store loaded (R.store.loaded()): the bookkeeping, the
+                   counts and the events go on, the queue waits, and one waiter thread (bounded waits, only while
+                   something waits) starts the worker once the store is there. While a worker run lasts
+                   PUBLISH_AFTER slices or more, GlobalState['core:mapsPending'] = { { bucket, x1, y1, x2, y2 }, … }
+                   boxes the queued work per bucket (client/maps.lua: isAreaReady / waitAreaReady say not ready
+                   inside a box of the player's bucket); cleared when the run ends, at core start and stop
+      respawn      Maps.respawn puts nodes back to their authored state: a promoted, displaced or changed node gets
+                   Scene.move / Scene.set (a promoted clone is demoted); a missing one is reconciled (queued when
+                   more than SLICE are missing)
+      events       Maps.on(typeId|'*', fn) listeners get 'added'|'changed'|'removed' for active content (queued
+                   here while the bookkeeping changes, delivered by maps_types.lua's drain); Maps.records(typeId)
 
     A context holds a REFERENCE to its element table ({ [elementId] = element }); maps.lua replaces element
     tables on change (never mutates one in place), so a context always sees the current content and a diff
-    only compares updatedAt. Core.MapRegions is looked up at call time (maps_regions.lua may load later in
-    the manifest) and every call is pcall'ed: a failing region module never breaks an apply.
+    only compares updatedAt. The `networked` / `networkedTotal` limits count the vehicle, ped and networked-prop
+    elements of every active context (ctx.netCount, R.netTotal()) whether their node exists or not.
+    Core.Scene and Core.SceneRuntime are looked up at call time: the scene files load after the map files.
 
-    Natives (fxref + natives_cfx.json 2026-09-26; apiset server, or client with a server RPC form — a
-    context RPC reaches the entity's owner, and is queued until a client owns it — runtime-facts §7):
-      CreateVehicleServerSetter(modelHash, type, x, y, z, heading) (server); CreatePed(pedType, modelHash,
-      x, y, z, heading, isNetwork, bScriptHostPed) and CreateObjectNoOffset(modelHash, x, y, z, isNetwork,
-      bScriptHostObj, dynamic) (entity RPCs, created on the server); SetEntityRotation(entity, pitch, roll,
-      yaw, rotationOrder, bDeadCheck), FreezeEntityPosition(entity, toggle), SetVehicleNumberPlateText(vehicle,
-      plateText), SetVehicleDoorsLocked(vehicle, doorLockStatus), SetVehicleColours(vehicle, colorPrimary,
-      colorSecondary), SetVehicleCustomPrimaryColour / SetVehicleCustomSecondaryColour(vehicle, r, g, b),
-      ClearPedTasks(ped) (context RPCs, fallible — the `mapCfg` state bag carries the config for
-      client/maps.lua); SetEntityRoutingBucket(entity, bucket), GetEntityRoutingBucket(entity),
-      SetEntityOrphanMode(entity, mode), DoesEntityExist(entity), DeleteEntity(entity), GetEntityCoords(entity),
-      GetEntityHeading(entity), GetEntityHealth(entity) (the synced health node: 0 until a client synced it),
-      NetworkGetNetworkIdFromEntity(entity), GetPedInVehicleSeat(vehicle, seatIndex) (server; 0 = empty);
-      NetworkGetEntityOwner(entity) (shared: a player's net
-      id, -1 while the server owns it). Entity(e).state, CreateThread, Wait, SetTimeout, GetGameTimer and
-      TriggerClientEvent are runtime helpers.
+    Natives: GetGameTimer (server, CFX). GlobalState, CreateThread, Wait and AddEventHandler are runtime helpers.
 ]]
 
 local R = Core.MapsRuntime
-assert(R and R.types, 'server/maps_types.lua must load before server/maps_runtime.lua')
+assert(R and R.types and R.nodeDef and R.emit, 'server/maps_types.lua must load before server/maps_runtime.lua')
 
 local Log = Core.Log
 local Utils = Core.Utils
 local Registry = Core.Registry
 
-local types = R.types
-local xyz, rgba, isFinite = R.xyz, R.rgba, R.isFinite
+local type, pairs, next, tonumber, tostring, mtype = type, pairs, next, tonumber, tostring, math.type
 
-local LISTENER_KIND <const> = 'mapsListener'
-local MAX_LISTENERS <const> = 512
-local DEFAULT_LOD <const> = 150
-local SPAWN_TIMEOUT_MS <const> = 5000
-local SPAWN_POLL_MS <const> = 50
-local PED_TYPE <const> = 4                  -- PED_TYPE_CIVMALE, as every server-created ped in core
-local ORPHAN_KEEP <const> = 2               -- SetEntityOrphanMode: KeepEntity
-local LOCKED <const>, UNLOCKED <const> = 2, 1   -- SetVehicleDoorsLocked
-local POSE_EVENT <const> = 'core:maps:pose'
-local VERIFY_MS <const> = 2000              -- an in-place move is checked against the synced pose this late
-local VERIFY_DIST <const> = 0.75            -- metres, horizontal (props fall and vehicles settle in z)
-local VERIFY_HEADING <const> = 20           -- degrees (vehicles and peds; a prop's rotation rides mapCfg.rot)
--- Normal GTA paint indexes { primary, secondary } for vehicles without a `color` field, picked by the uid's
--- joaat: metallic black, graphite, silver, dark silver, shadow silver, gun metal, white, frost white, red,
--- cabernet red, orange, race yellow, green, racing green, dark blue, blue, bright blue, midnight blue,
--- bronze, champagne, golden brown, purple (vehicleColors indexes 0..145).
-local PAINTS <const> = { { 0, 0 }, { 1, 1 }, { 4, 4 }, { 3, 3 }, { 7, 7 }, { 10, 10 }, { 111, 111 },
-    { 112, 112 }, { 27, 27 }, { 34, 34 }, { 38, 38 }, { 89, 89 }, { 53, 53 }, { 50, 50 }, { 62, 62 },
-    { 64, 64 }, { 70, 70 }, { 61, 61 }, { 90, 90 }, { 93, 93 }, { 97, 97 }, { 145, 145 } }
-local KIND_CODE <const> = { prop = 1, marker = 2, hide = 3, point = 4, zone = 5 }
-local FLAG_COLLISION <const>, FLAG_FROZEN <const>, FLAG_UNBREAKABLE <const> = 1, 2, 4
-local FLAG_EDITOR <const>, FLAG_DATA <const> = 8, 16
+local types, defOf, uidOf = R.types, R.nodeDef, R.uidOf
+local emit, flushEvents, recordOf = R.emit, R.flushEvents, R.recordOf   -- the event queue (maps_types.lua)
+local DATA_KIND <const> = R.DATA_KIND           -- point, zone, placeholder: the editor view's previews
 
-local hashCache = {}        -- [model] = signed joaat
+local DATA_RADIUS <const> = 150                 -- the editor view distance (metres)
+local LABELS_MAX <const> = 16
+local WAIT_FAST_MS <const>, WAIT_SLOW_MS <const>, WAIT_FAST_FOR_MS <const> = 100, 1000, 5000
+local WAIT_WARN_MS <const> = 30000
+local LOG_EVERY_MS <const> = 60000
+local TOL_M <const>, TOL_DEG <const> = 0.001, 0.01   -- respawn: "at its authored pose"
+local SLICE <const> = 200                       -- Scene calls per worker slice; the largest change reconciled inline
+local SLICE_ITEMS <const> = 4000                -- queue entries one slice looks at (stale ones, deferred spawns)
+local RETRY_MIN_MS <const>, RETRY_MAX_MS <const> = 5000, 60000   -- 'limit' refusals: the retry backoff
+local LIMIT_HOLD_MS <const> = 1000              -- after a 'limit' answer spawns wait this long (or for a removal)
+local PENDING_KEY <const> = 'core:mapsPending'  -- GlobalState: the boxes of a long projection, per bucket
+local PUBLISH_AFTER <const> = 3                 -- slices a worker run lasts before its boxes are published
+local FADE <const> = { fade = true }
+R.SLICE = SLICE
 
-local function hashOf(model)
-    local h = hashCache[model]
-    if not h then
-        h = R.joaat(model)
-        hashCache[model] = h
-    end
-    return h
+local loggedAt = {}                             -- key -> GetGameTimer() of its last line
+
+--- One line per key per minute: a map of 3,000 elements that all fail must not print 3,000 lines.
+local function logLimited(level, key, fmt, ...)
+    local now = GetGameTimer()
+    local last = loggedAt[key]
+    if last and now - last < LOG_EVERY_MS then return end
+    loggedAt[key] = now
+    Log[level](fmt, ...)
 end
 
-local function round(v, mult)
-    return math.floor(v * mult + 0.5) / mult
-end
+local function warnLimited(key, fmt, ...) logLimited('warn', key, fmt, ...) end
 
 --------------------------------------------------------------------------------
--- Tuples (§52.4a) and the region module
+-- The Scene bridge: readiness, calls as core, the map:data kind
 --------------------------------------------------------------------------------
 
-local function uidOf(mapId, elementId)
-    return mapId .. ':' .. elementId
-end
-R.uidOf = uidOf
-
-local regionsWarned = false
-
---- Core.MapRegions at call time (it may load after this file), or nil with one warning.
-local function regions()
-    local mr = rawget(Core, 'MapRegions')
-    if mr then return mr end
-    if not regionsWarned then
-        regionsWarned = true
-        Log.warn('maps: Core.MapRegions is not loaded; client-rendered map content is not streamed')
-    end
-    return nil
-end
-
-local function regionCall(name, ...)
-    local mr = regions()
-    local fn = mr and mr[name]
-    if type(fn) ~= 'function' then return end
-    local ok, err = pcall(fn, ...)
-    if not ok then Log.warn('maps: MapRegions.%s failed: %s', name, tostring(err)) end
-end
-
---- A boolean field of the element when the type declares it, else the fallback.
-local function flag(el, name, fallback)
-    local v = el.fields and el.fields[name]
-    if type(v) == 'boolean' then return v end
-    return fallback
-end
-
---- Marker extra from the fields (core:marker names), then the type's first marker preview, then defaults.
-local function markerExtra(def, el)
-    local f = el.fields or {}
-    local pv
-    if def and def.preview then
-        for i = 1, #def.preview do
-            if def.preview[i].kind == 'marker' then pv = def.preview[i] break end
-        end
-    end
-    local r, g, b, a = rgba(f.color)
-    if not r and pv then r, g, b, a = rgba(pv.color) end
-    if not r then r, g, b, a = 224, 163, 58, 180 end
-    local sx, sy, sz = xyz(f.scale)
-    if not sx and pv and type(pv.scale) == 'table' then sx, sy, sz = xyz(pv.scale) end
-    if not sx and pv and type(pv.scale) == 'number' then sx, sy, sz = pv.scale, pv.scale, pv.scale end
-    if not sx then sx, sy, sz = 1.0, 1.0, 1.0 end
-    local mtype = math.tointeger(f.markerType) or (pv and pv.type) or 1
-    local dd = isFinite(f.drawDistance) and f.drawDistance or 50
-    return { type = mtype, r = r, g = g, b = b, a = a, sx = round(sx, 1000), sy = round(sy, 1000),
-        sz = round(sz, 1000), dd = round(dd, 100), bob = flag(el, 'bob', false), face = flag(el, 'faceCamera', false) }
-end
-
---- extra for the editor view of data kinds and placeholders: t = the type id, f = the values of the fields
---- a '$field' label preview shows (scalars as strings, <= 64 chars). `extra` is added to when given.
-local function editorExtra(def, el, extra)
-    extra = extra or {}
-    extra.t = el.type
-    local names = def and def.labelFields
-    if names then
-        local f
-        for i = 1, #names do
-            local v = el.fields and el.fields[names[i]]
-            local kind = type(v)
-            if kind == 'string' or kind == 'number' or kind == 'boolean' then
-                f = f or {}
-                f[names[i]] = tostring(v):sub(1, 64)
-            end
-        end
-        extra.f = f
-    end
-    return extra
-end
-
---- The §52.4a tuple of a client-rendered element; an undefined type is packed as an editor-only point.
-local function tupleOf(mapId, el)
-    local def = types[el.type]
-    local p, r = el.pos, el.rot
-    local kind = def and def.kind or 'point'
-    local code = def and KIND_CODE[kind] or 4
-    local hash, flags, extra = 0, 0, nil
-    local lod = DEFAULT_LOD
-    if not def then
-        flags = FLAG_EDITOR | FLAG_DATA
-        extra = editorExtra(nil, el)
-    elseif kind == 'prop' then
-        local model = R.modelOf(def, el)
-        hash = model and hashOf(model) or 0
-        flags = (flag(el, 'collision', true) and FLAG_COLLISION or 0) | (flag(el, 'frozen', true) and FLAG_FROZEN or 0)
-            | (flag(el, 'unbreakable', false) and FLAG_UNBREAKABLE or 0)
-        if el.info and el.info.lod then lod = el.info.lod end
-    elseif kind == 'marker' then
-        extra = markerExtra(def, el)
-    elseif kind == 'hide' then
-        local model = el.fields and el.fields.model
-        hash = type(model) == 'string' and hashOf(model) or 0
-        local radius = el.fields and el.fields.radius
-        extra = { radius = isFinite(radius) and round(radius, 100) or 2 }
-    elseif kind == 'zone' then
-        flags = FLAG_DATA
-        local sx, sy, sz = xyz(el.fields and el.fields.size)
-        if not sx then sx, sy, sz = 4, 4, 3 end
-        extra = editorExtra(def, el, { sx = round(sx, 1000), sy = round(sy, 1000), sz = round(sz, 1000) })
-    else                                        -- point
-        flags = FLAG_DATA
-        extra = editorExtra(def, el)
-    end
-    return { uidOf(mapId, el.id), code, hash, round(p.x, 1000), round(p.y, 1000), round(p.z, 1000),
-        round(r.x, 100), round(r.y, 100), round(r.z, 100), flags, math.tointeger(lod) or DEFAULT_LOD, extra }
-end
-R.tupleOf = tupleOf
-
---------------------------------------------------------------------------------
--- Networked elements (§52.2): server entities, one spawn worker
---------------------------------------------------------------------------------
-
-local contexts = {}         -- [ctxKey] = ctx
-local byMap = {}            -- [mapId] = { [bucket] = ctx }
-local perBucket = {}        -- [bucket] = number of contexts in it (clearBucket only when alone)
--- ['<bucket>|<uid>'] = { key, ctxKey, elementId, uid, bucket, entity?, cancelled?, done? (the worker took
--- it), ready? (configured) + what the entity was made with: type, kind, model, pose, cfg, looks; in-place moves:
--- poseSeq, prevPose, anchor, verifying }
-local instances = {}
-local netTotal = 0          -- networked elements active in every context (desired, spawned or not)
--- [spawnHead..spawnTail] = queued instances; an explicit tail, since `#` of a queue whose consumed head is nil
--- can read 0 and put a new entry behind the worker's head (it was lost)
-local spawnQueue, spawnHead, spawnTail, spawning = {}, 1, 0, false
-local updateNet             -- forward: spawnOne hands an element that moved meanwhile back to it
-
-local function instKey(bucket, uid)
-    return bucket .. '|' .. uid
-end
-
---- Is `entity` still the map entity of `uid`? Server handles are pool slots handed to the next entity once one is
---- gone (a client may delete a map entity), so the handle alone never proves it: the `mapEl` bag does.
-local function ours(entity, uid)
-    return entity ~= nil and entity ~= 0 and DoesEntityExist(entity) and Entity(entity).state.mapEl == uid
-end
-
---- Deletes the instance's entity, never a foreign one that reused its handle.
-local function deleteEntity(entity, uid)
-    if ours(entity, uid) then DeleteEntity(entity) end
-end
-
---- The paint pair of a vehicle without a `color` field: the same for a uid on every spawn.
-local function paintOf(uid)
-    local pair = PAINTS[R.joaat(uid) % #PAINTS + 1]
-    return pair[1], pair[2]
-end
-R.paintOf = paintOf
-
---- Config the client applies to a map entity (RPC natives are fallible; the state bag is the source of
---- truth for client/maps.lua): peds invincible/frozen/scenario, vehicles locked, physics props rot.
-local function entityConfig(def, el)
-    local f = el.fields or {}
-    local cfg, any = {}, false
-    if def.kind == 'ped' then
-        cfg.invincible, cfg.frozen = flag(el, 'invincible', false), flag(el, 'frozen', false)
-        if type(f.scenario) == 'string' and f.scenario ~= '' then cfg.scenario = f.scenario end
-        any = true
-    elseif def.kind == 'vehicle' then
-        cfg.locked = flag(el, 'locked', false)
-        any = true
-    elseif def.kind == 'prop' then              -- networked physics prop: the owning client re-applies it
-        cfg.rot = { x = el.rot.x, y = el.rot.y, z = el.rot.z }
-        any = true
-    end
-    return any and cfg or nil
-end
-
-local function sameCfg(a, b)
-    if a == nil or b == nil then return a == b end
-    if a.invincible ~= b.invincible or a.frozen ~= b.frozen or a.scenario ~= b.scenario or a.locked ~= b.locked then
-        return false
-    end
-    local ra, rb = a.rot, b.rot
-    if ra == nil or rb == nil then return ra == rb end
-    return ra.x == rb.x and ra.y == rb.y and ra.z == rb.z
-end
-
---- What only the server's RPCs set on a vehicle: { plate?, color? (0xRRGGBB) }; {} for other kinds.
-local function looksOf(def, el)
-    if def.kind ~= 'vehicle' then return {} end
-    local f = el.fields or {}
-    local cr, cg, cb = rgba(f.color)
-    return { plate = type(f.plate) == 'string' and f.plate ~= '' and f.plate or nil,
-        color = cr and (cr << 16 | cg << 8 | cb) or nil }
-end
-
-local function setCustomColour(entity, rgb)
-    local r, g, b = (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255
-    SetVehicleCustomPrimaryColour(entity, r, g, b)
-    SetVehicleCustomSecondaryColour(entity, r, g, b)
-end
-
---- { x, y, z, rx, ry, rz } of an element (floats, as the natives take them).
-local function poseOf(el)
-    local p, r = el.pos, el.rot
-    return { p.x + 0.0, p.y + 0.0, p.z + 0.0, r.x + 0.0, r.y + 0.0, r.z + 0.0 }
-end
-
---- Vehicles and peds are created with a heading only, so only a physics prop compares pitch and roll.
-local function samePose(kind, a, b)
-    if a[1] ~= b[1] or a[2] ~= b[2] or a[3] ~= b[3] or a[6] ~= b[6] then return false end
-    return kind ~= 'prop' or (a[4] == b[4] and a[5] == b[5])
-end
-
---- Creates the entity; returns the handle or 0.
-local function createEntity(def, el, model)
-    local hash = hashOf(model)
-    local p, r = el.pos, el.rot
-    if def.kind == 'vehicle' then
-        local vt = el.info and el.info.vehicleType or 'automobile'
-        return CreateVehicleServerSetter(hash, vt, p.x + 0.0, p.y + 0.0, p.z + 0.0, (r.z % 360) + 0.0)
-    elseif def.kind == 'ped' then
-        return CreatePed(PED_TYPE, hash, p.x + 0.0, p.y + 0.0, p.z + 0.0, (r.z % 360) + 0.0, true, true)
-    end
-    return CreateObjectNoOffset(hash, p.x + 0.0, p.y + 0.0, p.z + 0.0, true, true, true)
-end
-
---- Everything after the entity exists: bucket first (server entities start in 0), orphan mode, state bags,
---- then the fallible cosmetic RPCs (queued by the server until a client owns the entity). Remembers the
---- config on the instance for in-place updates.
-local function configureEntity(inst, def, el, entity)
-    SetEntityRoutingBucket(entity, inst.bucket)
-    SetEntityOrphanMode(entity, ORPHAN_KEEP)
-    local state = Entity(entity).state
-    state:set('mapEl', inst.uid, true)
-    local cfg, looks = entityConfig(def, el), looksOf(def, el)
-    if cfg then state:set('mapCfg', cfg, true) end
-    local r = el.rot
-    if def.kind == 'prop' and (r.x ~= 0 or r.y ~= 0 or r.z ~= 0) then
-        SetEntityRotation(entity, r.x + 0.0, r.y + 0.0, r.z + 0.0, 2, false)
-    elseif def.kind == 'vehicle' then
-        local primary, secondary = paintOf(inst.uid)
-        SetVehicleColours(entity, primary, secondary)   -- a set `color` below paints over it
-        if looks.plate then SetVehicleNumberPlateText(entity, looks.plate) end
-        if looks.color then setCustomColour(entity, looks.color) end
-        if cfg and cfg.locked then SetVehicleDoorsLocked(entity, LOCKED) end
-    elseif def.kind == 'ped' and cfg and cfg.frozen then
-        FreezeEntityPosition(entity, true)
-    end
-    inst.cfg, inst.looks = cfg, looks
-end
-
---- One queued instance: still wanted? create, wait for it to exist (<= 5 s), configure. It reads the
---- element when it starts, so a change while it waits in the queue costs nothing; a change while the
---- entity is being created replaces the instance (updateNet), and this one deletes its entity.
-local function spawnOne(inst)
-    if instances[inst.key] ~= inst or inst.cancelled or inst.entity then return end
-    inst.done = true                            -- set first: every exit below is final for this instance
-    local ctx = contexts[inst.ctxKey]
-    local el = ctx and ctx.els[inst.elementId]
-    local def = el and types[el.type]
-    local model = def and R.modelOf(def, el)
-    if not model or not R.isNetworked(def) then return end
-    local entity = createEntity(def, el, model)
-    if not entity or entity == 0 then
-        Log.warn('maps: could not create %s (%s) for %s', def.kind, model, inst.uid)
-        return
-    end
-    inst.entity = entity
-    -- wait even when cancelled meanwhile: an entity can only be deleted once it exists
-    local deadline = GetGameTimer() + SPAWN_TIMEOUT_MS
-    while not DoesEntityExist(entity) and GetGameTimer() < deadline do
-        Wait(SPAWN_POLL_MS)
-    end
-    if inst.cancelled or instances[inst.key] ~= inst then
-        -- the handle the create native just returned (no mapEl yet): the one unchecked delete
-        if DoesEntityExist(entity) then DeleteEntity(entity) end
-        return
-    end
-    if not DoesEntityExist(entity) then
-        Log.warn('maps: %s (%s) for %s did not appear within %d ms', def.kind, model, inst.uid, SPAWN_TIMEOUT_MS)
-        inst.entity = nil
-        return
-    end
-    local cur = ctx.els[inst.elementId] or el
-    configureEntity(inst, def, cur, entity)
-    inst.type, inst.kind, inst.model, inst.pose, inst.ready = el.type, def.kind, model, poseOf(el), true
-    -- a change while it was created replaced this instance; a same-version copy placed elsewhere would not
-    if cur ~= el and not samePose(def.kind, inst.pose, poseOf(cur)) then updateNet(ctx, cur) end
-end
-
-local function queueSpawn(inst)
-    spawnTail = spawnTail + 1
-    spawnQueue[spawnTail] = inst
-    if spawning then return end
-    spawning = true
-    -- one worker; it ends as soon as the queue is empty
-    -- fxlint-disable-next-line P004
-    CreateThread(function()
-        while spawnHead <= spawnTail do
-            local item = spawnQueue[spawnHead]
-            spawnQueue[spawnHead] = nil
-            spawnHead = spawnHead + 1
-            local ok, err = pcall(spawnOne, item)
-            if not ok then Log.error('maps: spawning %s failed: %s', tostring(item.uid), tostring(err)) end
-        end
-        spawnQueue, spawnHead, spawnTail, spawning = {}, 1, 0, false
-    end)
-end
-
-local function spawnFor(ctx, el)
-    local uid = uidOf(ctx.mapId, el.id)
-    local key = instKey(ctx.bucket, uid)
-    local old = instances[key]
-    if old then
-        old.cancelled = true
-        deleteEntity(old.entity, uid)
-    end
-    local inst = { key = key, ctxKey = ctx.key, elementId = el.id, uid = uid, bucket = ctx.bucket }
-    instances[key] = inst
-    queueSpawn(inst)
-end
-
-local function despawn(bucket, uid)
-    local key = instKey(bucket, uid)
-    local inst = instances[key]
-    if not inst then return end
-    instances[key] = nil
-    inst.cancelled = true
-    deleteEntity(inst.entity, uid)
-end
-
-local function near(c, p)
-    local dx, dy = c.x - p[1], c.y - p[2]
-    return dx * dx + dy * dy <= VERIFY_DIST * VERIFY_DIST
-end
-
-local function nearHeading(h, p)
-    local d = (h - p[6]) % 360
-    return math.min(d, 360 - d) <= VERIFY_HEADING
-end
-
---- A vehicle somebody sits in is theirs to move: never re-created under them (seats -1..15).
-local function occupied(entity)
-    for seat = -1, 15 do
-        if GetPedInVehicleSeat(entity, seat) ~= 0 then return true end
-    end
-    return false
-end
-
---- ~VERIFY_MS after an in-place move: did the owning client apply it? Re-created only when the synced pose is
---- still where the entity was BEFORE the move (the pose before the last move, or before the first of a burst)
---- and not at the target — an entity that landed and then moved on (driven, kicked, bumped) is left alone, and
---- so is any vehicle with an occupant. Horizontal position, plus the heading of vehicles and peds while they
---- stand at the target position (a physics prop's rotation rides mapCfg.rot).
-local function verifyPose(inst, seq)
-    if instances[inst.key] ~= inst or inst.cancelled or inst.poseSeq ~= seq then return end
-    inst.verifying = false
-    local entity = inst.entity
-    if not ours(entity, inst.uid) then return end   -- destroyed or its handle reused: Maps.respawn's job
-    if inst.kind == 'vehicle' and occupied(entity) then return end
-    local p, prev, anchor, c = inst.pose, inst.prevPose, inst.anchor, GetEntityCoords(entity)
-    local stuck
-    if near(c, p) then
-        if inst.kind == 'prop' then return end
-        local h = GetEntityHeading(entity)
-        stuck = not nearHeading(h, p) and (nearHeading(h, prev) or nearHeading(h, anchor))
-    else
-        stuck = near(c, prev) or near(c, anchor)
-    end
-    if not stuck then return end
-    local ctx = contexts[inst.ctxKey]
-    local el = ctx and ctx.els[inst.elementId]
-    if not el or ctx.reps[el.id] ~= 'net' then return end
-    Log.debug('maps: %s did not move in place; re-created', inst.uid)
-    spawnFor(ctx, el)
-end
-
---- The transitions only a re-creation undoes: a cleared plate (the random one is gone), a cleared custom
---- colour and a ped that stops being invincible (both natives are client-only, and the client applies the
---- "on" states of mapCfg only).
-local function keepable(inst, cfg, looks)
-    local oc, ol = inst.cfg or {}, inst.looks or {}
-    if (ol.plate and not looks.plate) or (ol.color and not looks.color) then return false end
-    return not (oc.invincible and not (cfg and cfg.invincible))
-end
-
---- Updates a spawned entity to `el` without re-creating it -> true, or false when it has to be re-created:
---- another type, kind or model, the entity gone, not ours, in another bucket, dead, owned by the server
---- (nobody near: a re-creation is exact and unseen) or a transition keepable() refuses.
-local function moveInPlace(inst, def, el)
-    local entity = inst.entity
-    if not def or def.kind ~= inst.kind or el.type ~= inst.type or R.modelOf(def, el) ~= inst.model then
-        return false
-    end
-    if not ours(entity, inst.uid) or GetEntityRoutingBucket(entity) ~= inst.bucket then return false end
-    local state = Entity(entity).state
-    local owner = NetworkGetEntityOwner(entity)
-    if type(owner) ~= 'number' or owner < 1 then return false end
-    if def.kind ~= 'prop' and GetEntityHealth(entity) <= 0 then return false end
-    local cfg, looks = entityConfig(def, el), looksOf(def, el)
-    if not keepable(inst, cfg, looks) then return false end
-    local oc, ol = inst.cfg or {}, inst.looks or {}
-    if def.kind == 'vehicle' then
-        if looks.plate and looks.plate ~= ol.plate then SetVehicleNumberPlateText(entity, looks.plate) end
-        if looks.color and looks.color ~= ol.color then setCustomColour(entity, looks.color) end
-        if cfg.locked ~= oc.locked then SetVehicleDoorsLocked(entity, cfg.locked and LOCKED or UNLOCKED) end
-    elseif def.kind == 'ped' then
-        if cfg.frozen ~= oc.frozen then FreezeEntityPosition(entity, cfg.frozen) end
-        if oc.scenario and not cfg.scenario then ClearPedTasks(entity) end
-    end
-    if not sameCfg(inst.cfg, cfg) then state:set('mapCfg', cfg, true) end   -- invincible / scenario / rot
-    inst.cfg, inst.looks = cfg, looks
-    local pose = poseOf(el)
-    if not samePose(inst.kind, inst.pose, pose) then
-        -- a burst of moves before the check keeps the pose before its first move as the anchor
-        if not inst.verifying then inst.anchor = inst.pose end
-        inst.prevPose, inst.pose = inst.pose, pose
-        inst.poseSeq, inst.verifying = (inst.poseSeq or 0) + 1, true
-        TriggerClientEvent(POSE_EVENT, owner, NetworkGetNetworkIdFromEntity(entity), inst.uid,
-            pose[1], pose[2], pose[3], pose[4], pose[5], pose[6])
-        local seq = inst.poseSeq
-        SetTimeout(VERIFY_MS, function() verifyPose(inst, seq) end)
-    end
-    return true
-end
-
---- A changed networked element: still queued → nothing (spawnOne reads the latest element); being
---- created or failed → created again; spawned → updated in place when it can be, else re-created.
--- fxlint-disable-next-line C003 -- assigns the forward-declared local `updateNet` (spawnOne calls it)
-updateNet = function(ctx, el)
-    local inst = instances[instKey(ctx.bucket, uidOf(ctx.mapId, el.id))]
-    if inst and not inst.done and not inst.cancelled then return end
-    if inst and inst.ready and not inst.cancelled and moveInPlace(inst, types[el.type], el) then return end
-    spawnFor(ctx, el)
-end
-
---------------------------------------------------------------------------------
--- Events: Maps.on / Maps.records (active content only)
---------------------------------------------------------------------------------
-
-local listeners = {}        -- [handle] = { handle, seq, typeId, fn, owner }
-local listenerCount, listenerSeq = 0, 0
-local listenedTypes = {}    -- [typeId|'*'] = number of listeners
-local eventQueue, eventHead, draining = {}, 1, false
-
-local function recordOf(ctx, el)
-    local uid = uidOf(ctx.mapId, el.id)
-    return { uid = uid, key = ctx.bucket .. '|' .. uid, mapId = ctx.mapId, id = el.id, type = el.type,
-        pos = el.pos, rot = el.rot, fields = el.fields, layer = el.layer, bucket = ctx.bucket,
-        editor = ctx.source == 'draft' }
-end
-
---- Queued only: flushEvents() starts the drain once the caller finished its pass, so a listener that
---- calls back into Core.Maps never runs in the middle of a context update.
-local function emit(event, ctx, el)
-    if listenerCount == 0 or not (listenedTypes[el.type] or listenedTypes['*']) then return end
-    eventQueue[#eventQueue + 1] = { event = event, record = recordOf(ctx, el), mapId = ctx.mapId, typeId = el.type }
-end
-
-local function deliver(item)
-    local list = {}
-    for _, l in pairs(listeners) do
-        if l.typeId == item.typeId or l.typeId == '*' then list[#list + 1] = l end
-    end
-    table.sort(list, function(a, b) return a.seq < b.seq end)
-    for i = 1, #list do
-        local l = list[i]
-        if listeners[l.handle] == l then
-            local ok, err = pcall(l.fn, item.event, Utils.deepCopy(item.record), item.mapId)
-            if not ok then Log.warn('maps: listener of %s failed on %s: %s', l.owner, item.event, tostring(err)) end
-        end
-    end
-end
-
-local function flushEvents()
-    if draining or eventHead > #eventQueue then return end
-    draining = true
-    -- one drain thread at a time, ending when the queue is empty; listeners may Wait
-    -- fxlint-disable-next-line P004
-    CreateThread(function()
-        while eventHead <= #eventQueue do
-            local item = eventQueue[eventHead]
-            eventQueue[eventHead] = nil
-            eventHead = eventHead + 1
-            deliver(item)
-        end
-        eventQueue, eventHead, draining = {}, 1, false
-    end)
-end
-
---- Maps.on(typeId|'*', fn(event, record, mapId)) -> handle|nil. Owner-swept; seed with Maps.records.
-function R.on(typeId, fn)
-    if typeId ~= '*' and (type(typeId) ~= 'string' or #typeId > 64 or not typeId:find('^[%w_%-]+:[%w_%-]+$')) then
+--- Core.Scene once the scene files loaded AND its store loaded (persistent nodes in, ids settled), else nil.
+local function scene()
+    local Scene = Core.Scene
+    local SR = rawget(Core, 'SceneRuntime')
+    local store = type(SR) == 'table' and SR.store or nil
+    if type(Scene) ~= 'table' or type(Scene.spawn) ~= 'function' or type(store) ~= 'table'
+        or type(store.loaded) ~= 'function' or store.loaded() ~= true then
         return nil
     end
-    if not Utils.isCallable(fn) or listenerCount >= MAX_LISTENERS then return nil end
-    listenerSeq = listenerSeq + 1
-    local handle = 'maps:on:' .. listenerSeq
-    local owner = Registry.getCaller()
-    listeners[handle] = { handle = handle, seq = listenerSeq, typeId = typeId, fn = fn, owner = owner }
-    listenerCount = listenerCount + 1
-    listenedTypes[typeId] = (listenedTypes[typeId] or 0) + 1
-    Registry.track(LISTENER_KIND, handle, owner)
-    return handle
+    return Scene
 end
 
-local function dropListener(handle)
-    local l = listeners[handle]
-    if not l then return false end
-    listeners[handle] = nil
-    listenerCount = listenerCount - 1
-    local n = listenedTypes[l.typeId] - 1
-    listenedTypes[l.typeId] = n > 0 and n or nil
-    Registry.untrack(LISTENER_KIND, handle)
+local calls = 0                                 -- Scene calls made (a worker slice counts its budget in them)
+
+--- Scene[name](...) as core — the owner of every map node, whoever called Core.Maps — -> its results; a Lua
+--- error inside Scene is logged (once a minute per function) and answers false, 'error'.
+local function asCore(Scene, name, ...)
+    calls = calls + 1
+    local res = table.pack(Registry.withCaller('core', Scene[name], ...))
+    if not res[1] then
+        logLimited('error', 'error:' .. name, 'maps: Scene.%s failed: %s (further errors of it are not logged for a '
+            .. 'minute)', name, tostring(res[2]))
+        return false, 'error'
+    end
+    return table.unpack(res, 2, res.n)
+end
+
+--- `f` of a map:data node: <= 16 label values keyed by field name, strings <= 64 characters.
+local function labelsOk(v)
+    if type(v) ~= 'table' then return false, 'labels' end
+    local n = 0
+    for k, s in pairs(v) do
+        n = n + 1
+        if n > LABELS_MAX or type(k) ~= 'string' or #k > 48 or not k:find('^[%a_][%w_]*$')
+            or type(s) ~= 'string' or #s > 64 then
+            return false, 'labels'
+        end
+    end
     return true
 end
 
---- Maps.off(handle) -> bool (its owner or core).
-function R.off(handle)
-    local l = type(handle) == 'string' and listeners[handle]
-    if not l then return false end
-    local caller = Registry.getCaller()
-    if caller ~= l.owner and caller ~= 'core' then return false end
-    return dropListener(handle)
+-- The editor-only data kind (§55.21.1): t = type id, k = element kind ('point' | 'zone' | 'placeholder'),
+-- size = a zone's box, f = the values its type's '$field' label previews show. client/maps_preview.lua draws it.
+local DATA_DEF <const> = { id = DATA_KIND, class = 'data', radius = DATA_RADIUS, fields = {
+    { name = 't', type = 'string', maxLength = 64, required = true },
+    { name = 'k', type = 'string', maxLength = 16, pattern = '^%a+$', required = true },
+    { name = 'size', type = 'vector3', min = 0.1, max = 1000 },
+    { name = 'f', type = 'table', validate = labelsOk },
+    { name = 'mapEl', type = 'string', maxLength = 48 },
+    { name = 'mapType', type = 'string', maxLength = 64 },
+} }
+
+local kindDefined = false
+
+--- Defines map:data (as core) once. core's start does it before any plugin could take the id; a map:data
+--- spawn tries again when that failed.
+local function defineDataKind()
+    if kindDefined then return true end
+    local Scene = Core.Scene
+    if type(Scene) ~= 'table' or type(Scene.defineKind) ~= 'function' then return false end
+    local ok, err = asCore(Scene, 'defineKind', DATA_DEF)
+    if ok then
+        kindDefined = true
+    else
+        warnLimited('kind', 'maps: the scene kind %s was refused: %s', DATA_KIND, tostring(err))
+    end
+    return kindDefined
 end
 
-Registry.onOwnerStop(LISTENER_KIND, dropListener)
+--------------------------------------------------------------------------------
+-- Projection state: contexts, the queue of pending reconciles, the retry set, the pending boxes
+--------------------------------------------------------------------------------
+
+local contexts = {}         -- [ctxKey] = ctx (active)
+local closing = {}          -- [ctxKey] = ctx: closed, the worker still removes its nodes
+local byMap = {}            -- [mapId] = { [bucket] = ctx }
+local netTotal = 0          -- networked elements shown in every context (their nodes may not exist yet)
+-- the queue: (context, element id) entries, FIFO; an entry whose flag ctx.queued[id] was cleared meanwhile is stale
+local qc, qi, qh, qn = {}, {}, 1, 0
+local nQueued = 0           -- flags set (reconciles still due)
+local working, waiting, stopping, unavailable = false, false, false, false
+local retryN, retrying, backoff, roundMark = 0, false, RETRY_MIN_MS, 0
+local placed = 0            -- successful spawns (the retry thread's progress mark)
+local heldUntil = 0         -- GetGameTimer() until which spawns are not tried after a 'limit' answer
+local pend = {}             -- [bucket] = { n = flags set, x1, y1, x2, y2 = the box of their elements / nodes }
+local pendDirty, published = false, false
+local kick, whenReady, reconcile            -- forward declarations
+
+local function failed(ctx, id, what, err)
+    warnLimited(what .. ':' .. tostring(err), 'maps: %s of %s in bucket %d failed: %s (further %s failures of this '
+        .. 'kind are not logged for a minute)', what, uidOf(ctx.mapId, id), ctx.bucket, tostring(err), what)
+end
+
+--- Numeric element ids in ascending order (deterministic passes and event order).
+local function byId(a, b)
+    local na, nb = tonumber(a), tonumber(b)
+    if na and nb and na ~= nb then return na < nb end
+    return a < b
+end
+
+--- The keys of `t` sorted by byId. Element ids are canonical digit strings: they sort as integers (native
+--- comparisons, ~5x faster than the comparator on 20,000 ids); anything else falls back to the comparator.
+local function sortedIds(t)
+    local ids, n = {}, 0
+    for id in pairs(t) do
+        local v = type(id) == 'string' and tonumber(id) or nil
+        if mtype(v) ~= 'integer' then
+            n = -1
+            break
+        end
+        n = n + 1
+        ids[n] = v
+    end
+    if n >= 0 then
+        table.sort(ids)
+        for i = 1, n do
+            local s = tostring(ids[i])
+            if t[s] == nil then                 -- not canonical ('007'): the comparator decides
+                n = -1
+                break
+            end
+            ids[i] = s
+        end
+        if n >= 0 then return ids end
+    end
+    ids = {}
+    for id in pairs(t) do ids[#ids + 1] = id end
+    table.sort(ids, byId)
+    return ids
+end
+R.sortedIds = sortedIds
+
+--- The box of a bucket's queued work grows by the element's position (else its node's: a removal).
+local function pendAdd(ctx, id)
+    local b = ctx.bucket
+    local p = pend[b]
+    if not p then
+        p = { n = 0 }
+        pend[b] = p
+    end
+    p.n = p.n + 1
+    local el, have = ctx.els[id], ctx.nodes[id]
+    local pos = el and el.pos or (have and have.def.pos)
+    if not pos then return end
+    local x, y = pos.x, pos.y
+    if not p.x1 then
+        p.x1, p.y1, p.x2, p.y2, pendDirty = x, y, x, y, true
+        return
+    end
+    if x < p.x1 then p.x1, pendDirty = x, true elseif x > p.x2 then p.x2, pendDirty = x, true end
+    if y < p.y1 then p.y1, pendDirty = y, true elseif y > p.y2 then p.y2, pendDirty = y, true end
+end
+
+local function pendSub(b)
+    local p = pend[b]
+    if not p then return end
+    p.n = p.n - 1
+    if p.n <= 0 then
+        pend[b] = nil
+        pendDirty = true
+    end
+end
+
+--- GlobalState[PENDING_KEY]: the boxes of the queued work, written only when they changed (a long run's start,
+--- a bucket finished, the run's end) — never for inline work.
+local function publish()
+    if not pendDirty then return end
+    pendDirty = false
+    local list
+    for b, p in pairs(pend) do
+        if p.x1 then
+            list = list or {}
+            list[#list + 1] = { b, p.x1, p.y1, p.x2, p.y2 }
+        end
+    end
+    if list == nil and not published then return end
+    published = list ~= nil
+    GlobalState[PENDING_KEY] = list
+end
+
+--- Queues the reconcile of element `id` of `ctx` (once: a queued id is not queued again).
+local function dirty(ctx, id)
+    local q = ctx.queued
+    if q[id] then return end
+    q[id] = true
+    nQueued = nQueued + 1
+    qn = qn + 1
+    qc[qn], qi[qn] = ctx, id
+    pendAdd(ctx, id)
+end
+
+--- Clears the flag of a queued id (its queue entry turns stale) -> whether it was queued.
+local function undirty(ctx, id)
+    if not ctx.queued[id] then return false end
+    ctx.queued[id] = nil
+    nQueued = nQueued - 1
+    pendSub(ctx.bucket)
+    return true
+end
+
+local function dropRetry(ctx, id)
+    if ctx.retry[id] then
+        ctx.retry[id] = nil
+        retryN = retryN - 1
+    end
+end
+
+--- One thread while elements wait for scene capacity: queues them again after `backoff`, which doubles (<= 60 s)
+--- while no spawn succeeded since the round before and falls back to 5 s once one did.
+local function startRetry()
+    if retrying or stopping then return end
+    retrying = true
+    roundMark = placed
+    CreateThread(function()
+        while retryN > 0 and not stopping do
+            Wait(backoff)
+            if stopping then break end
+            warnLimited('retry', 'maps: %d element(s) wait for scene capacity (limit); retrying them (next try in '
+                .. 'at most %d s)', retryN, RETRY_MAX_MS // 1000)
+            heldUntil = 0
+            local list = {}
+            for _, ctx in pairs(contexts) do list[#list + 1] = ctx end
+            for i = 1, #list do
+                local ctx = list[i]
+                for id in pairs(ctx.retry) do
+                    ctx.retry[id] = nil
+                    retryN = retryN - 1
+                    dirty(ctx, id)
+                end
+            end
+            kick()
+            backoff = placed > roundMark and RETRY_MIN_MS or math.min(backoff * 2, RETRY_MAX_MS)
+            roundMark = placed
+        end
+        retrying = false
+    end)
+end
+
+--- The element waits for capacity (its spawn was refused 'limit', or would be).
+local function deferLimit(ctx, id)
+    if not ctx.retry[id] then
+        ctx.retry[id] = true
+        retryN = retryN + 1
+    end
+    startRetry()
+end
+
+--- Removes the element's node, if it has one (faded out on the clients when `fade`).
+local function unproject(ctx, id, fade)
+    local have = ctx.nodes[id]
+    if not have then return end
+    ctx.nodes[id] = nil
+    local Scene = scene()
+    if Scene then
+        local ok, err = asCore(Scene, 'remove', have.id, fade and FADE or nil)
+        if ok then
+            heldUntil = 0                       -- one of core's nodes is gone: a spawn may pass again
+        elseif err ~= 'missing' then
+            failed(ctx, id, 'remove', err)
+        end
+    end
+    if ctx.closed and closing[ctx.key] == ctx and next(ctx.nodes) == nil then closing[ctx.key] = nil end
+end
+
+local function samePose(a, b)
+    local p, q, r, s = a.pos, b.pos, a.rot, b.rot
+    return p.x == q.x and p.y == q.y and p.z == q.z and r.x == s.x and r.y == s.y and r.z == s.z
+end
+
+--- Deep equality of plain data (node fields).
+local function same(a, b)
+    if a == b then return true end
+    if type(a) ~= 'table' or type(b) ~= 'table' then return false end
+    for k, v in pairs(a) do
+        if not same(v, b[k]) then return false end
+    end
+    for k in pairs(b) do
+        if a[k] == nil then return false end
+    end
+    return true
+end
+
+--- The fields of `want` that differ from `have` -> patch | nil, removed names (sorted) | nil.
+local function fieldDiff(have, want)
+    local patch, removed
+    for k, v in pairs(want) do
+        if not same(v, have[k]) then
+            patch = patch or {}
+            patch[k] = v
+        end
+    end
+    for k in pairs(have) do
+        if want[k] == nil then
+            removed = removed or {}
+            removed[#removed + 1] = k
+        end
+    end
+    if removed then table.sort(removed) end
+    return patch, removed
+end
+
+--- Brings the node of a SHOWN element in line with it: spawn; Scene.move / Scene.set on the same node (a
+--- promoted one is demoted by Scene first); remove (faded) + spawn when the scene kind or the policy changed. A
+--- node that went missing is spawned again.
+local function project(ctx, el)
+    local Scene = scene()
+    if not Scene then                           -- (callers checked it; should the store go, the waiter starts over)
+        unavailable = true
+        return dirty(ctx, el.id)
+    end
+    local have = ctx.nodes[el.id]
+    if not have and GetGameTimer() < heldUntil then return deferLimit(ctx, el.id) end
+    local want = defOf(ctx, el)
+    if have and want and have.def.kind == want.kind and have.def.authority == want.authority then
+        if not samePose(have.def, want) then
+            local ok, err = asCore(Scene, 'move', have.id, want.pos, want.rot)
+            if ok then
+                have.def.pos, have.def.rot = want.pos, want.rot
+            elseif err == 'missing' then
+                ctx.nodes[el.id], have = nil, nil
+            else
+                failed(ctx, el.id, 'move', err)
+            end
+        end
+        if have then
+            local patch, removed = fieldDiff(have.def.fields, want.fields)
+            if patch or removed then
+                local ok, err = asCore(Scene, 'set', have.id, patch or {}, removed and { remove = removed } or nil)
+                if ok then
+                    have.def.fields = want.fields
+                elseif err == 'missing' then
+                    ctx.nodes[el.id], have = nil, nil
+                else
+                    failed(ctx, el.id, 'set', err)
+                end
+            end
+            if have then return dropRetry(ctx, el.id) end
+        end
+    elseif have then
+        unproject(ctx, el.id, true)             -- another kind: the old copy fades while the new one comes
+    end
+    if not want then return end
+    if GetGameTimer() < heldUntil then return deferLimit(ctx, el.id) end
+    if want.kind == DATA_KIND then defineDataKind() end
+    local id, err = asCore(Scene, 'spawn', want)
+    if id then
+        ctx.nodes[el.id] = { id = id, def = want }
+        placed = placed + 1
+        dropRetry(ctx, el.id)
+    elseif err == 'limit' then
+        heldUntil = GetGameTimer() + LIMIT_HOLD_MS
+        failed(ctx, el.id, 'spawn', err)
+        deferLimit(ctx, el.id)
+    elseif err == 'unavailable' then            -- the store went away under us: the waiter starts over
+        unavailable = true
+        dirty(ctx, el.id)
+    else
+        failed(ctx, el.id, 'spawn', err)
+    end
+end
+
+-- fxlint-disable-next-line C003 -- assigns the forward-declared local `reconcile` (settle and the worker call it)
+reconcile = function(ctx, id)
+    local fade = ctx.fading[id]
+    if fade then ctx.fading[id] = nil end
+    local el = ctx.reps[id] and ctx.els[id]
+    if el then return project(ctx, el) end
+    dropRetry(ctx, id)
+    unproject(ctx, id, fade or ctx.source == 'draft')
+end
+
+--- The worker's unit of work: <= SLICE Scene calls, <= SLICE_ITEMS queue entries.
+local function runSlice()
+    local budget, seen = calls + SLICE, 0
+    while qh <= qn and calls < budget and seen < SLICE_ITEMS and not (stopping or unavailable) do
+        local ctx, id = qc[qh], qi[qh]
+        qc[qh], qi[qh] = nil, nil
+        qh = qh + 1
+        seen = seen + 1
+        if undirty(ctx, id) then reconcile(ctx, id) end
+    end
+end
+
+--- ONE thread while the queue holds work: a slice per server tick (inside Scene.batch: one flush), Wait(0) between.
+local function worker()
+    local slices = 0
+    while qh <= qn and not stopping do
+        local Scene = scene()
+        if not Scene or unavailable then break end
+        local batch = Scene.batch
+        if type(batch) == 'function' then
+            batch(runSlice)
+        else
+            local ok, err = pcall(runSlice)
+            if not ok then logLimited('error', 'slice', 'maps: a projection slice failed: %s', tostring(err)) end
+        end
+        slices = slices + 1
+        if slices >= PUBLISH_AFTER then publish() end
+        -- fxlint-disable-next-line P002 -- only while the queue holds work: the thread ends when it drained
+        if qh <= qn and not (stopping or unavailable) then Wait(0) end
+    end
+    working = false
+    if qh > qn then
+        qc, qi, qh, qn = {}, {}, 1, 0
+        if not stopping then publish() end      -- the run is over: its boxes go
+    elseif unavailable or not scene() then
+        whenReady()
+    end
+end
+
+-- fxlint-disable-next-line C003 -- assigns the forward-declared local `kick`
+kick = function()
+    if working or stopping or qh > qn then return end
+    if unavailable or not scene() then return whenReady() end
+    working = true
+    CreateThread(worker)
+end
+
+--- One thread, only while the queue waits for the Scene store: bounded waits (100 ms for 5 s, then 1 s), one
+--- warning after 30 s; once the store is there the worker takes the queue.
+-- fxlint-disable-next-line C003 -- assigns the forward-declared local `whenReady`
+whenReady = function()
+    if waiting or stopping then return end
+    waiting = true
+    CreateThread(function()
+        local waited, warned = 0, false
+        repeat
+            local ms = waited < WAIT_FAST_FOR_MS and WAIT_FAST_MS or WAIT_SLOW_MS
+            Wait(ms)
+            waited = waited + ms
+            if not warned and waited >= WAIT_WARN_MS and not scene() then
+                warned = true
+                Log.warn('maps: the Core.Scene store has not loaded after %d s; map content waits for it',
+                    waited // 1000)
+            end
+        until stopping or scene()
+        waiting, unavailable = false, false
+        kick()
+    end)
+end
+
+--- The nodes of `ids` (an array, `n` long) of a context follow their elements: inline when they are few and the
+--- store is there, else through the queue.
+local function settle(ctx, ids, n)
+    n = n or #ids
+    if n == 0 then return end
+    if n <= SLICE and not unavailable and scene() then
+        for i = 1, n do
+            undirty(ctx, ids[i])
+            reconcile(ctx, ids[i])
+        end
+    else
+        for i = 1, n do dirty(ctx, ids[i]) end
+    end
+    kick()
+end
+
+AddEventHandler('onResourceStart', function(resource)
+    if resource ~= Core.name then return end
+    if GlobalState[PENDING_KEY] ~= nil then GlobalState[PENDING_KEY] = nil end   -- a crashed run's boxes: gone
+    defineDataKind()
+end)
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= Core.name then return end
+    stopping = true                             -- the worker, the waiter and the retry thread end on their next wake
+    if published then
+        published = false
+        GlobalState[PENDING_KEY] = nil
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- Respawn: nodes back to their authored state
+--------------------------------------------------------------------------------
+
+local function near(a, b) return math.abs(a - b) <= TOL_M end
+
+local function nearDeg(a, b)
+    local d = (a - b) % 360
+    return math.min(d, 360 - d) <= TOL_DEG
+end
+
+--- Maps.respawn for one shown element -> true (moved back / reset), 'missing' (no node, or one of another kind:
+--- removed; the caller reconciles it) or false (as authored).
+local function respawnOne(Scene, ctx, el)
+    local want = defOf(ctx, el)
+    if not want then return false end
+    local have = ctx.nodes[el.id]
+    local node = have and asCore(Scene, 'get', have.id) or nil
+    if type(node) ~= 'table' or node.kind ~= want.kind then
+        unproject(ctx, el.id, true)             -- (a node that is really gone answers 'missing': fine)
+        return 'missing'
+    end
+    local p, r, w, v = node.pos, node.rot, want.pos, want.rot
+    local displaced = node.promoted ~= nil or not (near(p.x, w.x) and near(p.y, w.y) and near(p.z, w.z)
+        and nearDeg(r.x, v.x) and nearDeg(r.y, v.y) and nearDeg(r.z, v.z))
+    local patch
+    for k, value in pairs(want.fields) do
+        if not same(value, node.fields and node.fields[k]) then
+            patch = patch or {}
+            patch[k] = value
+        end
+    end
+    if not displaced and not patch then
+        have.def = want
+        return false
+    end
+    if displaced then                           -- Scene demotes a promoted node at the authored pose first
+        local ok, err = asCore(Scene, 'move', have.id, want.pos, want.rot)
+        if not ok then
+            failed(ctx, el.id, 'respawn', err)
+            return false
+        end
+        have.def.pos, have.def.rot = want.pos, want.rot
+    end
+    if patch then
+        local ok, err = asCore(Scene, 'set', have.id, patch)
+        if not ok then
+            failed(ctx, el.id, 'respawn', err)
+            return displaced
+        end
+    end
+    have.def = want
+    return true
+end
 
 --------------------------------------------------------------------------------
 -- Contexts: active content per (map, bucket)
@@ -627,101 +628,109 @@ local function ctxKeyOf(mapId, bucket)
     return mapId .. '@' .. bucket
 end
 
---- 'net' for server entities, 'tuple' for everything the clients render (placeholders included).
+--- 'net' for what the networked limits count (vehicle, ped, networked prop), 'node' for everything else
+--- (placeholders included).
 local function repOf(el)
-    return R.isNetworked(types[el.type]) and 'net' or 'tuple'
+    return R.isNetworked(types[el.type]) and 'net' or 'node'
 end
 
-local function show(ctx, el)
-    local rep = repOf(el)
-    ctx.reps[el.id] = rep
-    if rep == 'tuple' then
-        regionCall('put', ctx.bucket, uidOf(ctx.mapId, el.id), tupleOf(ctx.mapId, el))
-    else
-        ctx.netCount, netTotal = ctx.netCount + 1, netTotal + 1
-        spawnFor(ctx, el)
-    end
+local function count(ctx, rep, d)
+    if rep == 'net' then ctx.netCount, netTotal = ctx.netCount + d, netTotal + d end
 end
 
---- bulk = the caller clears the whole bucket afterwards (no per-uid remove).
-local function hide(ctx, id, bulk)
-    local rep = ctx.reps[id]
-    if not rep then return end
-    ctx.reps[id] = nil
-    local uid = uidOf(ctx.mapId, id)
-    if rep == 'tuple' then
-        if not bulk then regionCall('remove', ctx.bucket, uid) end
-    else
-        ctx.netCount, netTotal = ctx.netCount - 1, netTotal - 1
-        despawn(ctx.bucket, uid)
-    end
-end
-
---- A changed element: a tuple is re-put (the region module moves it), an entity is updated in place when
---- it can be (updateNet), anything that changes representation is hidden and shown again.
+--- A changed element (or type): the counts follow its representation (its node follows through settle).
 local function reshow(ctx, el)
     local was, now = ctx.reps[el.id], repOf(el)
-    if was == 'tuple' and now == 'tuple' then
-        regionCall('put', ctx.bucket, uidOf(ctx.mapId, el.id), tupleOf(ctx.mapId, el))
-    elseif was == 'net' and now == 'net' then
-        updateNet(ctx, el)
-    else
-        hide(ctx, el.id)
-        show(ctx, el)
+    if was ~= now then
+        ctx.reps[el.id] = now
+        count(ctx, was, -1)
+        count(ctx, now, 1)
     end
 end
 
---- Numeric element ids in ascending order (deterministic passes and event order).
-local function sortedIds(t)
-    local ids = {}
-    for id in pairs(t) do ids[#ids + 1] = id end
-    table.sort(ids, function(a, b)
-        local na, nb = tonumber(a), tonumber(b)
-        if na and nb and na ~= nb then return na < nb end
-        return a < b
-    end)
-    return ids
+--- A new element (an element that is shown already is only re-shown: never counted twice).
+local function show(ctx, el)
+    if ctx.reps[el.id] then return reshow(ctx, el) end
+    local rep = repOf(el)
+    ctx.reps[el.id] = rep
+    count(ctx, rep, 1)
 end
-R.sortedIds = sortedIds
+
+local function hide(ctx, id)
+    local rep = ctx.reps[id]
+    if not rep then return false end
+    ctx.reps[id] = nil
+    count(ctx, rep, -1)
+    return true
+end
+
+--- The nodes a context that closed moments ago still has standing: the new context of the same map and bucket
+--- takes them over (reconciled like any change: kept, moved, set or removed) instead of making them again. The ids
+--- of adopted nodes whose element this content lacks are appended to `ids` (they go).
+local function adopt(ctx, old, ids)
+    closing[old.key] = nil
+    for id in pairs(old.queued) do undirty(old, id) end     -- its queue entries turn stale
+    ctx.nodes, old.nodes = old.nodes, {}
+    local extra = {}
+    for id in pairs(ctx.nodes) do
+        if not ctx.els[id] then extra[#extra + 1] = id end
+    end
+    table.sort(extra, byId)
+    for i = 1, #extra do ids[#ids + 1] = extra[i] end
+end
 
 --- Activates `els` of `mapId` in `bucket`. source: 'live' | 'published' | 'draft' (the editor bucket).
 function R.openContext(mapId, bucket, source, els)
     local key = ctxKeyOf(mapId, bucket)
     if contexts[key] then return contexts[key] end
-    local ctx = { key = key, mapId = mapId, bucket = bucket, source = source, els = els, reps = {}, netCount = 0 }
+    local ctx = { key = key, mapId = mapId, bucket = bucket, source = source, els = els, reps = {}, nodes = {},
+        queued = {}, fading = {}, retry = {}, netCount = 0, closed = false }
     contexts[key] = ctx
     byMap[mapId] = byMap[mapId] or {}
     byMap[mapId][bucket] = ctx
-    perBucket[bucket] = (perBucket[bucket] or 0) + 1
     local ids = sortedIds(els)
     for i = 1, #ids do
         local el = els[ids[i]]
-        show(ctx, el)
-        emit('added', ctx, el)
+        if el then
+            show(ctx, el)
+            emit('added', ctx, el)
+        end
     end
+    local old = closing[key]
+    if old then adopt(ctx, old, ids) end
+    settle(ctx, ids)
     flushEvents()
     return ctx
 end
 
---- Deactivates a context. An editor bucket nobody else renders into is cleared in one region call.
+--- Deactivates a context: what it showed leaves at once (counts, events), its nodes follow (inline, or sliced by
+--- the worker; faded for a draft's editor bucket).
 function R.closeContext(mapId, bucket)
     local key = ctxKeyOf(mapId, bucket)
     local ctx = contexts[key]
     if not ctx then return false end
-    local exclusive = ctx.source == 'draft' and perBucket[bucket] == 1
     local ids = sortedIds(ctx.reps)
     for i = 1, #ids do
         local id = ids[i]
-        hide(ctx, id, exclusive)
+        hide(ctx, id)
         local el = ctx.els[id]
         if el then emit('removed', ctx, el) end
     end
-    if exclusive then regionCall('clearBucket', bucket) end
     contexts[key] = nil
     byMap[mapId][bucket] = nil
     if next(byMap[mapId]) == nil then byMap[mapId] = nil end
-    local n = perBucket[bucket] - 1
-    perBucket[bucket] = n > 0 and n or nil
+    ctx.closed = true
+    for id in pairs(ctx.retry) do dropRetry(ctx, id) end
+    local gone, have = {}, 0
+    for i = 1, #ids do
+        if ctx.nodes[ids[i]] then gone[#gone + 1] = ids[i] end
+    end
+    for _ in pairs(ctx.nodes) do have = have + 1 end
+    if have > #gone then gone = sortedIds(ctx.nodes) end   -- nodes of elements hidden before (their removal queued)
+    if #gone > 0 then
+        closing[key] = ctx
+        settle(ctx, gone)
+    end
     flushEvents()
     return true
 end
@@ -732,61 +741,87 @@ function R.swapContext(mapId, bucket, els)
     if not ctx then return false end
     local old = ctx.els
     ctx.els = els
+    local touched = {}
     local gone = sortedIds(old)
     for i = 1, #gone do
         local id = gone[i]
-        if not els[id] and ctx.reps[id] then
-            hide(ctx, id)
+        if not els[id] and hide(ctx, id) then
             emit('removed', ctx, old[id])
+            touched[#touched + 1] = id
         end
     end
     local ids = sortedIds(els)
     for i = 1, #ids do
         local el, prev = els[ids[i]], old[ids[i]]
-        if not ctx.reps[el.id] then
+        if el and not ctx.reps[el.id] then
             show(ctx, el)
             emit('added', ctx, el)
-        elseif not prev or prev.updatedAt ~= el.updatedAt or prev.type ~= el.type then
+            touched[#touched + 1] = el.id
+        elseif el and (not prev or prev.updatedAt ~= el.updatedAt or prev.type ~= el.type) then
             reshow(ctx, el)
             emit('changed', ctx, el)
+            touched[#touched + 1] = el.id
         end
     end
+    settle(ctx, touched)
     flushEvents()
     return true
 end
 
---- After an apply on a map's working set: every context showing it (`source` 'live' or 'draft')
---- re-renders the touched ids. ids = ordered array, before = { [id] = element|false } (false: new).
+--- After an apply on a map's working set: every context showing it (`source` 'live' or 'draft') re-renders the
+--- touched ids. ids = ordered array, before = { [id] = element|false } (false: new). An element the apply deleted
+--- fades out (an editor watches it go).
 function R.applyChanges(mapId, source, ids, before)
     local ctxs = byMap[mapId]
     if not ctxs then return end
+    local list = {}
     for _, ctx in pairs(ctxs) do
-        if ctx.source == source then
-            for i = 1, #ids do
-                local id = ids[i]
-                local el, shown = ctx.els[id], ctx.reps[id] ~= nil
-                if el and shown then
-                    reshow(ctx, el)
-                    emit('changed', ctx, el)
-                elseif el then
-                    show(ctx, el)
-                    emit('added', ctx, el)
-                elseif shown then
-                    hide(ctx, id)
-                    if before[id] then emit('removed', ctx, before[id]) end
-                end
+        if ctx.source == source then list[#list + 1] = ctx end
+    end
+    for c = 1, #list do
+        local ctx = list[c]
+        local touched = {}
+        for i = 1, #ids do
+            local id = ids[i]
+            local el, shown = ctx.els[id], ctx.reps[id] ~= nil
+            if el and shown then
+                reshow(ctx, el)
+                emit('changed', ctx, el)
+                touched[#touched + 1] = id
+            elseif el then
+                show(ctx, el)
+                emit('added', ctx, el)
+                touched[#touched + 1] = id
+            elseif shown then
+                hide(ctx, id)
+                ctx.fading[id] = true
+                if before[id] then emit('removed', ctx, before[id]) end
+                touched[#touched + 1] = id
             end
         end
+        settle(ctx, touched)
     end
     flushEvents()
 end
 
---- A type was (re)defined or removed: its active elements are rendered again (no events: the content
---- did not change, only how it is shown).
+--- A type was (re)defined or removed: its active elements are projected again — a removed type's become
+--- placeholders, a returning one's their kind again (no events: the content did not change, only its form).
 function R.refreshType(typeId)
-    for _, ctx in pairs(contexts) do
-        for id, el in pairs(ctx.els) do
-            if el.type == typeId and ctx.reps[id] then reshow(ctx, el) end
+    local list = {}
+    for _, ctx in pairs(contexts) do list[#list + 1] = ctx end
+    for c = 1, #list do
+        local ctx, ids = list[c], {}
+        for id in pairs(ctx.reps) do
+            local el = ctx.els[id]
+            if el and el.type == typeId then ids[#ids + 1] = id end
+        end
+        if #ids > 0 then
+            table.sort(ids, byId)
+            for i = 1, #ids do
+                local el = ctx.els[ids[i]]
+                if el then reshow(ctx, el) end
+            end
+            settle(ctx, ids)
         end
     end
 end
@@ -795,25 +830,29 @@ function R.contextsOf(mapId) return byMap[mapId] or {} end
 function R.getContext(mapId, bucket) return contexts[ctxKeyOf(mapId, bucket)] end
 function R.netTotal() return netTotal end
 
---- Re-creates destroyed networked elements of a map's active contexts (all, or one element id).
---- An instance still being created is left alone. Returns how many were queued.
+--- Maps.respawn: the shown elements of a map's active contexts (all, or one element id) back to their authored
+--- state — a promoted, displaced or changed node is moved back and reset (Scene demotes a promoted clone first), a
+--- missing one is made again (inline, or queued past SLICE). -> how many nodes it touched (queued ones included).
+--- Nothing before the Scene store loaded. A spawn held back after a 'limit' answer is tried again.
 function R.respawn(mapId, elementId)
-    local count = 0
-    for _, ctx in pairs(byMap[mapId] or {}) do
-        for id, rep in pairs(ctx.reps) do
-            if rep == 'net' and (elementId == nil or id == elementId) then
-                local inst = instances[instKey(ctx.bucket, uidOf(mapId, id))]
-                -- queued, being created, or spawned and still ours (a reused handle is someone else's entity)
-                local alive = inst and (not inst.done or (not inst.ready and inst.entity ~= nil)
-                    or (inst.ready and ours(inst.entity, inst.uid)))
-                if not alive and ctx.els[id] then
-                    spawnFor(ctx, ctx.els[id])
-                    count = count + 1
-                end
-            end
+    local Scene = scene()
+    if not Scene then return 0 end
+    heldUntil = 0
+    local list, n = {}, 0
+    for _, ctx in pairs(byMap[mapId] or {}) do list[#list + 1] = ctx end
+    for c = 1, #list do
+        local ctx = list[c]
+        local ids = elementId ~= nil and { elementId } or sortedIds(ctx.reps)
+        local missing = {}
+        for i = 1, #ids do
+            local el = ctx.reps[ids[i]] and ctx.els[ids[i]]
+            local r = el and respawnOne(Scene, ctx, el)
+            if r == 'missing' then missing[#missing + 1] = el.id end
+            if r then n = n + 1 end
         end
+        settle(ctx, missing)
     end
-    return count
+    return n
 end
 
 --- Every active record of a type (all types with '*'): editor buckets included (record.editor = true).
@@ -829,21 +868,19 @@ function R.records(typeId)
     return out
 end
 
+--- { contexts, closing (closed, nodes still going), networked (shown), nodes (existing: active + closing), pending
+--- (reconciles queued), retrying (elements waiting for capacity), projecting (the worker runs), waiting (for the
+--- Scene store), listeners }
 function R.stats()
-    local n, spawned = 0, 0
-    for _ in pairs(contexts) do n = n + 1 end
-    for _, inst in pairs(instances) do
-        if inst.entity then spawned = spawned + 1 end
+    local n, nodes, nClosing = 0, 0, 0
+    for _, ctx in pairs(contexts) do
+        n = n + 1
+        for _ in pairs(ctx.nodes) do nodes = nodes + 1 end
     end
-    return { contexts = n, networked = netTotal, spawned = spawned, listeners = listenerCount }
+    for _, ctx in pairs(closing) do
+        nClosing = nClosing + 1
+        for _ in pairs(ctx.nodes) do nodes = nodes + 1 end
+    end
+    return { contexts = n, closing = nClosing, networked = netTotal, nodes = nodes, pending = nQueued,
+        retrying = retryN, projecting = working, waiting = waiting, listeners = R.listenerCount() }
 end
-
--- Core stops: its server entities go with it (orphan mode 2 would keep them otherwise).
-AddEventHandler('onResourceStop', function(resource)
-    if resource ~= Core.name then return end
-    for _, inst in pairs(instances) do
-        inst.cancelled = true
-        deleteEntity(inst.entity, inst.uid)
-    end
-    instances = {}
-end)

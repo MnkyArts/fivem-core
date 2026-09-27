@@ -120,11 +120,10 @@ end
 -- Not reachable through the export: core's own plumbing. A plugin replacing a remover, the DB adapter or
 -- the session/autosave machinery would take the whole server down with it when it stops.
 -- PlayerGrid (§22.1) is core's own spatial index; plugins reach it through Player.getInRange/getClosest.
--- MapRegions (§52.3) is the map runtime's region/pack/subscription engine; only server/maps.lua drives it.
 -- MapsRuntime is the internal table the four server/maps*.lua files share (activation, apply, journal).
 -- BanIdentity (§47) is the bans module's internal identity/account resolution helper (server/bans_identity.lua).
-local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true, UIForms = true, MapRegions = true,
-    MapsRuntime = true, BanIdentity = true }
+local INTERNAL_NAMESPACES <const> = { Registry = true, PlayerGrid = true, UIForms = true,
+    MapsRuntime = true, BanIdentity = true, SceneRuntime = true, SceneCodec = true, SceneMotion = true }
 local INTERNAL_FUNCTIONS <const> = {
     ['DB.setAdapter'] = true,
     ['Player.loadSession'] = true,
@@ -133,6 +132,8 @@ local INTERNAL_FUNCTIONS <const> = {
     ['Player.stopAutosave'] = true, ['DB.markDegraded'] = true,
     -- §47: the playerConnecting path only — it enriches the matching ban and counts a hit
     ['Bans.checkConnecting'] = true,
+    -- §55.6: the teleport prefetch is Player.setCoords' own (it subscribes a destination window for any src)
+    ['Scene.prefetch'] = true,
 }
 
 --- Look up an API function. Dotted sub-names ('menu.open') are stored flat on the namespace (§2.2);

@@ -30,12 +30,13 @@ local LIB_MODULES <const> = {
     Utils = 'utils', Math = 'math', Validate = 'validate', Log = 'log', Callback = 'callback',
     Net = 'net', Commands = 'commands', Keys = 'keys', Streaming = 'streaming', Anim = 'anim',
     Player = 'player', UI = 'ui', Locale = 'locale', Audio = 'audio', Geometry = 'geometry',
-    Schema = 'schema',
+    Schema = 'schema', Clock = 'clock', Scene = 'scene',
 }
 
 -- the one nesting level the proxy understands: Core.UI.menu.open -> call('UI', 'menu.open')
 local SUB_NAMESPACES <const> = {
     UI = { menu = true, input = true, alert = true, progress = true, skillCheck = true, textUI = true, hud = true, keys = true, spinner = true, stats = true, state = true, locale = true },
+    Scene = { voice = true, audio = true },
 }
 
 local READY_POLL_MS <const> = 100

@@ -31,8 +31,9 @@
 ---| '"moneyChanged"'       # (server) (src, account, amount, delta, reason)
 ---| '"factionChanged"'     # (server) (src, summary|nil) — membership or rank of an online member
 ---| '"factionUpdated"'     # (server) (factionId) — name/tag/colour/roster of a faction
----| '"vehicleSpawned"'     # (server) (netId, info)
----| '"vehicleDeleted"'     # (server) (netId)
+---| '"vehicleSpawned"'     # (server) (netId, info) — also when a parked car is promoted (key persisted cars by info.vehId)
+---| '"vehicleDeleted"'     # (server) (netId) — also when a parked car's clone parks again (§4.6 notes)
+---| '"vehicleAutoStored"'  # (server) (vehId, reason) — core garaged a parked car itself ('max_parked': over Config.Vehicles.MaxParked)
 ---| '"audit"'              # (server) (category, src, message) — from Core.Log.audit
 ---| '"doorLocked"'         # (server) (doorId, src|nil)
 ---| '"doorUnlocked"'       # (server) (doorId, src|nil)
@@ -74,6 +75,8 @@
 ---| '"marker"' | '"label"' | '"blip"' | '"interaction"' | '"page"' | '"vehicle"' | '"world"'
 ---| '"settings"' | '"settingsWatch"' | '"permDef"' | '"bucket"' | '"adminCategory"' | '"adminAction"' | '"adminPage"' | '"adminPlayerTab"'
 ---| '"mapType"' | '"mapsModelValidator"' | '"mapsListener"' | '"mapsDraft"' | '"mapHold"' | '"mapEditorView"'
+---| '"sceneNode"' | '"sceneKind"' | '"sceneListener"' | '"sceneInteract"' | '"sceneModelInfo"' | '"sceneFocus"' | '"sceneVoice"'
+---| '"sceneHold"' | '"sceneHandler"'
 
 ---Named `Core.Hooks` veto pipelines core runs itself (DESIGN §40, §23, §51, §52). Any other name is a
 ---plugin's own pipeline. Return `false, reason` from a callback to veto; errors fail closed.
@@ -82,6 +85,7 @@
 ---| '"chat:beforeMessage"'   # (server) { src, channel, text } — before a player's line is delivered, after setFilter (§23)
 ---| '"admin:before"'         # (server) { id, actor, targets, args } — step 10 of Admin.run; filter by id (§51)
 ---| '"maps:beforeApply"'     # (server) { mapId, mode, actor, source, count, ops } — last step of Maps.apply, ops = first 200 { op, id, type, model?, pos } (§52)
+---| '"scene:beforeSpawn"'    # (server) { kind, owner, bucket, pos, parent, offset, fields, persist, global, audience, radius } — the last step of Scene.spawn before R.audio.admit (§55.4)
 
 ---Weather names accepted by `Core.World.setWeather` (`Config.World.Weathers`).
 ---@alias CoreWeather
@@ -411,6 +415,7 @@
 ---@field vehId string|nil persistence record id, when the vehicle was persisted
 ---@field spawnedBy string resource that called Core.Vehicles.spawn
 ---@field createdAt integer os.time() of the spawn
+---@field parked? integer the Core.Scene node id while this vehicle is the adopted clone of a parked car (§55.21.4)
 
 ---@class CoreVehicleRecord
 ---@field id string vehId
@@ -419,8 +424,13 @@
 ---@field plate string
 ---@field props CoreVehicleProps
 ---@field stored boolean true only while deliberately garaged; false means it belongs in the persistent world
----@field position { x: number, y: number, z: number, heading: number }
+---@field position { x: number, y: number, z: number, heading: number, bucket?: integer } bucket when not 0
 ---@field meta table includes core `vehType`/`keyMode`; plugins use the remaining keys through Core.Vehicles.setData/getData
+---@field parked? integer|false the Core.Scene node id while the car is parked (§55.21.4), else false
+---@field locked? boolean the lock state kept while parked
+---@field keys? string[] the virtual key holders kept while parked
+---@field modelName? string the model name when known (parked nodes prefer it over the hash)
+---@field destroyed? boolean the car was wrecked: restoreRecord / park / the boot check refuse it, spawnRecord brings it back
 
 ---@class CoreVehicleAdoptOptions
 ---@field ownerSrc? integer current player gaining gameplay ownership
@@ -466,11 +476,11 @@
 ---@field lights? { [1]: boolean, [2]: boolean, [3]: integer } lights on, high beam, indicators (0..3)
 
 ---@class CoreAttachmentDef
----@field id string unique per player; re-adding the same id replaces the entry
----@field model string|integer prop model
----@field bone string|integer bone name or index the prop hangs on
----@field offset? vector3 position offset from the bone
----@field rotation? vector3 rotation offset in degrees
+---@field id? string unique per player (`^[%w_%-:]+$`, ≤ 64; default a uuid); re-adding the same id replaces the entry
+---@field model string|integer a model name (`^[%w_%-]+$`, ≤ 64) or an integer hash
+---@field bone? string|integer a bone tag 0..65535 or a bone name; anything else is 28422 (PH_R_Hand)
+---@field offset? vector3 position offset from the bone, each component ≤ 1000 m
+---@field rotation? vector3 rotation offset in degrees (applied in rotation order 1, the old applier's)
 
 ---@class CoreWeaponOptions
 ---@field tint? integer 0..31
@@ -608,7 +618,7 @@
 ---@field Money { Accounts: table<string, boolean>, MaxAmount: integer }
 ---@field Perms { Groups: table<string, string[]>, Weights: table<string, integer>, Inherits: table<string, string[]> } the §44 SEED of the `perm_groups` collection (user/helper/mod/admin/senior/owner)
 ---@field Factions table CreateCost, CostAccount, MaxMembers, MaxRanks, DefaultRanks, …
----@field Vehicles table SpawnTimeoutMs, LockKey, LockDistance, PlatePrefix, MaxPropsBytes
+---@field Vehicles table SpawnTimeoutMs, LockKey, LockDistance, PlatePrefix, MaxPropsBytes, AutoPark (true), AutoParkIdleMs (30000), AutoParkRadius (50), AutoParkSweepMs (10000), MaxParked (20000) — §4.6 parked cars
 ---@field Interactions table Key, ScanIntervalMs, FarScanIntervalMs, NearRange, MaxModels
 ---@field World table ScanIntervalMs, GridSize, TimeScale, StartTime, Weathers, WeatherCycle
 ---@field Locale string default language for Core.Locale
@@ -624,7 +634,8 @@
 ---@field DB { KeyPrefix: string, FlushIntervalMs: integer, Adapter: string }
 ---@field Admin { CarDefaultModel: string, RequireDuty: boolean, Scope: table<string, integer>, StaffPerm: string, LegacyCommands: boolean } §51: RequireDuty (true), Scope = max player targets per run by group (helper 1 … owner 2000; 1 for unlisted), StaffPerm ('core.admin.staff'), LegacyCommands (true; false = core's /tp /bring /kick /ban /setcash … are not registered, §4.8)
 ---@field Buckets { Range: integer[] } §50: the Core.Buckets allocation range, default { 10000, 60000 }
----@field Maps table §52.5: RegionSize (512), WindowHysteresis (64), CacheRegions (25), LatentBps (250000), PushOpsMax (32), MaxSpawnRadius (400), SpawnPerFrame (8), DespawnPerFrame (32), MaxLocalObjects (1500), MaxMarkers (64), PackBudgetBytes (2000000), PackBudgetWindowMs (10000)
+---@field Maps { MaxMarkers: integer } §55.21.1: the editor view's preview budget (64); map content streams as Core.Scene nodes
+---@field Scene table §55.20: CellSize (128), RegionSize (512), rings/tiers, FlushMs (50), MaxEventBytes (16384), budgets, Caps (props 3000, vehicles 64, modelsVehicles 32 …), Budgets, Radii, Fades, Visibility, Speed, Motion, DeadReckoning, Promote (… ProximityShare 0.7), Audio (… AllowAac true), Voice, Global { MaxNodes, MaxPerOwner }, MaxNodes, MaxNodesPerOwner, OwnerCaps ({ core = 60000, inventory = 40000 }), CoreReserve ({ nodes = 20000, persistent = 10000 }), MaxPersistent, MaxChildren (64), ObjectPool (nil = learned; 5300 with the pool raise), MaxFieldBytes, ClockMode, Debug — most read once at start
 ---@field Texts table<string, string>
 
 --------------------------------------------------------------------------------
@@ -659,6 +670,7 @@ Core = {}
 ---@overload fun(hook: '"factionUpdated"', fn: fun(factionId: string)): any
 ---@overload fun(hook: '"vehicleSpawned"', fn: fun(netId: integer, info: CoreVehicleInfo)): any
 ---@overload fun(hook: '"vehicleDeleted"', fn: fun(netId: integer)): any
+---@overload fun(hook: '"vehicleAutoStored"', fn: fun(vehId: string, reason: 'max_parked')): any
 ---@overload fun(hook: '"audit"', fn: fun(category: string, src: integer, message: string)): any
 ---@overload fun(hook: '"statChanged"', fn: fun(src: integer, name: string, value: number)): any
 ---@overload fun(hook: '"statThreshold"', fn: fun(src: integer, name: string, threshold: number, value: number)): any
@@ -2142,7 +2154,8 @@ Core.Vehicles = {}
 ---@return integer|nil netId
 ---@return string|nil err
 function Core.Vehicles.spawn(opts) end
----(server) Deletes a tracked vehicle.
+---(server) Deletes a tracked vehicle. A parked car's clone takes its scene node along (the record is out again at
+---the clone's pose) — a plain DeleteEntity on a clone would bring the car back at its parking spot.
 ---@param netId integer
 ---@return boolean removed
 function Core.Vehicles.delete(netId) end
@@ -2158,35 +2171,36 @@ function Core.Vehicles.getEntity(netId) end
 ---@param netId integer
 ---@return CoreVehicleInfo|nil
 function Core.Vehicles.getInfo(netId) end
----(server) State bag plus a best-effort `SetVehicleDoorsLocked` RPC.
----@param netId integer
+---(server) State bag plus a best-effort `SetVehicleDoorsLocked` RPC. A vehId acts on its live car, else on the record
+---(and a parked node's `locked` field) — no promotion needed.
+---@param target integer|string a netId or a vehId
 ---@param locked boolean
 ---@return boolean ok
-function Core.Vehicles.setLocked(netId, locked) end
+function Core.Vehicles.setLocked(target, locked) end
 ---(client) `isLocked(veh)` reads the state bag. (server) `isLocked(netId)`.
 ---@param veh integer client: an entity handle; server: a netId
 ---@return boolean locked
 function Core.Vehicles.isLocked(veh) end
----(server)
----@param netId integer
+---(server) A vehId acts on its live car, else on the record's keys (a parked or garaged car).
+---@param target integer|string a netId or a vehId
 ---@param charId string
 ---@return boolean ok
-function Core.Vehicles.giveKeys(netId, charId) end
----(server)
----@param netId integer
+function Core.Vehicles.giveKeys(target, charId) end
+---(server) A vehId acts on its live car, else on the record's keys.
+---@param target integer|string a netId or a vehId
 ---@param charId string
 ---@return boolean ok
-function Core.Vehicles.removeKeys(netId, charId) end
+function Core.Vehicles.removeKeys(target, charId) end
 ---(client/server) Explicit virtual-key check. `keyMode = 'item'` vehicles intentionally answer false; their domain plugin validates a physical key then calls `setLocked`.
 ---@param veh integer client: an entity handle; server: the player's src
 ---@param netId? integer server only
 ---@return boolean
 function Core.Vehicles.hasKeys(veh, netId) end
----(server)
----@param netId integer
+---(server) A vehId acts on its live car, else on the record (the virtual keys follow the owner).
+---@param target integer|string a netId or a vehId
 ---@param charId string|nil nil clears the owner
 ---@return boolean ok
-function Core.Vehicles.setOwner(netId, charId) end
+function Core.Vehicles.setOwner(target, charId) end
 ---(server)
 ---@param netId integer
 ---@return string|nil charId
@@ -2210,13 +2224,14 @@ function Core.Vehicles.getRecords(charId) end
 ---@param vehId string
 ---@return CoreVehicleRecord|nil
 function Core.Vehicles.getRecord(vehId) end
----(server) Spawns a stored vehicle from its record. Yields.
+---(server) Spawns a stored vehicle from its record. Yields. A PARKED record is promoted where it stands instead
+---(coords / heading / ownerSrc unused): the clone's netId after a bounded wait (SpawnTimeoutMs + 6 s).
 ---@param vehId string
 ---@param coords vector3
 ---@param heading? number
 ---@param ownerSrc? integer client the props are applied on
 ---@return integer|nil netId
----@return string|nil err
+---@return string|nil err 'already_spawned' | 'spawn_timeout' | 'promote_failed' | …
 function Core.Vehicles.spawnRecord(vehId, coords, heading, ownerSrc) end
 ---(server) Restores one out-of-garage record at its saved or supplied world position. Yields.
 ---@param vehId string
@@ -2224,26 +2239,43 @@ function Core.Vehicles.spawnRecord(vehId, coords, heading, ownerSrc) end
 ---@param heading? number defaults to record.position.heading
 ---@param ownerSrc? integer client that should receive the direct property replay
 ---@return integer|nil netId
----@return string|nil err
+---@return string|nil err 'parked' (a parked record is in the world as a scene node already) | 'destroyed' (a wreck: spawnRecord brings it back) | …
 function Core.Vehicles.restoreRecord(vehId, coords, heading, ownerSrc) end
 ---(server) Promotes an existing network vehicle into a tracked, server-owned persistent vehicle.
 ---Trusted server-resource API only; no client event exposes it.
 ---@param netId integer
 ---@param opts CoreVehicleAdoptOptions
 ---@return string|nil vehId
----@return string|nil err
+---@return string|nil err 'scene_clone' for a Core.Scene clone (an entity with state `sn`) | …
 function Core.Vehicles.adopt(netId, opts) end
----(server) Saves the last known position/props, then removes the entity from the world.
----@param netId integer
+---(server) Garages a vehicle: saves the last known position/props, then removes the entity from the world. A vehId
+---also garages its live vehicle, its parked node, or a record with nothing in the world; a parked car's clone takes
+---its node along.
+---@param target integer|string a netId or a vehId
 ---@return boolean ok
-function Core.Vehicles.store(netId) end
+function Core.Vehicles.store(target) end
+---(server) Parks a persisted vehicle (§55.21.4): it becomes a persistent Core.Scene `vehicle` node owned by core —
+---every client nearby shows a local copy, no networked entity exists — until a player tries to enter or damages it
+---(authority { mode = 'local' }: no proximity promotion). A live car is handed over (no blink). Only the WEAR of the
+---owner client's props read-back (≤ 1 s) is merged over the cached / record props (Core.Scene.mergeWear); the plate is
+---the record's. A parked car's clone is demoted instead (refused with someone inside); a parked record answers its
+---node. Past Config.Vehicles.MaxParked the longest-unused parked car is garaged (hook vehicleAutoStored). Yields.
+---@param target integer|string a netId or a vehId
+---@return integer|nil nodeId
+---@return string|nil err 'unavailable' 'bad_target' 'missing' 'not_persisted' 'no_record' 'record_stored' 'destroyed' 'occupied' 'busy' 'gone' 'no_entity' 'bad_coords' 'db' | a Scene error
+function Core.Vehicles.park(target) end
+---(server) A record's vehicle whether it is live, parked or garaged: getInfo's fields (netId only while a vehicle is
+---live — a promoted parked car's clone included) + parked (node id), stored, position, destroyed (a wreck).
+---@param vehId string
+---@return (CoreVehicleInfo|{ stored: boolean, position: table, destroyed: boolean })|nil
+function Core.Vehicles.getInfoByRecord(vehId) end
 ---(server) `saveProps(netId, props)` accepts a validated props table (the client route is
 ---`core:server:vehicleProps`). (client) `saveProps(veh)` sends the vehicle's current props.
 ---@param netId integer server: a netId; client: an entity handle
 ---@param props? CoreVehicleProps server only
 ---@return boolean ok
 function Core.Vehicles.saveProps(netId, props) end
----(server)
+---(server) Deletes the record (a parked car's node goes with it).
 ---@param vehId string
 ---@return boolean removed
 function Core.Vehicles.deleteRecord(vehId) end
@@ -2319,6 +2351,13 @@ function Core.Vehicles.getProps(veh) end
 ---@param props CoreVehicleProps
 ---@return boolean ok
 function Core.Vehicles.setProps(veh, props) end
+---(client) `setProps` for a LOCAL (non-networked) vehicle this client created itself — a Core.Scene local copy
+---(DESIGN §55.12, §6.8): the same apply at once, no network-control request, never yields (safe in a creation
+---frame). On a networked vehicle this client does not control it only touches the local copy until the owner syncs.
+---@param veh integer
+---@param props CoreVehicleProps
+---@return boolean ok false for a non-vehicle or a non-table
+function Core.Vehicles.setPropsLocal(veh, props) end
 ---(client)
 ---@param veh integer
 ---@param on boolean
@@ -3231,12 +3270,15 @@ function Core.Native.invokeWithResult(src, name, ...) end
 ---@class Core.Attachments
 Core.Attachments = {}
 
----(server) Attaches a prop to the player's ped; an entry with the same id is replaced.
----Persisted in `data.attachments` and replicated to every client.
+---(server) Attaches a prop to the player's ped; an entry with the same id is replaced (its node changes in place).
+---Persisted in `data.attachments`; every entry is ONE Core.Scene `prop` node owned by core, attached to the player
+---(§55.21.3), so every client near him shows it and it follows respawns, model swaps and bucket changes. While the
+---scene store loads, the ped has not reached the server or the scene is FULL ('limit'), the entry is stored, its id
+---returned, and its node follows (retry thread; a full scene: 5 s backoff doubling to 60 s).
 ---@param src integer
 ---@param def CoreAttachmentDef
 ---@return string|nil id
----@return string|nil err
+---@return string|nil err 'no session' | 'too many attachments' (12) | a validation message | 'scene refused the prop (<code>)' (any other refusal)
 function Core.Attachments.add(src, def) end
 ---(server)
 ---@param src integer
@@ -3475,65 +3517,6 @@ function Core.PlayerGrid.count() end
 function Core.PlayerGrid.cellOf(src) end
 
 --------------------------------------------------------------------------------
--- Core.MapRegions (server/maps_regions.lua §52.3) — internal region streaming
---------------------------------------------------------------------------------
-
----Regions, packs, subscriptions and coalesced pushes behind `Core.Maps` (§52.3, §52.4a). Internal: blocked
----in the export like `Core.Registry` (so is `Core.MapsRuntime`, the table the four server/maps*.lua files
----share); server/maps_runtime.lua is the only caller. Two audiences per window: EDITOR (Admin mode `editor` on, or
----in an open draft's bucket) and PUBLIC; flag 8/16 tuples reach editors only, each region has a full `v` and a
----public `pv` version.
----@class Core.MapRegions
-Core.MapRegions = {}
-
----(server, internal) Adds or moves one client-rendered element of `bucket`. `tuple` is the §52.4a tuple
----`{ uid, kind, modelHash, x, y, z, rx, ry, rz, flags, lod, extra? }` (tuple[1] == uid, [2..11] finite
----numbers, flags [10] an integer ≥ 0; extra nil or a table); FLAG_DATA/FLAG_EDITOR tuples reach editors only.
----The module keeps it by reference — pass a fresh table, never mutate it.
----@param bucket integer routing bucket >= 0
----@param uid string|integer 1..128 chars
----@param tuple table
----@return boolean ok false (and a warning) for an invalid bucket, uid or tuple
-function Core.MapRegions.put(bucket, uid, tuple) end
----(server, internal) Removes one element. false when (bucket, uid) is unknown.
----@param bucket integer
----@param uid string|integer
----@return boolean
-function Core.MapRegions.remove(bucket, uid) end
----(server, internal) Removes every element of `bucket`; subscribers of each region that had content get
----`core:maps:stale (bucket, key, 0)` (coalesced with the rest of the tick).
----@param bucket integer
----@return integer removed
-function Core.MapRegions.clearBucket(bucket) end
----(server, internal) Drops `src`'s window (playerDropped does this itself).
----@param src integer
----@return boolean hadWindow
-function Core.MapRegions.unsubscribe(src) end
----(server, internal) Re-checks an editor subscriber now (live bucket + mode/draft bucket); a loss downgrades it to
----public at once and sends `core:maps:stale` for its regions whose public view differs. Called from the
----`staffModeChanged` / `permsChanged` hooks; the flush re-checks editor targets as a backstop.
----@param src integer
----@param modeOn? boolean whether Admin mode `editor` is on, when the caller knows it (else `Admin.getModes`)
----@return boolean downgraded
-function Core.MapRegions.reaudience(src, modeOn) end
----(server, internal) The region key of a world position; nil for non-finite input.
----@param x number
----@param y number
----@return integer|nil
-function Core.MapRegions.keyOf(x, y) end
----(server, internal) The current versions of (bucket, key): full (editors) and public; 0 = empty for that audience.
----@param bucket integer
----@param key integer
----@return integer full
----@return integer public
-function Core.MapRegions.version(bucket, key) end
----(server, internal) Diagnostics: current `regions`, `elements`, `hidden` (editor-only), `subscribers`, `packs`
----(cached); totals `encodes`, `packsSent`, `deltas`, `stales`, `pushes`, `packets`, `windows`, `withheld`;
----`regionSize`, `version`.
----@return table
-function Core.MapRegions.stats() end
-
---------------------------------------------------------------------------------
 -- Core.Registry (server/api.lua + client/api.lua §2.3) — internal bookkeeping
 --------------------------------------------------------------------------------
 
@@ -3756,7 +3739,8 @@ function Core.Streaming.releaseWeaponAsset(weapon) end
 Core.Hooks = {}
 ---Registers an owner-scoped synchronous pipeline callback; callbacks must not yield.
 ---Return false, reason to veto. Failures fail closed; existing Core.on is unchanged.
----Core's own pipelines: 'money:beforeTransfer', 'chat:beforeMessage', 'admin:before', 'maps:beforeApply'.
+---Core's own pipelines: 'money:beforeTransfer', 'chat:beforeMessage', 'admin:before', 'maps:beforeApply',
+---'scene:beforeSpawn'.
 ---@param name CoreHookPipeline|string
 ---@param callback fun(payload:table,allowed?:boolean,reason?:string):boolean?,string?
 ---@param options? CoreHookPipelineOptions
@@ -4311,9 +4295,11 @@ function Core.Admin.getSelf() end
 function Core.Admin.getStaffStates() end
 
 --------------------------------------------------------------------------------
--- Core.Maps (server/maps_types.lua, maps_runtime.lua, maps.lua, maps_apply.lua; client/maps_spawn.lua,
---            maps_view.lua, maps.lua — DESIGN §52). A trusted server API: the caller (the admin plugin)
---            authorises its users. Errors are short codes (see README "Maps (§52)").
+-- Core.Maps (server/maps_types.lua, maps_runtime.lua, maps.lua, maps_apply.lua; client/maps_preview.lua,
+--            maps.lua — DESIGN §52, §55.21.1). A trusted server API: the caller (the admin plugin) authorises its
+--            users. Since 2026-09-27 every shown element is a Core.Scene node (server/maps_runtime.lua projects it,
+--            fields.mapEl = the uid); the client half is a facade over Core.Scene. Errors are short codes (see
+--            README "Maps (§52)").
 --------------------------------------------------------------------------------
 
 ---@class CoreMapTypeDef
@@ -4361,29 +4347,16 @@ function Core.Admin.getStaffStates() end
 ---@field editor boolean true in a draft's editor bucket
 
 ---@class CoreMapsClientStats
----@field regions integer regions with a known version (loaded or known empty)
----@field cached integer region records held (window + LRU cache)
----@field bucket integer|nil the routing bucket the regions belong to
----@field centre integer|nil the window's centre region key
----@field elements integer indexed elements (props, markers, data kinds, helpers; hides not included)
----@field spawned integer elements with a local object
----@field objects integer local objects owned (spawned + awaiting deletion)
----@field queued integer waiting to spawn (queue + model streaming)
----@field waiting integer waiting for their model
----@field despawning integer objects in the despawn queue
----@field capped integer wanted but beyond Config.Maps.MaxLocalObjects at the last evaluation
----@field failed integer elements whose model failed this session
----@field models integer model entries held
----@field loadingModels integer models streaming in
----@field hides integer world model hides applied
----@field markers integer markers being drawn
----@field previews integer editor previews being drawn
----@field editorView boolean
----@field evaluations integer
----@field created integer
----@field deleted integer
----@field lastEvalCells integer cells the last evaluation reached
----@field lastEvalElements integer elements it looked at one by one
+---@field elements integer map elements indexed on this client (wanted scene nodes carrying fields.mapEl)
+---@field spawned integer of those, the ones with an entity here
+---@field held integer uids held (Core.Maps.hold)
+---@field queued integer the materialiser's queue (every scene node, not only maps)
+---@field models integer assets the materialiser holds (models, anim dicts, ptfx)
+---@field failed integer nodes that failed this session (a missing model, a refused create)
+---@field previews integer editor previews drawn in the last pass
+---@field dataNodes integer live map:data records (points, zones, helpers, placeholders)
+---@field types integer element types known to the editor view
+---@field editorView boolean some resource has the editor view on
 
 ---@class Core.Maps
 Core.Maps = {}
@@ -4506,10 +4479,13 @@ function Core.Maps.closeDraft(id) end
 ---@param filter? { limit?: integer, before?: integer, author?: string }
 ---@return table[]|nil rows { mapId, seq, at, by, actor, source, count, ops }
 function Core.Maps.journal(id, filter) end
----(server) Re-creates destroyed networked elements (all, or one element id).
+---(server) Puts the scene nodes of a map's active contexts (all elements, or one element id) back to their authored
+---state: a promoted, displaced or changed node is moved back and reset (Scene demotes a promoted clone first); a missing
+---one is spawned again — and a spawn waiting on a 'limit' retry is tried at once. It examines every element
+---synchronously; more than 200 missing nodes are queued for the projector's worker. 0 before the Scene store loaded.
 ---@param id string
 ---@param elementId? string|integer
----@return integer queued
+---@return integer touched how many nodes it spawned, moved, reset or queued
 function Core.Maps.respawn(id, elementId) end
 ---(server) 'added'|'changed'|'removed' for ACTIVE content of a type ('*' = all), delivered in a thread,
 ---owner-swept (kind 'mapsListener'). Not replayed: seed with Maps.records.
@@ -4526,41 +4502,638 @@ function Core.Maps.off(handle) end
 ---@return CoreMapRecord[]
 function Core.Maps.records(typeId) end
 
----(client) True when the regions around `coords` are current for our bucket and every map prop within
----`radius` that a camera there would want is spawned (or failed, capped or held).
+---(client) True when the scene cells around `coords` are current and every node within `radius` a camera there
+---would want is materialised (or failed, or capped) — Core.Scene's readiness; map content is scene nodes. Not ready
+---inside a box of GlobalState 'core:mapsPending' of the player's bucket (a large map change still being projected).
 ---@param coords vector3
 ---@param radius? number default 50, clamped to 0..500
 ---@return boolean
 function Core.Maps.isAreaReady(coords, radius) end
----(client) Waits in the calling thread until `isAreaReady(coords)` or the timeout; moves the window onto
----`coords` first when they lie outside it. Spawn.teleport (§48) calls it with 3000 ms.
+---(client) Waits in the calling thread until `isAreaReady(coords)` or the timeout; asks the scene's focus reporter
+---for a report first, but moves no window (Spawn.teleport waits on Core.Scene.waitAreaReady, the same check).
 ---@param coords vector3
 ---@param timeoutMs? integer default 5000, clamped to 0..60000
 ---@return boolean ready
 function Core.Maps.waitAreaReady(coords, timeoutMs) end
----(client) The local object of a map element, or nil while it is not spawned.
----@param uid string|integer the element uid ('<mapId>:<elementId>')
+---(client) The entity of a map element: its local copy, else the promoted clone standing in for it, else a copy a
+---holder keeps (the server replaced or removed the node while it was held); nil while nothing is materialised.
+---@param uid string the element uid '<mapId>:<elementId>' (1..128 characters)
 ---@return integer|nil
 function Core.Maps.handleOf(uid) end
----(client) The map element uid of a local object the runtime spawned, or nil.
+---(client) The map element uid of an entity the scene materialised (a local copy or a promoted clone), or nil.
 ---@param entity integer
----@return string|integer|nil
+---@return string|nil uid
 function Core.Maps.uidOf(entity) end
----(client) The runtime leaves the element alone (no despawn, move or re-create) until released; returns its
----object when spawned. Owner-tracked (kind 'mapHold'): released when the calling resource stops.
----@param uid string|integer
+---(client) The runtime leaves the element's entity alone (no move, re-create or delete; changes apply on release)
+---until every holder released it; a hold taken before the node arrives applies when it comes. Returns the entity
+---when there is one. Owner-tracked (kind 'mapHold'; the scene hold runs under the owner key 'maps:<resource>', so a
+---resource's Scene.hold and Maps.hold never release each other).
+---@param uid string
 ---@return integer|nil entity
 function Core.Maps.hold(uid) end
----(client) Gives the caller's hold back; with no holder left the element takes its authoritative state
----(moved in place, re-created with a changed model, or deleted when the server removed it meanwhile).
----@param uid string|integer
+---(client) Gives the caller's hold back; with no holder left the element takes its authoritative state.
+---@param uid string
 ---@return boolean released false when the caller held nothing
 function Core.Maps.release(uid) end
----(client) Editor view for the calling resource (owner-tracked, kind 'mapEditorView'): previews of data kinds
----and editor-only helpers within 150 m, drawn while any owner has it on.
+---(client) Editor view for the calling resource (owner-tracked, kind 'mapEditorView'): the map:data previews
+---(points, zones, helpers, placeholders of undefined types) within 150 m, drawn while any owner has it on
+---(client/maps_preview.lua; ≤ Config.Maps.MaxMarkers at once).
 ---@param on boolean
 ---@return boolean ok false for a non-boolean
 function Core.Maps.setEditorView(on) end
 ---(client) A diagnostic snapshot of the runtime.
 ---@return CoreMapsClientStats
 function Core.Maps.stats() end
+
+--------------------------------------------------------------------------------
+-- Core.Clock (lib/clock/shared.lua — DESIGN §55.2). A lib: compiled into every VM, plugins too (no export hop).
+--------------------------------------------------------------------------------
+
+---@class Core.Clock
+Core.Clock = {}
+
+---(shared) u32 milliseconds on ONE timeline. Server: GetGameTimer() & 0xFFFFFFFF. Client: GetNetworkTimeAccurate()
+---& 0xFFFFFFFF (OneSync's network time, the server's timeline ±5–20 ms), latched once per frame; while it reads 0
+---(not synced yet) the game timer plus the last known offset. Compare stamps only with `Core.Clock.diff`.
+---@return integer
+function Core.Clock.now() end
+---(shared) a − b as a signed 32-bit difference: wrap-safe for stamps less than 24.8 days apart.
+---@param a integer
+---@param b integer
+---@return integer
+function Core.Clock.diff(a, b) end
+---(shared) (t + ms) mod 2^32; a fractional ms is floored.
+---@param t integer
+---@param ms number
+---@return integer
+function Core.Clock.add(t, ms) end
+---(shared) `add(now(), ms)`: a future-stamped plan (a motion's or an audio source's t0).
+---@param ms number
+---@return integer
+function Core.Clock.at(ms) end
+---(shared) Server: true. Client: the network time answered non-zero twice with an advancing value (sticky).
+---@return boolean
+function Core.Clock.ready() end
+---(shared) Client: a GetGameTimer()-based stamp → network time (the offset is the max of now() − GetGameTimer()
+---over the last 10 s). Server: the identity, masked to u32.
+---@param localMs integer
+---@return integer
+function Core.Clock.local2net(localMs) end
+---(shared) The inverse of `local2net`.
+---@param netMs integer
+---@return integer
+function Core.Clock.net2local(netMs) end
+
+--------------------------------------------------------------------------------
+-- Core.Scene (server/scene*.lua, client/scene*.lua, lib/scene/{shared,client}.lua — DESIGN §55). Server: a trusted
+-- API through the proxy; everything a plugin creates is owner-tracked. Client: the read API through the proxy,
+-- `handle` / `on` / `off` in the caller's VM. Errors are short codes (README "Scene streaming (Core.Scene)").
+--------------------------------------------------------------------------------
+
+---@alias CoreSceneKindClass 'prop'|'vehicle'|'ped'|'fx'|'data'|'audio'|'custom'
+---@alias CoreSceneTier 'S'|'M'|'L'|'G'
+---@alias CoreSceneState 'known'|'warm'|'staged'|'live'|'retiring'|'failed'|'off'
+---@alias CoreSceneServerEvent 'spawned'|'changed'|'removed'|'promoted'|'demoted'
+
+---What a server 'demoted' hook gets after the node copy (§55.15 final notes).
+---@class CoreSceneDemotedInfo
+---@field reason 'rest'|'manual'|'forced'|'evicted'|'lost'|'destroyed'
+---@field destroyed boolean the clone was wrecked
+---@field pos { x: number, y: number, z: number } the clone's last pose (the node follows it)
+---@field rot { x: number, y: number, z: number }
+---@field bucket integer the clone's last routing bucket
+---@field wear? table the last known wear props (Core.Scene.WEAR keys)
+---@alias CoreSceneClientEvent 'live'|'gone'|'changed'|'event'|'enter'|'exit'|'promoted'|'demoted'
+
+---A motion descriptor (§55.9; metres, degrees, Core.Clock ms; `t0` defaults to Clock.at(Motion.PlanLeadMs = 200)):
+---`{ t = 'tween', d, to = { x, y, z, rx?, ry?, rz? }, from?, e = 'linear'|'in'|'out'|'inout' }`,
+---`{ t = 'path', pts (≤ 64 { x, y, z }), sp = m/s | d = ms (one pass), loop = 'once'|'loop'|'pingpong', curve =
+---'linear'|'catmull', face = 'fixed'|'path', ph? }`, `{ t = 'spin', axis = 'x'|'y'|'z', dps, a0? }`,
+---`{ t = 'osc', dir, amp, period, phase? (deg) }`, `{ t = 'orbit', c, r, period, a0?, cw?, face = 'fixed'|'path'|
+---'center' }`, `{ t = 'keys', keys (≤ 128 { t, x, y, z, rx?, ry?, rz? }), loop?, smooth?, ph? }`. A plan whose t0
+---lies more than 24 h ahead is refused ('motion_future'). `Scene.drive` makes the server-steered `{ t = 'dr' }`.
+---@alias CoreSceneMotion table
+
+---A gated audience (§55.3, §55.6): exactly ONE key per table, combined with `any` / `all` (1..8 entries, nesting ≤ 3).
+---The effective audience of a node is its own AND every ancestor's. `players` and `fn` are refused on persistent
+---nodes; `fn` must be synchronous (a yield counts as "not allowed").
+---@alias CoreSceneAudience { players: integer[] }|{ faction: string }|{ perm: string }|{ editors: true }|{ near: number }|{ fn: fun(src: integer, nodeId: integer): boolean }|{ any: CoreSceneAudience[] }|{ all: CoreSceneAudience[] }
+
+---An interaction descriptor (§55.14); ≤ 4 per node.
+---@class CoreSceneInteract
+---@field action string ≤ 32, `[%w_-]`, unique per node
+---@field label? string ≤ 64, default the action
+---@field distance? number 0.5..20 m, default 2.0 (the server allows distance + 2 m from its own position)
+---@field icon? string
+---@field description? string ≤ 256
+---@field perm? string checked with Core.Perms.has before the handlers
+---@field cooldownMs? integer 0..60000, default 500, per (player, node, action)
+---@field data? table ≤ 1 KiB, handed to the onInteract handlers
+---@field prompt? { world?: boolean, offsetZ?: number, range?: number } true = the world dot, false = the text UI (nil: Config.Interactions.WorldPrompt); offsetZ −5..5 m, range 1..50 m
+
+---A promotion policy (§55.15): the kind's default, overridden per node.
+---@class CoreSceneAuthority
+---@field mode? 'local'|'promote'|'networked' proximity promotes players on foot ('promote') or anyone ('networked')
+---@field proximity? number 1..200 m (vehicles: 20)
+---@field enter? boolean a player trying to enter the local copy promotes it
+---@field damage? boolean damage to the local copy promotes it
+---@field actions? string[] ≤ 8 interaction actions that promote
+---@field restMs? integer 0..600000, default 3000
+---@field idleMs? integer 0..3600000, default 20000
+---@field onDestroyed? 'keep'|'remove' default 'keep' (demote at the stored pose)
+
+---@class CoreSceneSpawnDef
+---@field kind string a built-in ('prop' 'vehicle' 'ped' 'light' 'particle' 'marker' 'text' 'hide' 'zone' 'sound' 'group' 'audio.source' 'audio') or '<resource>:<name>'
+---@field pos? vector3|{ x: number, y: number, z: number } roots: x/y ±10000, z −1000..3000 (ignored for a child and an audio.source)
+---@field rot? vector3|{ x: number, y: number, z: number } Euler degrees, rotation order 2
+---@field bucket? integer default 0; a child defaults to its parent's
+---@field parent? integer a node id: the child rides its root (same bucket, depth ≤ 4, ≤ Config.Scene.MaxChildren descendants per root)
+---@field offset? vector3 relative to the parent (or its bone), each component ±1000 m
+---@field offrot? vector3
+---@field bone? integer|string a bone index or name on the parent's entity
+---@field rotOrder? integer children: 0..5, the rotation order `offrot` is applied in (default 2 = EULER_YXZ; Core.Attachments uses 1); ignored on roots
+---@field motion? CoreSceneMotion roots only
+---@field fields? table the kind's fields (Core.Schema), checked whole. Vehicle: model*, props, plate (`^[%w %-]*$`), locked, engine, lights, siren, doors, frozen, invincible, dirt, vtype (a CreateVehicleServerSetter type or a vehicles.meta name; filled from the model when absent), vehId; prop / vehicle / ped / marker / hide also mapEl, mapType (README "Scene streaming" lists every kind)
+---@field model? string|integer shorthand for fields.model: a name, an integer hash or a '0x%08X' string
+---@field audience? CoreSceneAudience nil = public in its bucket
+---@field radius? number stream radius override, 1..Config.Scene.TierL (a global node: ..65535)
+---@field global? boolean the bucket's global set (≤ Global.MaxNodes; a plugin ≤ Global.MaxPerOwner)
+---@field persist? boolean stored in Core.DB (`scene_nodes`): survives restarts and its owner's stop
+---@field interact? CoreSceneInteract[] ≤ 4
+---@field authority? CoreSceneAuthority
+---@field allowChildren? true|string[] who else may hang nodes under this one (its owner and core always may)
+
+---@class CoreSceneSetOpts
+---@field remove? string[] optional field names to delete (≤ 64)
+---@field interact? CoreSceneInteract[]|false false clears
+---@field audience? CoreSceneAudience|false false = public again
+---@field radius? number|false false = the kind's radius again
+---@field allowChildren? true|string[]|false
+
+---A server node copy (Scene.get / query / the Scene.on hooks). Changing it changes nothing.
+---@class CoreSceneNode
+---@field id integer
+---@field kind string
+---@field owner string the creating resource
+---@field bucket integer
+---@field pos { x: number, y: number, z: number } a child's: its world pose when it was last set
+---@field rot { x: number, y: number, z: number }
+---@field parent? integer
+---@field offset? { x: number, y: number, z: number }
+---@field offrot? { x: number, y: number, z: number }
+---@field bone? integer|string
+---@field rotOrder? integer a child's / attached node's rotation order (nil = 2)
+---@field motion? CoreSceneMotion
+---@field attach? { player?: integer, net?: integer }
+---@field fields table
+---@field audience? table data-only (an `fn` shows as `fn = true`)
+---@field radius number
+---@field tier? CoreSceneTier
+---@field global boolean
+---@field persist boolean
+---@field interact? CoreSceneInteract[]
+---@field authority? CoreSceneAuthority
+---@field deps? integer[] the dependency nodes it needs (an emitter: its source)
+---@field children? integer[] a root: every descendant id, parent first
+---@field ver integer per node: 1 on spawn, +1 per change, u32 wrapping to 1 (compare with Core.Clock.diff-style serial arithmetic)
+---@field placeholder? true the node's kind is not defined (any more)
+---@field allowChildren? true|string[]
+---@field promoted? { netId: integer }
+
+---@class CoreSceneKindDef
+---@field id string '<resource>:<name>' (`^[%w_%-]+:[%w_%-%.]+$`, ≤ 64); the prefix must be the defining resource
+---@field class CoreSceneKindClass plugin-drawn kinds use 'custom'
+---@field fields? CoreSchemaField[] a `{ name, type = 'table', validate = fn }` field is free-form JSON-safe data (≤ Config.Scene.MaxFieldBytes)
+---@field nearFields? string[] sent to near-ring subscribers only
+---@field radius? number|fun(node: table): number the stream radius (default by class)
+---@field handler? string the client resource that draws it (Core.Scene.handle there); default the owner
+---@field authority? CoreSceneAuthority the default promotion policy
+---@field budget? string the client cap key (Config.Scene.Caps); a custom kind gets `Caps.custom` of its own
+
+---@class CoreSceneQuery
+---@field pos vector3|{ x: number, y: number, z: number }
+---@field radius number 0..10000 m
+---@field bucket? integer default 0
+---@field kind? string
+---@field owner? string
+---@field limit? integer default 256 (≤ 4096)
+
+---The server's counters (Scene.stats on the server).
+---@class CoreSceneStats
+---@field nodes integer
+---@field byKind table<string, integer>
+---@field persistent integer
+---@field global integer
+---@field kinds integer
+---@field loaded boolean the persistent nodes are loaded
+---@field cells? integer
+---@field subscribers? integer
+---@field bytesPerSecond? number
+---@field flushMs? { p50: number, p99: number }
+---@field index? table
+---@field interest? table
+---@field flush? table
+---@field promote? table
+---@field audio? table
+---@field voice? table
+
+---@class CoreSceneAudioPlayDef: CoreSceneSpawnDef
+---@field id? integer an existing audio.source to change instead (with `fields` = the patch)
+---@field by? integer a player on whose behalf it plays: 1 play per 5 s per player, audited, never decoded to PCM
+
+---@class CoreSceneVoiceDef
+---@field talker integer a loaded player (the calling plugin authorises him)
+---@field speakers integer[] 1..32 distinct node ids of one bucket
+---@field fx? 'megaphone'|'pa'|'phone'|'radio'|'none' default 'none'
+---@field range? number 1..600 m, default 60
+---@field onEnd? fun(sessionId: integer, reason: 'stopped'|'owner'|'talker'|'dropped'|'speakers'|'no_voice') called once for an end the owner did not ask for
+
+---@class CoreSceneVoiceSession
+---@field id integer
+---@field owner string
+---@field talker integer
+---@field speakers integer[]
+---@field fx string
+---@field range number
+---@field bucket integer
+---@field listeners integer
+---@field startedAt integer
+
+---A client node copy (Scene.get on the client).
+---@class CoreSceneClientNode
+---@field id integer
+---@field kind? string
+---@field pos vector3
+---@field rot vector3
+---@field fields table
+---@field parent? integer
+---@field state CoreSceneState
+
+---What a client Scene.on listener gets as `info`.
+---@class CoreSceneEventInfo
+---@field event CoreSceneClientEvent
+---@field kind? string
+---@field entity? integer 'live': the entity (if any)
+---@field changes? string[] 'changed': what changed ('fields', 'move', 'motion', 'attach', 'interact', 'kind', 'promote', …)
+---@field fields? string[] 'changed': the changed field names
+---@field name? string 'event'
+---@field params? table 'event'
+---@field age? integer 'event': ms since it was emitted
+---@field pos? vector3 'event'
+---@field netId? integer 'promoted'
+
+---What a plugin kind's handler gets (a copy, §55.13).
+---@class CoreScenePluginView
+---@field id integer
+---@field kind string
+---@field pos vector3
+---@field rot vector3
+---@field fields table
+---@field parent? integer
+---@field radius number
+---@field motion? CoreSceneMotion
+---@field interact? CoreSceneInteract[]
+---@field attach? table
+---@field offset? table
+---@field offrot? table
+---@field bone? integer|string
+---@field netId? integer while promoted
+---@field changed? string update: what changed
+---@field changedFields? string[] update of 'fields': the names
+
+---@class CoreScenePluginHandlers
+---@field create fun(node: CoreScenePluginView): integer|nil a LOCAL entity (or nil); may yield — core waits ≤ 5 s for it
+---@field update? fun(node: CoreScenePluginView, entity: integer|nil, changed: string|nil)
+---@field destroy? fun(node: CoreScenePluginView, entity: integer|nil)
+---@field event? fun(node: CoreScenePluginView, entity: integer|nil, name: string, params: table|nil, age: integer)
+
+---The client's counters (Scene.stats on the client): the materialiser's, the cache's and the focus reporter's.
+---@class CoreSceneClientStats
+---@field nodes integer cached nodes
+---@field cells integer
+---@field cellsPending integer
+---@field cellsLive integer
+---@field cellsLru integer
+---@field gated integer
+---@field deps integer
+---@field kinds integer
+---@field byState { known: integer, warm: integer, staged: integer, live: integer, retiring: integer, failed: integer, off: integer }
+---@field byBudget table<string, integer> materialised per cap key
+---@field queued integer
+---@field fades integer
+---@field models { props: integer, vehicles: integer, peds: integer }
+---@field movers integer
+---@field lodScale number
+---@field poolSize integer the Object pool size in use (learned or Config.Scene.ObjectPool)
+---@field bytesIn integer
+---@field payloads integer
+---@field latent integer
+---@field gaps integer
+---@field resyncs integer
+---@field reports integer
+---@field bucket? integer
+---@field plugin { claims: integer, waiting: integer, bound: boolean, listens: integer }
+
+---@class Core.Scene.audio
+local CoreSceneAudio = {}
+---(server) Spawns an `audio.source` (kind implied), or with `def.id` changes one (`def.fields` = the patch). `by = src`
+---plays on that player's behalf. Refusals: 'def' 'by' 'rate_limit' 'missing', the spawn / set errors, and the
+---admission's 'audio_disabled' (setting scene.audio.enabled) | 'audio_streams' (scene.audio.maxStreams) | 'audio_rate'
+---(per-owner flood guard). Remote URLs must be https on a host in scene.audio.allowHosts.
+---@param def CoreSceneAudioPlayDef
+---@return integer|nil id
+---@return string|nil err
+---@return table|nil detail
+function CoreSceneAudio.play(def) end
+---(server) The kill switch: removes a source (with its emitters), an emitter, or every source ('all'), whatever the
+---owner. Audited 'scene.audio.kill'.
+---@param target integer|'all'
+---@param by? integer the acting player (audit)
+---@return boolean ok
+---@return integer|string nOrErr the number removed, or 'missing' | 'by'
+function CoreSceneAudio.kill(target, by) end
+---(server) The audio policy's counters (sources, streams, resolving, plays, kills, refusals, …).
+---@return table
+function CoreSceneAudio.stats() end
+
+---@class Core.Scene.voice
+local CoreSceneVoice = {}
+---(server) Routes the talker's voice through speaker nodes to the players near them (panned per listener;
+---needs `setr voice_useNativeAudio true` for panning). ≤ 1 session per talker, ≤ Voice.MaxSessions. Audited.
+---@param def CoreSceneVoiceDef
+---@return integer|nil sessionId
+---@return string|nil err 'def' 'talker' 'fx' 'range' 'speakers' 'missing' 'bucket' 'busy' 'limit' | 'unavailable'
+function CoreSceneVoice.start(def) end
+---(server) Ends a session (its owner or core).
+---@param sessionId integer
+---@return boolean ok
+---@return string|nil err 'missing' | 'owner'
+function CoreSceneVoice.stop(sessionId) end
+---(server)
+---@return CoreSceneVoiceSession[]
+function CoreSceneVoice.list() end
+
+---@class Core.Scene
+---@field audio Core.Scene.audio
+---@field voice Core.Scene.voice
+---@field PAINTS integer[][] (shared) the 22 stable vehicle paints { primary, secondary } (read-only)
+Core.Scene = {}
+
+---(server) Creates a node. Validation order: kind → fields → pose → rotation (motion) → model → parent / deps →
+---audience, interact, authority, radius → limits → the 'scene:beforeSpawn' pipeline → (audio.source) admission.
+---@param def CoreSceneSpawnDef
+---@return integer|nil id
+---@return string|nil err 'unavailable' 'def' 'kind' 'fields' 'pos' 'rot' 'offset' 'offrot' 'bone' 'rotOrder' 'motion' 'motion_future' 'model' 'parent' 'deps' 'audience' 'interact' 'authority' 'radius' 'global' 'persist' 'bucket' 'limit' 'hook' 'owner' 'allowChildren' 'audio_*'
+---@return table|string|nil detail Schema errors for 'fields' — `{ [name] = 'reserved' }` when a non-core caller sets mapEl / mapType / vehId — the hook's reason, …
+function Core.Scene.spawn(def) end
+---(server) Merges `patch` into the fields (the result is checked whole; nil in a patch does not delete — use
+---opts.remove). Owner or core.
+---@param id integer
+---@param patch? table
+---@param opts? CoreSceneSetOpts
+---@return boolean ok
+---@return string|nil err
+---@return table|nil detail
+function Core.Scene.set(id, patch, opts) end
+---(server) A teleport (absolute motions end; spin / osc stay) or, with a duration, a tween from the current pose.
+---For a child or an attached node `pos` / `rot` are its offset / offrot (no tween; opts.rotOrder 0..5 replaces its
+---rotation order, kept when absent).
+---@param id integer
+---@param pos vector3|table
+---@param rot? vector3|table
+---@param opts? { duration?: integer, ease?: 'linear'|'in'|'out'|'inout', rotOrder?: integer } duration 1..600000 ms, ease default 'inout'
+---@return boolean ok
+---@return string|nil err
+function Core.Scene.move(id, pos, rot, opts) end
+---(server) Sets (or with nil clears) the node's motion. Roots only.
+---@param id integer
+---@param desc CoreSceneMotion|nil
+---@return boolean ok
+---@return string|nil err
+---@return string|nil detail the validator's reason
+function Core.Scene.motion(id, desc) end
+---(server) `{ node = id }` re-parents (same bucket, depth ≤ 4, no cycle, a foreign parent must allow it);
+---`{ player = src }` / `{ net = netId }` attach a root (transient: they end at the last pose when the player drops or
+---the entity goes).
+---@param id integer
+---@param target { node?: integer, player?: integer, net?: integer }
+---@param opts? { offset?: vector3, offrot?: vector3, bone?: integer|string, rotOrder?: integer } rotOrder 0..5 (default 2): the order offrot is applied in
+---@return boolean ok
+---@return string|nil err
+function Core.Scene.attach(id, target, opts) end
+---(server) A child becomes a root at its current world pose; an attachment ends there.
+---@param id integer
+---@return boolean ok
+---@return string|nil err
+function Core.Scene.detach(id) end
+---(server) A one-shot event to the clients near a node (owner or core) or a position (anyone): client
+---`Scene.on('event')`, a plugin kind's `event` handler; `sound` nodes hear 'play' / 'stop'. Not journaled.
+---@param target integer|{ pos: vector3, bucket?: integer }
+---@param name string `^[%w_%-:%.]+$`, ≤ 32
+---@param params? table ≤ 1 KiB
+---@param opts? { radius?: number, horizonMs?: integer } radius 1..TierL (default the node's, 150 m for a position); horizonMs 0..30000 (2000)
+---@return boolean ok
+---@return string|nil err
+function Core.Scene.emit(target, name, params, opts) end
+---(server) Removes the node and its subtree (a source takes its emitters). `fade` asks clients for a fade-out;
+---they delete visibility-safely either way.
+---@param id integer
+---@param opts? { fade?: boolean }
+---@return boolean ok
+---@return string|nil err
+function Core.Scene.remove(id, opts) end
+---(server) Server-steered dead reckoning (C2): the first call makes the node's motion a `dr`; later calls send a DR
+---op only when the clients' extrapolation errs > DeadReckoning.Near (far: .Far) m or > .Degrees, or on the heartbeat.
+---Roots only; |vel| ≤ 300 m/s.
+---@param id integer
+---@param pos vector3|table
+---@param vel? vector3|table m/s
+---@param yaw? number degrees (default the node's)
+---@return boolean ok
+---@return boolean|string sentOrErr
+function Core.Scene.drive(id, pos, vel, yaw) end
+---(server) A copy of a node. (client) A copy of a cached node (`state` = the materialiser's).
+---@param id integer
+---@return CoreSceneNode|CoreSceneClientNode|nil
+function Core.Scene.get(id) end
+---(server) Copies of the nodes within `radius` of `pos`, nearest first (gated nodes included).
+---@param q CoreSceneQuery
+---@return CoreSceneNode[]
+function Core.Scene.query(q) end
+---(server) Node ids, ascending.
+---@param filter? { owner?: string, kind?: string, bucket?: integer }
+---@return integer[]
+function Core.Scene.list(filter) end
+---(server) Runs `fn(...)`: every change inside reaches the same flush. `fn` must not yield.
+---@param fn function
+---@param ... any
+---@return any ... fn's results, or nil, 'error' | 'fn'
+function Core.Scene.batch(fn, ...) end
+---(server) Hooks: 'spawned' | 'changed' (what) | 'removed' (reason) | 'promoted' (netId) | 'demoted' (info:
+---CoreSceneDemotedInfo) — fn(copy, ...) for a kind id, a node id or '*' (pcall'ed; owner-tracked 'sceneListener').
+---(client) 'live' | 'gone' | 'changed' | 'event' | 'enter' | 'exit' | 'promoted' | 'demoted' — fn(id, info), run in
+---the caller's VM; core raises the local event only for what some resource listens to.
+---@param event CoreSceneServerEvent|CoreSceneClientEvent
+---@param kindOrId string|integer|nil a kind id, a node id or '*' (nil = '*')
+---@param fn fun(a: any, b: any, ...)
+---@return string|integer|nil handle server 'sl:<n>', client an integer
+function Core.Scene.on(event, kindOrId, fn) end
+---(server) Removes a Scene.on / onInteract handle (its owner or core). (client) Removes a Scene.on listener.
+---@param handle string|integer
+---@return boolean removed
+function Core.Scene.off(handle) end
+---(server) A press of an `interact` descriptor, after core checked the bucket, every audience level, the
+---descriptor, `perm`, the server-side distance, the cooldown and a lease. Handlers of the id run first, then the
+---kind's; owner-tracked ('sceneInteract').
+---@param kindOrId string|integer
+---@param fn fun(src: integer, node: CoreSceneNode, action: string, data: table|nil)
+---@return string|nil handle 'si:<n>'
+function Core.Scene.onInteract(kindOrId, fn) end
+---(server) Defines (or, same owner, redefines) a kind. Owner-tracked ('sceneKind'): when the owner stops, its
+---nodes stay as placeholders. ≤ 256 new kind ids per plugin per server session.
+---@param def CoreSceneKindDef
+---@return boolean ok
+---@return string|nil err 'def' 'id' 'owner' 'limit' 'class' 'fields' 'fields:reserved:<name>' (a plugin kind may not declare mapEl / mapType / vehId) 'nearFields' 'radius' 'handler' 'authority' 'budget'
+function Core.Scene.defineKind(def) end
+---(server) The public kind list (no functions): { id, idx, class, fields, nearFields, radius, handler, budget,
+---authority, owner, builtin, dependency }.
+---@return table[]
+function Core.Scene.kinds() end
+---(server) The one model-info provider (owner-tracked; nil clears): answer `{ lod?, radius?, bbox = { min, max }?,
+---vehicleType? }`, nil (unknown: the Maps validator as an info source, then defaults) or false — the ONLY way a model
+---is refused ('model'); a model nobody knows spawns with the defaults. `model` is a name or an integer hash.
+---@param fn? fun(class: 'prop'|'vehicle'|'ped', model: string|integer): table|false|nil
+---@return boolean ok
+function Core.Scene.setModelInfo(fn) end
+---(server) Counters. (client) The client's counters.
+---@return CoreSceneStats|CoreSceneClientStats
+function Core.Scene.stats() end
+---(server) Pins a player's streaming focus to `pos` (a scripted camera far from the ped); nil clears. Trusted,
+---owner-tracked ('sceneFocus'); refused for a src nobody is connected as.
+---@param src integer
+---@param pos vector3|table|nil
+---@return boolean ok
+function Core.Scene.setFocus(src, pos) end
+---(server) Core only: re-owns a node (a persistent node of a resource that is gone).
+---@param id integer
+---@param owner? string default 'core'
+---@return boolean ok
+---@return string|nil err 'owner' | 'missing' | 'unavailable'
+function Core.Scene.adopt(id, owner) end
+---(server) Promotes a node to a networked clone now (owner or core; queued — the clone exists within ~5 s).
+---@param id integer
+---@return boolean|nil ok
+---@return string|nil err
+function Core.Scene.promote(id) end
+---(server) Forces a promoted node back to local copies, whatever the rest conditions — never a vehicle with someone
+---inside ('occupied').
+---@param id integer
+---@return boolean|nil ok
+---@return string|nil err 'not_promoted' | 'occupied' | …
+function Core.Scene.demote(id) end
+---(server) Reserves a node for one player: the first request wins, the holder renews with its `seq`, `ms = 0`
+---releases; other players' interactions with the promoted node are refused and it never demotes while leased.
+---@param id integer
+---@param src integer
+---@param ms? integer 0..3600000, default Config.Scene.Promote.LeaseMs (10000)
+---@param seq? integer the holder's sequence number (renew / release)
+---@return integer|nil seq
+---@return string|nil err 'missing' 'owner' 'src' 'ms' 'leased' 'stale' 'none'
+function Core.Scene.lease(id, src, ms, seq) end
+
+---(client) The entity of a node on this client: its local copy, a plugin's bound entity, or the promoted clone.
+---@param id integer
+---@return integer|nil entity
+function Core.Scene.handleOf(id) end
+---(client) The node id of an entity the runtime created, a plugin bound, or a promoted node's clone.
+---@param entity integer
+---@return integer|nil id
+function Core.Scene.idOf(entity) end
+---(client) True when the cells around `pos` are current and every node within `radius` a camera there would
+---want is materialised (or failed, or capped) — and no large map change is still being projected there (maps pending).
+---@param pos vector3|table
+---@param radius? number default 50, ≤ 500
+---@return boolean
+function Core.Scene.isAreaReady(pos, radius) end
+---(client) Waits in the calling thread until `isAreaReady(pos, radius)` or the timeout. It only waits.
+---@param pos vector3|table
+---@param radius? number default 50, ≤ 500
+---@param timeoutMs? integer default 5000, ≤ 60000
+---@return boolean ready
+function Core.Scene.waitAreaReady(pos, radius, timeoutMs) end
+---(client) The runtime leaves the node's entity alone (no move, re-create or delete) until released; returns the
+---entity when there is one. Owner-tracked ('sceneHold').
+---@param id integer
+---@return integer|nil entity
+function Core.Scene.hold(id) end
+---(client) Gives the caller's hold back; what changed meanwhile applies now.
+---@param id integer
+---@return boolean released
+function Core.Scene.release(id) end
+---(client, the caller's VM) This resource draws the nodes of plugin kind `kind` (defined with `handler` = this
+---resource). Core decides WHEN (radius, budget, priority, fades, visibility-safe deletes) and raises one local event
+---per state change — never per frame; the handlers run pcall'ed in this VM.
+---@param kind string '<resource>:<name>'
+---@param handlers CoreScenePluginHandlers
+---@return boolean ok
+function Core.Scene.handle(kind, handlers) end
+---(client, proxy) The lib's half of Scene.on: tells core that this resource listens (owner-tracked).
+---@param kindOrId string|integer
+---@param event CoreSceneClientEvent
+---@return boolean ok
+function Core.Scene.listen(kindOrId, event) end
+---(client, proxy) The inverse of `listen`.
+---@param kindOrId string|integer
+---@param event CoreSceneClientEvent
+---@return boolean ok
+function Core.Scene.unlisten(kindOrId, event) end
+---(client, proxy) The lib's half of Scene.handle: this resource draws `kind` (a second resource is refused while the
+---first runs). Owner-tracked ('sceneHandler').
+---@param kind string
+---@return boolean ok
+function Core.Scene.claim(kind) end
+---(client, proxy) The lib reports what the plugin's create returned (0 = none). false = the node is no longer wanted
+---(the plugin deletes its entity); false, 'refused' = a player ped, a networked entity or one core owns (ignored).
+---@param id integer
+---@param entity integer
+---@return boolean ok
+---@return string|nil why 'refused'
+function Core.Scene.bind(id, entity) end
+
+---(shared) Is `id` a well-formed kind id (a plugin '<resource>:<name>' or a reserved plain id)?
+---@param id any
+---@return boolean
+function Core.Scene.validKindId(id) end
+---(shared) Is `id` the plugin form '<resource>:<name>'?
+---@param id any
+---@return boolean
+function Core.Scene.isPluginKind(id) end
+---(shared) The streaming tier of a radius: S ≤ TierS (160), M ≤ TierM (448), else L; G when global.
+---@param radius number
+---@param global? boolean
+---@return CoreSceneTier
+function Core.Scene.tierOf(radius, global) end
+---(shared) The stable paint of vehicle node `id` (PAINTS[id % 22 + 1]): the same on the promoted clone and on
+---every client's local copy.
+---@param id integer
+---@return integer|nil primary
+---@return integer|nil secondary
+function Core.Scene.paintOf(id) end
+---(shared) The damage / wear keys of vehicle props `{ [key] = true }`: engineHealth, bodyHealth, tankHealth, dirtLevel,
+---fuelLevel, doors, windows, burstTyres, tyreHealth — the ONLY keys a props read-back from a clone's network owner may
+---change (everything else goes through saveProps / server APIs).
+---@type table<string, true>
+Core.Scene.WEAR = {}
+---(shared) Splits vehicle props into two fresh tables (either may be empty): the non-WEAR and the WEAR keys.
+---@param props table
+---@return table cosmetic
+---@return table wear
+function Core.Scene.splitProps(props) end
+---(shared) A fresh copy of `stored` with ONLY the WEAR keys of `readBack` merged in, clamped: healths 0..1000 (a restored
+---car never burns), dirt 0..15, fuel 0..100, doors / windows / burstTyres `{ [0..7] = boolean }`, tyreHealth
+---`{ [0..7] = 0..1000 }` (a read-back map replaces the stored one); unknown / non-finite values are dropped (the stored
+---value stays); `stored` is untouched.
+---@param stored table
+---@param readBack table
+---@return table merged
+function Core.Scene.mergeWear(stored, readBack) end

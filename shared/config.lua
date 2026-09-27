@@ -55,6 +55,11 @@ Config = {
     Vehicles = {
         SpawnTimeoutMs = 5000, LockKey = 'U', LockDistance = 20.0, PlatePrefix = 'LS-',
         MaxPropsBytes = 16384,
+        -- §55.21.4: an idle persisted car with nobody inside or within AutoParkRadius m for AutoParkIdleMs is parked
+        -- (its networked clone becomes a Core.Scene node); the sweep walks the live cars every AutoParkSweepMs, in slices
+        AutoPark = true, AutoParkIdleMs = 30000, AutoParkRadius = 50, AutoParkSweepMs = 10000,
+        -- at most this many parked cars; beyond it the longest-unused one is stored (its node removed, hook fired)
+        MaxParked = 20000,
     },
     Interactions = {
         Key = 'E', ScanIntervalMs = 300, FarScanIntervalMs = 1000, NearRange = 60.0, MaxModels = 8,
@@ -190,12 +195,48 @@ Config = {
     },
     -- Core.Buckets allocation range (DESIGN §50); charcreator's studio uses 1000 + src, below it
     Buckets = { Range = { 10000, 60000 } },
-    -- Core.Maps runtime (DESIGN §52); limits are Core.Settings keys `maps.limits.*`
-    Maps = {
-        RegionSize = 512, WindowHysteresis = 64, CacheRegions = 25, LatentBps = 250000, PushOpsMax = 32,
-        MaxSpawnRadius = 400, SpawnPerFrame = 8, DespawnPerFrame = 32, MaxLocalObjects = 1500, MaxMarkers = 64,
-        -- per-player pack byte budget (anti-abuse token bucket; a legit client refills faster than it spends)
-        PackBudgetBytes = 2000000, PackBudgetWindowMs = 10000,
+    -- Core.Maps (DESIGN §52, §55.21.1): elements stream as Core.Scene nodes, so every streaming tunable lives in
+    -- Config.Scene; limits are Core.Settings keys `maps.limits.*`. MaxMarkers = the editor view's preview budget.
+    Maps = { MaxMarkers = 64 },
+    -- Core.Scene streaming (DESIGN §55); `Caps.props` 3000 assumes server.cfg `increase_pool_size "Object" 2000`
+    Scene = {
+        CellSize = 128, RegionSize = 512,                        -- read once (key encoding)
+        NearRing = 160, FarRing = 448, FarRegions = 1024, LeaveMargin = 64, LeaveDwellMs = 3000,
+        TierS = 160, TierM = 448, TierL = 1500,
+        FlushMs = 50, MaxEventBytes = 16384, MaxBacklogBytes = 262144, LatentBps = 750000,
+        PackBudgetBytes = 2000000, PackBudgetWindowMs = 10000, JournalOps = 64, JournalMs = 10000,
+        Focus = { MinMove = 16, MinIntervalMs = 250, Slack = 50, MaxSpeed = 90 }, BackstopMs = 5000,
+        Lead = { Seconds = 1.5, Max = 150 },
+        ClientLruCells = 48, ClientLruMs = 120000, ModelLingerMs = 30000,
+        -- vehicles / modelsVehicles are sized for parked player cars (§55.21.4); measure dense lots on scene_probe
+        Caps = { props = 3000, peds = 48, vehicles = 64, lights = 32, particles = 32, markers = 64, texts = 64,
+                 sounds = 24, hides = 200, custom = 64, modelsProps = 150, modelsPeds = 20, modelsVehicles = 32 },
+        Budgets = { PropsPerFrame = 8, EntityPerFrame = 1, CustomPerFrame = 2, DeletesPerFrame = 32,
+                    ModelRequestsPerFrame = 2, ModelsInFlight = 30, TeleportMultiplier = 10 },
+        Radii = { Band = 20, SmallBand = 5, Margin = 10, Warm = 50, OutMin = 20, OutFactor = 0.25, PropCap = 500 },
+        Fades = { PropInMs = 300, PropOutMs = 450, PedMs = 600, VehicleMs = 400, Max = 48, MaxVehicles = 8 },
+        Visibility = { UnseenMs = 1500, ImportantUnseenMs = 4000, DeferMaxMs = 10000, SwapMargin = 10, SwapCooldownMs = 100 },
+        Speed = { SkipSmallAbove = 50, NoFadeAbove = 80 },
+        Motion = { NearRadius = 50, MidHz = 15, ServerHz = 2, RecellTolerance = 8, PlanLeadMs = 200 },
+        DeadReckoning = { Near = 0.25, Far = 1.0, Degrees = 3, NearHz = 10, FarHz = 1, HeartbeatMs = 5000, Snap = 5 },
+        -- ProximityShare: the part of MaxEntities proximity promotions may hold; enter / manual / action use the rest
+        Promote = { MaxEntities = 1000, MaxPropsPerArea = 32, CloneWaitMs = 10000, DeleteDelayMs = 500, RestSpeed = 0.05,
+                    LeaseMs = 10000, SwapDist = 0.05, SwapDeg = 2, ProximityShare = 0.7 },
+        Audio = { Voices = 32, Decoders = 4, ClipCacheMb = 64, HrtfVoices = 8, ListenerHz = 20, LosProbesPerSecond = 8,
+                  ProfileSfx = 300, ProfileMusic = 306,
+                  -- AAC / M4A / AAC-only HLS: FiveM's CEF decodes AAC (scene_probe P8 in game, 2026-09-26: audio/aac +
+                  -- mp4a.40.2 'probably' with MSE, AudioDecoder mp4a.40.2 supported)
+                  AllowAac = true },
+        Voice = { Submixes = 8, PanHz = 15, MaxListeners = 64, MaxSessions = 16 },
+        Global = { MaxNodes = 256, MaxPerOwner = 64 }, MaxNodes = 100000, MaxNodesPerOwner = 20000, MaxPersistent = 50000,
+        -- per-owner overrides of MaxNodesPerOwner: map elements, player attachments and parked vehicles all count as 'core';
+        -- inventory's ground drops are one prop node each
+        OwnerCaps = { core = 60000, inventory = 40000 },
+        -- the share of MaxNodes / MaxPersistent only core may use, so plugins can never starve maps, attachments, parked cars
+        CoreReserve = { nodes = 20000, persistent = 10000 },
+        MaxChildren = 64,                                        -- descendants per root (§55.3)
+        ObjectPool = 5300,       -- = this server.cfg's increase_pool_size "Object" 2000 (3300 + 2000); nil assumes 3300 and learns
+        MaxFieldBytes = 8192, ClockMode = 'network', Debug = false,
     },
     Texts = {
         loading = 'Loading your character...', respawn_in = 'Respawn in %d s', respawn_now = 'Respawning...',

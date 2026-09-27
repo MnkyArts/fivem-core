@@ -520,6 +520,13 @@ function Player.setCoords(src, coords, heading, opts)
     if vehicle ~= 0 or opts.fade == false then
         flags = { withVehicle = vehicle ~= 0, fade = opts.fade ~= false }
     end
+    -- §55.6: subscribe the destination's scene window before the client moves (Scene.waitAreaReady gates the reveal)
+    local sceneRuntime = Core.SceneRuntime
+    local interest = sceneRuntime and sceneRuntime.interest
+    if interest and Utils.isCallable(interest.prefetch) then
+        local ok, err = pcall(interest.prefetch, src, target.x, target.y, target.z)
+        if not ok then Core.Log.warn('Player.setCoords: scene prefetch failed: %s', tostring(err)) end
+    end
     TriggerClientEvent('core:client:teleport', src, target, dir, flags)
     return true
 end

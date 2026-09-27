@@ -10,13 +10,16 @@
     `Config.Native.Allow` (§28) may run, no list at all denies everything, and the hard DENY set
     below is refused on both sides whatever the config says.
 
-    Attachments live on the character document (`data.attachments`) and are replicated as ONE table on
-    `Player(src).state.attachments` (§8) — every client applies them to that player's ped.
+    Attachments live on the character document (`data.attachments`); each entry is ONE Core.Scene 'prop' node
+    owned by core and attached to the player (§55.21.3) — the scene's clients put the object on that ped. The
+    `attachments` state bag (§8) is no longer written.
 
-    Natives (verified with fxref 2026-09-12): GetPlayerPed (apiset server, `playerSrc`),
-    GetEntityCoords (apiset server, ONE argument), NetworkGetEntityFromNetworkId (apiset server),
-    DoesEntityExist (client+server), GetResourceState (shared).
-    `Player(src).state`, `promise`, `Citizen.Await`, `SetTimeout` and `exports` are runtime helpers.
+    Natives (verified with fxref 2026-09-12, GetPlayerRoutingBucket 2026-09-27): GetPlayerPed (apiset server,
+    `playerSrc`), GetEntityCoords (apiset server, ONE argument), GetPlayerRoutingBucket (apiset server,
+    `playerSrc`), NetworkGetEntityFromNetworkId (apiset server), DoesEntityExist (client+server),
+    GetResourceState (shared), GetGameTimer (apiset server). Server event: onPlayerBucketChange (player, bucket,
+    oldBucket).
+    `promise`, `Citizen.Await`, `SetTimeout`, `CreateThread`, `Wait` and `exports` are runtime helpers.
 ]]
 
 local Native = {}
@@ -40,7 +43,7 @@ local AUDIO_MAX_TARGETS <const> = 20      -- DESIGN §20: playAt never fans out 
 local AUDIO_DEFAULT_RANGE <const> = 20.0
 local AUDIO_MAX_RANGE <const> = 200.0
 local audioCandidates = {}                  -- reused by Audio.playAt: PlayerGrid.candidates fills it, its count is what counts
-local MAX_ATTACHMENTS <const> = 12        -- bounds the replicated state-bag payload
+local MAX_ATTACHMENTS <const> = 12        -- props per player (each one is a scene node)
 local DEFAULT_BONE <const> = 28422        -- PH_R_Hand, the usual prop bone
 local RAYCAST_MAX_DISTANCE <const> = 100.0
 local RAYCAST_SLACK <const> = 5.0         -- the client's hit may sit slightly past the probe end
@@ -271,16 +274,46 @@ function Audio.playAt(coords, name, set, range)
 end
 
 --------------------------------------------------------------------------------
--- Core.Attachments (DESIGN §20) — props on the player's ped
---   stored on the character document (data.attachments), replicated as ONE table
---   on Player(src).state.attachments; client/remote.lua attaches the objects.
+-- Core.Attachments (DESIGN §20, §55.21.3) — props on the player's ped
+--   The character document (data.attachments) is the truth. Every entry is ONE scene 'prop' node owned
+--   by core: spawned at the ped in the player's routing bucket, then Scene.attach(id, { player = src },
+--   { bone, offset, offrot, rotOrder = 1 }); every client near the player materialises the object on that ped
+--   (client/scene_kinds.lua re-attaches it when the ped changes). Nodes are made on playerLoaded and on
+--   add, changed in place on a re-add of the same id, removed (faded) on remove / clear / playerDropped.
+--   A player whose nodes cannot be made yet (the scene store still loading, no ped on the server yet)
+--   waits for ONE retry thread that exists only while somebody waits (1 s pace, 32 players per server tick).
+--   A prop the scene refuses for CAPACITY ('limit': core's node cap, the global one — review RV4 F3) is kept
+--   stored and retried by the same thread with a backoff (5 s, doubling to 60 s while nothing gets placed);
+--   for 1 s after a 'limit' answer no new node is tried (it would be refused too) unless one of ours was
+--   removed. The `attachments` state bag (§8) is no longer written; the key stays reserved
+--   (server/player.lua CORE_STATE_KEYS).
 --------------------------------------------------------------------------------
 
 local ID_PATTERN <const> = '^[%w_%-:]+$'
+local NAME_PATTERN <const> = '^[%w_%-]+$'   -- a scene model / bone name (Core.Schema 'model', R.valid.bone)
+local BONE_MAX <const> = 65535              -- ped bone tags are 16-bit (R.valid.bone)
+local OFFSET_MAX <const> = 1000.0           -- R.valid.offset: each component within ±1000 m
+local RETRY_MS <const> = 1000               -- the retry thread's pace while somebody waits
+local SYNC_SLICE <const> = 32               -- players one retry pass syncs per server tick
+local SLICE_WAIT_MS <const> = 50            -- one server tick (sv 20 Hz) between two slices
+local CAP_MIN_MS <const>, CAP_MAX_MS <const> = 5000, 60000   -- 'limit' (scene capacity): the retry backoff
+local CAP_HOLD_MS <const> = 1000            -- after a 'limit' answer new nodes wait this long (or for a removal)
+local CAP_LOG_MS <const> = 60000            -- one capacity warning per minute
+local LIMIT <const> = 'limit'
+local FADE <const> = { fade = true }        -- a removed prop fades out where it is seen (§55.11)
+local TRANSIENT <const> = { unavailable = true, attach = true }   -- scene answers that mean "not yet"
+local ROT_ORDER <const> = 1                 -- the attachment's rotation order (attachOpts)
+
+local held = {}          -- [src] = { bucket, nodes = { [attachmentId] = { id = nodeId?, model, pose, failed? } } }
+local waiting = {}       -- [src] = true: a sync that could not run yet (scene store loading, no ped): 1 s pace
+local capped = {}        -- [src] = true: a prop the scene refused for capacity: retried with the backoff
+local retrying = false   -- the retry thread runs
+local capBackoff, capDue, capHeldUntil, capLogAt = CAP_MIN_MS, 0, 0, nil
+local placedCount = 0    -- nodes made (the backoff's progress mark)
 
 --- The stored list (a copy, always an array), clamped to MAX_ATTACHMENTS. A document that grew
---- past the cap (older data, a manual DB edit) is trimmed here, so every write and every
---- republish sends a bounded table.
+--- past the cap (older data, a manual DB edit) is trimmed here, so no player ever gets more
+--- nodes than that.
 local function readList(src)
     local list = Core.Player.getData(src, 'attachments')
     if type(list) ~= 'table' then return {} end
@@ -294,35 +327,343 @@ local function readList(src)
     return out
 end
 
---- Persist + replicate in one step (the whole table, §8).
-local function writeList(src, list)
-    Core.Player.setData(src, 'attachments', list)
-    Player(src).state:set('attachments', list, true)
+--- Core.Scene with its store loaded; false while the store still loads; nil when this VM has no scene.
+local function sceneApi()
+    local Scene = rawget(Core, 'Scene')
+    if type(Scene) ~= 'table' or type(rawget(Scene, 'spawn')) ~= 'function' then return nil end
+    local R = rawget(Core, 'SceneRuntime')
+    local store = type(R) == 'table' and R.store or nil
+    if type(store) == 'table' and type(store.loaded) == 'function' and not store.loaded() then return false end
+    return Scene
 end
 
---- Validated, JSON-safe entry from a caller's definition, or nil, err.
-local function toEntry(def, existingId)
+--- fn(...) as core, whoever called the Attachments API (the nodes are core's) -> fn's results | nil, 'error'.
+local function asCore(fn, ...)
+    local res = table.pack(Core.Registry.withCaller('core', fn, ...))
+    if not res[1] then
+        Log.error('Attachments: a scene call failed (%s)', tostring(res[2]))
+        return nil, 'error'
+    end
+    return table.unpack(res, 2, res.n)
+end
+
+--- The scene `model` of an entry: a name as is, a hash as '0x' + 8 hex digits (the scene's model field
+--- takes names only; the client's prop handler reads that form back as the hash).
+local function sceneModel(model)
+    if math.type(model) == 'integer' then return ('0x%08X'):format(model & 0xFFFFFFFF) end
+    return model
+end
+
+--- An integer, or nil. An integral float counts: a stored entry may come back from a JSON round trip that way.
+local function toInt(value)
+    return type(value) == 'number' and math.tointeger(value) or nil
+end
+
+--- A bone tag 0..65535 or a bone name; anything else is the default hand bone.
+local function toBone(value)
+    local tag = toInt(value)
+    if tag and tag >= 0 and tag <= BONE_MAX then return tag end
+    if Utils.isString(value, MAX_NAME_LEN) and value:find(NAME_PATTERN) then return value end
+    return DEFAULT_BONE
+end
+
+--- Validated, JSON-safe entry from a caller's definition (or a stored entry), or nil, err.
+local function toEntry(def)
     if type(def) ~= 'table' then return nil, 'definition must be a table' end
-    local model = def.model
-    if not (Utils.isString(model, MAX_NAME_LEN) or math.type(model) == 'integer') then
+    local model = toInt(def.model) or def.model
+    if not ((Utils.isString(model, MAX_NAME_LEN) and model:find(NAME_PATTERN)) or math.type(model) == 'integer') then
         return nil, 'model must be a model name or a hash'
     end
     local id = def.id
     if id ~= nil then
-        if not Utils.isString(id, MAX_NAME_LEN) or not id:match(ID_PATTERN) then return nil, 'invalid id' end
+        if not Utils.isString(id, MAX_NAME_LEN) or not id:find(ID_PATTERN) then return nil, 'invalid id' end
     else
-        id = existingId or Utils.uuid()
+        id = Utils.uuid()
     end
-    local bone = math.type(def.bone) == 'integer' and def.bone or DEFAULT_BONE
     local offset = toVector3(def.offset) or vector3(0.0, 0.0, 0.0)
+    if math.abs(offset.x) > OFFSET_MAX or math.abs(offset.y) > OFFSET_MAX or math.abs(offset.z) > OFFSET_MAX then
+        return nil, 'offset out of range'
+    end
     local rotation = toVector3(def.rotation) or vector3(0.0, 0.0, 0.0)
     return {
-        id = id, model = model, bone = bone,
+        id = id, model = model, bone = toBone(def.bone),
         offset = Utils.vector3ToTable(offset), rotation = Utils.vector3ToTable(rotation),
     }
 end
 
---- Attach a prop. An existing entry with the same id is replaced.
+--- What a node is attached with: a different key means Scene.attach again.
+local function poseKey(e)
+    local o, r = e.offset, e.rotation
+    return ('%s|%.4f|%.4f|%.4f|%.4f|%.4f|%.4f'):format(tostring(e.bone), o.x, o.y, o.z, r.x, r.y, r.z)
+end
+
+local function clampTo(v, lo, hi)
+    if v ~= v then return 0.0 end
+    return v < lo and lo or (v > hi and hi or v)
+end
+
+--- The ped's position inside the scene's world box: the node's own pose until the attachment takes over.
+local function pedPos(ped)
+    local c = GetEntityCoords(ped)
+    return { x = clampTo(c.x, -9999.0, 9999.0), y = clampTo(c.y, -9999.0, 9999.0), z = clampTo(c.z, -999.0, 2999.0) }
+end
+
+--- Scene.attach options of entry `e`. Rotation order 1: what core's old attachments applier used (the community
+--- prop-table convention, dpemotes-style `..., true, true, false, true, 1, true`), so stored and copied offsets keep
+--- looking the same on the scene's AttachEntityToEntity.
+local function attachOpts(e)
+    return { bone = e.bone, offset = e.offset, offrot = e.rotation, rotOrder = ROT_ORDER }
+end
+
+--- A new node for entry `e` of player `src`: spawned at the ped, then attached to the player — one synchronous
+--- run, so the index coalesces both into one PUT (§55.5). Runs as core. -> node id | nil, err
+local function spawnNode(Scene, src, e, bucket, pos)
+    local id, err = Scene.spawn({ kind = 'prop', bucket = bucket, pos = pos,
+        fields = { model = sceneModel(e.model), collision = false, frozen = false } })
+    if not id then return nil, err end
+    local ok, aerr = Scene.attach(id, { player = src }, attachOpts(e))
+    if not ok then
+        Scene.remove(id)
+        return nil, aerr
+    end
+    return id
+end
+
+--- The existing node of `rec` brought in line with `e`: a model change is a Scene.set, a bone / offset /
+--- rotation change a Scene.attach again. Runs as core. -> true | nil, err
+local function updateNode(Scene, src, rec, e, pose)
+    if rec.model ~= e.model then
+        local ok, err = Scene.set(rec.id, { model = sceneModel(e.model) })
+        if not ok then return nil, err end
+        rec.model = e.model
+    end
+    if rec.pose ~= pose then
+        local ok, err = Scene.attach(rec.id, { player = src }, attachOpts(e))
+        if not ok then return nil, err end
+        rec.pose = pose
+    end
+    return true
+end
+
+--- Removes (fades) one node, as core. A removed node frees scene capacity: new nodes are tried again.
+local function removeNode(id)
+    local Scene = rawget(Core, 'Scene')
+    local remove = type(Scene) == 'table' and rawget(Scene, 'remove') or nil
+    if id and type(remove) == 'function' and asCore(remove, id, FADE) then capHeldUntil = 0 end
+end
+
+--- Removes every node of src (oldest first) and forgets them; the stored list stays.
+local function dropAll(src)
+    local mine = held[src]
+    if not mine then return end
+    held[src] = nil
+    local ids = {}
+    for _, rec in pairs(mine.nodes) do ids[#ids + 1] = rec.id end
+    table.sort(ids)
+    for i = 1, #ids do removeNode(ids[i]) end
+end
+
+--- held[src] for the player's CURRENT routing bucket (a node's bucket never changes: nodes left in another
+--- bucket are removed and made again in this one). -> holder, fresh (true = made now)
+local function holder(src)
+    local bucket = math.tointeger(GetPlayerRoutingBucket(src)) or 0
+    local mine = held[src]
+    if mine and mine.bucket == bucket then return mine, false end
+    if mine then dropAll(src) end
+    mine = { bucket = bucket, nodes = {} }
+    held[src] = mine
+    return mine, true
+end
+
+--- Makes the node of entry `e` exist and match it. -> true | nil, err (TRANSIENT codes: try again later)
+local function place(Scene, src, mine, e, pos)
+    local pose = poseKey(e)
+    local rec = mine.nodes[e.id]
+    if rec and rec.id then
+        if rec.model == e.model and rec.pose == pose then return true end
+        local ok, err = asCore(updateNode, Scene, src, rec, e, pose)
+        if ok then return true end
+        if err ~= 'missing' and err ~= 'attach' then return nil, err end   -- refused: the node keeps its state
+        if err == 'attach' then removeNode(rec.id) end                     -- half updated: made again below
+    end
+    mine.nodes[e.id] = nil
+    local id, err = asCore(spawnNode, Scene, src, e, mine.bucket, pos)
+    if not id then
+        if err == LIMIT then capHeldUntil = GetGameTimer() + CAP_HOLD_MS end
+        return nil, err
+    end
+    placedCount = placedCount + 1
+    mine.nodes[e.id] = { id = id, model = e.model, pose = pose }
+    return true
+end
+
+--- Brings src's nodes in line with the stored list and the player's bucket. -> true = done, false = retry soon,
+--- LIMIT = a prop waits for scene capacity (the backoff)
+local function syncPlayer(src)
+    local Scene = sceneApi()
+    if Scene == nil then return true end                  -- no scene in this VM: nothing is ever made
+    if not toLoaded(src) then
+        dropAll(src)
+        return true
+    end
+    if Scene == false then return false end               -- the scene store still loads
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return false end          -- the ped has not reached the server yet
+    local list = readList(src)
+    if #list == 0 and not held[src] then return true end  -- nothing to make, nothing made
+    local mine = holder(src)
+    local pos, wanted, again, full, bad = pedPos(ped), {}, false, false, 0
+    for i = 1, #list do
+        local e = list[i].id ~= nil and toEntry(list[i]) or nil
+        if not e then
+            bad = bad + 1
+        elseif not wanted[e.id] then
+            wanted[e.id] = true
+            local rec, pose = mine.nodes[e.id], poseKey(e)
+            local refused = rec and rec.failed and rec.model == e.model and rec.pose == pose   -- until it changes
+            if not refused and not (rec and rec.id) and GetGameTimer() < capHeldUntil then
+                full = true                                   -- a new node now would be refused too
+            elseif not refused then
+                local ok, err = place(Scene, src, mine, e, pos)
+                if not ok and TRANSIENT[err] then
+                    again = true
+                elseif not ok and err == LIMIT then           -- capacity: stored, retried with the backoff
+                    full = true
+                elseif not ok then                            -- refused: no node until the entry changes
+                    local old = mine.nodes[e.id]
+                    if old then removeNode(old.id) end
+                    mine.nodes[e.id] = { model = e.model, pose = pose, failed = true }
+                    Log.warn('Attachments: the scene refused prop %s of player %d (%s)', e.id, src, tostring(err))
+                end
+            end
+        end
+    end
+    for aid, rec in pairs(mine.nodes) do
+        if not wanted[aid] then
+            removeNode(rec.id)
+            mine.nodes[aid] = nil
+        end
+    end
+    if bad > 0 then Log.warn('Attachments: player %d has %d unusable stored attachment(s)', src, bad) end
+    if again then return false end
+    return full and LIMIT or true
+end
+
+local ensureRetry                                         -- forward: the retry thread
+
+--- src waits for the 1 s retry (the scene store loading, no ped yet, a transient refusal).
+local function queue(src)
+    waiting[src] = true
+    ensureRetry()
+end
+
+--- src waits for scene capacity: the first one of a shortage arms the backoff.
+local function cap(src)
+    local now = GetGameTimer()
+    if next(capped) == nil and capDue <= now then capDue = now + capBackoff end
+    capped[src] = true
+    if not capLogAt or now - capLogAt >= CAP_LOG_MS then
+        capLogAt = now
+        Log.warn('Attachments: the scene has no room for a prop of player %d (limit); it is stored and retried '
+            .. '(further capacity waits are not logged for a minute)', src)
+    end
+    ensureRetry()
+end
+
+--- One pass over the players of `set` (SYNC_SLICE per server tick), each filed by its sync's answer: done → out,
+--- false → waiting, LIMIT → capped.
+local function pass(set)
+    local Scene = sceneApi()
+    if Scene == nil then                                  -- no scene: nothing will ever be made
+        for src in pairs(waiting) do waiting[src] = nil end
+        for src in pairs(capped) do capped[src] = nil end
+        return
+    end
+    if Scene == false then return end
+    local list = {}
+    for src in pairs(set) do list[#list + 1] = src end
+    table.sort(list)
+    for i = 1, #list do
+        local src = list[i]
+        if set[src] then
+            set[src] = nil
+            local ok, res = pcall(syncPlayer, src)
+            if not ok then
+                Log.error('Attachments: sync of player %d failed (%s)', src, tostring(res))
+            elseif res == LIMIT then
+                cap(src)
+            elseif not res then
+                waiting[src] = true
+            end
+        end
+        if i % SYNC_SLICE == 0 and i < #list then Wait(SLICE_WAIT_MS) end
+    end
+end
+
+--- ONE thread while somebody waits: the waiting players every second; the capped ones when the backoff is due
+--- (then 5 s again after a round that placed something, else twice as long, <= 60 s).
+-- fxlint-disable-next-line C003 -- assigns the forward-declared local `ensureRetry`
+ensureRetry = function()
+    if retrying then return end
+    retrying = true
+    CreateThread(function()
+        repeat
+            Wait(RETRY_MS)
+            local ok, err = pcall(pass, waiting)
+            if not ok then Log.error('Attachments: a retry pass failed (%s)', tostring(err)) end
+            if next(capped) ~= nil and GetGameTimer() >= capDue then
+                local mark = placedCount
+                capHeldUntil = 0                          -- capacity may have freed meanwhile: try again
+                ok, err = pcall(pass, capped)
+                if not ok then Log.error('Attachments: a capacity retry failed (%s)', tostring(err)) end
+                capBackoff = placedCount > mark and CAP_MIN_MS or math.min(capBackoff * 2, CAP_MAX_MS)
+                capDue = GetGameTimer() + capBackoff
+            end
+        until next(waiting) == nil and next(capped) == nil
+        retrying = false
+    end)
+end
+
+--- Syncs src now when the scene and the ped allow it, else through the retry thread.
+local function sync(src)
+    local ok, res = pcall(syncPlayer, src)
+    if not ok then
+        Log.error('Attachments: sync of player %d failed (%s)', src, tostring(res))
+    elseif res == LIMIT then
+        cap(src)
+    elseif not res then
+        queue(src)
+    end
+end
+
+--- The node of a new / changed entry: now when the scene and the ped allow it, else by the retry thread.
+--- -> true | nil, err (the scene refused the prop: the caller stores nothing)
+local function placeNow(src, e)
+    local Scene = sceneApi()
+    if Scene == nil then return true end                  -- no scene in this VM: stored only
+    local ped = Scene and GetPlayerPed(src) or 0
+    if not ped or ped == 0 then                           -- the store still loads / no ped yet: the entry is
+        queue(src)                                        -- stored and the retry thread makes its node
+        return true
+    end
+    local mine, fresh = holder(src)
+    local rec = mine.nodes[e.id]
+    if rec and rec.failed then mine.nodes[e.id] = nil end -- a re-add tries a refused entry again
+    local ok, err = place(Scene, src, mine, e, pedPos(ped))
+    if fresh then queue(src) end                          -- the other entries follow (no sync yet / new bucket)
+    if ok then return true end
+    if TRANSIENT[err] then
+        queue(src)
+        return true
+    end
+    if err == LIMIT then                                  -- capacity: stored, its node follows when there is room
+        cap(src)
+        return true
+    end
+    return nil, err
+end
+
+--- Attach a prop. An existing entry with the same id is replaced (its node changes in place).
 --- @return string|nil id, string|nil err
 function Attachments.add(src, def)
     local target = toLoaded(src)
@@ -333,16 +674,21 @@ function Attachments.add(src, def)
         return nil, err
     end
     local list = readList(target)
+    local index
     for i = 1, #list do
         if list[i].id == entry.id then
-            list[i] = entry
-            writeList(target, list)
-            return entry.id
+            index = i
+            break
         end
     end
-    if #list >= MAX_ATTACHMENTS then return nil, 'too many attachments' end
-    list[#list + 1] = entry
-    writeList(target, list)
+    if not index and #list >= MAX_ATTACHMENTS then return nil, 'too many attachments' end
+    local ok, perr = placeNow(target, entry)
+    if not ok then
+        Log.error('Attachments.add: the scene refused prop %s (%s)', entry.id, tostring(perr))
+        return nil, ('scene refused the prop (%s)'):format(tostring(perr))
+    end
+    list[index or #list + 1] = entry
+    Core.Player.setData(target, 'attachments', list)
     return entry.id
 end
 
@@ -354,7 +700,13 @@ function Attachments.remove(src, id)
     for i = 1, #list do
         if list[i].id == id then
             table.remove(list, i)
-            writeList(target, list)
+            Core.Player.setData(target, 'attachments', list)
+            local mine = held[target]
+            local rec = mine and mine.nodes[id]
+            if rec then
+                mine.nodes[id] = nil
+                removeNode(rec.id)
+            end
             return true
         end
     end
@@ -365,7 +717,8 @@ end
 function Attachments.clear(src)
     local target = toLoaded(src)
     if not target then return false end
-    writeList(target, {})
+    Core.Player.setData(target, 'attachments', {})
+    dropAll(target)
     return true
 end
 
@@ -376,14 +729,44 @@ function Attachments.list(src)
     return readList(target)
 end
 
--- Stored props have to reach the bag again when the character comes back: server/player.lua
--- only replicates the §8 keys, `attachments` is written here and nowhere else.
+-- The stored props get their nodes when the character comes in (after a core restart as well: the hook
+-- fires again for every client that asks core for its load).
 Core.on('playerLoaded', function(src)
     local target = toLoaded(src)
+    if target then sync(target) end
+end)
+
+-- server/player.lua emits this BEFORE the session goes — and before scene.lua's own playerDropped handler,
+-- which would otherwise leave a dropped player's attachments standing at their last pose.
+Core.on('playerDropped', function(src)
+    local target = toSrc(src)
     if not target then return end
-    local list = readList(target)
-    if #list == 0 then return end
-    Player(target).state:set('attachments', list, true)
+    waiting[target], capped[target] = nil, nil
+    dropAll(target)
+end)
+
+-- The engine's own server event (a local one: clients cannot raise it) for every routing-bucket change —
+-- Player.setBucket (§48, §50) or the raw native: the nodes follow the player into the new bucket.
+AddEventHandler('onPlayerBucketChange', function(player)
+    local target = toLoaded(tonumber(player))
+    if target and held[target] then sync(target) end
+end)
+
+-- A core restart took every node with the old VM: once the scene store is ready, every loaded player is
+-- synced (one whose playerLoaded hook already did it costs a compare per entry).
+CreateThread(function()
+    Wait(0)                                               -- every server file has loaded
+    local Scene = sceneApi()
+    while Scene == false do
+        Wait(RETRY_MS)
+        Scene = sceneApi()
+    end
+    if Scene == nil then return end
+    local players = Core.Player.getPlayers()
+    for i = 1, #players do waiting[players[i]] = true end
+    local ok, err = pcall(pass, waiting)
+    if not ok then Log.error('Attachments: the start sync failed (%s)', tostring(err)) end
+    if next(waiting) ~= nil or next(capped) ~= nil then ensureRetry() end
 end)
 
 --------------------------------------------------------------------------------

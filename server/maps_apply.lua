@@ -695,7 +695,8 @@ function Maps.journal(id, filter)
     return rows
 end
 
---- Maps.respawn(id, elementId?) -> count re-queued (networked elements whose entity is gone)
+--- Maps.respawn(id, elementId?) -> how many element nodes were put back to their authored state (spawned again,
+--- moved back — a promoted clone is demoted first — or reset; maps_runtime.lua)
 function Maps.respawn(id, elementId)
     if not R.ensureLoaded() or type(id) ~= 'string' or not maps[id] then return 0 end
     local eid = elementId ~= nil and R.normId(elementId) or nil

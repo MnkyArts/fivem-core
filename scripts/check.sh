@@ -90,7 +90,9 @@ else
     skip 'tests/client_ui_tests.lua does not exist yet'
 fi
 # §41–§53 (admin platform): libs, services and the map runtime, one suite per module.
-for suite in raycast schema settings perms buckets audit bans targets admin_api registry_caller client_registry_caller client_adminstate callback maps maps_store maps_regions client_maps chat_hook; do
+for suite in raycast schema settings perms buckets audit bans targets admin_api registry_caller client_registry_caller client_adminstate callback maps maps_store client_maps chat_hook \
+             scene_codec scene_motion scene_server scene_index scene_interest client_scene_cache client_scene_mat client_scene_kinds \
+             scene_audio scene_voice scene_promote scene_attach scene_parked; do
     if [ -f "tests/${suite}_tests.lua" ]; then
         lua5.4 "tests/${suite}_tests.lua" || fail "tests/${suite}_tests.lua"
     else
